@@ -7,6 +7,14 @@ import triton.language as tl
 # -- Shared async D-to-H copy infrastructure --
 # Used by both ScatterForGroupedGemm and moe_ep_prepare_dispatch to avoid
 # per-call cudaStreamSynchronize overhead from .tolist() / .item().
+#
+# These are process-global, not per-thread, which is fine because the MoE ops only ever run
+# on one thread at a time. DualPipeV launches forwards from a single thread and runs every
+# backward through run_backward(), which disables autograd multithreading (dualpipe/utils.py),
+# and nothing recomputes the MoE forward on a separate thread. If that ever changes (two
+# models stepping in one process, or a plain multithreaded .backward() overlapping a forward)
+# the shared buffers would race and corrupt the ks / EP-splits read-back, so key the buffer
+# by threading.get_ident() and drop the shared copy stream/event at that point.
 
 _pinned_buffers: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
 _GEMM_ALLOC_ALIGNMENT = 1024
