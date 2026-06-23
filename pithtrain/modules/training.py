@@ -26,7 +26,7 @@ from pithtrain.models.deepseek_v2_lite import DeepseekV2LiteModel
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
 from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
-from pithtrain.modules.load_balance import make_load_balance_loss_fn
+from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
 from pithtrain.modules.optimizer import Muon
 
 from .distributed import DistributedCfg, DistributedCtx
@@ -218,6 +218,18 @@ class TrainingCfg(SlottedDefault):
       accumulation steps (https://arxiv.org/abs/2501.11873).
     * "sequence" - Sequence-level loss computed independently per sequence
       then averaged over the batch (https://arxiv.org/abs/2405.04434).
+    """
+
+    benchmark: bool = False
+    """
+    Benchmark mode: enable tuning that makes throughput measurement easy-to-setup and comparable
+    but is wrong for real training. Effects include:
+
+    * Force-balanced MoE routing: every expert gets an equal, dropless token load.
+      This is the convention NeMo Megatron-Bridge uses for its MoE benchmarks
+      (https://docs.nvidia.com/nemo/megatron-bridge/latest/performance-summary.html).
+
+    By default, this flag is False, so normal training is unaffected.
     """
 
     fp8_training: Literal["deep-gemm", "disabled"] = "disabled"
@@ -498,6 +510,12 @@ def setup_model(
                     if hasattr(loss_fn, "init_buffers"):
                         loss_fn.init_buffers(gate.num_experts, gate.weight.device)
                     gate.load_balance_loss_fn = loss_fn
+
+    # Benchmark mode: force-balance every MoE gate's routing.
+    if cfg.benchmark:
+        for module in modules.modules():
+            if hasattr(module, "router_replay"):
+                module.router_replay = force_balance(module.num_experts)
 
     ctx.model = DualPipeV(modules, pp_group=pp_group, ep_group=ep_group)
     set_p2p_tensor_shapes([(micro_batch_size, local_seq_len, hidden_size)])

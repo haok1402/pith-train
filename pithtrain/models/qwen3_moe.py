@@ -195,6 +195,7 @@ class Qwen3MoeGate(nn.Module):
         self.num_experts_per_tok = num_experts_per_tok
         self.norm_topk_prob = norm_topk_prob
         self.load_balance_loss_fn = None
+        self.router_replay = None
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size)), requires_grad=True)
 
     @torch.compile(fullgraph=True)
@@ -223,6 +224,9 @@ class Qwen3MoeGate(nn.Module):
         logits = F.linear(hidden_states, self.weight, None)
         scores = logits.softmax(dim=-1, dtype=torch.float32)
         topk_weight, topk_idx = torch.topk(scores, k=self.num_experts_per_tok, dim=-1, sorted=False)
+        if self.router_replay is not None:
+            topk_idx = self.router_replay(topk_idx)
+            topk_weight = scores.gather(-1, topk_idx)
 
         if self.norm_topk_prob:
             topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
