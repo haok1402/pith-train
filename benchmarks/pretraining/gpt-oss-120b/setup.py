@@ -1,32 +1,22 @@
 #!/usr/bin/env python3
 """
-Prepare the model checkpoint and the pretraining dataset.
+Prepare the tokenizer and the pretraining dataset.
 """
 
 from pathlib import Path
 
 from huggingface_hub import snapshot_download
+from transformers import AutoTokenizer
 
-from pithtrain.tasks import convert_checkpoint, tokenize_corpus
-from pithtrain.tasks.convert_checkpoint import ConvertCheckpointCfg
+from pithtrain.tasks import tokenize_corpus
 from pithtrain.tasks.tokenize_corpus import TokenizeCorpusCfg
 
 if __name__ == "__main__":
     Path("workspace").resolve().mkdir(parents=True, exist_ok=True)
 
 if __name__ == "__main__":
-    kwargs = dict()
-    kwargs["repo_id"] = "openai/gpt-oss-120b"
-    kwargs["local_dir"] = "workspace/checkpoints/gpt-oss-120b/hf-import"
-    snapshot_download(**kwargs, repo_type="model")
-
-if __name__ == "__main__":
-    cfg = ConvertCheckpointCfg()
-    cfg.operation = "hf2dcp"
-    cfg.load_path = Path("workspace/checkpoints/gpt-oss-120b/hf-import")
-    cfg.save_path = Path("workspace/checkpoints/gpt-oss-120b/torch-dcp/step-00000000")
-    if not Path(cfg.save_path, ".metadata").exists():
-        convert_checkpoint.launch(cfg)
+    tokenizer = AutoTokenizer.from_pretrained("openai/gpt-oss-120b")
+    tokenizer.save_pretrained("workspace/checkpoints/gpt-oss-120b/hf-import")
 
 if __name__ == "__main__":
     kwargs = dict()
@@ -59,4 +49,4 @@ training.max_steps = 25
 training.dataset = Path("workspace/datasets/dclm-baseline/toktxt/gpt-oss")
 training.moe_load_balance_type = "micro-batch"
 training.moe_load_balance_coef = 1e-3
-training.save_location = Path("workspace/checkpoints/gpt-oss-120b")
+training.benchmark = True

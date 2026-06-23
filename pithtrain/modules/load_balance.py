@@ -1,6 +1,6 @@
-"""MoE routing load balance losses."""
+"""Load balancing for MoE routing."""
 
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 import torch.distributed
@@ -252,3 +252,20 @@ def make_load_balance_loss_fn(
             raise ValueError(f"Unknown moe_load_balance_type: {lb_type!r}")
     MoELoadBalanceLossTracker.register(loss)
     return loss
+
+
+def force_balance(num_experts: int) -> Callable[[torch.Tensor], torch.Tensor]:
+    """
+    Build a benchmark-only router replay that spreads tokens evenly across all
+    ``num_experts`` (round-robin), giving every expert an equal, dropless load.
+    The returned callable rewrites a gate's top-k indices, keeping their shape.
+    """
+
+    def replay(topk_idx: torch.Tensor) -> torch.Tensor:
+        num_tokens, top_k = topk_idx.shape
+        stride = num_experts // top_k
+        t = torch.arange(num_tokens, device=topk_idx.device).unsqueeze(1)
+        j = torch.arange(top_k, device=topk_idx.device).unsqueeze(0)
+        return (t + j * stride) % num_experts
+
+    return replay

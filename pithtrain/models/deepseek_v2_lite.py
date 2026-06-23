@@ -241,6 +241,7 @@ class DeepseekV2LiteMoEGate(nn.Module):
         self.num_experts = config.n_routed_experts
         self.routed_scaling_factor = config.routed_scaling_factor
         self.load_balance_loss_fn = None
+        self.router_replay = None
         self.weight = nn.Parameter(
             torch.empty((self.n_routed_experts, config.hidden_size)), requires_grad=True
         )
@@ -262,6 +263,9 @@ class DeepseekV2LiteMoEGate(nn.Module):
         logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32), None)
         scores = logits.softmax(dim=-1, dtype=torch.float32)
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
+        if self.router_replay is not None:
+            topk_idx = self.router_replay(topk_idx)
+            topk_weight = scores.gather(-1, topk_idx)
         topk_weight = topk_weight * self.routed_scaling_factor
 
         if self.training and self.load_balance_loss_fn is not None:

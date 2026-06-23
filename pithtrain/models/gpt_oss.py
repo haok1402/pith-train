@@ -271,6 +271,7 @@ class GptOssTopKRouter(nn.Module):
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.load_balance_loss_fn = None
+        self.router_replay = None
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size)), requires_grad=True)
         self.bias = nn.Parameter(torch.zeros(num_experts))
 
@@ -284,6 +285,9 @@ class GptOssTopKRouter(nn.Module):
         logits = F.linear(hidden_states, self.weight, self.bias)
 
         topk_logits, topk_idx = torch.topk(logits, k=self.num_experts_per_tok, dim=-1, sorted=True)
+        if self.router_replay is not None:
+            topk_idx = self.router_replay(topk_idx)
+            topk_logits = logits.gather(-1, topk_idx)
         topk_weight = F.softmax(topk_logits, dim=-1, dtype=torch.float32)
 
         if self.training and self.load_balance_loss_fn is not None:
