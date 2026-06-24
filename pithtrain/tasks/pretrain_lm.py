@@ -509,3 +509,4 @@ def launch(cfg: PretrainLMCfg) -> None:
         raise_if_dataset_insufficient(cfg, ctx)
         while ctx.training.step < cfg.training.max_steps:
             train_step(cfg, ctx)
+            assert False  # debug first-step
