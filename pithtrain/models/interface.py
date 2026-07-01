@@ -3,6 +3,8 @@ from typing import Dict, List, NamedTuple, Optional, Protocol
 import torch
 import torch.nn as nn
 
+from pithtrain.modules.distributed import DistributedCtx
+
 
 class ForwardAttnOutput(NamedTuple):
     """Output from the forward_attn method of a decoder layer."""
@@ -23,17 +25,17 @@ class DecoderLayerMlpProtocol(Protocol):
     """
     Protocol for the MLP component of a decoder layer in DualPipeV.
 
-    If the experts attribute is present, we treat the MLP as a MoE layer.
+    May be a dense MLP or a MoE block; MoE variants additionally expose
+    ``experts``, ``num_experts``, and ``experts_per_rank`` (checked via
+    ``hasattr``). Distributed state lives on the layer's ``ctx``, not here.
     """
-
-    ep_size: int
-    ep_group: torch.distributed.ProcessGroup
 
 
 class DecoderLayerProtocol(Protocol):
     """Protocol for a decoder layer in DualPipeV."""
 
     idx: int
+    ctx: DistributedCtx
     mlp: DecoderLayerMlpProtocol
 
     def reference_forward(

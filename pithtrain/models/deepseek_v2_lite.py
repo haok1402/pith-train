@@ -5,7 +5,6 @@ from dataclasses import fields
 from typing import List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from transformers.models.deepseek_v2.configuration_deepseek_v2 import DeepseekV2Config
@@ -16,6 +15,7 @@ from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_fo
 from pithtrain.dualpipe.utils import run_backward
 from pithtrain.layers.factory import ModelImplMode, get_group_linear_cls, get_linear_cls
 from pithtrain.models.interface import ForwardAttnOutput
+from pithtrain.modules.distributed import DistributedCtx
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func
@@ -222,16 +222,15 @@ class DeepseekV2LiteMoEWithGroupGeMM(nn.Module):
     def __init__(
         self,
         config: DeepseekV2Config,
-        ep_group: Optional[dist.ProcessGroup] = None,
+        ctx: DistributedCtx,
         layer_id: int = 0,
     ):
         super().__init__()
         self.config = config
-        self.ep_group = ep_group
+        self.ctx = ctx
         self.num_experts_per_tok = config.num_experts_per_tok
-        self.ep_size = getattr(config, "ep_size", 1)
-        self.ep_rank = ep_group.rank() if ep_group is not None else 0
-        self.experts_per_rank = config.n_routed_experts // self.ep_size
+        self.ep_rank = ctx.ep_rank  # read by checkpoint localization
+        self.experts_per_rank = config.n_routed_experts // ctx.ep_size
         self.n_routed_experts = config.n_routed_experts
 
         self.experts = DeepseekV2LiteExperts(config, self.experts_per_rank)
@@ -253,7 +252,7 @@ class DeepseekV2LiteMoEWithGroupGeMM(nn.Module):
         return y
 
     def moe_infer(self, x, topk_ids, topk_weight):
-        assert self.ep_size == 1, "reference implementation only supports ep_size=1"
+        assert self.ctx.ep_size == 1, "reference implementation only supports ep_size=1"
         expert_idxs = topk_ids.view(-1)
         sorted_tokens = (
             x.unsqueeze(1).expand(-1, self.num_experts_per_tok, -1).reshape(-1, x.shape[-1])
@@ -276,8 +275,8 @@ class DeepseekV2LiteAttention(nn.Module):
     def __init__(
         self,
         config: DeepseekV2Config,
+        ctx: DistributedCtx,
         layer_id: int = 0,
-        cp_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
         self.config = config
@@ -289,8 +288,8 @@ class DeepseekV2LiteAttention(nn.Module):
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
 
-        self.cp_group = cp_group
-        self.use_ring_attn = cp_group is not None and cp_group.size() > 1
+        self.ctx = ctx
+        self.use_ring_attn = ctx.cp_size > 1
 
         LinearCls = get_linear_cls()
         self.q_proj = LinearCls(self.hidden_size, self.num_heads * self.q_head_dim, bias=False)
@@ -347,7 +346,7 @@ class DeepseekV2LiteAttention(nn.Module):
                 sm_scale=self.softmax_scale,
                 qk_nope_head_dim=self.qk_nope_head_dim,
                 v_head_dim=self.v_head_dim,
-                cp_group=self.cp_group,
+                cp_group=self.ctx.cp_group,
                 kv_b_quant=kv_b_quant,
             )
         else:
@@ -372,17 +371,15 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
         self,
         config: DeepseekV2Config,
         layer_id: int,
-        ep_group: Optional[dist.ProcessGroup] = None,
-        cp_group: Optional[dist.ProcessGroup] = None,
+        ctx: DistributedCtx,
     ):
         super().__init__()
         self.idx = layer_id
-        self.self_attn = DeepseekV2LiteAttention(
-            config=config, layer_id=layer_id, cp_group=cp_group
-        )
+        self.ctx = ctx
+        self.self_attn = DeepseekV2LiteAttention(config=config, ctx=ctx, layer_id=layer_id)
 
         self.mlp = (
-            DeepseekV2LiteMoEWithGroupGeMM(config, ep_group, layer_id)
+            DeepseekV2LiteMoEWithGroupGeMM(config, ctx, layer_id)
             if (
                 config.n_routed_experts is not None
                 and layer_id >= config.first_k_dense_replace
@@ -452,9 +449,9 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
             hidden_states,
             topk_ids,
             self.mlp.n_routed_experts,
-            self.mlp.ep_size,
+            self.ctx.ep_size,
             self.mlp.experts_per_rank,
-            self.mlp.ep_group,
+            self.ctx.ep_group,
         )
         return ForwardAttnOutput(
             sorted_tokens,
@@ -505,7 +502,7 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
         """
 
         def moe_finalize(moe_outs, moe_local_idxs, topk_weight) -> torch.Tensor:
-            if self.mlp.ep_size > 1:
+            if self.ctx.ep_size > 1:
                 assert moe_local_idxs is not None
                 seq_len, topk = topk_weight.shape
                 # Memory-efficient equivalent of
@@ -566,16 +563,32 @@ class DeepseekV2LiteModel(nn.Module):
     def __init__(
         self,
         config: DeepseekV2Config,
-        num_stages: int,
-        stage_id: int,
-        ep_group: Optional[dist.ProcessGroup] = None,
-        cp_group: Optional[dist.ProcessGroup] = None,
+        ctx: DistributedCtx,
+        *,
+        phase: int,
     ):
         super().__init__()
+        num_stages = 2 * ctx.pp_size
+        stage_id = ctx.pp_rank if phase == 0 else num_stages - 1 - ctx.pp_rank
+        self._build(config, ctx, num_stages, stage_id)
+
+    @classmethod
+    def full(cls, config: DeepseekV2Config, ctx: DistributedCtx) -> "DeepseekV2LiteModel":
+        """Build the unpartitioned full model (all layers, stage 0) for correctness-test references."""
+        self = cls.__new__(cls)
+        nn.Module.__init__(self)
+        self._build(config, ctx, num_stages=1, stage_id=0)
+        return self
+
+    def _build(
+        self,
+        config: DeepseekV2Config,
+        ctx: DistributedCtx,
+        num_stages: int,
+        stage_id: int,
+    ) -> None:
         self.stage_id = stage_id
-        self.cp_group = cp_group
-        self.cp_rank = cp_group.rank() if cp_group is not None else 0
-        self.cp_size = cp_group.size() if cp_group is not None else 1
+        self.ctx = ctx
         self.embed_tokens = (
             nn.Embedding(config.vocab_size, config.hidden_size) if stage_id == 0 else None
         )
@@ -597,7 +610,7 @@ class DeepseekV2LiteModel(nn.Module):
         layer_id_end = layer_id_begin + num_local_layers[stage_id]
         self.layers = nn.ModuleDict(
             {
-                str(i): DeepseekV2LiteDecoderLayer(config, i, ep_group, cp_group=cp_group)
+                str(i): DeepseekV2LiteDecoderLayer(config, i, ctx)
                 for i in range(layer_id_begin, layer_id_end)
             }
         )
@@ -627,9 +640,9 @@ class DeepseekV2LiteModel(nn.Module):
         # global chunks. Build the global position IDs by concatenating the
         # front block and the mirror back block, then gather cos/sin by position.
         block = seq_len // 2
-        global_seq_len = seq_len * self.cp_size
-        front_start = self.cp_rank * block
-        back_start = (2 * self.cp_size - self.cp_rank - 1) * block
+        global_seq_len = seq_len * self.ctx.cp_size
+        front_start = self.ctx.cp_rank * block
+        back_start = (2 * self.ctx.cp_size - self.ctx.cp_rank - 1) * block
         position_ids = torch.cat(
             [
                 torch.arange(front_start, front_start + block, device=hidden_states.device),

@@ -58,12 +58,13 @@ in most cases that's exactly how past bugs landed.
 6. **When tests fail, diagnose before relaxing anything.** Print actual
    magnitudes. A 6-order-of-magnitude gradient discrepancy is not bf16
    noise. Never loosen thresholds or add name-based skips as a first move.
-7. **Reject unused process-group arguments explicitly.** If a model's
-   `__init__` accepts a group it does not actually implement (e.g.
-   `cp_group` on a model with no ring-attention path), silently ignoring
-   it will produce wrong results when a real group is eventually passed.
-   Raise `NotImplementedError` when `group is not None and group.size() > 1`.
-   See `reference/protocol.md` §init-requirements.
+7. **Reject unsupported parallelism axes explicitly.** A model's `__init__`
+   receives a single `ctx: DistributedCtx` covering every axis. If it does not
+   actually implement one (e.g. context parallelism on a model with no
+   ring-attention path), silently ignoring `ctx.cp_size > 1` will produce wrong
+   results when a real CP mesh is eventually used. Raise `NotImplementedError`
+   when `ctx.<axis>_size > 1` for each unsupported axis. See
+   `reference/protocol.md` §init-requirements.
 8. **Thread config values through `__init__`; don't hardcode them.** Any
    value that appears in HF's `config.json` is a per-checkpoint knob —
    read it from the config even if every released checkpoint currently
@@ -153,8 +154,9 @@ go back and `print()` it from the actual data.
    - Model (forward / backward / stage-record copy)
 3. Checklist for the decoder layer:
    - [ ] `self.idx = layer_idx`
-   - [ ] `self.mlp.ep_size` and `self.mlp.ep_group` exposed (so
-         `DecoderLayerMlpProtocol` is satisfied)
+   - [ ] `self.ctx = ctx` stored (constructor takes a `ctx: DistributedCtx`;
+         read ranks/sizes/groups from `self.ctx.*` rather than passing loose
+         `cp_group`/`ep_group`/`ep_size` kwargs)
    - [ ] `@torch.compile(fullgraph=True)` on `_forward_attn_compute`,
          router/gate `compute`, and `forward_aggregate`
    - [ ] Shared experts (if any) fold into residual at the end of
@@ -186,11 +188,11 @@ No new reference file needed — the changes are small and mechanical.
 
 1. `pithtrain/modules/training.py`:
    - Import the new `<Model>Model` class.
-   - Add a branch in `setup_model`:
+   - Add a branch in `setup_model` (models are constructed uniformly with
+     `ctx=distributed`; no per-model group kwargs):
      ```python
      elif module_config.model_type == "<model_type>":
          ModelClass = <Model>Model
-         model_kwargs = {"cp_group": cp_group}  # or {} if no CP support
      ```
    - Add the new class to the `apply_fsdp` `isinstance` assertion tuple.
    - Add the HF ID to the `TrainingCfg.model` `Literal[...]` union (if
@@ -330,10 +332,11 @@ high-signal self-reviews that save a review round-trip:
 2. **Dangling `docs/`, `AGENTS.md`, `CLAUDE.md`, `.agents/`, `.claude/` pointers in comments or
    docstrings.** Those paths aren't committed, so any pointer is a
    broken link. Grep the new files and inline the derivation or delete.
-3. **Unused parameters for interface compatibility.** Accept them
-   (e.g. `cp_group` for protocol parity), then either prefix with `_`
-   or `raise NotImplementedError` when `size() > 1` (Hard Rule 7).
-   Bare unused params trip pyright/pylance.
+3. **Unhandled distributed axes.** The constructor takes a single
+   `ctx: DistributedCtx` (always stored on `self`, so never a bare unused
+   param). If the model does not implement an axis the ctx carries, reject it
+   explicitly via `if ctx.<axis>_size > 1: raise NotImplementedError`
+   (Hard Rule 7) rather than silently ignoring it.
 
 ## Common failure modes → where to look
 
@@ -344,7 +347,7 @@ high-signal self-reviews that save a review round-trip:
 | FSDP loss matches but grads don't | `reference/testing.md` §label-scaling + `reference/pitfalls.md` §nan-padding |
 | `RuntimeError: tensor data is not allocated yet` | Wrong reshard settings — check `apply_fsdp` |
 | Inference gibberish but FSDP passed | `reference/checkpoint.md` §weight-norm-comparison + `reference/conventions.md` §example-config + §thread-config + §activation-math |
-| Wrong results only when a real `cp_group` is passed | `reference/protocol.md` §init-requirements (silent-ignore of unused groups) |
+| Wrong results only when a real CP/EP mesh is used | `reference/protocol.md` §init-requirements (silent-ignore of an unsupported `ctx` axis) |
 | "invalid gradient shape" in stage 4 backward | `reference/protocol.md` §stage-record-copy |
 | `compile-inside-compile` on attention | `reference/compile.md` §flex-unwrap |
 | Left-padded prompts give gibberish on short inputs | `reference/pitfalls.md` §trim-to-shortest |

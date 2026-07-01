@@ -5,7 +5,6 @@ from dataclasses import fields
 from typing import List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from flash_attn.cute.interface import flash_attn_func
 from torch import nn
@@ -18,6 +17,7 @@ from pithtrain.layers.deepgemm_fp8_linear import FP8GroupLinearFunc
 from pithtrain.layers.factory import ModelImplMode, get_linear_cls
 from pithtrain.layers.group_linear import GroupLinearFunc
 from pithtrain.models.interface import ForwardAttnOutput
+from pithtrain.modules.distributed import DistributedCtx
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.clamped_swiglu import clamped_swiglu
 from pithtrain.operators.deepgemm_fp8_quantize import fused_blockwise_transpose_cast_to_fp8_batched
@@ -323,18 +323,16 @@ class GptOssMLP(nn.Module):
         num_experts_per_tok: int,
         intermediate_size: int,
         swiglu_limit: float,
-        ep_size: int = 1,
-        ep_group: Optional[dist.ProcessGroup] = None,
+        ctx: DistributedCtx,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
 
-        self.ep_size = ep_size
-        self.ep_group = ep_group
-        self.ep_rank = ep_group.rank() if ep_group is not None else 0
-        self.experts_per_rank = num_experts // ep_size
+        self.ctx = ctx
+        self.ep_rank = ctx.ep_rank  # read by checkpoint localization
+        self.experts_per_rank = num_experts // ctx.ep_size
 
         self.experts = GptOssExperts(
             self.experts_per_rank, hidden_size, intermediate_size, swiglu_limit
@@ -354,7 +352,7 @@ class GptOssMLP(nn.Module):
         topk_ids: torch.Tensor,
         topk_weight: torch.Tensor,
     ) -> torch.Tensor:
-        assert self.ep_size == 1, "Reference implementation only supports ep_size=1"
+        assert self.ctx.ep_size == 1, "Reference implementation only supports ep_size=1"
         expert_idxs = topk_ids.view(-1)
         sorted_tokens = (
             x.unsqueeze(1).expand(-1, self.num_experts_per_tok, -1).reshape(-1, x.shape[-1])
@@ -474,17 +472,17 @@ class GptOssDecoderLayer(nn.Module):
         num_experts: int,
         num_experts_per_tok: int,
         swiglu_limit: float,
+        ctx: DistributedCtx,
         rms_norm_eps: float,
         attention_bias: bool,
         layer_idx: int,
         is_sliding: bool = False,
         sliding_window: int = 128,
-        ep_size: int = 1,
-        ep_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
         self.idx = layer_idx
         self.hidden_size = hidden_size
+        self.ctx = ctx
 
         self.self_attn = GptOssAttention(
             hidden_size=hidden_size,
@@ -502,8 +500,7 @@ class GptOssDecoderLayer(nn.Module):
             num_experts_per_tok=num_experts_per_tok,
             intermediate_size=intermediate_size,
             swiglu_limit=swiglu_limit,
-            ep_size=ep_size,
-            ep_group=ep_group,
+            ctx=ctx,
         )
 
         self.input_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -545,9 +542,9 @@ class GptOssDecoderLayer(nn.Module):
             hidden_states,
             topk_ids,
             self.mlp.num_experts,
-            self.mlp.ep_size,
+            self.ctx.ep_size,
             self.mlp.experts_per_rank,
-            self.mlp.ep_group,
+            self.ctx.ep_group,
         )
 
         return ForwardAttnOutput(
@@ -588,7 +585,7 @@ class GptOssDecoderLayer(nn.Module):
         topk_weight: Optional[torch.Tensor],
         residual: torch.Tensor,
     ) -> torch.Tensor:
-        if self.mlp.ep_size > 1:
+        if self.ctx.ep_size > 1:
             assert moe_local_idxs is not None
             seq_len, topk = topk_weight.shape
             permuted_probs = topk_weight.view(-1)[moe_local_idxs]
@@ -640,13 +637,25 @@ class GptOssModel(nn.Module):
     def __init__(
         self,
         config,
-        num_stages: int,
-        stage_id: int,
-        cp_group: Optional[dist.ProcessGroup] = None,
-        ep_group: Optional[dist.ProcessGroup] = None,
+        ctx: DistributedCtx,
+        *,
+        phase: int,
     ):
         super().__init__()
-        if cp_group is not None and cp_group.size() > 1:
+        num_stages = 2 * ctx.pp_size
+        stage_id = ctx.pp_rank if phase == 0 else num_stages - 1 - ctx.pp_rank
+        self._build(config, ctx, num_stages, stage_id)
+
+    @classmethod
+    def full(cls, config, ctx: DistributedCtx) -> "GptOssModel":
+        """Build the unpartitioned full model (all layers, stage 0) for correctness-test references."""
+        self = cls.__new__(cls)
+        nn.Module.__init__(self)
+        self._build(config, ctx, num_stages=1, stage_id=0)
+        return self
+
+    def _build(self, config, ctx: DistributedCtx, num_stages: int, stage_id: int) -> None:
+        if ctx.cp_size > 1:
             raise NotImplementedError("GptOssModel does not support context parallelism yet.")
 
         self.config = config
@@ -668,8 +677,6 @@ class GptOssModel(nn.Module):
         sliding_window = getattr(config, "sliding_window", 128)
         rope_theta = getattr(config, "rope_theta", 150000.0)
         rope_scaling = getattr(config, "rope_scaling", None) or {}
-
-        ep_size = getattr(config, "ep_size", 1)
 
         layer_types = getattr(config, "layer_types", None)
         if layer_types is None:
@@ -702,8 +709,7 @@ class GptOssModel(nn.Module):
                     layer_idx=i,
                     is_sliding=(layer_types[i] == "sliding_attention"),
                     sliding_window=sliding_window,
-                    ep_size=ep_size,
-                    ep_group=ep_group,
+                    ctx=ctx,
                 )
                 for i in range(layer_id_begin, layer_id_end)
             }

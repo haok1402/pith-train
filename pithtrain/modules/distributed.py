@@ -7,7 +7,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Generator, Literal
+from typing import Generator, Literal, Optional
 
 import torch
 
@@ -99,6 +99,15 @@ class DistributedCtx:
     ep_rank: int
     ep_size: int
 
+    pp_group: Optional[torch.distributed.ProcessGroup] = None
+    """Process group spanning the PP axis (device_mesh.get_group("pp"))."""
+
+    cp_group: Optional[torch.distributed.ProcessGroup] = None
+    """Process group spanning the CP axis; None when cp_size == 1."""
+
+    ep_group: Optional[torch.distributed.ProcessGroup] = None
+    """Process group spanning the EP axis (device_mesh.get_group("ep"))."""
+
 
 def setup_torch_runtime() -> None:
     """Apply torch runtime tuning: enable TF32 matmul and raise the dynamo recompile cap."""
@@ -189,6 +198,10 @@ def setup_device_mesh(cfg: DistributedCfg, ctx: DistributedCtx) -> None:
     ctx.pp_rank = ctx.device_mesh.get_local_rank("pp")
     ctx.cp_rank = ctx.device_mesh.get_local_rank("cp")
     ctx.ep_rank = ctx.device_mesh.get_local_rank("ep")
+
+    ctx.pp_group = ctx.device_mesh.get_group("pp")
+    ctx.cp_group = ctx.device_mesh.get_group("cp") if ctx.cp_size > 1 else None
+    ctx.ep_group = ctx.device_mesh.get_group("ep")
 
 
 @contextmanager

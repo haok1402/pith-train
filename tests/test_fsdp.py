@@ -4,6 +4,7 @@ The loss and gradients are compared with a reference implementation.
 """
 
 import argparse
+from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Union
@@ -169,6 +170,28 @@ def apply_fsdp(model, mesh: torch.distributed.DeviceMesh, dtype):
     return model
 
 
+def single_rank_ctx(ctx: DistributedCtx) -> DistributedCtx:
+    """
+    Return a copy of ``ctx`` collapsed to a single EP/CP rank.
+
+    EP and CP are reset to size 1 with no group handle, so a model built from it
+    holds every expert locally and runs no ring/all-to-all collectives — the
+    shape needed for the unsharded reference model. ``DistributedCtx`` is
+    ``init=False`` (``SlottedDefault``), so it is copied field-by-field rather
+    than via ``dataclasses.replace``.
+    """
+    single = DistributedCtx()
+    for f in fields(ctx):
+        setattr(single, f.name, getattr(ctx, f.name))
+    single.ep_size = 1
+    single.ep_rank = 0
+    single.ep_group = None
+    single.cp_size = 1
+    single.cp_rank = 0
+    single.cp_group = None
+    return single
+
+
 def main(ctx: DistributedCtx, model_name: str):
     """
     Main testing function.
@@ -181,7 +204,6 @@ def main(ctx: DistributedCtx, model_name: str):
         Model name or local config path.
     """
 
-    pp_group = ctx.device_mesh.get_group("pp")
     ep_group = ctx.device_mesh.get_group("ep")
     dp_size, pp_size, ep_size = ctx.dp_size, ctx.pp_size, ctx.ep_size
     pp_rank, ep_rank = ctx.pp_rank, ctx.ep_rank
@@ -253,12 +275,9 @@ def main(ctx: DistributedCtx, model_name: str):
     ]
 
     # Create the reference full model.
-    config.ep_size = 1
-
-    full_modules = ModelClass(config, num_stages=1, stage_id=0)
+    full_modules = ModelClass.full(config, single_rank_ctx(ctx))
 
     full_modules.to(dtype=dtype)
-    config.ep_size = ep_size
     full_modules.apply(fill_weights)
 
     # Run the reference step.
@@ -282,10 +301,8 @@ def main(ctx: DistributedCtx, model_name: str):
     num_stages = pp_size * 2
     local_full_modules = []
 
-    local_full_modules.append(ModelClass(config, num_stages=num_stages, stage_id=pp_rank))
-    local_full_modules.append(
-        ModelClass(config, num_stages=num_stages, stage_id=num_stages - 1 - pp_rank)
-    )
+    local_full_modules.append(ModelClass(config, ctx, phase=0))
+    local_full_modules.append(ModelClass(config, ctx, phase=1))
 
     local_full_modules = nn.Sequential(*local_full_modules)
     if pp_rank == 0:
@@ -303,14 +320,8 @@ def main(ctx: DistributedCtx, model_name: str):
     # Create the local modules with the same weights but zero gradients.
     local_modules = []
 
-    local_modules.append(
-        ModelClass(config, num_stages=num_stages, stage_id=pp_rank, ep_group=ep_group)
-    )
-    local_modules.append(
-        ModelClass(
-            config, num_stages=num_stages, stage_id=num_stages - 1 - pp_rank, ep_group=ep_group
-        )
-    )
+    local_modules.append(ModelClass(config, ctx, phase=0))
+    local_modules.append(ModelClass(config, ctx, phase=1))
 
     local_modules = nn.Sequential(*local_modules)
     local_modules.to(dtype=dtype)
@@ -320,10 +331,7 @@ def main(ctx: DistributedCtx, model_name: str):
     apply_fsdp(local_modules, ctx.device_mesh, dtype)
 
     # Wrap the modules with DualPipeV.
-    kwargs = dict()
-    kwargs["pp_group"] = pp_group
-    kwargs["ep_group"] = ep_group
-    dualpipev_model = DualPipeV(local_modules, **kwargs)
+    dualpipev_model = DualPipeV(local_modules, ctx=ctx)
 
     # Run the DualPipeV step.
     kwargs = dict()

@@ -34,6 +34,7 @@ from pithtrain.dualpipe import comm
 from pithtrain.dualpipe.execution import IntermediateTensors, create_intermediate_tensors
 from pithtrain.dualpipe.overlap import overlapped_forward_backward
 from pithtrain.dualpipe.utils import FP8WeightCacheControl, WeightGradStore, gather, scatter
+from pithtrain.modules.distributed import DistributedCtx
 
 
 class DualPipeV(nn.Module):
@@ -57,8 +58,7 @@ class DualPipeV(nn.Module):
     def __init__(
         self,
         modules: Tuple[nn.Module, nn.Module],
-        pp_group: dist.ProcessGroup,
-        ep_group: dist.ProcessGroup,
+        ctx: DistributedCtx,
     ) -> None:
         super().__init__()
 
@@ -68,12 +68,12 @@ class DualPipeV(nn.Module):
         self.batch_dim = 0
         self.rank = torch.distributed.get_rank()
 
-        self.pp_group = pp_group
-        self.ep_group = ep_group
-        self.pp_size = self.pp_group.size()
-        self.ep_size = self.ep_group.size()
-        self.ep_rank = self.ep_group.rank()
-        self.pp_rank = self.pp_group.rank()
+        self.pp_group = ctx.pp_group
+        self.ep_group = ctx.ep_group
+        self.pp_size = ctx.pp_size
+        self.ep_size = ctx.ep_size
+        self.pp_rank = ctx.pp_rank
+        self.ep_rank = ctx.ep_rank
         self.prev_pp_rank = self.pp_rank - 1 if self.pp_rank > 0 else None
         self.next_pp_rank = self.pp_rank + 1 if self.pp_rank < self.pp_size - 1 else None
         self.is_first_pp_rank = self.pp_rank == 0

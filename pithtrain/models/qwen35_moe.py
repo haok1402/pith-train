@@ -10,7 +10,6 @@ from dataclasses import fields
 from typing import List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -20,6 +19,7 @@ from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_fo
 from pithtrain.dualpipe.utils import run_backward
 from pithtrain.layers.factory import ModelImplMode, get_group_linear_cls, get_linear_cls
 from pithtrain.models.interface import ForwardAttnOutput
+from pithtrain.modules.distributed import DistributedCtx
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func
@@ -360,16 +360,15 @@ class Qwen35MoeSparseMoeBlock(nn.Module):
     Routed experts + a sigmoid-gated shared expert.
     """
 
-    def __init__(self, config, ep_size: int = 1, ep_group: Optional[dist.ProcessGroup] = None):
+    def __init__(self, config, ctx: DistributedCtx):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
 
-        self.ep_size = ep_size
-        self.ep_group = ep_group
-        self.ep_rank = ep_group.rank() if ep_group is not None else 0
-        self.experts_per_rank = self.num_experts // ep_size
+        self.ctx = ctx
+        self.ep_rank = ctx.ep_rank  # read by checkpoint localization
+        self.experts_per_rank = self.num_experts // ctx.ep_size
 
         self.gate = Qwen35MoeTopKRouter(config)
         self.experts = Qwen35MoeExperts(self.experts_per_rank, self.hidden_size, config.moe_intermediate_size)
@@ -395,7 +394,7 @@ class Qwen35MoeSparseMoeBlock(nn.Module):
         return y + self.shared_out(identity)
 
     def moe_infer(self, x: torch.Tensor, topk_ids: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
-        assert self.ep_size == 1, "Reference implementation only supports ep_size=1"
+        assert self.ctx.ep_size == 1, "Reference implementation only supports ep_size=1"
         expert_idxs = topk_ids.view(-1)
         sorted_tokens = x.unsqueeze(1).expand(-1, self.num_experts_per_tok, -1).reshape(-1, x.shape[-1])
         output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = scatter_for_grouped_gemm(sorted_tokens, expert_idxs, self.experts_per_rank)
@@ -418,19 +417,20 @@ class Qwen35MoeDecoderLayer(nn.Module):
     DeltaNet) or ``self_attn`` (full attention), selected by ``layer_type``.
     """
 
-    def __init__(self, config, layer_idx: int, ep_size: int = 1, ep_group: Optional[dist.ProcessGroup] = None):
+    def __init__(self, config, layer_idx: int, ctx: DistributedCtx):
         super().__init__()
         self.idx = layer_idx
         self.hidden_size = config.hidden_size
         self.layer_type = config.layer_types[layer_idx]
         self.is_linear = self.layer_type == "linear_attention"
+        self.ctx = ctx
 
         if self.is_linear:
             self.linear_attn = Qwen35MoeGatedDeltaNet(config, layer_idx)
         else:
             self.self_attn = Qwen35MoeAttention(config)
 
-        self.mlp = Qwen35MoeSparseMoeBlock(config, ep_size=ep_size, ep_group=ep_group)
+        self.mlp = Qwen35MoeSparseMoeBlock(config, ctx=ctx)
 
         self.input_layernorm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -460,7 +460,7 @@ class Qwen35MoeDecoderLayer(nn.Module):
         hidden_states, residual = self._forward_attn_compute(hidden_states)
 
         topk_ids, topk_weight = self.mlp.gate(hidden_states)
-        sorted_tokens, idxs, expert_idxs, expand_idx, dedup_input_splits, dedup_output_splits, input_splits, output_splits = moe_ep_prepare_dispatch(hidden_states, topk_ids, self.mlp.num_experts, self.mlp.ep_size, self.mlp.experts_per_rank, self.mlp.ep_group)
+        sorted_tokens, idxs, expert_idxs, expand_idx, dedup_input_splits, dedup_output_splits, input_splits, output_splits = moe_ep_prepare_dispatch(hidden_states, topk_ids, self.mlp.num_experts, self.ctx.ep_size, self.mlp.experts_per_rank, self.ctx.ep_group)
         return ForwardAttnOutput(sorted_tokens, idxs, topk_weight, output_splits, input_splits, expert_idxs, residual, expand_idx, dedup_input_splits, dedup_output_splits)
 
     def forward_mlp(self, gathered_tokens: torch.Tensor, expert_idxs: Optional[torch.Tensor] = None, expand_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -481,7 +481,7 @@ class Qwen35MoeDecoderLayer(nn.Module):
         """
         Stage 5: weighted expert sum + residual (shared expert already in residual).
         """
-        if self.mlp.ep_size > 1:
+        if self.ctx.ep_size > 1:
             assert moe_local_idxs is not None
             seq_len, topk = topk_weight.shape
             permuted_probs = topk_weight.view(-1)[moe_local_idxs]
@@ -525,9 +525,22 @@ class Qwen35MoeModel(nn.Module):
     Qwen3.5-MoE text model for DualPipeV pipeline + expert parallelism.
     """
 
-    def __init__(self, config, num_stages: int, stage_id: int, cp_group: Optional[dist.ProcessGroup] = None, ep_group: Optional[dist.ProcessGroup] = None):
+    def __init__(self, config, ctx: DistributedCtx, *, phase: int):
         super().__init__()
-        if cp_group is not None and cp_group.size() > 1:
+        num_stages = 2 * ctx.pp_size
+        stage_id = ctx.pp_rank if phase == 0 else num_stages - 1 - ctx.pp_rank
+        self._build(config, ctx, num_stages, stage_id)
+
+    @classmethod
+    def full(cls, config, ctx: DistributedCtx) -> "Qwen35MoeModel":
+        """Build the unpartitioned full model (all layers, stage 0) for correctness-test references."""
+        self = cls.__new__(cls)
+        nn.Module.__init__(self)
+        self._build(config, ctx, num_stages=1, stage_id=0)
+        return self
+
+    def _build(self, config, ctx: DistributedCtx, num_stages: int, stage_id: int) -> None:
+        if ctx.cp_size > 1:
             raise NotImplementedError("Qwen35MoeModel does not support context parallelism (linear attention needs a bespoke sequence-sharded recurrence).")
         self.config = config
         self.stage_id = stage_id
@@ -537,7 +550,6 @@ class Qwen35MoeModel(nn.Module):
         head_dim = config.head_dim
         vocab_size = config.vocab_size
         rope_params = config.rope_parameters
-        ep_size = getattr(config, "ep_size", 1)
 
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size) if stage_id == 0 else None
 
@@ -546,7 +558,7 @@ class Qwen35MoeModel(nn.Module):
         layer_id_end = layer_id_begin + num_local_layers[stage_id]
 
         self.layers = nn.ModuleDict({
-            str(i): Qwen35MoeDecoderLayer(config, layer_idx=i, ep_size=ep_size, ep_group=ep_group)
+            str(i): Qwen35MoeDecoderLayer(config, layer_idx=i, ctx=ctx)
             for i in range(layer_id_begin, layer_id_end)
         })
 

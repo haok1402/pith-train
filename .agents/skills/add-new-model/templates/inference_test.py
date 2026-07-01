@@ -164,29 +164,19 @@ def _load_localized_from_canonical(canonical: dict, dualpipev: DualPipeV) -> dic
 
 
 def build_dualpipev(config, ctx: DistributedCtx, dtype: torch.dtype) -> DualPipeV:
-    """Build the DualPipeV wrapper around two model replicas (stage_id and
-    its mirror) for this pp_rank.  Inference doesn't wrap with FSDP —
-    DP=CP=1, so sharding has no benefit and DTensor-in-state_dict makes
-    the localization pass messier.
+    """Build the DualPipeV wrapper around the two V-shape chunks (phase 0 and
+    phase 1) for this pp_rank.  Inference doesn't wrap with FSDP — DP=CP=1, so
+    sharding has no benefit and DTensor-in-state_dict makes the localization
+    pass messier.
     """
-    pp_size = ctx.pp_size
-    pp_rank = ctx.pp_rank
-    ep_group = ctx.device_mesh.get_group("ep")
-    pp_group = ctx.device_mesh.get_group("pp")
-
-    config.ep_size = ctx.ep_size
-    num_stages = pp_size * 2
     modules = [
-        # TODO_MODEL: if the model takes cp_group or other kwargs, pass them here.
-        <Model>Model(config, num_stages=num_stages, stage_id=pp_rank, ep_group=ep_group),  # noqa: F821
-        <Model>Model(  # noqa: F821
-            config, num_stages=num_stages, stage_id=num_stages - 1 - pp_rank, ep_group=ep_group
-        ),
+        <Model>Model(config, ctx, phase=0),  # noqa: F821
+        <Model>Model(config, ctx, phase=1),  # noqa: F821
     ]
     modules = nn.Sequential(*modules)
     modules.to(device=torch.cuda.current_device(), dtype=dtype)
 
-    return DualPipeV(modules, pp_group=pp_group, ep_group=ep_group)
+    return DualPipeV(modules, ctx=ctx)
 
 
 # ── autoregressive decode via DualPipeV ───────────────────────────────────

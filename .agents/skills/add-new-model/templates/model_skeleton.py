@@ -22,7 +22,6 @@ from dataclasses import fields
 from typing import List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -32,6 +31,7 @@ from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_fo
 from pithtrain.dualpipe.utils import run_backward
 from pithtrain.layers.factory import ModelImplMode, get_linear_cls
 from pithtrain.models.interface import ForwardAttnOutput
+from pithtrain.modules.distributed import DistributedCtx
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
 from pithtrain.operators.token_scatter import padded_index_gather, scatter_for_grouped_gemm
@@ -230,19 +230,16 @@ class HFPrefixMLP(nn.Module):  # TODO_HF rename to match HF
         num_experts: int,
         num_experts_per_tok: int,
         intermediate_size: int,
-        ep_size: int = 1,
-        ep_group: Optional[dist.ProcessGroup] = None,
+        ctx: DistributedCtx,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
 
-        # Protocol contract (DecoderLayerMlpProtocol):
-        self.ep_size = ep_size
-        self.ep_group = ep_group
-        self.ep_rank = ep_group.rank() if ep_group is not None else 0
-        self.experts_per_rank = num_experts // ep_size
+        self.ctx = ctx
+        self.ep_rank = ctx.ep_rank  # read by checkpoint localization
+        self.experts_per_rank = num_experts // ctx.ep_size
 
         self.experts = HFPrefixExperts(self.experts_per_rank, hidden_size, intermediate_size)
         # TODO_HF: name this attribute per HF: self.router OR self.gate.
@@ -261,7 +258,7 @@ class HFPrefixMLP(nn.Module):  # TODO_HF rename to match HF
     def _moe_infer(
         self, x: torch.Tensor, topk_ids: torch.Tensor, topk_weight: torch.Tensor
     ) -> torch.Tensor:
-        assert self.ep_size == 1, "Reference implementation only supports ep_size=1"
+        assert self.ctx.ep_size == 1, "Reference implementation only supports ep_size=1"
         expert_idxs = topk_ids.view(-1)
         sorted_tokens = (
             x.unsqueeze(1).expand(-1, self.num_experts_per_tok, -1).reshape(-1, x.shape[-1])
@@ -348,15 +345,15 @@ class HFPrefixDecoderLayer(nn.Module):  # TODO_HF rename to match HF
         intermediate_size: int,
         num_experts: int,
         num_experts_per_tok: int,
+        ctx: DistributedCtx,
         rms_norm_eps: float,
         attention_bias: bool,
         layer_idx: int,
-        ep_size: int = 1,
-        ep_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
         self.idx = layer_idx  # protocol field — nvtx range labels use this
         self.hidden_size = hidden_size
+        self.ctx = ctx
 
         self.self_attn = HFPrefixAttention(
             hidden_size=hidden_size,
@@ -371,8 +368,7 @@ class HFPrefixDecoderLayer(nn.Module):  # TODO_HF rename to match HF
             num_experts=num_experts,
             num_experts_per_tok=num_experts_per_tok,
             intermediate_size=intermediate_size,
-            ep_size=ep_size,
-            ep_group=ep_group,
+            ctx=ctx,
         )
 
         self.input_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -445,9 +441,9 @@ class HFPrefixDecoderLayer(nn.Module):  # TODO_HF rename to match HF
             hidden_states,
             topk_ids,
             self.mlp.num_experts,
-            self.mlp.ep_size,
+            self.ctx.ep_size,
             self.mlp.experts_per_rank,
-            self.mlp.ep_group,
+            self.ctx.ep_group,
         )
         return ForwardAttnOutput(
             sorted_tokens,
@@ -498,7 +494,7 @@ class HFPrefixDecoderLayer(nn.Module):  # TODO_HF rename to match HF
         residual inside `_forward_attn_compute` — do NOT re-add them here.
         """
         if hasattr(self.mlp, "experts"):
-            if self.mlp.ep_size > 1:
+            if self.ctx.ep_size > 1:
                 assert moe_local_idxs is not None
                 seq_len, topk = topk_weight.shape
                 permuted_probs = topk_weight.view(-1)[moe_local_idxs]
@@ -549,15 +545,28 @@ class HFPrefixModel(nn.Module):  # TODO_HF rename: typically `<Prefix>Model`
     def __init__(
         self,
         config,
-        num_stages: int,
-        stage_id: int,
-        cp_group: Optional[dist.ProcessGroup] = None,
-        ep_group: Optional[dist.ProcessGroup] = None,
+        ctx: DistributedCtx,
+        *,
+        phase: int,
     ):
         super().__init__()
+        num_stages = 2 * ctx.pp_size
+        stage_id = ctx.pp_rank if phase == 0 else num_stages - 1 - ctx.pp_rank
+        self._build(config, ctx, num_stages, stage_id)
+
+    @classmethod
+    def full(cls, config, ctx: DistributedCtx) -> "HFPrefixModel":
+        """Build the unpartitioned full model (all layers, stage 0) for correctness-test references."""
+        self = cls.__new__(cls)
+        nn.Module.__init__(self)
+        self._build(config, ctx, num_stages=1, stage_id=0)
+        return self
+
+    def _build(self, config, ctx: DistributedCtx, num_stages: int, stage_id: int) -> None:
         self.config = config
         self.stage_id = stage_id
         self.num_stages = num_stages
+        self.ctx = ctx
 
         # TODO_HF: read fields off `config`.  Use `getattr(config, X, default)`
         # for fields that are optional in HF's config.
@@ -573,8 +582,6 @@ class HFPrefixModel(nn.Module):  # TODO_HF rename: typically `<Prefix>Model`
         vocab_size = config.vocab_size
         max_position_embeddings = config.max_position_embeddings
         rope_theta = getattr(config, "rope_theta", 10000.0)
-
-        ep_size = getattr(config, "ep_size", 1)
 
         # First stage has embed_tokens; last stage has norm + lm_head.
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size) if stage_id == 0 else None
@@ -594,11 +601,10 @@ class HFPrefixModel(nn.Module):  # TODO_HF rename: typically `<Prefix>Model`
                     intermediate_size=intermediate_size,
                     num_experts=num_experts,
                     num_experts_per_tok=num_experts_per_tok,
+                    ctx=ctx,
                     rms_norm_eps=rms_norm_eps,
                     attention_bias=attention_bias,
                     layer_idx=i,
-                    ep_size=ep_size,
-                    ep_group=ep_group,
                 )
                 for i in range(layer_id_begin, layer_id_end)
             }

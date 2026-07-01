@@ -57,9 +57,12 @@ keep = min(config.num_hidden_layers, 4)
 if getattr(config, "layer_types", None) is not None:
     config.layer_types = config.layer_types[:keep]
 config.num_hidden_layers = keep
-config.ep_size = 1
 
-model = <Model>Model(config, num_stages=1, stage_id=0)
+# Reference model: the unpartitioned full model (all layers, single stage).
+# Built via the `full` classmethod from a single-rank ctx (ep_size=cp_size=1)
+# so it holds every expert locally and runs no EP/CP collectives. test_fsdp.py
+# defines a single_rank_ctx(ctx) helper that collapses a real ctx to this.
+model = <Model>Model.full(config, single_rank_ctx(ctx))
 # Init any raw-Parameter experts (needed when not using GroupLinear)
 for p in model.parameters():
     if p.dim() >= 2:

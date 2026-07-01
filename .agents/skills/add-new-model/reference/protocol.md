@@ -25,7 +25,8 @@ Plus a non-pipelined `reference_forward` for testing/inference.
 ```python
 class DecoderLayerProtocol(Protocol):
     idx: int                   # layer index (used by nvtx range labels)
-    mlp: DecoderLayerMlpProtocol   # must expose ep_size + ep_group
+    ctx: DistributedCtx        # single distributed ctx (groups/ranks/sizes)
+    mlp: DecoderLayerMlpProtocol   # MoE variants expose experts_per_rank + ep_rank
 
     def reference_forward(self, hidden_states) -> Tensor: ...
     def forward_attn(self, hidden_states) -> ForwardAttnOutput: ...
@@ -87,9 +88,9 @@ def forward_attn(self, hidden_states) -> ForwardAttnOutput:
         hidden_states,
         topk_ids,
         self.mlp.num_experts,
-        self.mlp.ep_size,
+        self.ctx.ep_size,
         self.mlp.experts_per_rank,
-        self.mlp.ep_group,
+        self.ctx.ep_group,
     )
     return ForwardAttnOutput(
         sorted_tokens, idxs, topk_weight,
@@ -162,7 +163,7 @@ def forward(self, x, grouped_mm_offs, ks=None, ks_tensor=None):
 @torch.compile(fullgraph=True)
 def forward_aggregate(self, moe_outs, moe_local_idxs, topk_weight, residual):
     if hasattr(self.mlp, "experts"):
-        if self.mlp.ep_size > 1:
+        if self.ctx.ep_size > 1:
             # EP path: moe_local_idxs maps back through dedup
             assert moe_local_idxs is not None
             seq_len, topk = topk_weight.shape
@@ -322,6 +323,15 @@ def backward(module, dy, loss, intermediate_tensors):
 
 ## Model.__init__ requirements <a id="init-requirements"></a>
 
+- Signature: `__init__(self, config, ctx: DistributedCtx, *, phase: int)`. The
+  model is one V-shape chunk; `num_stages = 2 * ctx.pp_size` and
+  `stage_id = ctx.pp_rank if phase == 0 else num_stages - 1 - ctx.pp_rank` are
+  derived from `ctx` + `phase` (not passed in). `phase` is required — there is
+  no default, since every rank builds both phases explicitly.
+- A `@classmethod full(cls, config, ctx)` builds the unpartitioned reference
+  model (`num_stages=1, stage_id=0`); used only by correctness tests. Factor
+  the construction body into a shared `_build(self, config, ctx, num_stages, stage_id)`
+  so `__init__` and `full` share it.
 - `self.stage_id`, `self.num_stages` stored for later checks.
 - Layers distributed via `layer_partition(config.num_hidden_layers, num_stages)`.
 - `self.layers` is an `nn.ModuleDict` keyed by the absolute layer id as a
@@ -335,40 +345,40 @@ def backward(module, dy, loss, intermediate_tensors):
 
 ### Fail loud on unsupported parallelism dimensions
 
-`setup_model` passes every model a consistent set of process groups
-(`cp_group`, any future parallelism groups). A model that doesn't
-implement a dimension **must reject** a non-trivial group for that
-dimension — silently ignoring the argument will produce wrong results
-the first time a real group is passed, and the bug is hard to trace.
+`setup_model` passes every model a single `ctx: DistributedCtx` covering
+every parallelism axis (CP, EP, PP, DP — groups, ranks, and sizes).
+A model that doesn't implement an axis **must reject** a non-trivial size
+for it — silently ignoring `ctx.<axis>_size > 1` will produce wrong results
+the first time a real mesh for that axis is used, and the bug is hard to
+trace.
 
-Keep the parameter in the signature for interface parity, and reject at
-the top of `__init__`:
+Reject at the top of `_build` (so both `__init__` and `full` enforce it):
 
 ```python
 class <Prefix>Model(nn.Module):
-    def __init__(
-        self,
-        config,
-        num_stages: int,
-        stage_id: int,
-        cp_group: dist.ProcessGroup | None = None,
-    ):
+    def __init__(self, config, ctx: DistributedCtx, *, phase: int):
         super().__init__()
-        if cp_group is not None and cp_group.size() > 1:
+        num_stages = 2 * ctx.pp_size
+        stage_id = ctx.pp_rank if phase == 0 else num_stages - 1 - ctx.pp_rank
+        self._build(config, ctx, num_stages, stage_id)
+
+    def _build(self, config, ctx, num_stages, stage_id):
+        if ctx.cp_size > 1:
             raise NotImplementedError(
                 "<Prefix>Model does not support context parallelism."
             )
-        # ... rest of __init__ ...
+        # ... rest of _build ...
 ```
 
-When the dimension *is* implemented (Qwen3, DeepSeek-V2 with ring
-attention), the parameter is used normally. When it's not (any model
-that doesn't have a ring-attention path), the `NotImplementedError`
-converts a silent correctness bug into a loud configuration error.
+When the axis *is* implemented (Qwen3, DeepSeek-V2 with ring
+attention), `ctx.cp_group` / `ctx.cp_rank` / `ctx.cp_size` are read
+directly. When it's not (any model that doesn't have a ring-attention
+path), the `NotImplementedError` converts a silent correctness bug into
+a loud configuration error.
 
 **Rule:** when a new model is wired into `setup_model`, walk every
-process-group argument it accepts and confirm it is either (a)
-genuinely used or (b) rejected with `NotImplementedError` when
+parallelism axis on the ctx and confirm it is either (a) genuinely used
+or (b) rejected with `NotImplementedError` when
 `size() > 1`. "Unused but accepted" is the hardest class of silent
 correctness bug to find.
 
