@@ -28,22 +28,19 @@ class FP8WeightCacheControl:
     (optimizer steps only after all micro-batches). This allows each FP8 linear
     module to quantize its weight once and reuse the result for subsequent chunks.
 
-    Usage:
-        - Set ``enabled = True`` when FP8 training is configured.
-        - Call ``step()`` at the start of each ``DualPipeV.step()`` to invalidate
-          stale caches from the previous training step.
+    Call ``step()`` at the start of each ``DualPipeV.step()`` to invalidate stale
+    caches from the previous training step.
     """
 
-    enabled: bool = False
-    _version: int = 0
+    version: int = 0
 
     @classmethod
     def step(cls):
         """Increment version to invalidate all module caches."""
-        cls._version += 1
+        cls.version += 1
 
     @classmethod
-    def clear_caches(cls, *modules: nn.Module) -> None:
+    def clear(cls, *modules: nn.Module) -> None:
         """Release all cached FP8 weight tensors from modules to free GPU memory.
 
         Should be called after the pipeline step completes and before
@@ -84,6 +81,10 @@ class WeightGradStore:
 
 
 def run_backward(tensors: List[torch.Tensor], grad_tensors: List[torch.Tensor]) -> None:
+    pairs = [(t, g) for t, g in zip(tensors, grad_tensors) if t is not None]
+    if not pairs:
+        return
+    tensors, grad_tensors = map(tuple, zip(*pairs))
     kwargs = dict(
         keep_graph=False,
         create_graph=False,

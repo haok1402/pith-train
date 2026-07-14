@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/_static/img/pithtrain-logo-text-dark.png">
-    <img alt="PithTrain" src="docs/_static/img/pithtrain-logo-text-light.png" width="480">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/pithtrain-logo-text-dark.png">
+    <img alt="PithTrain" src="docs/images/pithtrain-logo-text-light.png" width="480">
   </picture>
 </p>
 
@@ -75,7 +75,7 @@ For hardware requirements, supported models, scaling and multi-node runs, troubl
 ## Architecture
 
 <p align="center">
-  <img src="docs/_static/img/PithTrain-arch.svg" width="100%">
+  <img src="docs/images/PithTrain-arch.svg" width="100%">
 </p>
 
 PithTrain is structured in three layers:
@@ -89,11 +89,9 @@ PithTrain is structured in three layers:
   - *Training Infrastructure* — `torch.compile`, optimizer and LR scheduling, checkpointing, logging, etc.
 - **Operator** — PyTorch (basic ops, NCCL), operator libraries (DeepGEMM, FlashAttention), and Python DSLs (Triton).
 
-For a developer-level tour of the system — the 5-stage overlapped pipeline, the model protocol, the 4D device mesh, etc. — see [`docs/architecture.md`](docs/architecture.md).
-
 ## Contributing
 
-Contributions are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the development setup, testing and correctness-validation workflow, design principles, extension recipes, etc.
+Contributions are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the development setup, testing and correctness-validation workflow, design principles, extension recipes, etc. For a developer-level tour of the system — the 5-stage overlapped pipeline, the model protocol, the 4D device mesh, etc. — see [`docs/architecture.md`](docs/architecture.md).
 
 ## Acknowledgement
 
