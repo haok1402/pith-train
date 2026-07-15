@@ -15,9 +15,9 @@ import torch.nn as nn
 
 from pithtrain.dualpipe.utils import FP8WeightCacheControl
 from pithtrain.operators.deepgemm_quantize import (
-    fused_blockwise_transpose_cast_to_fp8,
-    fused_rowwise_blockwise_transpose_cast_to_fp8,
-    fused_rowwise_transpose_cast_to_fp8,
+    fp8cast_blockwise_transpose,
+    fp8cast_rowwise_blockwise_transpose,
+    fp8cast_rowwise_transpose,
 )
 
 ARCH_MAJOR, _ = torch.cuda.get_device_capability()
@@ -52,7 +52,7 @@ def fp8_act_weight_gemm(
     has one source of truth."""
     m, n = input_2d.shape[0], weight_fp8.shape[0]
     input_fp8, scale_input, input_t_fp8, scale_input_t = (
-        fused_rowwise_blockwise_transpose_cast_to_fp8(input_2d)
+        fp8cast_rowwise_blockwise_transpose(input_2d)
     )
     output = _fp8_gemm_nt(
         input_fp8, scale_input, weight_fp8, scale_weight, m, n, input_2d.device, input_2d.dtype
@@ -73,7 +73,7 @@ def fp8_dgrad_wgrad(
     dtype. Shared by ``_fp8_linear_bwd`` and the MLA ring so dgrad/wgrad have one source of
     truth; the caller supplies ``input_t_fp8`` (saved from the forward, or recomputed)."""
     m, n = grad_2d.shape
-    grad_fp8, scale_grad, grad_t_fp8, scale_grad_t = fused_rowwise_transpose_cast_to_fp8(grad_2d)
+    grad_fp8, scale_grad, grad_t_fp8, scale_grad_t = fp8cast_rowwise_transpose(grad_2d)
     grad_input = _fp8_gemm_nt(
         grad_fp8, scale_grad, weight_t_fp8, scale_weight_t, m, k, grad_2d.device, grad_2d.dtype
     )
@@ -184,11 +184,11 @@ class FP8Linear(nn.Linear):
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if torch.compiler.is_compiling():
-            return fused_blockwise_transpose_cast_to_fp8(self.weight)
+            return fp8cast_blockwise_transpose(self.weight)
         ver = FP8WeightCacheControl.version
         if self._wq_version == ver:
             return self._wq_cache
-        result = fused_blockwise_transpose_cast_to_fp8(self.weight)
+        result = fp8cast_blockwise_transpose(self.weight)
         self._wq_cache = result
         self._wq_version = ver
         return result

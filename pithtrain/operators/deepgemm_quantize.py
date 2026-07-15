@@ -9,11 +9,11 @@ PTX ``cvt.rp.satfinite.ue8m0x2.f32``.  On Hopper (SM90), produces plain
 float32 scales (``amax / 448``).  Block granularity is fixed at 128 elements.
 
 Public kernels:
-    1. fused_rowwise_colwise_cast_to_fp8 -- rowwise(x) + colwise(x)
-    2. fused_rowwise_transpose_cast_to_fp8 -- rowwise(x) + rowwise(x.T)
-    3. fused_rowwise_blockwise_transpose_cast_to_fp8 -- rowwise(x) + blockwise(x.T)
-    4. fused_blockwise_transpose_cast_to_fp8 -- blockwise(x) + blockwise(x.T), 2D
-    5. fused_blockwise_transpose_cast_to_fp8_batched -- blockwise(x) + blockwise(x.T), 3D
+    1. fp8cast_rowwise_colwise -- rowwise(x) + colwise(x)
+    2. fp8cast_rowwise_transpose -- rowwise(x) + rowwise(x.T)
+    3. fp8cast_rowwise_blockwise_transpose -- rowwise(x) + blockwise(x.T)
+    4. fp8cast_blockwise_transpose -- blockwise(x) + blockwise(x.T), 2D
+    5. fp8cast_blockwise_transpose_batched -- blockwise(x) + blockwise(x.T), 3D
 """
 
 import torch
@@ -31,7 +31,7 @@ _USE_E8M0_SCALES = ARCH_MAJOR >= 10
 
 
 @triton.jit
-def _compute_fp8_scale(amax, SCALING_MODE: tl.constexpr):
+def compute_fp8_scale(amax, SCALING_MODE: tl.constexpr):
     """Compute float32 scale from per-group amax values.
 
     Given ``amax`` (the max absolute value of a group), computes a scaling
@@ -86,12 +86,12 @@ def _compute_fp8_scale(amax, SCALING_MODE: tl.constexpr):
 
 
 # ---------------------------------------------------------------------------
-# fused_rowwise_colwise: rowwise(x) + colwise(x)
+# fp8cast_rowwise_colwise: rowwise(x) + colwise(x)
 # ---------------------------------------------------------------------------
 
 
 @triton.jit
-def _fused_rowwise_colwise_fp8_kernel(
+def fp8cast_rowwise_colwise_kernel(
     x_ptr,
     out_tok_ptr,
     scale_tok_ptr,
@@ -147,7 +147,7 @@ def _fused_rowwise_colwise_fp8_kernel(
     # --- Rowwise path (axis=1 reduction, per-row, per-128-col-block) ---
     abs_reshaped = tl.reshape(abs_bf16, BLOCK_ROWS * CHUNKS, BLOCK_ROWS)
     tok_amax = tl.max(abs_reshaped, axis=1)  # (128 * CHUNKS,)
-    tok_scale, tok_rcp = _compute_fp8_scale(tok_amax, SCALING_MODE)
+    tok_scale, tok_rcp = compute_fp8_scale(tok_amax, SCALING_MODE)
 
     x_f32 = x_bf16.to(tl.float32)
     x_reshaped = tl.reshape(x_f32, BLOCK_ROWS * CHUNKS, BLOCK_ROWS)
@@ -167,7 +167,7 @@ def _fused_rowwise_colwise_fp8_kernel(
 
     # --- Colwise path (axis=0 reduction, per-column within 128-row group) ---
     ch_amax = tl.max(abs_bf16, axis=0)  # (BLOCK_N,)
-    ch_scale, ch_rcp = _compute_fp8_scale(ch_amax, SCALING_MODE)
+    ch_scale, ch_rcp = compute_fp8_scale(ch_amax, SCALING_MODE)
 
     ch_fp8 = (x_f32 * ch_rcp[None, :]).to(tl.float8e4nv)
 
@@ -203,7 +203,7 @@ def _fused_rowwise_colwise_fp8_kernel(
         tl.store(scale_ch_ptrs, ch_scale, mask=ch_scale_mask)
 
 
-def fused_rowwise_colwise_cast_to_fp8(
+def fp8cast_rowwise_colwise(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused rowwise + colwise FP8 quantization (single read of *x*).
@@ -237,7 +237,7 @@ def fused_rowwise_colwise_cast_to_fp8(
     _BLOCK_N = 128
     grid = (num_row_groups, (N + _BLOCK_N - 1) // _BLOCK_N)
 
-    _fused_rowwise_colwise_fp8_kernel[grid](
+    fp8cast_rowwise_colwise_kernel[grid](
         x_ptr=x,
         out_tok_ptr=out_tok,
         scale_tok_ptr=scale_tok,
@@ -263,13 +263,13 @@ def fused_rowwise_colwise_cast_to_fp8(
     return out_tok, scale_tok, out_ch, scale_ch
 
 
-def fused_rowwise_kmajor_cast_to_fp8(
+def fp8cast_rowwise_kmajor(
     x: torch.Tensor,
     grouped_mm_offs: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused rowwise + K-major colwise FP8 quantization (single read of *x*).
 
-    Same as :func:`fused_rowwise_colwise_cast_to_fp8` for the rowwise outputs,
+    Same as :func:`fp8cast_rowwise_colwise` for the rowwise outputs,
     but the colwise FP8 data is written directly in K-major flat layout used by
     the grouped wgrad GEMM on Hopper, and colwise scales are transposed.
 
@@ -313,7 +313,7 @@ def fused_rowwise_kmajor_cast_to_fp8(
     _BLOCK_N = 128
     grid = (num_row_groups, (N + _BLOCK_N - 1) // _BLOCK_N)
 
-    _fused_rowwise_colwise_fp8_kernel[grid](
+    fp8cast_rowwise_colwise_kernel[grid](
         x_ptr=x,
         out_tok_ptr=out_tok,
         scale_tok_ptr=scale_tok,
@@ -340,12 +340,12 @@ def fused_rowwise_kmajor_cast_to_fp8(
 
 
 # ---------------------------------------------------------------------------
-# fused_rowwise_transpose: rowwise(x) + rowwise(x.T)
+# fp8cast_rowwise_transpose: rowwise(x) + rowwise(x.T)
 # ---------------------------------------------------------------------------
 
 
 @triton.jit
-def _fused_rowwise_transpose_fp8_kernel(
+def fp8cast_rowwise_transpose_kernel(
     x_ptr,
     out_tok_ptr,
     scale_tok_ptr,
@@ -391,7 +391,7 @@ def _fused_rowwise_transpose_fp8_kernel(
     # --- Rowwise on x (axis=1 reduction) ---
     abs_reshaped = tl.reshape(abs_bf16, BLOCK_ROWS * CHUNKS, BLOCK_ROWS)
     tok_amax = tl.max(abs_reshaped, axis=1)  # (128 * CHUNKS,)
-    tok_scale, tok_rcp = _compute_fp8_scale(tok_amax, SCALING_MODE)
+    tok_scale, tok_rcp = compute_fp8_scale(tok_amax, SCALING_MODE)
 
     x_f32 = x_bf16.to(tl.float32)
     x_reshaped = tl.reshape(x_f32, BLOCK_ROWS * CHUNKS, BLOCK_ROWS)
@@ -411,7 +411,7 @@ def _fused_rowwise_transpose_fp8_kernel(
 
     # --- Transposed rowwise on x.T (axis=0 reduction of x tile) ---
     t_amax = tl.max(abs_bf16, axis=0)  # (BLOCK_N,)
-    t_scale, t_rcp = _compute_fp8_scale(t_amax, SCALING_MODE)
+    t_scale, t_rcp = compute_fp8_scale(t_amax, SCALING_MODE)
 
     # Scale each column of x by its transpose-token scale, cast to FP8
     t_fp8 = (x_f32 * t_rcp[None, :]).to(tl.float8e4nv)
@@ -432,7 +432,7 @@ def _fused_rowwise_transpose_fp8_kernel(
     tl.store(scale_t_ptrs, t_scale, mask=scale_t_mask)
 
 
-def fused_rowwise_transpose_cast_to_fp8(
+def fp8cast_rowwise_transpose(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused rowwise FP8 quantization of x *and* x.T (single read of *x*).
@@ -467,7 +467,7 @@ def fused_rowwise_transpose_cast_to_fp8(
         (N + _BLOCK_N - 1) // _BLOCK_N,
     )
 
-    _fused_rowwise_transpose_fp8_kernel[grid](
+    fp8cast_rowwise_transpose_kernel[grid](
         x_ptr=x,
         out_tok_ptr=out_tok,
         scale_tok_ptr=scale_tok,
@@ -491,12 +491,12 @@ def fused_rowwise_transpose_cast_to_fp8(
 
 
 # ---------------------------------------------------------------------------
-# fused_rowwise_blockwise_transpose: rowwise(x) + blockwise(x.T)
+# fp8cast_rowwise_blockwise_transpose: rowwise(x) + blockwise(x.T)
 # ---------------------------------------------------------------------------
 
 
 @triton.jit
-def _fused_rowwise_blockwise_transpose_fp8_kernel(
+def fp8cast_rowwise_blockwise_transpose_kernel(
     x_ptr,
     out_tok_ptr,
     scale_tok_ptr,
@@ -542,7 +542,7 @@ def _fused_rowwise_blockwise_transpose_fp8_kernel(
 
     # --- Rowwise path (one 128-element column block per tile) ---
     tok_amax = tl.max(abs_bf16, axis=1)  # (128,)
-    tok_scale, tok_rcp = _compute_fp8_scale(tok_amax, SCALING_MODE)  # (128,)
+    tok_scale, tok_rcp = compute_fp8_scale(tok_amax, SCALING_MODE)  # (128,)
 
     x_f32 = x_bf16.to(tl.float32)
     tok_fp8 = (x_f32 * tok_rcp[:, None]).to(tl.float8e4nv)
@@ -558,7 +558,7 @@ def _fused_rowwise_blockwise_transpose_fp8_kernel(
 
     # --- Blockwise transpose path (reuse tok_amax) ---
     block_amax = tl.max(tok_amax, axis=0)  # scalar
-    blk_scale, blk_rcp = _compute_fp8_scale(block_amax, SCALING_MODE)  # scalar
+    blk_scale, blk_rcp = compute_fp8_scale(block_amax, SCALING_MODE)  # scalar
 
     blk_fp8 = (x_f32 * blk_rcp).to(tl.float8e4nv)
 
@@ -580,7 +580,7 @@ def _fused_rowwise_blockwise_transpose_fp8_kernel(
     tl.store(scale_blk_t_ptr + scale_blk_t_offset, blk_scale)
 
 
-def fused_rowwise_blockwise_transpose_cast_to_fp8(
+def fp8cast_rowwise_blockwise_transpose(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused rowwise FP8 quant of *x* and blockwise FP8 quant of *x*.T.
@@ -617,7 +617,7 @@ def fused_rowwise_blockwise_transpose_cast_to_fp8(
         (K + BLOCK - 1) // BLOCK,
     )
 
-    _fused_rowwise_blockwise_transpose_fp8_kernel[grid](
+    fp8cast_rowwise_blockwise_transpose_kernel[grid](
         x_ptr=x,
         out_tok_ptr=out_tok,
         scale_tok_ptr=scale_tok,
@@ -640,12 +640,12 @@ def fused_rowwise_blockwise_transpose_cast_to_fp8(
 
 
 # ---------------------------------------------------------------------------
-# fused_blockwise_transpose: blockwise(x) + blockwise(x.T), 2D
+# fp8cast_blockwise_transpose: blockwise(x) + blockwise(x.T), 2D
 # ---------------------------------------------------------------------------
 
 
 @triton.jit
-def _fused_blockwise_transpose_fp8_kernel(
+def fp8cast_blockwise_transpose_kernel(
     x_ptr,
     out_ptr,
     scale_ptr,
@@ -691,7 +691,7 @@ def _fused_blockwise_transpose_fp8_kernel(
     block_amax = tl.max(row_max, axis=0)  # scalar
 
     # Compute scalar scale
-    scale_val, rcp_val = _compute_fp8_scale(block_amax, SCALING_MODE)
+    scale_val, rcp_val = compute_fp8_scale(block_amax, SCALING_MODE)
 
     # Scale and cast (once)
     x_f32 = x_bf16.to(tl.float32)
@@ -720,7 +720,7 @@ def _fused_blockwise_transpose_fp8_kernel(
     tl.store(scale_t_ptr + scale_t_offset, scale_val)
 
 
-def fused_blockwise_transpose_cast_to_fp8(
+def fp8cast_blockwise_transpose(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused blockwise FP8 quantization of x *and* x.T (single read of *x*).
@@ -750,7 +750,7 @@ def fused_blockwise_transpose_cast_to_fp8(
 
     grid = (scale_rows, scale_cols)
 
-    _fused_blockwise_transpose_fp8_kernel[grid](
+    fp8cast_blockwise_transpose_kernel[grid](
         x_ptr=x,
         out_ptr=out,
         scale_ptr=scale,
@@ -773,12 +773,12 @@ def fused_blockwise_transpose_cast_to_fp8(
 
 
 # ---------------------------------------------------------------------------
-# fused_blockwise_transpose_batched: blockwise(x) + blockwise(x.T), 3D
+# fp8cast_blockwise_transpose_batched: blockwise(x) + blockwise(x.T), 3D
 # ---------------------------------------------------------------------------
 
 
 @triton.jit
-def _fused_blockwise_transpose_fp8_batched_kernel(
+def fp8cast_blockwise_transpose_batched_kernel(
     x_ptr,
     out_ptr,
     scale_ptr,
@@ -832,7 +832,7 @@ def _fused_blockwise_transpose_fp8_batched_kernel(
     row_max = tl.max(abs_bf16, axis=1)  # (BLOCK,)
     block_amax = tl.max(row_max, axis=0)  # scalar
 
-    scale_val, rcp_val = _compute_fp8_scale(block_amax, SCALING_MODE)
+    scale_val, rcp_val = compute_fp8_scale(block_amax, SCALING_MODE)
 
     # Scale and cast (once)
     x_f32 = x_bf16.to(tl.float32)
@@ -863,7 +863,7 @@ def _fused_blockwise_transpose_fp8_batched_kernel(
     tl.store(scale_t_ptr + scale_t_offset, scale_val)
 
 
-def fused_blockwise_transpose_cast_to_fp8_batched(
+def fp8cast_blockwise_transpose_batched(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused blockwise FP8 quantization of x *and* x.transpose(1,2) for batched (G, N, K).
@@ -893,7 +893,7 @@ def fused_blockwise_transpose_cast_to_fp8_batched(
 
     grid = (scale_rows, scale_cols, G)
 
-    _fused_blockwise_transpose_fp8_batched_kernel[grid](
+    fp8cast_blockwise_transpose_batched_kernel[grid](
         x_ptr=x,
         out_ptr=out,
         scale_ptr=scale,

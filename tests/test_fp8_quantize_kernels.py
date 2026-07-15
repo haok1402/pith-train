@@ -35,7 +35,7 @@ def _make_bf16(shape, device="cuda"):
 
 
 # ---------------------------------------------------------------------------
-# fused_rowwise_colwise_cast_to_fp8
+# fp8cast_rowwise_colwise
 # ---------------------------------------------------------------------------
 
 
@@ -54,12 +54,12 @@ def _make_bf16(shape, device="cuda"):
 def test_fused_per_token_per_channel(M, N):
     """Fused per_token+per_channel matches calling the two kernels separately."""
     from pithtrain.operators.deepgemm_quantize import (
-        fused_rowwise_colwise_cast_to_fp8,
+        fp8cast_rowwise_colwise,
     )
 
     x = _make_bf16((M, N))
 
-    tok_fp8, tok_scale, ch_fp8, ch_scale = fused_rowwise_colwise_cast_to_fp8(x)
+    tok_fp8, tok_scale, ch_fp8, ch_scale = fp8cast_rowwise_colwise(x)
 
     ref_tok_fp8, ref_tok_scale = ref_per_token(x, use_ue8m0=_USE_E8M0, gran_k=128)
     ref_ch_fp8, ref_ch_scale = ref_per_channel(x, use_ue8m0=_USE_E8M0, gran_k=128)
@@ -91,11 +91,11 @@ def test_fused_per_token_per_channel(M, N):
 def test_fused_per_token_per_channel_all_zeros():
     """Fused kernel handles all-zero input (scale clamp prevents div-by-zero)."""
     from pithtrain.operators.deepgemm_quantize import (
-        fused_rowwise_colwise_cast_to_fp8,
+        fp8cast_rowwise_colwise,
     )
 
     x = torch.zeros((128, 256), device="cuda", dtype=torch.bfloat16)
-    tok_fp8, tok_scale, ch_fp8, ch_scale = fused_rowwise_colwise_cast_to_fp8(x)
+    tok_fp8, tok_scale, ch_fp8, ch_scale = fp8cast_rowwise_colwise(x)
 
     assert tok_scale.dtype == torch.float32
     assert torch.isfinite(ch_scale).all()
@@ -104,7 +104,7 @@ def test_fused_per_token_per_channel_all_zeros():
 
 
 # ---------------------------------------------------------------------------
-# fused_rowwise_transpose_cast_to_fp8
+# fp8cast_rowwise_transpose
 # ---------------------------------------------------------------------------
 
 
@@ -123,12 +123,12 @@ def test_fused_per_token_per_channel_all_zeros():
 def test_fused_per_token_and_transpose(M, N):
     """Fused per_token+transpose matches calling per_token on x and x.T separately."""
     from pithtrain.operators.deepgemm_quantize import (
-        fused_rowwise_transpose_cast_to_fp8,
+        fp8cast_rowwise_transpose,
     )
 
     x = _make_bf16((M, N))
 
-    tok_fp8, tok_scale, t_fp8, t_scale = fused_rowwise_transpose_cast_to_fp8(x)
+    tok_fp8, tok_scale, t_fp8, t_scale = fp8cast_rowwise_transpose(x)
 
     ref_tok_fp8, ref_tok_scale = ref_per_token(x, use_ue8m0=_USE_E8M0, gran_k=128)
     ref_t_fp8, ref_t_scale = ref_per_token(x.T, use_ue8m0=_USE_E8M0, gran_k=128)
@@ -157,11 +157,11 @@ def test_fused_per_token_and_transpose(M, N):
 def test_fused_per_token_and_transpose_all_zeros():
     """Fused transpose kernel handles all-zero input."""
     from pithtrain.operators.deepgemm_quantize import (
-        fused_rowwise_transpose_cast_to_fp8,
+        fp8cast_rowwise_transpose,
     )
 
     x = torch.zeros((64, 256), device="cuda", dtype=torch.bfloat16)
-    tok_fp8, tok_scale, t_fp8, t_scale = fused_rowwise_transpose_cast_to_fp8(x)
+    tok_fp8, tok_scale, t_fp8, t_scale = fp8cast_rowwise_transpose(x)
 
     assert tok_scale.dtype == torch.float32
     assert t_scale.dtype == torch.float32
@@ -170,7 +170,7 @@ def test_fused_per_token_and_transpose_all_zeros():
 
 
 # ---------------------------------------------------------------------------
-# fused_rowwise_blockwise_transpose_cast_to_fp8
+# fp8cast_rowwise_blockwise_transpose
 # ---------------------------------------------------------------------------
 
 
@@ -191,12 +191,12 @@ def test_fused_per_token_and_transpose_all_zeros():
 def test_fused_per_token_and_per_block_transpose(M, K):
     """Fused per_token+per_block_transpose matches separate per_token(x) + per_block(x.T)."""
     from pithtrain.operators.deepgemm_quantize import (
-        fused_rowwise_blockwise_transpose_cast_to_fp8,
+        fp8cast_rowwise_blockwise_transpose,
     )
 
     x = _make_bf16((M, K))
 
-    tok_fp8, tok_scale, blk_t_fp8, blk_t_scale = fused_rowwise_blockwise_transpose_cast_to_fp8(x)
+    tok_fp8, tok_scale, blk_t_fp8, blk_t_scale = fp8cast_rowwise_blockwise_transpose(x)
 
     ref_tok_fp8, ref_tok_scale = ref_per_token(x, use_ue8m0=_USE_E8M0, gran_k=128)
     ref_blk_t_fp8, ref_blk_t_scale = ref_per_block(x.T, use_ue8m0=_USE_E8M0, gran_k=128)
@@ -225,11 +225,11 @@ def test_fused_per_token_and_per_block_transpose(M, K):
 def test_fused_per_token_and_per_block_transpose_all_zeros():
     """Fused per_token+per_block_transpose handles all-zero input."""
     from pithtrain.operators.deepgemm_quantize import (
-        fused_rowwise_blockwise_transpose_cast_to_fp8,
+        fp8cast_rowwise_blockwise_transpose,
     )
 
     x = torch.zeros((64, 256), device="cuda", dtype=torch.bfloat16)
-    tok_fp8, tok_scale, blk_t_fp8, blk_t_scale = fused_rowwise_blockwise_transpose_cast_to_fp8(x)
+    tok_fp8, tok_scale, blk_t_fp8, blk_t_scale = fp8cast_rowwise_blockwise_transpose(x)
 
     assert torch.isfinite(tok_scale).all()
     assert torch.isfinite(blk_t_scale).all()
@@ -238,7 +238,7 @@ def test_fused_per_token_and_per_block_transpose_all_zeros():
 
 
 # ---------------------------------------------------------------------------
-# fused_blockwise_transpose_cast_to_fp8 (2D)
+# fp8cast_blockwise_transpose (2D)
 # ---------------------------------------------------------------------------
 
 
@@ -258,12 +258,12 @@ def test_fused_per_token_and_per_block_transpose_all_zeros():
 def test_fused_per_block_and_transpose(M, K):
     """Fused per_block+transpose matches separate per_block(x) + per_block(x.T)."""
     from pithtrain.operators.deepgemm_quantize import (
-        fused_blockwise_transpose_cast_to_fp8,
+        fp8cast_blockwise_transpose,
     )
 
     x = _make_bf16((M, K))
 
-    fp8, scale, fp8_t, scale_t = fused_blockwise_transpose_cast_to_fp8(x)
+    fp8, scale, fp8_t, scale_t = fp8cast_blockwise_transpose(x)
 
     ref_fp8, ref_scale = ref_per_block(x, use_ue8m0=_USE_E8M0, gran_k=128)
     ref_fp8_t, ref_scale_t = ref_per_block(x.T, use_ue8m0=_USE_E8M0, gran_k=128)
@@ -291,11 +291,11 @@ def test_fused_per_block_and_transpose(M, K):
 def test_fused_per_block_and_transpose_all_zeros():
     """Fused per_block+transpose handles all-zero input (finite scales)."""
     from pithtrain.operators.deepgemm_quantize import (
-        fused_blockwise_transpose_cast_to_fp8,
+        fp8cast_blockwise_transpose,
     )
 
     x = torch.zeros((128, 256), device="cuda", dtype=torch.bfloat16)
-    fp8, scale, fp8_t, scale_t = fused_blockwise_transpose_cast_to_fp8(x)
+    fp8, scale, fp8_t, scale_t = fp8cast_blockwise_transpose(x)
 
     assert torch.isfinite(scale).all()
     assert torch.isfinite(scale_t).all()
@@ -315,11 +315,11 @@ def test_fused_per_block_and_transpose_all_zeros():
 def test_fused_per_block_and_transpose_scale_symmetry(M, K):
     """Verifies scale == scale_t.T for the fused per_block+transpose kernel."""
     from pithtrain.operators.deepgemm_quantize import (
-        fused_blockwise_transpose_cast_to_fp8,
+        fp8cast_blockwise_transpose,
     )
 
     x = _make_bf16((M, K))
-    _, scale, _, scale_t = fused_blockwise_transpose_cast_to_fp8(x)
+    _, scale, _, scale_t = fp8cast_blockwise_transpose(x)
 
     assert torch.equal(scale, scale_t.T), (
         f"scale vs scale_t.T max diff = {(scale - scale_t.T).abs().max().item()}"
@@ -327,7 +327,7 @@ def test_fused_per_block_and_transpose_scale_symmetry(M, K):
 
 
 # ---------------------------------------------------------------------------
-# fused_blockwise_transpose_cast_to_fp8_batched (3D)
+# fp8cast_blockwise_transpose_batched (3D)
 # ---------------------------------------------------------------------------
 
 
@@ -345,12 +345,12 @@ def test_fused_per_block_and_transpose_scale_symmetry(M, K):
 def test_fused_per_block_and_transpose_batched(G, N, K):
     """Fused batched per_block+transpose matches separate per_block calls per group."""
     from pithtrain.operators.deepgemm_quantize import (
-        fused_blockwise_transpose_cast_to_fp8_batched,
+        fp8cast_blockwise_transpose_batched,
     )
 
     x = _make_bf16((G, N, K))
 
-    fp8, scale, fp8_t, scale_t = fused_blockwise_transpose_cast_to_fp8_batched(x)
+    fp8, scale, fp8_t, scale_t = fp8cast_blockwise_transpose_batched(x)
 
     # Reference: loop + stack of ref_per_block per group
     ref_fp8_list, ref_scale_list = [], []
@@ -390,11 +390,11 @@ def test_fused_per_block_and_transpose_batched(G, N, K):
 def test_fused_per_block_and_transpose_batched_all_zeros():
     """Fused batched per_block+transpose handles all-zero input (finite scales)."""
     from pithtrain.operators.deepgemm_quantize import (
-        fused_blockwise_transpose_cast_to_fp8_batched,
+        fp8cast_blockwise_transpose_batched,
     )
 
     x = torch.zeros((4, 128, 256), device="cuda", dtype=torch.bfloat16)
-    fp8, scale, fp8_t, scale_t = fused_blockwise_transpose_cast_to_fp8_batched(x)
+    fp8, scale, fp8_t, scale_t = fp8cast_blockwise_transpose_batched(x)
 
     assert torch.isfinite(scale).all()
     assert torch.isfinite(scale_t).all()
@@ -413,11 +413,11 @@ def test_fused_per_block_and_transpose_batched_all_zeros():
 def test_fused_per_block_and_transpose_batched_scale_symmetry(G, N, K):
     """Verifies scale == scale_t.transpose(1,2) for the batched fused kernel."""
     from pithtrain.operators.deepgemm_quantize import (
-        fused_blockwise_transpose_cast_to_fp8_batched,
+        fp8cast_blockwise_transpose_batched,
     )
 
     x = _make_bf16((G, N, K))
-    _, scale, _, scale_t = fused_blockwise_transpose_cast_to_fp8_batched(x)
+    _, scale, _, scale_t = fp8cast_blockwise_transpose_batched(x)
 
     assert torch.equal(scale, scale_t.transpose(1, 2)), (
         f"scale vs scale_t.T max diff = {(scale - scale_t.transpose(1, 2)).abs().max().item()}"

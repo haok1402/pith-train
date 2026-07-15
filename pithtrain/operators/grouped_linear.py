@@ -8,9 +8,9 @@ import torch.nn.functional as F
 
 from pithtrain.dualpipe.utils import FP8WeightCacheControl, WeightGradStore
 from pithtrain.operators.deepgemm_quantize import (
-    fused_blockwise_transpose_cast_to_fp8_batched,
-    fused_rowwise_colwise_cast_to_fp8,
-    fused_rowwise_kmajor_cast_to_fp8,
+    fp8cast_blockwise_transpose_batched,
+    fp8cast_rowwise_colwise,
+    fp8cast_rowwise_kmajor,
 )
 from pithtrain.operators.linear import ARCH_MAJOR
 
@@ -132,10 +132,10 @@ class FP8GroupedLinearFunc(torch.autograd.Function):
         # (fused transpose), eliminating a separate kernel launch in backward.
         if ARCH_MAJOR >= 10:
             input_fp8, scale_input, input_ch_fp8, scale_input_ch = (
-                fused_rowwise_colwise_cast_to_fp8(input)
+                fp8cast_rowwise_colwise(input)
             )
         else:
-            input_fp8, scale_input, input_ch_fp8, scale_input_ch = fused_rowwise_kmajor_cast_to_fp8(
+            input_fp8, scale_input, input_ch_fp8, scale_input_ch = fp8cast_rowwise_kmajor(
                 input, grouped_mm_offs
             )
 
@@ -184,11 +184,11 @@ class FP8GroupedLinearFunc(torch.autograd.Function):
         # FP8 tensors in one pass, eliminating a redundant BF16 read.
         # On Hopper the colwise output is K-major (fused transpose).
         if ARCH_MAJOR >= 10:
-            grad_fp8, scale_grad, grad_ch_fp8, scale_grad_ch = fused_rowwise_colwise_cast_to_fp8(
+            grad_fp8, scale_grad, grad_ch_fp8, scale_grad_ch = fp8cast_rowwise_colwise(
                 grad_output
             )
         else:
-            grad_fp8, scale_grad, grad_ch_fp8, scale_grad_ch = fused_rowwise_kmajor_cast_to_fp8(
+            grad_fp8, scale_grad, grad_ch_fp8, scale_grad_ch = fp8cast_rowwise_kmajor(
                 grad_output, grouped_mm_offs
             )
 
@@ -262,11 +262,11 @@ class FP8GroupedLinear(nn.Module):
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if torch.compiler.is_compiling():
-            return fused_blockwise_transpose_cast_to_fp8_batched(self.weight)
+            return fp8cast_blockwise_transpose_batched(self.weight)
         ver = FP8WeightCacheControl.version
         if self._wq_version == ver:
             return self._wq_cache
-        result = fused_blockwise_transpose_cast_to_fp8_batched(self.weight)
+        result = fp8cast_blockwise_transpose_batched(self.weight)
         self._wq_cache = result
         self._wq_version = ver
         return result

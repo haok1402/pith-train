@@ -14,7 +14,7 @@ from pithtrain.dualpipe.utils import FP8WeightCacheControl
 from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.clamped_swiglu import clamped_swiglu
-from pithtrain.operators.deepgemm_quantize import fused_blockwise_transpose_cast_to_fp8_batched
+from pithtrain.operators.deepgemm_quantize import fp8cast_blockwise_transpose_batched
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
 from pithtrain.operators.grouped_linear import FP8GroupedLinearFunc, GroupedLinearFunc
@@ -110,14 +110,14 @@ class GptOssExperts(nn.Module):
 
     def _quantized_weight(self, name: str, weight: torch.Tensor) -> tuple:
         if torch.compiler.is_compiling():
-            return fused_blockwise_transpose_cast_to_fp8_batched(weight)
+            return fp8cast_blockwise_transpose_batched(weight)
         ver = FP8WeightCacheControl.version
         cache = self._wq_cache
         if self._wq_version != ver or cache is None:
             cache = self._wq_cache = {}
             self._wq_version = ver
         if name not in cache:
-            cache[name] = fused_blockwise_transpose_cast_to_fp8_batched(weight)
+            cache[name] = fp8cast_blockwise_transpose_batched(weight)
         return cache[name]
 
     def _group_linear(

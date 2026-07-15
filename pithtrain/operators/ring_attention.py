@@ -67,7 +67,7 @@ from torch.distributed import (
 from torch.distributed.distributed_c10d import _resolve_process_group
 
 from pithtrain.operators.deepgemm_quantize import (
-    fused_rowwise_blockwise_transpose_cast_to_fp8,
+    fp8cast_rowwise_blockwise_transpose,
 )
 
 # FP8 (deep-gemm) shared GEMM recipe + the activation quantizer for the in-ring kv_b
@@ -642,7 +642,7 @@ def mla_zigzag_backward(
                 .reshape(b * n, out_features)
                 .to(normed_kv.dtype)
             )
-            _, _, x_t_fp8, scale_x_t = fused_rowwise_blockwise_transpose_cast_to_fp8(
+            _, _, x_t_fp8, scale_x_t = fp8cast_rowwise_blockwise_transpose(
                 nkv_blk.reshape(b * n, lora_rank)
             )
             d_nkv_2d, dW_blk = fp8_dgrad_wgrad(
