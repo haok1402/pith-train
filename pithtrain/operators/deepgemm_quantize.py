@@ -20,12 +20,6 @@ import torch
 import triton
 import triton.language as tl
 
-# DeepGEMM block granularity -- hardcoded, all callers use 128
-_BLOCK_K: tl.constexpr = 128
-
-# FP8 E4M3 max representable value
-_FP8_MAX: tl.constexpr = 448.0
-
 # Detect SM version once at import time
 ARCH_MAJOR, _ = torch.cuda.get_device_capability()
 _USE_E8M0_SCALES = ARCH_MAJOR >= 10
