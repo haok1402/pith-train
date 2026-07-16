@@ -28,7 +28,7 @@ Style: 100-char line length, double quotes, `py312` target. Rules: E, F, I, W (i
 
 ```bash
 # Single-GPU unit tests (kernels, ops, layer protocol)
-pytest tests/test_fp8_quantize_kernels.py -v
+pytest tests/operators/test_deepgemm_quantize.py -v
 pytest tests/test_deepgemm_fp8_linear_correctness.py -v
 pytest tests/test_grouped_linear_correctness.py -v
 pytest tests/test_ep_dedup_dispatch.py -v
@@ -36,7 +36,7 @@ pytest tests/test_silu_mul.py tests/test_clamped_swiglu.py tests/test_indexed_bi
 pytest tests/operators/test_ring_attention.py -v
 
 # Single test function
-pytest tests/test_fp8_quantize_kernels.py::test_name -v
+pytest tests/operators/test_deepgemm_quantize.py::test_name -v
 
 # Multi-GPU integration test — boots DualPipeV with FSDP, ~4 GPUs, pp=2 ep=2
 bash tests/test_dualpipev.sh

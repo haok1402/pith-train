@@ -2,9 +2,9 @@
 FP8 linear layer (DeepGEMM) and the shared FP8 GEMM recipe.
 
 ``FP8Linear`` is a drop-in ``nn.Linear`` replacement backed by DeepGEMM's Float8 E4M3 GEMM with
-per-block (128-element) scales -- E8M0 power-of-2 scales on Blackwell (SM100+), FP32 scales on
-Hopper (SM90). ``fp8_act_weight_gemm`` / ``fp8_dgrad_wgrad`` own the forward/backward GEMM
-convention and are shared with the MLA pass-latent ring attention.
+per-block (128-element) E8M0 power-of-2 scales -- native (MXFP8 PTX) on Blackwell (SM100+) and
+emulated on Hopper (SM90). ``fp8_act_weight_gemm`` / ``fp8_dgrad_wgrad`` own the forward/backward
+GEMM convention and are shared with the MLA pass-latent ring attention.
 """
 
 from typing import Tuple

@@ -100,7 +100,7 @@ What FSDP shards over. Expert weights are already unique per EP rank, so FSDP sh
 
 ## 5. FP8 training
 
-FP8 matmuls are backed by DeepSeek's [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM), which does 128-element block-scaled FP8 GEMMs (E8M0/MXFP8 scales on Blackwell, float32 scales on Hopper). PithTrain wraps it in `pithtrain/operators/linear.py` and `pithtrain/operators/grouped_linear.py`, with the block-scaling quantization in custom Triton kernels (`pithtrain/operators/deepgemm_quantize.py`).
+FP8 matmuls are backed by DeepSeek's [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM), which does 128-element block-scaled FP8 GEMMs (E8M0 power-of-2 scales on both -- native MXFP8 PTX on Blackwell, emulated on Hopper). PithTrain wraps it in `pithtrain/operators/linear.py` and `pithtrain/operators/grouped_linear.py`, with the block-scaling quantization in custom Triton kernels (`pithtrain/operators/deepgemm_quantize.py`).
 
 A whole model flips between FP8 and BF16 through one flag, `TrainingCfg.fp8`. At training setup (`pithtrain/modules/training.py`) it binds the linear classes the models build with, published on the `training` context:
 
