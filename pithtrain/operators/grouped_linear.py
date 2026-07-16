@@ -131,9 +131,7 @@ class FP8GroupedLinearFunc(torch.autograd.Function):
         # On Hopper the colwise output is written directly in K-major layout
         # (fused transpose), eliminating a separate kernel launch in backward.
         if ARCH_MAJOR >= 10:
-            input_fp8, scale_input, input_ch_fp8, scale_input_ch = (
-                fp8cast_rowwise_colwise(input)
-            )
+            input_fp8, scale_input, input_ch_fp8, scale_input_ch = fp8cast_rowwise_colwise(input)
         else:
             input_fp8, scale_input, input_ch_fp8, scale_input_ch = fp8cast_rowwise_kmajor(
                 input, grouped_mm_offs
@@ -184,9 +182,7 @@ class FP8GroupedLinearFunc(torch.autograd.Function):
         # FP8 tensors in one pass, eliminating a redundant BF16 read.
         # On Hopper the colwise output is K-major (fused transpose).
         if ARCH_MAJOR >= 10:
-            grad_fp8, scale_grad, grad_ch_fp8, scale_grad_ch = fp8cast_rowwise_colwise(
-                grad_output
-            )
+            grad_fp8, scale_grad, grad_ch_fp8, scale_grad_ch = fp8cast_rowwise_colwise(grad_output)
         else:
             grad_fp8, scale_grad, grad_ch_fp8, scale_grad_ch = fp8cast_rowwise_kmajor(
                 grad_output, grouped_mm_offs

@@ -51,8 +51,8 @@ def fp8_act_weight_gemm(
     so a later wgrad can reuse it. Shared by ``_fp8_linear_fwd`` and the MLA ring so the recipe
     has one source of truth."""
     m, n = input_2d.shape[0], weight_fp8.shape[0]
-    input_fp8, scale_input, input_t_fp8, scale_input_t = (
-        fp8cast_rowwise_blockwise_transpose(input_2d)
+    input_fp8, scale_input, input_t_fp8, scale_input_t = fp8cast_rowwise_blockwise_transpose(
+        input_2d
     )
     output = _fp8_gemm_nt(
         input_fp8, scale_input, weight_fp8, scale_weight, m, n, input_2d.device, input_2d.dtype
