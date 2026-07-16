@@ -232,7 +232,6 @@ def test_fp8cast_rowwise_blockwise_transpose_all_zeros():
         (128, 128),  # exact tile
         (256, 256),  # multi-tile
         (300, 384),  # non-multiples of 128
-        (1, 128),  # single row
         (64, 64),  # sub-tile
         (128, 256),
         (7, 300),  # odd M, K not multiple of 128

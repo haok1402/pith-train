@@ -689,15 +689,11 @@ def fp8cast_blockwise_transpose_kernel(
     out_ptrs = out_ptr + row_offs[:, None] * stride_out_row + col_offs[None, :]
     tl.store(out_ptrs, fp8_tile, mask=mask)
 
-    # Transpose in registers
-    fp8_tile_t = tl.trans(fp8_tile)  # (BLOCK, BLOCK)
-
-    # Store transposed FP8 data: out_t(K, M) at tile (pid_col, pid_row)
-    t_row_offs = col_start + tl.arange(0, BLOCK)
-    t_col_offs = row_start + tl.arange(0, BLOCK)
-    out_t_ptrs = out_t_ptr + t_row_offs[:, None] * stride_out_t_row + t_col_offs[None, :]
-    t_mask = (t_row_offs[:, None] < K) & (t_col_offs[None, :] < M)
-    tl.store(out_t_ptrs, fp8_tile_t, mask=t_mask)
+    # Store transposed FP8 data to out_t(K, M) without tl.trans (which
+    # miscompiles fp8 tiles): write the same tile to swapped-index addresses,
+    # so element (i, j) lands at out_t[col_start + j, row_start + i].
+    out_t_ptrs = out_t_ptr + col_offs[None, :] * stride_out_t_row + row_offs[:, None]
+    tl.store(out_t_ptrs, fp8_tile, mask=mask)
 
     # Store scale: one value at (pid_row, pid_col)
     scale_offset = pid_row * scale_cols + pid_col
@@ -829,16 +825,12 @@ def fp8cast_blockwise_transpose_batched_kernel(
     out_ptrs = out_base + row_offs[:, None] * stride_out_row + col_offs[None, :]
     tl.store(out_ptrs, fp8_tile, mask=mask)
 
-    # Transpose in registers
-    fp8_tile_t = tl.trans(fp8_tile)  # (BLOCK, BLOCK)
-
-    # Store transposed FP8 data: out_t(G, K, N)
-    t_row_offs = col_start + tl.arange(0, BLOCK)
-    t_col_offs = row_start + tl.arange(0, BLOCK)
+    # Store transposed FP8 data to out_t(G, K, N) without tl.trans (which
+    # miscompiles fp8 tiles): write the same tile to swapped-index addresses,
+    # so element (i, j) lands at out_t[pid_g, col_start + j, row_start + i].
     out_t_base = out_t_ptr + pid_g * stride_out_t_g
-    out_t_ptrs = out_t_base + t_row_offs[:, None] * stride_out_t_row + t_col_offs[None, :]
-    t_mask = (t_row_offs[:, None] < K) & (t_col_offs[None, :] < N)
-    tl.store(out_t_ptrs, fp8_tile_t, mask=t_mask)
+    out_t_ptrs = out_t_base + col_offs[None, :] * stride_out_t_row + row_offs[:, None]
+    tl.store(out_t_ptrs, fp8_tile, mask=mask)
 
     # Store scale: (G, ceil(N/128), ceil(K/128)) at (pid_g, pid_row, pid_col)
     scale_offset = pid_g * stride_scale_g + pid_row * scale_cols + pid_col
