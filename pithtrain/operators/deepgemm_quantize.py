@@ -4,9 +4,9 @@ Fused Triton kernels for FP8 quantization with architecture-aware scaling.
 Replaces the pure-PyTorch quantization utilities from ``deep_gemm.utils.math``
 with single-pass Triton kernels that fuse pad -> abs -> amax -> scale -> cast.
 
-On Blackwell (SM100+), produces E8M0 power-of-2 scaling factors for MXFP8 via
-PTX ``cvt.rp.satfinite.ue8m0x2.f32``.  On Hopper (SM90), produces plain
-float32 scales (``amax / 448``).  Block granularity is fixed at 128 elements.
+Both architectures use E8M0 power-of-2 scaling factors: computed natively via
+PTX ``cvt.rp.satfinite.ue8m0x2.f32`` on Blackwell (SM100+) and emulated with
+IEEE-754 bit manipulation on Hopper (SM90). Block granularity is 128 elements.
 
 Public kernels:
     1. fp8cast_rowwise_colwise -- rowwise(x) + colwise(x)
@@ -20,9 +20,10 @@ import torch
 import triton
 import triton.language as tl
 
-# Detect SM version once at import time
+# SM100+ has the native E8M0 PTX op; SM90 emulates the same power-of-2 scale in
+# software. Resolved once at import and passed to the kernels as a constexpr.
 ARCH_MAJOR, _ = torch.cuda.get_device_capability()
-_USE_E8M0_SCALES = ARCH_MAJOR >= 10
+NATIVE_E8M0 = ARCH_MAJOR >= 10
 
 
 # ---------------------------------------------------------------------------
@@ -31,18 +32,14 @@ _USE_E8M0_SCALES = ARCH_MAJOR >= 10
 
 
 @triton.jit
-def compute_fp8_scale(amax, SCALING_MODE: tl.constexpr):
-    """Compute float32 scale from per-group amax values.
+def compute_fp8_scale(amax, NATIVE_E8M0: tl.constexpr):
+    """Compute the float32 E8M0 (power-of-2) scale from per-group amax values.
 
-    Given ``amax`` (the max absolute value of a group), computes a scaling
-    factor for FP8 quantization.
-
-    Both modes produce power-of-2 scales so that quantize and dequantize
+    The scale is always a power of 2, so quantize and dequantize
     multiplications are exact (IEEE-754 exponent shift, no mantissa rounding).
-
-    - ``"e8m0"``: SM100+ E8M0 scale via PTX ``cvt.rp.satfinite.ue8m0x2.f32``.
-    - ``"fp32"``: Equivalent power-of-2 ceil via IEEE-754 bit manipulation
-      (used on Hopper / SM90 where the PTX instruction is unavailable).
+    ``NATIVE_E8M0`` selects how it is produced: the SM100+ native PTX
+    ``cvt.rp.satfinite.ue8m0x2.f32`` when True, or a software-emulated
+    power-of-2 ceil (IEEE-754 bit manipulation) on SM90 when False.
 
     Returns (scale, reciprocal_scale), both exact powers of 2.
     """
@@ -51,8 +48,8 @@ def compute_fp8_scale(amax, SCALING_MODE: tl.constexpr):
     amax_clamped = tl.maximum(amax.to(tl.float32), 1e-4)
     scale_input = amax_clamped * FP8_MAX_RCP
 
-    if SCALING_MODE == "e8m0":
-        # SM100: use PTX cvt.rp (round-positive = ceil) to E8M0
+    if NATIVE_E8M0:
+        # SM100: native PTX cvt.rp (round-positive = ceil) to E8M0
         scale_e8m0_biased = tl.inline_asm_elementwise(
             asm="cvt.rp.satfinite.ue8m0x2.f32 $0, 0.0, $1;",
             constraints="=h,r",
@@ -64,10 +61,9 @@ def compute_fp8_scale(amax, SCALING_MODE: tl.constexpr):
 
         scale_fp = (scale_e8m0_biased.to(tl.int32) << 23).to(tl.float32, bitcast=True)
     else:
-        tl.static_assert(SCALING_MODE == "fp32")
-        # Ceil to nearest power of 2 via IEEE-754 bit manipulation:
-        # clear mantissa bits (floor to pow2), then increment exponent if
-        # the original value wasn't already an exact power of 2.
+        # SM90: emulate the same E8M0 power-of-2 ceil via IEEE-754 bit
+        # manipulation -- clear mantissa bits (floor to pow2), then increment
+        # the exponent if the value wasn't already an exact power of 2.
         bits = scale_input.to(tl.int32, bitcast=True)
         mantissa = bits & 0x007FFFFF
         scale_fp = ((bits & 0x7F800000) + tl.where(mantissa != 0, 0x00800000, 0)).to(
@@ -108,7 +104,7 @@ def fp8cast_rowwise_colwise_kernel(
     block_to_group_ptr,
     cumsum_ptr,
     BLOCK_N: tl.constexpr,
-    SCALING_MODE: tl.constexpr,
+    NATIVE_E8M0: tl.constexpr,
     WRITE_KMAJOR: tl.constexpr = False,
 ):
     """Fused rowwise + colwise FP8 quantization from a single tile load.
@@ -147,7 +143,7 @@ def fp8cast_rowwise_colwise_kernel(
     # --- Rowwise path (axis=1 reduction, per-row, per-128-col-block) ---
     abs_reshaped = tl.reshape(abs_bf16, BLOCK_ROWS * CHUNKS, BLOCK_ROWS)
     tok_amax = tl.max(abs_reshaped, axis=1)  # (128 * CHUNKS,)
-    tok_scale, tok_rcp = compute_fp8_scale(tok_amax, SCALING_MODE)
+    tok_scale, tok_rcp = compute_fp8_scale(tok_amax, NATIVE_E8M0)
 
     x_f32 = x_bf16.to(tl.float32)
     x_reshaped = tl.reshape(x_f32, BLOCK_ROWS * CHUNKS, BLOCK_ROWS)
@@ -167,7 +163,7 @@ def fp8cast_rowwise_colwise_kernel(
 
     # --- Colwise path (axis=0 reduction, per-column within 128-row group) ---
     ch_amax = tl.max(abs_bf16, axis=0)  # (BLOCK_N,)
-    ch_scale, ch_rcp = compute_fp8_scale(ch_amax, SCALING_MODE)
+    ch_scale, ch_rcp = compute_fp8_scale(ch_amax, NATIVE_E8M0)
 
     ch_fp8 = (x_f32 * ch_rcp[None, :]).to(tl.float8e4nv)
 
@@ -232,8 +228,6 @@ def fp8cast_rowwise_colwise(
     out_ch = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=x.device)
     scale_ch = torch.empty((num_row_groups, N), dtype=torch.float32, device=x.device)
 
-    scaling_mode = "e8m0" if _USE_E8M0_SCALES else "fp32"
-
     _BLOCK_N = 128
     grid = (num_row_groups, (N + _BLOCK_N - 1) // _BLOCK_N)
 
@@ -254,7 +248,7 @@ def fp8cast_rowwise_colwise(
         block_to_group_ptr=out_tok,
         cumsum_ptr=out_tok,
         BLOCK_N=_BLOCK_N,
-        SCALING_MODE=scaling_mode,
+        NATIVE_E8M0=NATIVE_E8M0,
         WRITE_KMAJOR=False,
         num_warps=4,
         num_stages=2,
@@ -308,8 +302,6 @@ def fp8cast_rowwise_kmajor(
     ).to(torch.int32)
     block_to_group.clamp_(max=grouped_mm_offs.shape[0] - 1)
 
-    scaling_mode = "e8m0" if _USE_E8M0_SCALES else "fp32"
-
     _BLOCK_N = 128
     grid = (num_row_groups, (N + _BLOCK_N - 1) // _BLOCK_N)
 
@@ -330,7 +322,7 @@ def fp8cast_rowwise_kmajor(
         block_to_group_ptr=block_to_group,
         cumsum_ptr=grouped_mm_offs,
         BLOCK_N=_BLOCK_N,
-        SCALING_MODE=scaling_mode,
+        NATIVE_E8M0=NATIVE_E8M0,
         WRITE_KMAJOR=True,
         num_warps=4,
         num_stages=2,
@@ -360,7 +352,7 @@ def fp8cast_rowwise_transpose_kernel(
     stride_out_t_row,
     stride_scale_t_row,
     BLOCK_N: tl.constexpr,
-    SCALING_MODE: tl.constexpr,
+    NATIVE_E8M0: tl.constexpr,
 ):
     """Fused rowwise quantization of x (M, N) and x.T (N, M).
 
@@ -391,7 +383,7 @@ def fp8cast_rowwise_transpose_kernel(
     # --- Rowwise on x (axis=1 reduction) ---
     abs_reshaped = tl.reshape(abs_bf16, BLOCK_ROWS * CHUNKS, BLOCK_ROWS)
     tok_amax = tl.max(abs_reshaped, axis=1)  # (128 * CHUNKS,)
-    tok_scale, tok_rcp = compute_fp8_scale(tok_amax, SCALING_MODE)
+    tok_scale, tok_rcp = compute_fp8_scale(tok_amax, NATIVE_E8M0)
 
     x_f32 = x_bf16.to(tl.float32)
     x_reshaped = tl.reshape(x_f32, BLOCK_ROWS * CHUNKS, BLOCK_ROWS)
@@ -411,7 +403,7 @@ def fp8cast_rowwise_transpose_kernel(
 
     # --- Transposed rowwise on x.T (axis=0 reduction of x tile) ---
     t_amax = tl.max(abs_bf16, axis=0)  # (BLOCK_N,)
-    t_scale, t_rcp = compute_fp8_scale(t_amax, SCALING_MODE)
+    t_scale, t_rcp = compute_fp8_scale(t_amax, NATIVE_E8M0)
 
     # Scale each column of x by its transpose-token scale, cast to FP8
     t_fp8 = (x_f32 * t_rcp[None, :]).to(tl.float8e4nv)
@@ -459,8 +451,6 @@ def fp8cast_rowwise_transpose(
     out_t = torch.empty((N, M), dtype=torch.float8_e4m3fn, device=x.device)
     scale_t = torch.empty((N, scale_t_cols), dtype=torch.float32, device=x.device)
 
-    scaling_mode = "e8m0" if _USE_E8M0_SCALES else "fp32"
-
     _BLOCK_N = 128
     grid = (
         (M + BLOCK - 1) // BLOCK,
@@ -482,7 +472,7 @@ def fp8cast_rowwise_transpose(
         stride_out_t_row=M,
         stride_scale_t_row=scale_t_cols,
         BLOCK_N=_BLOCK_N,
-        SCALING_MODE=scaling_mode,
+        NATIVE_E8M0=NATIVE_E8M0,
         num_warps=4,
         num_stages=2,
     )
@@ -510,7 +500,7 @@ def fp8cast_rowwise_blockwise_transpose_kernel(
     stride_scale_tok_row,
     stride_out_blk_t_row,
     scale_blk_t_cols,
-    SCALING_MODE: tl.constexpr,
+    NATIVE_E8M0: tl.constexpr,
 ):
     """Fused rowwise quantization of x and blockwise quantization of x.T.
 
@@ -542,7 +532,7 @@ def fp8cast_rowwise_blockwise_transpose_kernel(
 
     # --- Rowwise path (one 128-element column block per tile) ---
     tok_amax = tl.max(abs_bf16, axis=1)  # (128,)
-    tok_scale, tok_rcp = compute_fp8_scale(tok_amax, SCALING_MODE)  # (128,)
+    tok_scale, tok_rcp = compute_fp8_scale(tok_amax, NATIVE_E8M0)  # (128,)
 
     x_f32 = x_bf16.to(tl.float32)
     tok_fp8 = (x_f32 * tok_rcp[:, None]).to(tl.float8e4nv)
@@ -558,7 +548,7 @@ def fp8cast_rowwise_blockwise_transpose_kernel(
 
     # --- Blockwise transpose path (reuse tok_amax) ---
     block_amax = tl.max(tok_amax, axis=0)  # scalar
-    blk_scale, blk_rcp = compute_fp8_scale(block_amax, SCALING_MODE)  # scalar
+    blk_scale, blk_rcp = compute_fp8_scale(block_amax, NATIVE_E8M0)  # scalar
 
     blk_fp8 = (x_f32 * blk_rcp).to(tl.float8e4nv)
 
@@ -610,8 +600,6 @@ def fp8cast_rowwise_blockwise_transpose(
         (scale_blk_t_rows, scale_blk_t_cols), dtype=torch.float32, device=x.device
     )
 
-    scaling_mode = "e8m0" if _USE_E8M0_SCALES else "fp32"
-
     grid = (
         (M + BLOCK - 1) // BLOCK,
         (K + BLOCK - 1) // BLOCK,
@@ -631,7 +619,7 @@ def fp8cast_rowwise_blockwise_transpose(
         stride_scale_tok_row=scale_tok_cols,
         stride_out_blk_t_row=M,
         scale_blk_t_cols=scale_blk_t_cols,
-        SCALING_MODE=scaling_mode,
+        NATIVE_E8M0=NATIVE_E8M0,
         num_warps=4,
         num_stages=2,
     )
@@ -659,7 +647,7 @@ def fp8cast_blockwise_transpose_kernel(
     scale_cols,
     stride_out_t_row,
     scale_t_cols,
-    SCALING_MODE: tl.constexpr,
+    NATIVE_E8M0: tl.constexpr,
 ):
     """Fused blockwise (128x128) FP8 quantization of x and x.T.
 
@@ -691,7 +679,7 @@ def fp8cast_blockwise_transpose_kernel(
     block_amax = tl.max(row_max, axis=0)  # scalar
 
     # Compute scalar scale
-    scale_val, rcp_val = compute_fp8_scale(block_amax, SCALING_MODE)
+    scale_val, rcp_val = compute_fp8_scale(block_amax, NATIVE_E8M0)
 
     # Scale and cast (once)
     x_f32 = x_bf16.to(tl.float32)
@@ -746,8 +734,6 @@ def fp8cast_blockwise_transpose(
     out_t = torch.empty((K, M), dtype=torch.float8_e4m3fn, device=x.device)
     scale_t = torch.empty((scale_cols, scale_rows), dtype=torch.float32, device=x.device)
 
-    scaling_mode = "e8m0" if _USE_E8M0_SCALES else "fp32"
-
     grid = (scale_rows, scale_cols)
 
     fp8cast_blockwise_transpose_kernel[grid](
@@ -764,7 +750,7 @@ def fp8cast_blockwise_transpose(
         scale_cols=scale_cols,
         stride_out_t_row=M,
         scale_t_cols=scale_rows,
-        SCALING_MODE=scaling_mode,
+        NATIVE_E8M0=NATIVE_E8M0,
         num_warps=4,
         num_stages=2,
     )
@@ -798,7 +784,7 @@ def fp8cast_blockwise_transpose_batched_kernel(
     stride_out_t_row,
     scale_t_cols,
     stride_scale_t_g,
-    SCALING_MODE: tl.constexpr,
+    NATIVE_E8M0: tl.constexpr,
 ):
     """Fused batched blockwise (128x128) FP8 quantization of x and x.transpose(1,2).
 
@@ -832,7 +818,7 @@ def fp8cast_blockwise_transpose_batched_kernel(
     row_max = tl.max(abs_bf16, axis=1)  # (BLOCK,)
     block_amax = tl.max(row_max, axis=0)  # scalar
 
-    scale_val, rcp_val = compute_fp8_scale(block_amax, SCALING_MODE)
+    scale_val, rcp_val = compute_fp8_scale(block_amax, NATIVE_E8M0)
 
     # Scale and cast (once)
     x_f32 = x_bf16.to(tl.float32)
@@ -889,8 +875,6 @@ def fp8cast_blockwise_transpose_batched(
     out_t = torch.empty((G, K, N), dtype=torch.float8_e4m3fn, device=x.device)
     scale_t = torch.empty((G, scale_cols, scale_rows), dtype=torch.float32, device=x.device)
 
-    scaling_mode = "e8m0" if _USE_E8M0_SCALES else "fp32"
-
     grid = (scale_rows, scale_cols, G)
 
     fp8cast_blockwise_transpose_batched_kernel[grid](
@@ -913,7 +897,7 @@ def fp8cast_blockwise_transpose_batched(
         stride_out_t_row=N,
         scale_t_cols=scale_rows,
         stride_scale_t_g=scale_cols * scale_rows,
-        SCALING_MODE=scaling_mode,
+        NATIVE_E8M0=NATIVE_E8M0,
         num_warps=4,
         num_stages=2,
     )
