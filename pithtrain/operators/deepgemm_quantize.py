@@ -7,18 +7,20 @@ with single-pass Triton kernels that fuse pad -> abs -> amax -> scale -> cast.
 Both architectures use E8M0 power-of-2 scaling factors: computed natively via
 PTX ``cvt.rp.satfinite.ue8m0x2.f32`` on Blackwell (SM100+) and emulated with
 IEEE-754 bit manipulation on Hopper (SM90). Block granularity is 128 elements.
-
-Public kernels:
-    1. fp8cast_rowwise_colwise -- rowwise(x) + colwise(x)
-    2. fp8cast_rowwise_transpose -- rowwise(x) + rowwise(x.T)
-    3. fp8cast_rowwise_blockwise_transpose -- rowwise(x) + blockwise(x.T)
-    4. fp8cast_blockwise_transpose -- blockwise(x) + blockwise(x.T), 2D
-    5. fp8cast_blockwise_transpose_batched -- blockwise(x) + blockwise(x.T), 3D
 """
 
 import torch
 import triton
 import triton.language as tl
+
+__all__ = [
+    "fp8cast_rowwise_colwise",
+    "fp8cast_rowwise_kmajor",
+    "fp8cast_rowwise_transpose",
+    "fp8cast_rowwise_blockwise_transpose",
+    "fp8cast_blockwise_transpose",
+    "fp8cast_blockwise_transpose_batched",
+]
 
 # SM100+ has the native E8M0 PTX op; SM90 emulates the same power-of-2 scale in
 # software. Resolved once at import and passed to the kernels as a constexpr.
@@ -32,7 +34,7 @@ NATIVE_E8M0 = ARCH_MAJOR >= 10
 
 
 @triton.jit
-def compute_fp8_scale(amax, NATIVE_E8M0: tl.constexpr):
+def _compute_fp8_scale(amax, NATIVE_E8M0: tl.constexpr):
     """Compute the float32 E8M0 (power-of-2) scale from per-group amax values.
 
     The scale is always a power of 2, so quantize and dequantize
@@ -87,7 +89,7 @@ def compute_fp8_scale(amax, NATIVE_E8M0: tl.constexpr):
 
 
 @triton.jit
-def fp8cast_rowwise_colwise_kernel(
+def _fp8cast_rowwise_colwise_kernel(
     x_ptr,
     out_tok_ptr,
     scale_tok_ptr,
@@ -143,7 +145,7 @@ def fp8cast_rowwise_colwise_kernel(
     # --- Rowwise path (axis=1 reduction, per-row, per-128-col-block) ---
     abs_reshaped = tl.reshape(abs_bf16, BLOCK_ROWS * CHUNKS, BLOCK_ROWS)
     tok_amax = tl.max(abs_reshaped, axis=1)  # (128 * CHUNKS,)
-    tok_scale, tok_rcp = compute_fp8_scale(tok_amax, NATIVE_E8M0)
+    tok_scale, tok_rcp = _compute_fp8_scale(tok_amax, NATIVE_E8M0)
 
     x_f32 = x_bf16.to(tl.float32)
     x_reshaped = tl.reshape(x_f32, BLOCK_ROWS * CHUNKS, BLOCK_ROWS)
@@ -163,7 +165,7 @@ def fp8cast_rowwise_colwise_kernel(
 
     # --- Colwise path (axis=0 reduction, per-column within 128-row group) ---
     ch_amax = tl.max(abs_bf16, axis=0)  # (BLOCK_N,)
-    ch_scale, ch_rcp = compute_fp8_scale(ch_amax, NATIVE_E8M0)
+    ch_scale, ch_rcp = _compute_fp8_scale(ch_amax, NATIVE_E8M0)
 
     ch_fp8 = (x_f32 * ch_rcp[None, :]).to(tl.float8e4nv)
 
@@ -231,7 +233,7 @@ def fp8cast_rowwise_colwise(
     _BLOCK_N = 128
     grid = (num_row_groups, (N + _BLOCK_N - 1) // _BLOCK_N)
 
-    fp8cast_rowwise_colwise_kernel[grid](
+    _fp8cast_rowwise_colwise_kernel[grid](
         x_ptr=x,
         out_tok_ptr=out_tok,
         scale_tok_ptr=scale_tok,
@@ -305,7 +307,7 @@ def fp8cast_rowwise_kmajor(
     _BLOCK_N = 128
     grid = (num_row_groups, (N + _BLOCK_N - 1) // _BLOCK_N)
 
-    fp8cast_rowwise_colwise_kernel[grid](
+    _fp8cast_rowwise_colwise_kernel[grid](
         x_ptr=x,
         out_tok_ptr=out_tok,
         scale_tok_ptr=scale_tok,
@@ -337,7 +339,7 @@ def fp8cast_rowwise_kmajor(
 
 
 @triton.jit
-def fp8cast_rowwise_transpose_kernel(
+def _fp8cast_rowwise_transpose_kernel(
     x_ptr,
     out_tok_ptr,
     scale_tok_ptr,
@@ -383,7 +385,7 @@ def fp8cast_rowwise_transpose_kernel(
     # --- Rowwise on x (axis=1 reduction) ---
     abs_reshaped = tl.reshape(abs_bf16, BLOCK_ROWS * CHUNKS, BLOCK_ROWS)
     tok_amax = tl.max(abs_reshaped, axis=1)  # (128 * CHUNKS,)
-    tok_scale, tok_rcp = compute_fp8_scale(tok_amax, NATIVE_E8M0)
+    tok_scale, tok_rcp = _compute_fp8_scale(tok_amax, NATIVE_E8M0)
 
     x_f32 = x_bf16.to(tl.float32)
     x_reshaped = tl.reshape(x_f32, BLOCK_ROWS * CHUNKS, BLOCK_ROWS)
@@ -403,7 +405,7 @@ def fp8cast_rowwise_transpose_kernel(
 
     # --- Transposed rowwise on x.T (axis=0 reduction of x tile) ---
     t_amax = tl.max(abs_bf16, axis=0)  # (BLOCK_N,)
-    t_scale, t_rcp = compute_fp8_scale(t_amax, NATIVE_E8M0)
+    t_scale, t_rcp = _compute_fp8_scale(t_amax, NATIVE_E8M0)
 
     # Scale each column of x by its transpose-token scale, cast to FP8
     t_fp8 = (x_f32 * t_rcp[None, :]).to(tl.float8e4nv)
@@ -457,7 +459,7 @@ def fp8cast_rowwise_transpose(
         (N + _BLOCK_N - 1) // _BLOCK_N,
     )
 
-    fp8cast_rowwise_transpose_kernel[grid](
+    _fp8cast_rowwise_transpose_kernel[grid](
         x_ptr=x,
         out_tok_ptr=out_tok,
         scale_tok_ptr=scale_tok,
@@ -486,7 +488,7 @@ def fp8cast_rowwise_transpose(
 
 
 @triton.jit
-def fp8cast_rowwise_blockwise_transpose_kernel(
+def _fp8cast_rowwise_blockwise_transpose_kernel(
     x_ptr,
     out_tok_ptr,
     scale_tok_ptr,
@@ -532,7 +534,7 @@ def fp8cast_rowwise_blockwise_transpose_kernel(
 
     # --- Rowwise path (one 128-element column block per tile) ---
     tok_amax = tl.max(abs_bf16, axis=1)  # (128,)
-    tok_scale, tok_rcp = compute_fp8_scale(tok_amax, NATIVE_E8M0)  # (128,)
+    tok_scale, tok_rcp = _compute_fp8_scale(tok_amax, NATIVE_E8M0)  # (128,)
 
     x_f32 = x_bf16.to(tl.float32)
     tok_fp8 = (x_f32 * tok_rcp[:, None]).to(tl.float8e4nv)
@@ -548,7 +550,7 @@ def fp8cast_rowwise_blockwise_transpose_kernel(
 
     # --- Blockwise transpose path (reuse tok_amax) ---
     block_amax = tl.max(tok_amax, axis=0)  # scalar
-    blk_scale, blk_rcp = compute_fp8_scale(block_amax, NATIVE_E8M0)  # scalar
+    blk_scale, blk_rcp = _compute_fp8_scale(block_amax, NATIVE_E8M0)  # scalar
 
     blk_fp8 = (x_f32 * blk_rcp).to(tl.float8e4nv)
 
@@ -605,7 +607,7 @@ def fp8cast_rowwise_blockwise_transpose(
         (K + BLOCK - 1) // BLOCK,
     )
 
-    fp8cast_rowwise_blockwise_transpose_kernel[grid](
+    _fp8cast_rowwise_blockwise_transpose_kernel[grid](
         x_ptr=x,
         out_tok_ptr=out_tok,
         scale_tok_ptr=scale_tok,
@@ -633,7 +635,7 @@ def fp8cast_rowwise_blockwise_transpose(
 
 
 @triton.jit
-def fp8cast_blockwise_transpose_kernel(
+def _fp8cast_blockwise_transpose_kernel(
     x_ptr,
     out_ptr,
     scale_ptr,
@@ -679,7 +681,7 @@ def fp8cast_blockwise_transpose_kernel(
     block_amax = tl.max(row_max, axis=0)  # scalar
 
     # Compute scalar scale
-    scale_val, rcp_val = compute_fp8_scale(block_amax, NATIVE_E8M0)
+    scale_val, rcp_val = _compute_fp8_scale(block_amax, NATIVE_E8M0)
 
     # Scale and cast (once)
     x_f32 = x_bf16.to(tl.float32)
@@ -732,7 +734,7 @@ def fp8cast_blockwise_transpose(
 
     grid = (scale_rows, scale_cols)
 
-    fp8cast_blockwise_transpose_kernel[grid](
+    _fp8cast_blockwise_transpose_kernel[grid](
         x_ptr=x,
         out_ptr=out,
         scale_ptr=scale,
@@ -760,7 +762,7 @@ def fp8cast_blockwise_transpose(
 
 
 @triton.jit
-def fp8cast_blockwise_transpose_batched_kernel(
+def _fp8cast_blockwise_transpose_batched_kernel(
     x_ptr,
     out_ptr,
     scale_ptr,
@@ -814,7 +816,7 @@ def fp8cast_blockwise_transpose_batched_kernel(
     row_max = tl.max(abs_bf16, axis=1)  # (BLOCK,)
     block_amax = tl.max(row_max, axis=0)  # scalar
 
-    scale_val, rcp_val = compute_fp8_scale(block_amax, NATIVE_E8M0)
+    scale_val, rcp_val = _compute_fp8_scale(block_amax, NATIVE_E8M0)
 
     # Scale and cast (once)
     x_f32 = x_bf16.to(tl.float32)
@@ -869,7 +871,7 @@ def fp8cast_blockwise_transpose_batched(
 
     grid = (scale_rows, scale_cols, G)
 
-    fp8cast_blockwise_transpose_batched_kernel[grid](
+    _fp8cast_blockwise_transpose_batched_kernel[grid](
         x_ptr=x,
         out_ptr=out,
         scale_ptr=scale,
