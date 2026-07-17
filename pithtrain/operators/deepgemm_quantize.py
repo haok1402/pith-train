@@ -655,7 +655,7 @@ def _fp8cast_blockwise_transpose_kernel(
 
     Each program processes one 128x128 tile of x, computing a single amax
     and FP8 scale for the tile.  The quantized tile is stored to both
-    ``out (M, K)`` and, transposed via ``tl.trans``, to ``out_t (K, M)``.
+    ``out (M, K)`` and, transposed via swapped-index stores, to ``out_t (K, M)``.
     The same scalar scale is written to both ``scale`` and ``scale_t`` at
     swapped indices.
     """
