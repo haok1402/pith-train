@@ -7,8 +7,8 @@ List, compare, and pull files for runs in a wandb project.
 
 RUN is a run id or display name.
 
-compare reports, per run, the per-step delta range, the final delta and what it
-settles into, and whether that final delta sits inside the run's own noise.
+compare reports, per run, the per-step delta range and the final delta with what
+it settles into. It reports facts, not a verdict; judge significance yourself.
 --drop-first drops step 0 (a warmup outlier for throughput; do not use it for loss).
 
 logs downloads output.log (a run's stdout+stderr, crash tracebacks included) to
@@ -46,18 +46,6 @@ def series(run, key):
         if v is not None:
             d[int(row["_step"])] = v
     return d
-
-
-def noise_floor(vals, tail=20):
-    """
-    The run's own noise floor: mean step-to-step change over the last tail
-    steps, restricted to the tail so the steep early-training descent does not
-    inflate it.
-    """
-    v = vals[-tail:] if len(vals) > tail else vals
-    if len(v) < 2:
-        return 0.0
-    return statistics.mean(abs(v[i] - v[i - 1]) for i in range(1, len(v)))
 
 
 def fmt(x):
@@ -98,20 +86,14 @@ def cmd_compare(api, path, args):
         f"[{steps[0]}-{fs}]{'  (dropped step 0)' if args.drop_first else ''}\n"
     )
 
-    ref_noise = noise_floor([ref[s] for s in steps])
     for sel, var in vars_.items():
         deltas = [var[s] - ref[s] for s in steps]
         final = deltas[-1]
         settling = statistics.mean(deltas[-min(5, len(deltas)) :])
-        verdict = "INSIDE" if abs(final) < ref_noise else "ABOVE"
         print(f"=== {sel} vs {id2name[ref_id]} ===")
         print(
             f"  per-step delta : range [{fmt(min(deltas))}, {fmt(max(deltas))}]   "
-            f"final(step {fs}) {fmt(final)}   settling {fmt(settling)}"
-        )
-        print(
-            f"  vs noise       : steady-state jitter {ref_noise:,.5f}  ->  "
-            f"final delta is {verdict} the noise\n"
+            f"final(step {fs}) {fmt(final)}   settling {fmt(settling)}\n"
         )
 
 

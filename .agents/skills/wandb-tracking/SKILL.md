@@ -34,13 +34,12 @@ Run `runs.py list` first. It prints `id | state | steps | name` and the **union 
 
 ### Delta reporting (comparing loss curves)
 
-`runs.py compare` is the canonical report: it matters for loss curves because a raw final number hides the trajectory. Each `--runs` entry is compared against `--ref` (`delta = run - ref`); for a pairwise A-vs-B use `--ref B --runs A`. It reports three things per run:
+`runs.py compare` is the canonical report: it matters for loss curves because a raw final number hides the trajectory. Each `--runs` entry is compared against `--ref` (`delta = run - ref`); for a pairwise A-vs-B use `--ref B --runs A`. It reports, per run:
 
 - **per-step delta range** across all steps (the extreme is usually an early transient).
 - **final delta** at the last step, plus **settling** (mean of the last 5): where it's headed.
-- **noise floor**: the ref run's own step-to-step jitter, and whether the final delta is INSIDE or ABOVE it. A gap smaller than the jitter is negligible.
 
-Report to the user as prose + a small table; always state the step count / horizon (a 64-step run only rules out *large* effects, so say so).
+These are facts, not a verdict. Report them to the user as prose plus a small table, and always state the step count / horizon: a 64-step run only rules out *large* effects, so say so, and judge the deltas against that horizon yourself.
 
 ## Throughput
 

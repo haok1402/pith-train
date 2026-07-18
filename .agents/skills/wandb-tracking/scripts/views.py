@@ -152,7 +152,7 @@ def main():
                 shown, hidden = shown_hidden(json.loads(n["spec"]), id2name)
                 print(f"    shown : {shown}")
                 print(f"    hidden: {hidden}")
-            except (KeyError, json.JSONDecodeError):
+            except (KeyError, IndexError, json.JSONDecodeError):
                 print("    (no runset selection in spec)")
         return
 
