@@ -222,6 +222,10 @@ class DeepSeekV2Attention(nn.Module):
         self.kv_b_proj = training.Linear(config.kv_lora_rank, self.num_heads * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim), bias=False)  # fmt: skip
         self.o_proj = training.Linear(self.num_heads * self.v_head_dim, hidden_size, bias=False)
         self.softmax_scale = self.q_head_dim ** (-0.5)
+        rope_scaling = config.rope_scaling
+        if rope_scaling is not None and rope_scaling.get("mscale_all_dim", 0):
+            mscale = DeepSeekV2RotaryEmbedding.yarn_get_mscale(rope_scaling["factor"], rope_scaling["mscale_all_dim"])  # fmt: skip
+            self.softmax_scale = self.softmax_scale * mscale * mscale
 
     @staticmethod
     def rotate_half(x: torch.Tensor) -> torch.Tensor:
