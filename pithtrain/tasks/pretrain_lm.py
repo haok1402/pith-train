@@ -8,29 +8,17 @@ from typing import List, Tuple
 
 import torch
 import torch.cuda
-import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 import wandb
 from torch.distributed._tensor import DTensor
-from torch.distributed.checkpoint import FileSystemReader
-from torch.distributed.checkpoint.state_dict import (
-    StateDictOptions,
-    get_state_dict,
-    set_model_state_dict,
-    set_state_dict,
-)
-from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.elastic.multiprocessing.errors import record
-from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LRScheduler
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, logging, training
 from pithtrain.modules.checkpoint import (
-    to_canonical_model,
-    to_canonical_optim,
-    to_localized_model,
-    to_localized_optim,
+    find_checkpoint,
+    load_checkpoint,
+    save_checkpoint,
 )
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
@@ -175,73 +163,6 @@ def clip_grad_norm_(
     return total_norm
 
 
-class AppState(Stateful):
-    """Stateful object to save and load the checkpoint."""
-
-    def __init__(
-        self,
-        model: nn.Module,
-        optimizers: tuple[Optimizer, ...],
-        schedulers: tuple[LRScheduler, ...],
-        model_only: bool = False,
-    ):
-        self.model = model
-        self.optimizers = optimizers
-        self.schedulers = schedulers
-        self.model_only = model_only
-
-    def state_dict(self):
-        """
-        Serialize the model, optimizer, and scheduler to a state dictionary.
-
-        Both model and optimizer states are converted to canonical (PP-independent) format:
-        the module.{N}. prefix is stripped so FQNs use global layer IDs (e.g.
-        layers.0.weight), and stacked expert weights are expanded to individual
-        expert tensors with global IDs.
-
-        When ``model_only`` is set (e.g. loading a checkpoint converted from
-        HuggingFace that has no optimizer/scheduler), only model keys are
-        advertised so DCP's planner does not look for missing optimizer keys.
-        """
-        if self.model_only:
-            model_state, _ = get_state_dict(self.model, self.optimizers)
-            return {"model": to_canonical_model(model_state, self.model)}
-        model_state, optim_state = get_state_dict(self.model, self.optimizers)
-        model_state = to_canonical_model(model_state, self.model)
-        optim_state = to_canonical_optim(optim_state, self.model)
-        sched_state = [s.state_dict() for s in self.schedulers]
-        return {"model": model_state, "optimizer": optim_state, "scheduler": sched_state}
-
-    def load_state_dict(self, state_dict):
-        """
-        Restore the model, optimizer, and scheduler from the checkpoint.
-
-        Canonical (PP-independent) FQNs are mapped back to local FQNs using the
-        current model structure.  The optimizer param_groups are rebuilt from
-        the current model so that DCP's cross-rank deduplication of non-tensor
-        metadata does not cause FQN mismatches.
-
-        Released checkpoints from HuggingFace may not necessarily include the states of the
-        optimizer and scheduler, so we skip the loading of these states if they are missing.
-        """
-        model_state = to_localized_model(state_dict["model"], self.model)
-        optim_state = state_dict.get("optimizer")
-        sched_state = state_dict.get("scheduler")
-
-        if optim_state:
-            optim_state = to_localized_optim(optim_state, self.model, self.optimizers)
-            kwargs = dict(model_state_dict=model_state, optim_state_dict=optim_state)
-            set_state_dict(self.model, self.optimizers, **kwargs)
-        else:
-            options = StateDictOptions(strict=False)
-            set_model_state_dict(self.model, model_state, options=options)
-        if sched_state:
-            if isinstance(sched_state, dict):  # legacy single-scheduler ckpt
-                sched_state = [sched_state]
-            for scheduler, st in zip(self.schedulers, sched_state):
-                scheduler.load_state_dict(st)
-
-
 def raise_if_dataset_insufficient(cfg: PretrainLMCfg) -> None:
     """Raise if configured run requires more samples than available in dataset."""
     global_batch_size = cfg.training.global_batch_size
@@ -270,82 +191,6 @@ def raise_if_dataset_insufficient(cfg: PretrainLMCfg) -> None:
     raise SystemExit(1)
 
 
-def save_checkpoint(cfg: PretrainLMCfg) -> None:
-    """
-    Save the checkpoint at the current step.
-
-    Uses cpu_offload=True (with the default full_state_dict=False)
-    so that each rank's local FSDP shards are moved to CPU -- no GPU
-    all-gather is performed.  Expert DTensors are split into per-expert
-    entries locally (via unwrap_dtensor_experts in resharding.py),
-    so each rank writes only the expert keys it owns.  Non-expert
-    DTensors are kept as CPU DTensors and DCP saves each rank's shard.
-    """
-    stdout = logging.stdout
-    assert cfg.training.save_location is not None
-    save_location = Path(cfg.training.save_location, "torch-dcp", "step-%08d" % training.step)
-    model = training.model
-    optimizers = training.optimizers
-    schedulers = training.schedulers
-
-    options = StateDictOptions(cpu_offload=True)
-    model_state, optim_state = get_state_dict(model, optimizers, options=options)
-    state_dict = dict()
-    state_dict["app"] = dict()
-    state_dict["app"]["model"] = to_canonical_model(model_state, model)
-    state_dict["app"]["optimizer"] = to_canonical_optim(optim_state, model)
-    state_dict["app"]["scheduler"] = [s.state_dict() for s in schedulers]
-
-    stdout.info("Save checkpoint: %s" % save_location)
-    t0 = time.monotonic()
-    gc.collect()
-    torch.cuda.empty_cache()
-    dcp.save(state_dict, checkpoint_id=save_location)
-    rank = torch.distributed.get_rank()
-    rng_path = Path(save_location, "rng-rank-%05d.pt" % rank)
-    torch.save(torch.cuda.get_rng_state(), rng_path)
-    dt = torch.tensor(time.monotonic() - t0, device="cuda")
-    dt_min, dt_max = dt.clone(), dt.clone()
-    torch.distributed.all_reduce(dt_min, op=torch.distributed.ReduceOp.MIN)
-    torch.distributed.all_reduce(dt_max, op=torch.distributed.ReduceOp.MAX)
-    stdout.info("Save checkpoint: Elapsed min=%.1fs, max=%.1fs" % (dt_min.item(), dt_max.item()))
-
-
-def load_checkpoint(cfg: PretrainLMCfg) -> None:
-    """Load the checkpoint from the latest step."""
-    stdout = logging.stdout
-    if cfg.training.save_location is None:
-        stdout.info("No save_location set; training from scratch.")
-        return
-    path2step = lambda p: int(p.stem.removeprefix("step-"))
-    checkpoints = Path(cfg.training.save_location, "torch-dcp").glob("step-*")
-    checkpoints = sorted(checkpoints, key=path2step)
-    if not checkpoints:
-        stdout.info("No checkpoint found; training from scratch.")
-        return
-    load_location = checkpoints.pop()
-    stdout.info("Load checkpoint: %s" % load_location)
-    t0 = time.monotonic()
-    torch.cuda.empty_cache()
-    metadata = FileSystemReader(str(load_location)).read_metadata()
-    model_only = all(k.startswith("app.model.") for k in metadata.state_dict_metadata)
-    model = training.model
-    optimizers, schedulers = training.optimizers, training.schedulers
-    app_state = AppState(model, optimizers, schedulers, model_only=model_only)
-    dcp.load({"app": app_state}, checkpoint_id=load_location)
-    rank = torch.distributed.get_rank()
-    rng_path = Path(load_location, "rng-rank-%05d.pt" % rank)
-    if rng_path.exists():
-        rng_state = torch.load(rng_path, weights_only=True)
-        torch.cuda.set_rng_state(rng_state)
-    training.step = path2step(load_location)
-    dt = torch.tensor(time.monotonic() - t0, device="cuda")
-    dt_min, dt_max = dt.clone(), dt.clone()
-    torch.distributed.all_reduce(dt_min, op=torch.distributed.ReduceOp.MIN)
-    torch.distributed.all_reduce(dt_max, op=torch.distributed.ReduceOp.MAX)
-    stdout.info("Load checkpoint: Elapsed min=%.1fs, max=%.1fs" % (dt_min.item(), dt_max.item()))
-
-
 def train_step(cfg: PretrainLMCfg) -> None:
     """Execute one step of training."""
     # Start the nsys and the memory profiler.
@@ -371,9 +216,7 @@ def train_step(cfg: PretrainLMCfg) -> None:
 
     torch.cuda.memory.reset_peak_memory_stats()
 
-    model = training.model
-    optimizers = training.optimizers
-    schedulers = training.schedulers
+    model, optimizers, schedulers = training.model, training.optimizers, training.schedulers
     model.train()
 
     dp_size = distributed.dp_size
@@ -509,7 +352,8 @@ def train_step(cfg: PretrainLMCfg) -> None:
         should_save |= training.step % cfg.training.save_interval == 0
         should_save |= training.step == cfg.training.max_steps
         if should_save:
-            save_checkpoint(cfg)
+            assert cfg.training.save_location is not None
+            save_checkpoint(cfg.training.save_location, training.step)
 
     # Run deferred GC here so cyclic collection never fires mid-forward/backward.
     gc.collect()
@@ -523,7 +367,10 @@ def launch(cfg: PretrainLMCfg) -> None:
     setup_training(cfg)
     logger = logging.stdout
     logger.info("launch(cfg=%s)" % cfg)
-    load_checkpoint(cfg)
+    step = find_checkpoint(cfg.training.save_location)
+    if step is not None:
+        load_checkpoint(cfg.training.save_location, step)
+    training.step = step or 0
     raise_if_dataset_insufficient(cfg)
     # Keep cyclic GC off the pipeline critical path; train_step collects manually per step.
     gc.disable()
