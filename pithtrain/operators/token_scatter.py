@@ -208,6 +208,12 @@ class ScatterForGroupedGemm(torch.autograd.Function):
         group_counts_2 = all_zeros[num_groups : num_groups * 2]
         completion_counter = all_zeros[num_groups * 2 :]
 
+        # The prep kernel masks its load of expert_idxs with m, the row count of input_tokens,
+        # not with the length of expert_idxs. A shorter one is read out of bounds and the
+        # garbage indexes group_counts, so check the length here rather than fault later.
+        if expert_idxs.shape[0] != m:
+            raise ValueError(f"{expert_idxs.shape[0]=} must equal the input row count {m=}")
+
         # Prep kernel: fused bincount + pad + cumsum (1 launch)
         BLOCK = 1024
         num_ctas = min(triton.cdiv(m, BLOCK), 32)

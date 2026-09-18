@@ -427,9 +427,8 @@ def fused_dedup_prepare_dispatch(
 def _build_expert_idxs_kernel(
     tokens_per_expert_group_ptr,  # [NUM_EXPERTS] int64
     expert_idxs_ptr,  # [total] int64, output
-    output_splits_tensor_ptr,  # [EP_SIZE] int64, output
+    total,
     NUM_EXPERTS: tl.constexpr,
-    EP_SIZE: tl.constexpr,
     EXPERTS_PER_RANK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -438,22 +437,13 @@ def _build_expert_idxs_kernel(
     Reads tokens_per_expert_group (NUM_EXPERTS,) and produces:
       expert_idxs          - local expert index (expert_id % experts_per_rank)
                              for each token slot, via segmented fill.
-      output_splits_tensor - total tokens per EP rank (grouped sum), written
-                             by CTA 0.
+
+    ``total`` is a kernel argument rather than a device-side sum so that the store mask
+    and the caller's allocation are the same number. Masking a store to one tensor with
+    a length read out of a different tensor is exactly how this kernel used to write out
+    of bounds when the caller's size guess was too small.
     """
     pid = tl.program_id(0)
-
-    # Compute total and output_splits_tensor (only from CTA 0)
-    total = tl.zeros([], dtype=tl.int64)
-    for e in tl.static_range(NUM_EXPERTS):
-        total += tl.load(tokens_per_expert_group_ptr + e)
-
-    if pid == 0:
-        for g in tl.static_range(EP_SIZE):
-            rank_sum = tl.zeros([], dtype=tl.int64)
-            for e in tl.static_range(EXPERTS_PER_RANK):
-                rank_sum += tl.load(tokens_per_expert_group_ptr + g * EXPERTS_PER_RANK + e)
-            tl.store(output_splits_tensor_ptr + g, rank_sum)
 
     # Parallel fill: each thread determines which expert segment it belongs to.
     # We compute expert starts inline via a running accumulator,
@@ -475,37 +465,34 @@ def _build_expert_idxs_kernel(
 
 def build_expert_idxs(
     tokens_per_expert_group: torch.Tensor,
-    ep_size: int,
     experts_per_rank: int,
-    max_total: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused expert_idxs + output_splits_tensor, replacing arange + mod + repeat_interleave + sum.
+    total: int,
+) -> torch.Tensor:
+    """Fused expert_idxs, replacing arange + mod + repeat_interleave.
 
-    expert_idxs is over-allocated to max_total. The caller must slice it to
-    [:sum(output_splits)] after obtaining output_splits on CPU.
+    ``total`` must equal ``tokens_per_expert_group.sum()`` - the number of token slots
+    this rank received. It is a host int because the caller already reads those counts
+    back to build the all-to-all splits; deriving the size from anything local (this
+    rank's own token count) is wrong, because the senders decide how many slots arrive.
     """
     num_experts = tokens_per_expert_group.shape[0]
     device = tokens_per_expert_group.device
 
-    expert_idxs = torch.empty(max_total, dtype=torch.int64, device=device)
-    output_splits_tensor = torch.empty(ep_size, dtype=torch.int64, device=device)
-
-    if max_total == 0:
-        output_splits_tensor.zero_()
-        return expert_idxs, output_splits_tensor
+    expert_idxs = torch.empty(total, dtype=torch.int64, device=device)
+    if total == 0:
+        return expert_idxs
 
     BLOCK = 1024
-    grid = (triton.cdiv(max_total, BLOCK),)
+    grid = (triton.cdiv(total, BLOCK),)
     _build_expert_idxs_kernel[grid](
         tokens_per_expert_group,
         expert_idxs,
-        output_splits_tensor,
+        total,
         NUM_EXPERTS=num_experts,
-        EP_SIZE=ep_size,
         EXPERTS_PER_RANK=experts_per_rank,
         BLOCK=BLOCK,
     )
-    return expert_idxs, output_splits_tensor
+    return expert_idxs
 
 
 @triton.jit
@@ -621,10 +608,10 @@ def prepare_dispatch(
     tokens_per_expert_group = recv_meta_2d[:, :experts_per_rank].reshape(-1)
     dedup_tokens_from_each_gpu = recv_meta_2d[:, experts_per_rank]  # (ep_size,)
 
-    m = topk_ids.shape[0]
-    expert_idxs, output_splits_tensor = build_expert_idxs(
-        tokens_per_expert_group, ep_size, experts_per_rank, max_total=m * k * ep_size
-    )
+    # Per-sender grouped sum over this rank's local experts. Reduced here rather than
+    # inside build_expert_idxs because its host copy, taken by the D-to-H batch below, is
+    # what sizes expert_idxs - so it has to exist before that call.
+    output_splits_tensor = tokens_per_expert_group.view(ep_size, experts_per_rank).sum(dim=1)
 
     # -- Batch D-to-H copies on main stream --
     dedup_input_splits_cpu = get_pinned_buffer(
@@ -645,9 +632,11 @@ def prepare_dispatch(
     input_splits = input_splits_cpu.tolist()
     output_splits = output_splits_cpu.tolist()
 
-    # Trim over-allocated expert_idxs to actual size
+    # One entry per received token slot. expand_idx below has the same length, and stage 3
+    # indexes the gathered rows by it, so all three must agree exactly: the row count is
+    # decided by the senders, never by this rank's own token count.
     total_output = sum(output_splits)
-    expert_idxs = expert_idxs[:total_output]
+    expert_idxs = build_expert_idxs(tokens_per_expert_group, experts_per_rank, total_output)
 
     # -- expand_idx all-to-all + adjustment --
     received_expand_idx = expand_idx.new_empty(total_output)
