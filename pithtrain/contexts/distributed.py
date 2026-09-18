@@ -16,16 +16,6 @@ world_size: int
 Total number of processes across all nodes.
 """
 
-local_rank: int
-"""
-Rank within this node, and the CUDA device index for this process.
-"""
-
-local_world_size: int
-"""
-Number of processes on this node, i.e. GPUs per node.
-"""
-
 device: torch.device
 """
 The CUDA device for this process. Prefer it over plain cuda when allocating.

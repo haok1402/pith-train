@@ -1,9 +1,10 @@
-"""PithTrain distributed module."""
+"""
+PithTrain distributed module.
+"""
 
 import atexit
 import os
 import sys
-import threading
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -17,9 +18,6 @@ from pithtrain.contexts import distributed
 class DistributedCfg(SlottedDefault):
     """
     Configuration for distributed runtime.
-
-    Parallelism degrees (PP, CP, EP), FSDP replica count, and operation timeout. Both DP
-    degrees are derived from the world size.
     """
 
     pipeline_parallel_size: int = 1
@@ -50,8 +48,8 @@ class DistributedCfg(SlottedDefault):
     """
     Timeout for distributed operations.
 
-    Applied to NCCL collectives and the watchdog heartbeat. Scale up for multi-node runs; keep
-    small to fail fast.
+    Passed to init_process_group, so it bounds every collective. Scale up for multi-node runs;
+    keep small to fail fast.
     """
 
     hsdp_replica: int = 1
@@ -67,50 +65,29 @@ class DistributedCfg(SlottedDefault):
 
 
 def setup_torch_runtime() -> None:
-    """Apply torch runtime tuning: enable TF32 matmul and raise the dynamo recompile cap."""
+    """
+    Apply the process-wide torch tuning that every launch path shares.
+    """
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
     torch._dynamo.config.recompile_limit = 64
 
 
-def setup_default_process_group(cfg: DistributedCfg) -> None:
+def setup_default_process_group(cfg: DistributedCfg, device_id: int) -> None:
     """
-    Initialize the default process group from torchrun environment variables.
+    Create and own the default process group, and register its teardown at exit.
 
-    Read global/local rank info into the distributed context, apply NCCL env tuning, register
-    cleanup at exit, and set the current CUDA device from the local rank.
+    The teardown runs only on a clean exit. On a crash the excepthook hard-exits first, because
+    destroy_process_group shuts NCCL down collectively and would hang draining work that peers
+    who already died will never satisfy.
     """
-    assert torch.cuda.is_available(), "CUDA is not available."
-    assert "TORCHELASTIC_RUN_ID" in os.environ, "Not launched with torchrun."
-
-    distributed.rank = int(os.environ["RANK"])
-    distributed.world_size = int(os.environ["WORLD_SIZE"])
-    distributed.local_rank = int(os.environ["LOCAL_RANK"])
-    distributed.local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
-
-    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
-    os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "0")
-    os.environ.setdefault("TORCH_NCCL_DUMP_ON_TIMEOUT", "1")
-    os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = str(int(cfg.timeout.total_seconds()))
-
-    kwargs = dict(backend="nccl", device_id=distributed.local_rank, timeout=cfg.timeout)
+    kwargs = dict(backend="nccl", device_id=device_id, timeout=cfg.timeout)
     torch.distributed.init_process_group(**kwargs)
     atexit.register(torch.distributed.destroy_process_group)
-    torch.cuda.set_device(distributed.local_rank)
-    distributed.device = torch.device("cuda", distributed.local_rank)
 
-
-def setup_failfast_excepthook() -> None:
-    """
-    Install a fail-fast excepthook that bypasses the NCCL drain on uncaught exceptions.
-
-    Default torch.distributed shutdown can hang indefinitely while draining in-flight NCCL work
-    that peers will never satisfy. Hard-exiting bypasses the drain so NCCL wor on other ranks
-    fail fast instead of hanging.
-    """
     original = sys.excepthook
 
-    def excepthook(exc_type, exc_value, exc_tb, *_):
+    def excepthook(exc_type, exc_value, exc_tb):
         try:
             original(exc_type, exc_value, exc_tb)
         except Exception:
@@ -123,23 +100,23 @@ def setup_failfast_excepthook() -> None:
         os._exit(1)
 
     sys.excepthook = excepthook
-    threading.excepthook = lambda args: excepthook(*args)
 
 
-def setup_device_mesh(cfg: DistributedCfg) -> None:
+def setup_device_mesh(cfg: DistributedCfg, device_id: int) -> None:
     """
-    Build the attention and expert views of the rank space and publish per-axis groups.
+    Publish the rank and device for this process, then the attention and expert views of the ranks.
 
-    MoE parallel folding (https://arxiv.org/abs/2504.14960 section 3.2): attention and the
-    experts factor the same block of world_size // pp_size ranks two different ways, dp x cp for
-    attention and dp x ep for the experts. PP is the one shared axis and stays outermost, so a
-    rank agrees with itself about which pipeline stage it holds. Each view puts its high-traffic
-    axis innermost, so the ring K/V exchange and the MoE all-to-all each run over a contiguous
-    rank block and stay inside the NVLink domain independently of one another.
-
-    So cp_size and ep_size each need only divide the stage size, not each other, and ep_rank says
-    only which experts a rank hosts: which data a rank loads is dp_rank alone.
+    This follows MoE parallel folding (https://arxiv.org/abs/2504.14960): attention and the experts
+    each get their own mesh over the same ranks, (pp, dp, cp) for attention and (pp, dp, ep) for
+    the experts. Both put pp first, so a rank holds the same pipeline stage either way, and both
+    put their busiest axis last, so cp and ep groups are contiguous rank blocks. The attention
+    dp_rank alone decides which data a rank loads.
     """
+    distributed.rank = torch.distributed.get_rank()
+    distributed.world_size = torch.distributed.get_world_size()
+    distributed.device = torch.device("cuda", device_id)
+    torch.cuda.set_device(distributed.device)
+
     pp_size = cfg.pipeline_parallel_size
     cp_size = cfg.context_parallel_size
     ep_size = cfg.expert_parallel_size
@@ -171,16 +148,17 @@ def setup_device_mesh(cfg: DistributedCfg) -> None:
     distributed.ep_size, distributed.ep_rank = ep_size, expt_mesh.get_local_rank("ep")
     distributed.ep_group = expt_mesh.get_group("ep")
 
-    # Neither dp axis gets a process group: no collective runs over them directly, and FSDP
-    # reduces there off a DeviceMesh, which the two views already provide. Only the attention dp
-    # is published, since that is what decides which data a rank loads.
+    # No process group for either dp axis: FSDP reduces off a DeviceMesh, which both views
+    # already provide. Only the attention dp is published, since it decides what a rank loads.
     distributed.dp_size, distributed.dp_rank = attn_dp_size, attn_mesh.get_local_rank("dp")
 
 
 def setup_distributed(cfg: object) -> None:
-    """Initialize the distributed runtime: process group and device mesh."""
+    """
+    Initialize the distributed runtime under torchrun.
+    """
     assert hasattr(cfg, "distributed") and isinstance(cfg.distributed, DistributedCfg)
     setup_torch_runtime()
-    setup_default_process_group(cfg.distributed)
-    setup_failfast_excepthook()
-    setup_device_mesh(cfg.distributed)
+    device_id = int(os.environ["LOCAL_RANK"])
+    setup_default_process_group(cfg.distributed, device_id)
+    setup_device_mesh(cfg.distributed, device_id)
