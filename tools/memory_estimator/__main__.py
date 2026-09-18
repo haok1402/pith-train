@@ -255,9 +255,10 @@ def main():
         )
         sys.exit(1)
     num_chunks = args.global_batch_size // chunk_divisor
-    if num_chunks < args.pp_size * 2:
+    floor = 1 if args.pp_size == 1 else args.pp_size * 2
+    if num_chunks < floor:
         print(
-            f"Error: num_chunks ({num_chunks}) must be >= pp_size * 2 ({args.pp_size * 2}). "
+            f"Error: num_chunks ({num_chunks}) must be >= {floor} at pp_size {args.pp_size}. "
             f"Increase global_batch_size or decrease micro_batch_size.",
             file=sys.stderr,
         )

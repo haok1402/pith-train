@@ -84,6 +84,17 @@ def layer_partition(num_layers: int, stage_count: int, stage_index: int) -> rang
     return range(begin, end)
 
 
+def min_chunks(pp_size: int) -> int:
+    """
+    The smallest number of chunks a step can schedule at this pp_size.
+
+    Below two per rank the step 4 count goes negative on the low pipeline ranks, which then skip
+    forwards and backwards their neighbours are waiting on, and the step hangs rather than raises.
+    One pipeline rank is exempt: it is both first and last, so the step posts no point-to-point.
+    """
+    return 1 if pp_size == 1 else pp_size * 2
+
+
 @dataclass(slots=True, kw_only=True)
 class Microbatch:
     """
@@ -538,7 +549,8 @@ class DualPipeV(nn.Module):
 
         Arguments:
             microbatches: The micro-batches to run, in order. Required on every pipeline rank,
-                identical on each. See Microbatch.
+                identical on each, and at least min_chunks(pp_size) of them.
+                See Microbatch.
             objective: Invoked once per micro-batch as objective(model_outputs,
                 objective_inputs), returning a (loss, objective_output) pair. The loss is
                 scheduled for backward, or None for a collection-only pass under
@@ -576,10 +588,8 @@ class DualPipeV(nn.Module):
         self._reset_states()
         FP8WeightCacheControl.step()
         num_chunks = self.setup_step_metadata(microbatches)
-        assert num_chunks >= pp_size * 2, (
-            f"the V-shape gives each rank two model chunks, so a step needs at least "
-            f"{pp_size * 2} micro-batches, got {num_chunks}"
-        )
+        floor = min_chunks(pp_size)
+        assert num_chunks >= floor, f"{pp_size=} requires {floor=} chunks got {num_chunks=}"
         self._ensure_chunk_records_allocated(num_chunks)
 
         if self.is_first_pp_rank:
