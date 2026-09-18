@@ -261,8 +261,7 @@ def generate(
 
 def main(args):
     dtype = torch.bfloat16
-    torch.cuda.set_device(distributed.local_rank)
-    torch.set_default_device(torch.cuda.current_device())
+    torch.set_default_device(distributed.device)
 
     if distributed.rank == 0:
         dcp_path, hf_path = _ensure_dcp_checkpoint(args.hf_id, args.root)

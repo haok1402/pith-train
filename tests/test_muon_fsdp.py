@@ -69,7 +69,7 @@ def main():
     # the flattened dp x cp attention mesh. At ep=cp=1 both collapse to pure dp.
     expt_fsdp_mesh = distributed.expt_mesh["dp"]
     attn_fsdp_mesh = distributed.attn_mesh["dp", "cp"]._flatten()
-    device = torch.device("cuda", distributed.local_rank)
+    device = distributed.device
     lr = 0.1
 
     # Full weights + grads, identical on every rank (same seed).

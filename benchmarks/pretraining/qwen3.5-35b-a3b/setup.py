@@ -29,7 +29,7 @@ if __name__ == "__main__":
     cfg = ConvertCheckpointCfg()
     cfg.operation = "hf2dcp"
     cfg.load_path = Path("workspace/checkpoints/qwen3.5-35b-a3b/hf-import")
-    cfg.save_path = Path("workspace/checkpoints/qwen3.5-35b-a3b/torch-dcp/step-00000000")
+    cfg.save_path = Path("workspace/checkpoints/qwen3.5-35b-a3b/torch-dcp/00000000")
     if not Path(cfg.save_path, ".metadata").exists():
         convert_checkpoint.launch(cfg)
 
@@ -55,13 +55,15 @@ from pithtrain.modules.training import make_constant_scheduler, make_muon_optimi
 from pithtrain.tasks.pretrain_lm import PretrainLMCfg
 
 cfg = PretrainLMCfg()
+
+cfg.dataset = Path("workspace/datasets/dclm-baseline/toktxt/qwen3.5")
+
 training = cfg.training
 training.model = Path("examples/pretrain_lm/qwen3.5-35b-a3b/config.json")
 training.optimizer = make_muon_optimizer
 training.scheduler = make_constant_scheduler
 training.lr = 1.0e-6
 training.max_steps = 25
-training.dataset = Path("workspace/datasets/dclm-baseline/toktxt/qwen3.5")
 training.moe_load_balance_type = "global-batch"
 training.moe_load_balance_coef = 1e-3
 training.benchmark = True

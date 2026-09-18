@@ -300,18 +300,133 @@ def test_build_expert_idxs(ms, k, num_experts, ep_size, seed):
     tokens_per_expert_group = torch.randint(0, max(ms, 2), (num_experts,), device=device)
 
     # Reference (PyTorch)
-    ref_output_splits = tokens_per_expert_group.view(ep_size, experts_per_rank).sum(1)
     ref_expert_idxs = (
         torch.arange(num_experts, device=device) % experts_per_rank
     ).repeat_interleave(tokens_per_expert_group)
 
-    # Fused kernel (over-allocated, then sliced like the caller does)
-    total = tokens_per_expert_group.sum().item()
-    max_total = max(total, ms * k * ep_size)  # ensure >= actual total
-    expert_idxs, output_splits_tensor = build_expert_idxs(
-        tokens_per_expert_group, ep_size, experts_per_rank, max_total=max_total
-    )
-    expert_idxs = expert_idxs[:total]
+    total = int(tokens_per_expert_group.sum())
+    expert_idxs = build_expert_idxs(tokens_per_expert_group, experts_per_rank, total)
 
-    assert torch.equal(output_splits_tensor, ref_output_splits), "output_splits_tensor mismatch"
+    assert expert_idxs.numel() == total, "one entry per received token slot"
     assert torch.equal(expert_idxs, ref_expert_idxs), "expert_idxs mismatch"
+
+
+def test_build_expert_idxs_does_not_write_past_its_buffer():
+    """The store mask must come from the allocation, not from a device-side sum.
+
+    The kernel fills ``sum(tokens_per_expert_group)`` entries but is launched over whole
+    BLOCK-sized CTAs, so the last CTA covers offsets past the end. Sizing the output from
+    the same number the mask uses is what keeps that tail masked off. The previous version
+    took the mask bound from ``tokens_per_expert_group`` and the size from the caller, so
+    whenever the caller guessed low it wrote the difference into the next allocation --
+    which in practice was ``output_splits_tensor``, i.e. it corrupted the all-to-all split
+    sizes rather than any tensor the MoE math would notice.
+    """
+    from pithtrain.operators.ep_dispatch import build_expert_idxs
+
+    device = "cuda"
+    ep_size, experts_per_rank = 8, 16
+    num_experts = ep_size * experts_per_rank
+
+    # Not a multiple of the kernel's BLOCK, so the last CTA really does have a tail.
+    total = 5501
+    counts = torch.full((num_experts,), total // num_experts, dtype=torch.int64, device=device)
+    counts[: total % num_experts] += 1
+    assert int(counts.sum()) == total
+
+    # Canary slab behind the output, so an overrun is observable rather than left to
+    # whatever the caching allocator happened to hand out next.
+    slab = torch.full((total + 4096,), -1, dtype=torch.int64, device=device)
+    slab[:total] = build_expert_idxs(counts, experts_per_rank, total)
+    torch.cuda.synchronize()
+    assert int((slab[total:] != -1).sum()) == 0, "kernel wrote past the end of expert_idxs"
+
+
+def _ragged_dispatch_worker(rank, world_size, tokens_per_rank, out):
+    """One EP rank of test_prepare_dispatch_ragged_token_counts."""
+    import os
+
+    import torch.distributed as dist
+
+    from pithtrain.operators.all_to_all import direct_all_to_all
+    from pithtrain.operators.ep_dispatch import prepare_dispatch
+    from pithtrain.operators.token_scatter import padded_index_gather, scatter_for_grouped_gemm
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29517")
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+    ep_size, experts_per_rank, k, hidden = world_size, 4, 4, 64
+    num_experts = ep_size * experts_per_rank
+    device = torch.device("cuda", rank)
+    torch.manual_seed(1234 + rank)
+
+    m = tokens_per_rank[rank]
+    hidden_states = torch.randn(1, m, hidden, device=device, dtype=torch.bfloat16)
+    topk_ids = torch.stack([torch.randperm(num_experts, device=device)[:k] for _ in range(m)])
+    topk_weight = torch.rand(m, k, device=device)
+
+    dispatch_tokens, routing = prepare_dispatch(
+        hidden_states,
+        topk_ids,
+        topk_weight,
+        num_experts,
+        ep_size,
+        experts_per_rank,
+        dist.group.WORLD,
+    )
+    gathered = direct_all_to_all(
+        dispatch_tokens.detach(),
+        routing.dispatch_splits.output_splits,
+        routing.dispatch_splits.input_splits,
+        dist.group.WORLD,
+    )
+    work = getattr(gathered, "comm_work", None)
+    if work is not None:
+        work.wait()
+
+    # The two lines of forward_stage3 that consume the routing info.
+    expanded = padded_index_gather(gathered, routing.expand_idx)
+    scatter_for_grouped_gemm(expanded, routing.expert_idxs, experts_per_rank)
+
+    out.append(
+        (
+            rank,
+            m,
+            expanded.shape[0],
+            routing.expert_idxs.numel(),
+            sum(routing.combine_splits.output_splits),
+        )
+    )
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+def test_prepare_dispatch_ragged_token_counts():
+    """A rank holding a short packed micro-batch still receives every slot routed at it.
+
+    The received row count is decided by the *senders*, so it has nothing to do with this
+    rank's own token count: ``expert_idxs`` must have one entry per received row, the same
+    length as ``expand_idx``, which is what stage 3 gathers by.
+
+    The skew (8 tokens against 4096) is what packed / ragged micro-batching produces and
+    fixed-shape pretraining never does. Every other case in this file gives all senders the
+    same ``ms``, and with equal token counts the old local bound ``m * k * ep_size`` is
+    always large enough, so nothing goes wrong.
+    """
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    manager = mp.Manager()
+    out = manager.list()
+    mp.spawn(_ragged_dispatch_worker, args=(world_size, [8, 4096], out), nprocs=world_size)
+
+    assert len(out) == world_size
+    for rank, m, rows, idxs, expected in sorted(out):
+        assert rows == expected, f"rank {rank}: gathered {rows} rows, expected {expected}"
+        assert idxs == expected, (
+            f"rank {rank} (m={m}): expert_idxs has {idxs} entries but {expected} rows were "
+            f"received; the old code capped it at m * k * ep_size = {m * 4 * world_size}"
+        )

@@ -6,6 +6,8 @@ from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
 cfg = PretrainLMCfg()
 
+cfg.dataset = Path("workspace/datasets/dclm-baseline/toktxt/gpt-oss")
+
 cfg.distributed.context_parallel_size = 1
 cfg.distributed.pipeline_parallel_size = 4
 cfg.distributed.expert_parallel_size = 8
@@ -19,7 +21,6 @@ cfg.training.max_steps = 4096
 cfg.training.micro_batch_size = 1
 cfg.training.global_batch_size = 1024
 cfg.training.sequence_length = 2048
-cfg.training.dataset = Path("workspace/datasets/dclm-baseline/toktxt/gpt-oss")
 cfg.training.moe_load_balance_type = "global-batch"
 cfg.training.moe_load_balance_coef = 1e-3
 cfg.training.save_interval = 256

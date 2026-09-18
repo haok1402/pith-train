@@ -97,15 +97,14 @@ def main(cfg: PretrainLMCfg):
     assert not bad, ("non-finite params after step", bad[:3])
 
     # Snapshot, save, rebuild fresh optimizers, load, compare.
-    training.step = 1
     before = opt_state_snapshot(optimizers, model)
-    save_checkpoint(cfg.training.save_location, training.step)
+    save_checkpoint(cfg.training.save_location, 1)
 
     # fresh, empty-state optimizers + schedulers
     training.optimizers = cfg.training.optimizer(cfg.training)
     training.schedulers = cfg.training.scheduler(cfg.training)
     step = find_checkpoint(cfg.training.save_location)
-    assert step == training.step, f"find_checkpoint returned {step}, expected {training.step}"
+    assert step == 1, f"find_checkpoint returned {step}, expected 1"
     load_checkpoint(cfg.training.save_location, step)
     after = opt_state_snapshot(training.optimizers, model)
 
@@ -178,7 +177,6 @@ def _entry():
     t.save_location = scratch / "checkpoint"
 
     # Build model + optimizers + schedulers directly (no dataset needed).
-    training.step = 0
     torch.manual_seed(0)
     setup_model(cfg.training, cfg.distributed)
     training.optimizers = cfg.training.optimizer(cfg.training)

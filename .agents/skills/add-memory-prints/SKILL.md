@@ -604,7 +604,7 @@ In `train_step`, instrument the first training step with a full memory timeline 
 **Before the forward/backward call** (after `model.train()`):
 
 ```python
-_mem_profile = ctx.training.step == 0
+_mem_profile = step == 0
 _mem_snapshot = _mem_profile and torch.distributed.get_rank() in RANKS
 if _mem_profile:
     model.memory_profiling = True

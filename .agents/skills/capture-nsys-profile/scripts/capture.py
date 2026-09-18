@@ -45,6 +45,8 @@ global_batch_size = 32 * dp_size
 
 cfg = PretrainLMCfg()
 
+cfg.dataset = Path(specs["dataset"])
+
 distributed = cfg.distributed
 distributed.pipeline_parallel_size = pp_size
 distributed.expert_parallel_size = ep_size
@@ -59,7 +61,6 @@ training.max_steps = 6
 training.micro_batch_size = 1
 training.global_batch_size = global_batch_size
 training.sequence_length = parsed.sequence_length
-training.dataset = Path(specs["dataset"])
 training.moe_load_balance_type = specs["moe_load_balance_type"]
 training.moe_load_balance_coef = specs["moe_load_balance_coef"]
 training.fp8 = False

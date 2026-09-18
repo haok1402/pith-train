@@ -52,7 +52,6 @@ def launch(cfg: DistributedCfg, worker: Callable, *args) -> None:
     os.environ.setdefault("NODE_RANK", "0")
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "15213")
-    os.environ.setdefault("TORCHELASTIC_RUN_ID", "pytest")
 
     world_size = int(os.environ["WORLD_SIZE"])
     local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])

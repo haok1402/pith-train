@@ -6,6 +6,8 @@ from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
 cfg = PretrainLMCfg()
 
+cfg.dataset = Path("workspace/datasets/dclm-baseline/toktxt/<tokenizer>")
+
 distributed = cfg.distributed
 distributed.pipeline_parallel_size = <pipeline-parallel-size>
 distributed.expert_parallel_size = <expert-parallel-size>
@@ -13,7 +15,6 @@ distributed.context_parallel_size = <context-parallel-size>
 
 training = cfg.training
 training.model = Path("examples/pretrain_lm/<model>/config.json")
-training.dataset = Path("workspace/datasets/dclm-baseline/toktxt/<tokenizer>")
 training.optimizer = make_adamw_optimizer
 training.scheduler = make_constant_scheduler
 training.lr = 1e-6
