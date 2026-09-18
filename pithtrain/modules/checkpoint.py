@@ -401,7 +401,7 @@ def find_checkpoint(root: Optional[Path]) -> Optional[int]:
     continues at exactly this number. With five steps done, the next one to run is five. Storing the
     count rather than the index is what keeps every caller free of offset arithmetic.
     """
-    if root is None: return None # fmt: skip
+    if root is None: return None  # fmt: skip
     latest = max(Path(root, "torch-dcp").glob("[0-9]" * 8), default=None)
     return int(latest.name) if latest is not None else None
 
