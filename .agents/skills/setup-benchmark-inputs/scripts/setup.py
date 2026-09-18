@@ -17,13 +17,13 @@ MODELS = {
         "model_id": "deepseek-ai/DeepSeek-V2-Lite",
         "corpus_toktxt": "workspace/datasets/dclm-baseline/toktxt/deepseek-v2",
         "hf_import": "workspace/checkpoints/deepseek-v2-lite/hf-import",
-        "torch_dcp": "workspace/checkpoints/deepseek-v2-lite/torch-dcp/step-00000000",
+        "torch_dcp": "workspace/checkpoints/deepseek-v2-lite/torch-dcp/00000000",
     },
     "qwen3-30b-a3b": {
         "model_id": "Qwen/Qwen3-30B-A3B",
         "corpus_toktxt": "workspace/datasets/dclm-baseline/toktxt/qwen3",
         "hf_import": "workspace/checkpoints/qwen3-30b-a3b/hf-import",
-        "torch_dcp": "workspace/checkpoints/qwen3-30b-a3b/torch-dcp/step-00000000",
+        "torch_dcp": "workspace/checkpoints/qwen3-30b-a3b/torch-dcp/00000000",
     },
 }
 

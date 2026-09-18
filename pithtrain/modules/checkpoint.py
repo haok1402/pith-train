@@ -10,7 +10,7 @@ Runtime format (localized):
   - Experts stacked per EP rank: shape [experts_per_rank, ...]
 
 A checkpoint is one DCP directory holding the model, optimizer and scheduler state plus a
-per-rank CUDA RNG file, kept at root/torch-dcp/step-XXXXXXXX. A checkpoint is identified by its
+per-rank CUDA RNG file, kept at root/torch-dcp/XXXXXXXX. A checkpoint is identified by its
 step, so all three entry points take a root and a step: save_checkpoint writes one, load_checkpoint
 reads one, and find_checkpoint reports the newest step under a root, or None when there is none.
 The layout itself never leaves this module.
@@ -394,7 +394,7 @@ def find_checkpoint(root: Optional[Path]) -> Optional[int]:
     The step of the newest checkpoint under root, or None when there is none to load.
 
     A checkpoint is identified by its step, so the step is what this returns and what save and load
-    take. The root/torch-dcp/step-XXXXXXXX layout stays inside this module. Nothing is read into the
+    take. The root/torch-dcp/XXXXXXXX layout stays inside this module. Nothing is read into the
     runtime state here: the caller loads, and decides what the step means for its own loop.
 
     The step counts completed units of work rather than naming the last one, so a resuming run
@@ -402,8 +402,8 @@ def find_checkpoint(root: Optional[Path]) -> Optional[int]:
     count rather than the index is what keeps every caller free of offset arithmetic.
     """
     if root is None: return None # fmt: skip
-    latest = max(Path(root, "torch-dcp").glob("step-*"), default=None)
-    return int(latest.name.removeprefix("step-")) if latest is not None else None
+    latest = max(Path(root, "torch-dcp").glob("[0-9]" * 8), default=None)
+    return int(latest.name) if latest is not None else None
 
 
 class CheckpointState(Stateful):
@@ -481,7 +481,7 @@ def save_checkpoint(root: Path, step: int) -> None:
     """
     stdout = logging.stdout
     model, optimizers, schedulers = training.model, training.optimizers, training.schedulers
-    location = Path(root, "torch-dcp", "step-%08d" % step)
+    location = Path(root, "torch-dcp", "%08d" % step)
 
     options = StateDictOptions(cpu_offload=True)
     model_state, optim_state = get_state_dict(model, optimizers, options=options)
@@ -519,7 +519,7 @@ def load_checkpoint(root: Path, step: int) -> None:
     slot such as an RL reference policy.
     """
     stdout = logging.stdout
-    location = Path(root, "torch-dcp", "step-%08d" % step)
+    location = Path(root, "torch-dcp", "%08d" % step)
     stdout.info("Load checkpoint: %s" % location)
 
     t0 = time.monotonic()

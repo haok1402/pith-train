@@ -128,7 +128,7 @@ If `logging.wandb` is configured, the same metrics are logged to Weights & Biase
 
 ## Checkpoints
 
-- **Resuming** is automatic: a run loads the latest `<save_location>/torch-dcp/step-XXXXXXXX` on startup.
+- **Resuming** is automatic: a run loads the latest `<save_location>/torch-dcp/XXXXXXXX` on startup.
 - **Reshardable:** checkpoints are stored in a parallelism-independent format, so you can resume the same run under a *different* PP/EP/DP layout (e.g. start on one node, continue on two).
 - **Export to HuggingFace** with `convert_checkpoint` for downstream evaluation/inference with standard tooling.
 - **Import from HuggingFace** with the same tool to start from released weights (continued pretraining). Imported checkpoints carry no optimizer state, which the loader handles.

@@ -1,6 +1,6 @@
 ---
 name: setup-benchmark-inputs
-description: Set up the minimal set of artifacts (tokenized DCLM corpus shard + released HuggingFace checkpoint converted to DCP) required to benchmark, profile, or regression-test a MoE model in PithTrain. Use when the user asks to "prepare benchmark inputs", "set up the benchmark workspace", "download the DCLM shard", "fetch and convert the released checkpoint", "tokenize DCLM for DeepSeek/Qwen3", or when a downstream skill (capture-nsys-profile, validate-correctness, or any short canonical run) needs its workspace pre-populated. Produce `workspace/datasets/dclm-baseline/toktxt/<model>` and `workspace/checkpoints/<model>/torch-dcp/step-00000000`. Idempotent and safe to re-run.
+description: Set up the minimal set of artifacts (tokenized DCLM corpus shard + released HuggingFace checkpoint converted to DCP) required to benchmark, profile, or regression-test a MoE model in PithTrain. Use when the user asks to "prepare benchmark inputs", "set up the benchmark workspace", "download the DCLM shard", "fetch and convert the released checkpoint", "tokenize DCLM for DeepSeek/Qwen3", or when a downstream skill (capture-nsys-profile, validate-correctness, or any short canonical run) needs its workspace pre-populated. Produce `workspace/datasets/dclm-baseline/toktxt/<model>` and `workspace/checkpoints/<model>/torch-dcp/00000000`. Idempotent and safe to re-run.
 ---
 
 # Setup Benchmark Inputs
