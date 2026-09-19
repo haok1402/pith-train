@@ -187,8 +187,10 @@ class TrainingCfg(SlottedDefault):
 
     model: Path
     """
-    The model to train, a path to a HuggingFace-compatible config.json or to the directory holding
-    one, for example examples/pretrain_lm/qwen3-30b-a3b.
+    The model to train, a HuggingFace model directory, for example
+    examples/pretrain_lm/qwen3-30b-a3b. Only config.json is read: the architecture is built from
+    it and the weights come from the checkpoint, so a directory holding config.json alone is
+    enough to pretrain from scratch.
     """
 
     save_interval: Optional[int] = None

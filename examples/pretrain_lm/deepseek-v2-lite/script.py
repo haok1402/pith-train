@@ -17,7 +17,7 @@ distributed.pipeline_parallel_size = 2
 distributed.expert_parallel_size = 2
 
 training = cfg.training
-training.model = Path("examples/pretrain_lm/deepseek-v2-lite/config.json")
+training.model = Path("examples/pretrain_lm/deepseek-v2-lite")
 training.optimizer = make_muon_optimizer
 kwargs = dict(start_lr=1.0e-4, warmup_ratio=0.00, final_lr=1.0e-4)
 training.scheduler = partial(make_wsd_scheduler, **kwargs)

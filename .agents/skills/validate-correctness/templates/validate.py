@@ -15,7 +15,7 @@ distributed.expert_parallel_size = <expert-parallel-size>
 distributed.context_parallel_size = <context-parallel-size>
 
 training = cfg.training
-training.model = Path("examples/pretrain_lm/<model>/config.json")
+training.model = Path("examples/pretrain_lm/<model>")
 training.optimizer = make_adamw_optimizer
 training.moe_load_balance_type = "<moe-load-balance-type>"
 training.moe_load_balance_coef = 1e-3

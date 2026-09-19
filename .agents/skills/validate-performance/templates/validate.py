@@ -14,7 +14,7 @@ distributed.expert_parallel_size = <expert-parallel-size>
 distributed.context_parallel_size = <context-parallel-size>
 
 training = cfg.training
-training.model = Path("examples/pretrain_lm/<model>/config.json")
+training.model = Path("examples/pretrain_lm/<model>")
 training.optimizer = make_adamw_optimizer
 training.scheduler = make_constant_scheduler
 training.lr = 1e-6

@@ -44,7 +44,7 @@ cfg = PretrainLMCfg()
 cfg.dataset = Path("workspace/datasets/dclm-baseline/toktxt/gpt-oss")
 
 training = cfg.training
-training.model = Path("benchmarks/pretraining/gpt-oss-120b/model.json")
+training.model = Path("benchmarks/pretraining/gpt-oss-120b")
 training.optimizer = make_muon_optimizer
 training.scheduler = make_constant_scheduler
 training.lr = 1.0e-6

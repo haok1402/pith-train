@@ -50,7 +50,7 @@ cfg = PretrainLMCfg()
 cfg.dataset = Path("workspace/datasets/dclm-baseline/toktxt/qwen3.5")
 
 training = cfg.training
-training.model = Path("benchmarks/pretraining/qwen3.5-122b-a10b/model.json")
+training.model = Path("benchmarks/pretraining/qwen3.5-122b-a10b")
 training.optimizer = make_muon_optimizer
 training.scheduler = make_constant_scheduler
 training.lr = 1.0e-6

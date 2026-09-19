@@ -12,7 +12,7 @@ cfg.distributed.context_parallel_size = 1
 cfg.distributed.pipeline_parallel_size = 1
 cfg.distributed.expert_parallel_size = 8
 
-cfg.training.model = Path("examples/pretrain_lm/gpt-oss-20b/config.json")
+cfg.training.model = Path("examples/pretrain_lm/gpt-oss-20b")
 cfg.training.optimizer = make_muon_optimizer
 kwargs = dict(start_lr=1.0e-5, warmup_ratio=0.03, final_lr=1.0e-5)
 cfg.training.scheduler = partial(make_wsd_scheduler, **kwargs)

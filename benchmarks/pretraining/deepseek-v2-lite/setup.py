@@ -44,7 +44,7 @@ cfg = PretrainLMCfg()
 cfg.dataset = Path("workspace/datasets/dclm-baseline/toktxt/deepseek-v2")
 
 training = cfg.training
-training.model = Path("benchmarks/pretraining/deepseek-v2-lite/model.json")
+training.model = Path("benchmarks/pretraining/deepseek-v2-lite")
 training.optimizer = make_muon_optimizer
 training.scheduler = make_constant_scheduler
 training.lr = 1.0e-6
