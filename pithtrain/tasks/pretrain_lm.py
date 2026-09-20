@@ -10,9 +10,7 @@ from typing import List, Tuple
 
 import torch
 import torch.cuda
-import torch.nn as nn
 import wandb
-from torch.distributed._tensor import DTensor
 from torch.distributed.elastic.multiprocessing.errors import record
 
 from pithtrain.config import SlottedDefault
@@ -26,6 +24,7 @@ from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
+from pithtrain.modules.optimizer import clip_grad_norm
 from pithtrain.modules.training import TrainingCfg, setup_training
 from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.cross_entropy import cross_entropy
@@ -154,43 +153,6 @@ def objective(
 
 
 @torch.no_grad()
-def clip_grad_norm_(
-    model: nn.Module, max_norm: float, norm_type: float = 2.0, hsdp_replica: int = 1
-) -> torch.Tensor:
-    """
-    Clip gradients by global norm across all ranks, FSDP and pipeline alike, and return the total
-    gradient norm before clipping.
-
-    The world-wide sum counts each gradient element once, since every element lives on a single
-    rank. At hsdp_replica above 1 each element sits on that many ranks, so the summed square is
-    divided by the same count.
-    """
-    grads = []
-    for p in model.parameters():
-        if p.grad is None:
-            continue
-        g = p.grad
-        if isinstance(g, DTensor):
-            g = g.to_local()
-        grads.append(g)
-    if not grads:
-        first_param = next(model.parameters(), None)
-        device = first_param.device if first_param is not None else torch.device("cpu")
-        return torch.tensor(0.0, device=device)
-    local_norm = torch.nn.utils.get_total_norm(grads, norm_type=norm_type)
-    # Global L2 norm: all-reduce sum of squared norms across all ranks (FSDP + pipeline).
-    local_norm_sq = local_norm**norm_type
-    torch.distributed.all_reduce(local_norm_sq, op=torch.distributed.ReduceOp.SUM)
-    local_norm_sq = local_norm_sq / hsdp_replica
-    total_norm = (local_norm_sq ** (1.0 / norm_type)).clamp(min=1e-6)
-    clip_coef = (max_norm / total_norm).clamp(max=1.0)
-    if clip_coef < 1.0:
-        for p in model.parameters():
-            if p.grad is not None:
-                p.grad.mul_(clip_coef)
-    return total_norm
-
-
 def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     """
     Execute one step of training.
@@ -261,7 +223,7 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
             p.grad.mul_(scale)
 
     # Clip the gradients.
-    gradient_norm = clip_grad_norm_(
+    gradient_norm = clip_grad_norm(
         model, max_norm=1.0, norm_type=2, hsdp_replica=cfg.distributed.hsdp_replica
     )
 

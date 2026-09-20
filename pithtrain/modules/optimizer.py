@@ -18,6 +18,9 @@ are done locally.
 The update is scaled by Moonlight's ``0.2 * sqrt(max(n, m))`` so its RMS
 matches AdamW's and both share one LR. ``zeropower_via_newtonschulz5`` is
 verbatim from the public reference (mirrored by DeepSpeed).
+
+``clip_grad_norm`` also lives here: it runs between backward and
+``optimizer.step`` and clips by a global norm over every rank.
 """
 
 import math
@@ -209,3 +212,40 @@ class Muon(torch.optim.Optimizer):
             ).redistribute(placements=p.placements)
         p.mul_(1 - lr * wd)
         p.add_(orth, alpha=-lr)
+
+
+def clip_grad_norm(
+    model: torch.nn.Module, max_norm: float, norm_type: float = 2.0, hsdp_replica: int = 1
+) -> torch.Tensor:
+    """
+    Clip gradients by global norm across all ranks, FSDP and pipeline alike, and return the total
+    gradient norm before clipping.
+
+    The world-wide sum counts each gradient element once, since every element lives on a single
+    rank. At hsdp_replica above 1 each element sits on that many ranks, so the summed square is
+    divided by the same count.
+    """
+    grads = []
+    for p in model.parameters():
+        if p.grad is None:
+            continue
+        g = p.grad
+        if isinstance(g, DTensor):
+            g = g.to_local()
+        grads.append(g)
+    if not grads:
+        first_param = next(model.parameters(), None)
+        device = first_param.device if first_param is not None else torch.device("cpu")
+        return torch.tensor(0.0, device=device)
+    local_norm = torch.nn.utils.get_total_norm(grads, norm_type=norm_type)
+    # Global L2 norm: all-reduce sum of squared norms across all ranks (FSDP + pipeline).
+    local_norm_sq = local_norm**norm_type
+    torch.distributed.all_reduce(local_norm_sq, op=torch.distributed.ReduceOp.SUM)
+    local_norm_sq = local_norm_sq / hsdp_replica
+    total_norm = (local_norm_sq ** (1.0 / norm_type)).clamp(min=1e-6)
+    clip_coef = (max_norm / total_norm).clamp(max=1.0)
+    if clip_coef < 1.0:
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad.mul_(clip_coef)
+    return total_norm
