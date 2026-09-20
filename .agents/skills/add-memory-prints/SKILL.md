@@ -160,13 +160,13 @@ def _setup_mem(label: str) -> None:
 
 ### In `setup_default_process_group`
 
-**Important**: this runs BEFORE `init_process_group`, so `torch.distributed.get_rank()` is not available. Use `ctx.local_rank` for the rank guard.
+**Important**: this runs BEFORE `init_process_group`, so `torch.distributed.get_rank()` is not available, and `distributed.rank` is not published until `setup_device_mesh`. Use the `device_id` parameter for the rank guard.
 
-After setting `ctx.local_rank`, move `torch.cuda.set_device(ctx.local_rank)` to BEFORE `init_process_group` if it isn't already. Then add a memory probe before and after `init_process_group`:
+`torch.cuda.mem_get_info` reads the current device, which nothing has set this early, so the probe sets it itself; `setup_device_mesh` sets it again later, harmlessly. Add a memory probe before and after `init_process_group`:
 
 ```python
 # Probe: isolate CUDA context cost from NCCL communicator init
-torch.cuda.set_device(ctx.local_rank)
+torch.cuda.set_device(device_id)
 torch.cuda.synchronize()
 _free0, _total = torch.cuda.mem_get_info()
 _non_pt0 = _total - _free0
@@ -177,9 +177,9 @@ G = 1024**3
 torch.cuda.synchronize()
 _free1, _ = torch.cuda.mem_get_info()
 _non_pt1 = _total - _free1
-if ctx.local_rank in RANKS:
+if device_id in RANKS:
     print(
-        f"[rank={ctx.rank}] init_process_group | "
+        f"[rank={torch.distributed.get_rank()}] init_process_group | "
         f"cuda_ctx={_non_pt0 / G:.2f} "
         f"after_nccl_world={_non_pt1 / G:.2f} "
         f"nccl_world_cost={(_non_pt1 - _non_pt0) / G:.2f}",
@@ -202,9 +202,9 @@ torch.cuda.synchronize()
 _free_after, _ = torch.cuda.mem_get_info()
 _non_pt_after = _total - _free_after
 G = 1024**3
-if ctx.local_rank in RANKS:
+if device_id in RANKS:
     print(
-        f"[rank={ctx.rank}] init_device_mesh | "
+        f"[rank={distributed.rank}] init_device_mesh | "
         f"non-pt={_non_pt_after / G:.2f} "
         f"mesh_cost={(_non_pt_after - _non_pt_before) / G:.2f}",
         flush=True,

@@ -439,9 +439,8 @@ def _build_expert_idxs_kernel(
                              for each token slot, via segmented fill.
 
     ``total`` is a kernel argument rather than a device-side sum so that the store mask
-    and the caller's allocation are the same number. Masking a store to one tensor with
-    a length read out of a different tensor is exactly how this kernel used to write out
-    of bounds when the caller's size guess was too small.
+    and the caller's allocation are the same number. Masking a store to one tensor with a
+    length read out of a different tensor writes out of bounds whenever the two disagree.
     """
     pid = tl.program_id(0)
 

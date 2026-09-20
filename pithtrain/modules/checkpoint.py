@@ -46,7 +46,6 @@ from torch.optim.lr_scheduler import LRScheduler
 from pithtrain.contexts import distributed, logging, training
 
 __all__ = [
-    "CheckpointState",
     "find_checkpoint",
     "load_checkpoint",
     "save_checkpoint",
@@ -476,7 +475,7 @@ def save_checkpoint(root: Path, step: int) -> None:
 
     Uses cpu_offload=True, with the default full_state_dict=False, so that each rank's local FSDP
     shards move to CPU without any GPU all-gather. Expert DTensors are split into per-expert
-    entries locally by unwrap_dtensor_experts in resharding.py, so each rank writes only the
+    entries locally by unwrap_dtensor_experts, so each rank writes only the
     expert keys it owns. Non-expert DTensors stay as CPU DTensors and DCP saves each rank's shard.
     """
     stdout = logging.stdout
