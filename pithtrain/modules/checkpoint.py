@@ -25,7 +25,7 @@ import gc
 import re
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
 import torch
 import torch.distributed.checkpoint as dcp
@@ -47,6 +47,7 @@ from pithtrain.contexts import distributed, logging, training
 
 __all__ = [
     "find_checkpoint",
+    "iter_canonical_parameters",
     "load_checkpoint",
     "save_checkpoint",
     "to_canonical_model",
@@ -261,6 +262,25 @@ def to_canonical_model(
     Canonicalize model state: strip module prefix, unstack experts.
     """
     return unpack(state_dict, dict(model.named_modules()), lambda v, n, i: v[i])
+
+
+def iter_canonical_parameters() -> Iterator[Tuple[str, torch.Tensor]]:
+    """
+    Yield this rank's parameters under canonical names, one gathered tensor at a time.
+
+    Gathering per parameter keeps the extra memory at one parameter. full_tensor is a collective,
+    so every rank must consume every entry: filtering or stopping early hangs the others. Only
+    this rank's layers are yielded; joining pipeline stages is the caller's job.
+    """
+    model = training.model
+    named_modules = dict(model.named_modules())
+    for localized_fqn, param in model.named_parameters():
+        gathered = param.detach()
+        if isinstance(gathered, DTensor):
+            gathered = gathered.full_tensor()
+        # Handed a plain tensor, unpack skips unwrap_dtensor_experts and emits every expert of
+        # this EP rank as a slice of the gathered stack, not just the few in the FSDP shard.
+        yield from unpack({localized_fqn: gathered}, named_modules, lambda v, n, i: v[i]).items()
 
 
 def _expand_localized_fqn(localized_fqn: str, named_modules: Dict[str, nn.Module]) -> list:
