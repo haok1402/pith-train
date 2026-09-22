@@ -16,6 +16,7 @@ import torch.distributed.fsdp
 import torch.nn as nn
 from torch.distributed import DeviceMesh
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
+from torch.distributed.tensor import DTensor
 from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 from transformers import AutoConfig
@@ -451,6 +452,107 @@ def setup_model(
                 module.router_replay = force_balance(module.num_experts)
 
     training.model = DualPipeV(modules)
+
+
+_offloaded_state: list[tuple[torch.UntypedStorage, torch.Tensor]] = []
+"""
+Each evicted CUDA storage with its pinned host copy; non-empty only while offloaded.
+"""
+
+_pinned_buffers: dict[int, list[torch.Tensor]] = {}
+"""
+Free pinned host buffers by byte size, kept for the life of the process. Page-locking is the
+expensive part of an offload, so the buffers are allocated once rather than on every rollout.
+"""
+
+
+def _take_pinned(num_bytes: int) -> torch.Tensor:
+    """
+    A pinned host buffer of exactly num_bytes, reused from the pool when one is free.
+    """
+    free = _pinned_buffers.setdefault(num_bytes, [])
+    if free:
+        return free.pop()
+    return torch.empty(num_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
+
+
+def _storage_bytes(storage: torch.UntypedStorage) -> torch.Tensor:
+    """
+    A uint8 tensor spanning the whole of storage, for copying it somewhere else.
+    """
+    return torch.empty(0, dtype=torch.uint8, device=storage.device).set_(storage)
+
+
+def _training_state_storages() -> list[torch.UntypedStorage]:
+    """
+    The distinct CUDA storages behind this rank's parameter shards and optimizer state.
+
+    Deduplicated by address, because FSDP2 keeps the padded shard buffer and the parameter's local
+    tensor as two views of one allocation.
+    """
+    storages: dict[int, torch.UntypedStorage] = {}
+
+    def collect(tensor: torch.Tensor) -> None:
+        local = tensor._local_tensor if isinstance(tensor, DTensor) else tensor
+        if local.device.type != "cuda":
+            return
+        storage = local.untyped_storage()
+        if storage.size() > 0:
+            storages.setdefault(storage.data_ptr(), storage)
+
+    for param in training.model.parameters():
+        collect(param)
+    for optimizer in training.optimizers:
+        for state in optimizer.state.values():
+            for value in state.values():
+                if isinstance(value, torch.Tensor):
+                    collect(value)
+
+    return list(storages.values())
+
+
+def offload_training_state() -> None:
+    """
+    Move this rank's parameter shards and optimizer state to pinned host memory and free the GPU
+    memory behind them. Only the storages are resized away, so every tensor, view and optimizer
+    state entry survives and reload has nothing to rebuild. Gradients are not included.
+    """
+    if _offloaded_state:
+        return
+
+    # An unsharded parameter is a separate allocation the walk below would not see.
+    for module in training.model.modules():
+        if isinstance(module, FSDPModule):
+            module.reshard()
+
+    for storage in _training_state_storages():
+        host = _take_pinned(storage.size())
+        host.copy_(_storage_bytes(storage), non_blocking=True)
+        _offloaded_state.append((storage, host))
+
+    # The copies are asynchronous, so nothing may be freed until they land.
+    torch.cuda.synchronize()
+    for storage, _ in _offloaded_state:
+        storage.resize_(0)
+    torch.cuda.empty_cache()
+
+
+def reload_training_state() -> None:
+    """
+    Bring the offloaded state back onto the device. A no-op when nothing was offloaded.
+    """
+    if not _offloaded_state:
+        return
+
+    for storage, host in _offloaded_state:
+        storage.resize_(host.numel())
+        _storage_bytes(storage).copy_(host, non_blocking=True)
+
+    # The copies are asynchronous, so no buffer may return to the pool until they land.
+    torch.cuda.synchronize()
+    for _, host in _offloaded_state:
+        _pinned_buffers[host.numel()].append(host)
+    _offloaded_state.clear()
 
 
 def setup_training(cfg: object) -> None:
