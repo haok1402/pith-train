@@ -9,7 +9,11 @@ from transformers.models.deepseek_v2.configuration_deepseek_v2 import DeepseekV2
 
 from pithtrain.contexts import distributed, training
 from pithtrain.models.interface import RoutingInfo
-from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
+from pithtrain.modules.load_balance import (
+    MoELoadBalanceLossInjector,
+    MoELoadBalanceLossTracker,
+    replay_indices,
+)
 from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
@@ -145,7 +149,7 @@ class DeepSeekV2MoEGate(nn.Module):
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.hidden_size)), requires_grad=True)  # fmt: skip
 
     def forward(
-        self, hidden_states: torch.Tensor
+        self, hidden_states: torch.Tensor, replay_idx: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32), None)  # fmt: skip
@@ -159,8 +163,8 @@ class DeepSeekV2MoEGate(nn.Module):
             score_mask = group_mask.unsqueeze(-1).expand(n_tokens, self.num_group, self.num_experts // self.num_group).reshape(n_tokens, -1)  # fmt: skip
             scores = scores.masked_fill(~score_mask.bool(), 0.0)
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
-        if self.router_replay is not None:
-            topk_idx = self.router_replay(topk_idx)
+        if replay_idx is not None:
+            topk_idx = replay_idx
             topk_weight = scores.gather(-1, topk_idx)
         topk_weight = topk_weight * self.routed_scaling_factor
         if self.load_balance_loss_fn is None:
@@ -186,7 +190,8 @@ class DeepSeekV2MoE(nn.Module):
     def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         identity = hidden_states
         orig_shape = hidden_states.shape
-        topk_idx, topk_weight, lb_loss = self.gate(hidden_states)
+        replay_idx = replay_indices(self.gate, hidden_states, self.num_experts_per_tok)
+        topk_idx, topk_weight, lb_loss = self.gate(hidden_states, replay_idx)
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -298,6 +303,7 @@ class DeepSeekV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         rotary_posemb: tuple[torch.Tensor, torch.Tensor],
         cu_seqlens: torch.Tensor | None = None,
+        replay_idx: torch.Tensor | None = None,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -308,7 +314,7 @@ class DeepSeekV2DecoderLayer(nn.Module):
         if isinstance(self.mlp, DeepSeekV2MLP):
             return hidden_states, residual, None, None, None
         residual = residual + self.mlp.shared_experts(hidden_states)
-        topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states)
+        topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states, replay_idx)
         return hidden_states, residual, topk_idx, topk_weight, lb_loss
 
     def forward_stage1(
@@ -317,7 +323,10 @@ class DeepSeekV2DecoderLayer(nn.Module):
         rotary_posemb: tuple[torch.Tensor, torch.Tensor],
         cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, RoutingInfo | None]:
-        hidden_states, residual, topk_idx, topk_weight, lb_loss = self.forward_stage1_compute(hidden_states, rotary_posemb, cu_seqlens)  # fmt: skip
+        replay_idx = None
+        if isinstance(self.mlp, DeepSeekV2MoE):
+            replay_idx = replay_indices(self.mlp.gate, hidden_states, self.mlp.num_experts_per_tok)
+        hidden_states, residual, topk_idx, topk_weight, lb_loss = self.forward_stage1_compute(hidden_states, rotary_posemb, cu_seqlens, replay_idx)  # fmt: skip
         if isinstance(self.mlp, DeepSeekV2MLP):
             return hidden_states, residual, None
         if lb_loss is not None:

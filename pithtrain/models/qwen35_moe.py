@@ -7,7 +7,11 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5Moe
 
 from pithtrain.contexts import distributed, training
 from pithtrain.models.interface import RoutingInfo
-from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
+from pithtrain.modules.load_balance import (
+    MoELoadBalanceLossInjector,
+    MoELoadBalanceLossTracker,
+    replay_indices,
+)
 from pithtrain.operators.cp_sequence import (
     contiguous_to_zigzag,
     prepend_conv_state,
@@ -229,14 +233,14 @@ class Qwen35MoeTopKRouter(nn.Module):
         self.weight = nn.Parameter(torch.empty((config.num_experts, config.hidden_size)), requires_grad=True)  # fmt: skip
 
     def forward(
-        self, hidden_states: torch.Tensor
+        self, hidden_states: torch.Tensor, replay_idx: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         logits = F.linear(hidden_states, self.weight, None)
         scores = logits.softmax(dim=-1, dtype=torch.float32)
         topk_weight, topk_idx = torch.topk(scores, k=self.num_experts_per_tok, dim=-1, sorted=False)
-        if self.router_replay is not None:
-            topk_idx = self.router_replay(topk_idx)
+        if replay_idx is not None:
+            topk_idx = replay_idx
             topk_weight = scores.gather(-1, topk_idx)
         topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
         if self.load_balance_loss_fn is None:
@@ -268,7 +272,8 @@ class Qwen35MoeSparseMoeBlock(nn.Module):
     def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         identity = hidden_states
         orig_shape = hidden_states.shape
-        topk_idx, topk_weight, lb_loss = self.gate(hidden_states)
+        replay_idx = replay_indices(self.gate, hidden_states, self.num_experts_per_tok)
+        topk_idx, topk_weight, lb_loss = self.gate(hidden_states, replay_idx)
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -305,7 +310,10 @@ class Qwen35MoeDecoderLayer(nn.Module):
 
     @torch.compile(fullgraph=True)
     def forward_stage1_compute(
-        self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]
+        self,
+        hidden_states: torch.Tensor,
+        rotary_posemb: tuple[torch.Tensor, torch.Tensor],
+        replay_idx: torch.Tensor | None = None,
     ):
         if self.to_contiguous:
             hidden_states = zigzag_to_contiguous(hidden_states, distributed.cp_group)
@@ -319,7 +327,7 @@ class Qwen35MoeDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         residual = residual + self.mlp.shared_out(hidden_states)
-        topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states)
+        topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states, replay_idx)
         return hidden_states, residual, topk_idx, topk_weight, lb_loss
 
     def forward_stage1(
@@ -329,7 +337,8 @@ class Qwen35MoeDecoderLayer(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, RoutingInfo | None]:
         assert cu_seqlens is None, "packed sequences are not yet implemented for Gated DeltaNet"
-        hidden_states, residual, topk_idx, topk_weight, lb_loss = self.forward_stage1_compute(hidden_states, rotary_posemb)  # fmt: skip
+        replay_idx = replay_indices(self.mlp.gate, hidden_states, self.mlp.num_experts_per_tok)
+        hidden_states, residual, topk_idx, topk_weight, lb_loss = self.forward_stage1_compute(hidden_states, rotary_posemb, replay_idx)  # fmt: skip
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
         dispatch_tokens, routing = prepare_dispatch(hidden_states, topk_idx, topk_weight, self.mlp.num_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)  # fmt: skip

@@ -7,7 +7,11 @@ from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from pithtrain.contexts import distributed, training
 from pithtrain.models.interface import RoutingInfo
-from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
+from pithtrain.modules.load_balance import (
+    MoELoadBalanceLossInjector,
+    MoELoadBalanceLossTracker,
+    replay_indices,
+)
 from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
@@ -77,14 +81,14 @@ class Qwen3MoeGate(nn.Module):
         self.weight = nn.Parameter(torch.empty((self.num_experts, config.hidden_size)), requires_grad=True)  # fmt: skip
 
     def forward(
-        self, hidden_states: torch.Tensor
+        self, hidden_states: torch.Tensor, replay_idx: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         logits = F.linear(hidden_states, self.weight, None)
         scores = logits.softmax(dim=-1, dtype=torch.float32)
         topk_weight, topk_idx = torch.topk(scores, k=self.num_experts_per_tok, dim=-1, sorted=False)
-        if self.router_replay is not None:
-            topk_idx = self.router_replay(topk_idx)
+        if replay_idx is not None:
+            topk_idx = replay_idx
             topk_weight = scores.gather(-1, topk_idx)
         if self.norm_topk_prob:
             topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
@@ -108,7 +112,8 @@ class Qwen3MoeMoE(nn.Module):
 
     def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
-        topk_idx, topk_weight, lb_loss = self.gate(hidden_states)
+        replay_idx = replay_indices(self.gate, hidden_states, self.num_experts_per_tok)
+        topk_idx, topk_weight, lb_loss = self.gate(hidden_states, replay_idx)
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -192,6 +197,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         rotary_posemb: tuple[torch.Tensor, torch.Tensor],
         cu_seqlens: torch.Tensor | None = None,
+        replay_idx: torch.Tensor | None = None,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -199,7 +205,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states)
+        topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states, replay_idx)
         return hidden_states, residual, topk_idx, topk_weight, lb_loss
 
     def forward_stage1(
@@ -208,7 +214,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         rotary_posemb: tuple[torch.Tensor, torch.Tensor],
         cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, RoutingInfo | None]:
-        hidden_states, residual, topk_idx, topk_weight, lb_loss = self.forward_stage1_compute(hidden_states, rotary_posemb, cu_seqlens)  # fmt: skip
+        replay_idx = replay_indices(self.mlp.gate, hidden_states, self.mlp.num_experts_per_tok)
+        hidden_states, residual, topk_idx, topk_weight, lb_loss = self.forward_stage1_compute(hidden_states, rotary_posemb, cu_seqlens, replay_idx)  # fmt: skip
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
         dispatch_tokens, routing = prepare_dispatch(hidden_states, topk_idx, topk_weight, self.mlp.num_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)  # fmt: skip

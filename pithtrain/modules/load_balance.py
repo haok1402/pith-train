@@ -257,18 +257,31 @@ def make_load_balance_loss_fn(
     return loss
 
 
-def force_balance(num_experts: int) -> Callable[[torch.Tensor], torch.Tensor]:
+def force_balance(num_experts: int) -> Callable[[int, int], torch.Tensor]:
     """
     Build a benchmark-only router replay that spreads tokens evenly across all
     ``num_experts`` (round-robin), giving every expert an equal, dropless load.
-    The returned callable rewrites a gate's top-k indices, keeping their shape.
+    The returned callable gives the ``[num_tokens, top_k]`` indices a gate should use.
     """
 
-    def replay(topk_idx: torch.Tensor) -> torch.Tensor:
-        num_tokens, top_k = topk_idx.shape
+    def replay(num_tokens: int, top_k: int) -> torch.Tensor:
         stride = num_experts // top_k
-        t = torch.arange(num_tokens, device=topk_idx.device).unsqueeze(1)
-        j = torch.arange(top_k, device=topk_idx.device).unsqueeze(0)
+        device = torch.cuda.current_device()
+        t = torch.arange(num_tokens, device=device).unsqueeze(1)
+        j = torch.arange(top_k, device=device).unsqueeze(0)
         return (t + j * stride) % num_experts
 
     return replay
+
+
+def replay_indices(
+    gate: torch.nn.Module, hidden_states: torch.Tensor, top_k: int
+) -> torch.Tensor | None:
+    """
+    The replayed top-k indices from gate.router_replay, or None if none is installed.
+
+    Resolved in eager so the compiled gate gets them as an input, not traced Python state.
+    """
+    if gate.router_replay is None:
+        return None
+    return gate.router_replay(hidden_states.shape[:-1].numel(), top_k)

@@ -181,6 +181,7 @@ class DualPipeV(nn.Module):
 
     def _reset_states(self) -> None:
         WeightGradStore.clear()
+        training.current_microbatch = None
 
         self.input_chunks: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = (
             [],
@@ -254,6 +255,7 @@ class DualPipeV(nn.Module):
         cu_seqlens = (
             self.cu_seqlens_chunks[chunk_id] if self.cu_seqlens_chunks is not None else None
         )
+        training.current_microbatch = chunk_id
         outputs = self.module[phase](*inputs, cu_seqlens=cu_seqlens)
         self.module[phase].chunk_record = None
         outputs = [outputs] if isinstance(outputs, torch.Tensor) else outputs
@@ -363,6 +365,10 @@ class DualPipeV(nn.Module):
         nvtx.range_push(
             f"forward chunk {chunk_id0} (phase{phase0}) backward chunk {chunk_id1} (phase{phase1})"
         )
+        # This runs one micro-batch's forward against another's backward, and the backward drives
+        # the saved autograd graph without re-entering model code, so the forward's is the one to
+        # publish: nothing in the backward half can read it.
+        training.current_microbatch = chunk_id0
         outputs0, loss0, objective_output0, input_grads1 = overlapped_forward_backward(
             module0,
             inputs0,
