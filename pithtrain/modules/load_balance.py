@@ -261,15 +261,20 @@ def force_balance(num_experts: int) -> Callable[[int, int], torch.Tensor]:
     """
     Build a benchmark-only router replay that spreads tokens evenly across all
     ``num_experts`` (round-robin), giving every expert an equal, dropless load.
-    The returned callable gives the ``[num_tokens, top_k]`` indices a gate should use.
+    The returned callable gives the ``[num_tokens, top_k]`` indices a gate should use. They depend
+    only on the shape, so each shape is built once and the same tensor is returned after that.
     """
+    cache: dict[tuple[int, int], torch.Tensor] = {}
 
     def replay(num_tokens: int, top_k: int) -> torch.Tensor:
-        stride = num_experts // top_k
-        device = torch.cuda.current_device()
-        t = torch.arange(num_tokens, device=device).unsqueeze(1)
-        j = torch.arange(top_k, device=device).unsqueeze(0)
-        return (t + j * stride) % num_experts
+        indices = cache.get((num_tokens, top_k))
+        if indices is None:
+            stride = num_experts // top_k
+            device = torch.cuda.current_device()
+            t = torch.arange(num_tokens, device=device).unsqueeze(1)
+            j = torch.arange(top_k, device=device).unsqueeze(0)
+            indices = cache[(num_tokens, top_k)] = (t + j * stride) % num_experts
+        return indices
 
     return replay
 
