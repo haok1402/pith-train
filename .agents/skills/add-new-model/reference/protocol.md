@@ -60,7 +60,7 @@ Everything before the expert dispatch happens here. Split the compute-heavy pref
 
 ```python
 @torch.compile(fullgraph=True)
-def forward_stage1_compute(self, hidden_states, rotary_posemb, cu_seqlens=None):
+def forward_stage1_compute(self, hidden_states, rotary_posemb, cu_seqlens=None, replay_idx=None):
     residual = hidden_states
     hidden_states = self.input_layernorm(hidden_states)
     hidden_states = self.self_attn(hidden_states, rotary_posemb, cu_seqlens)
@@ -72,12 +72,14 @@ def forward_stage1_compute(self, hidden_states, rotary_posemb, cu_seqlens=None):
     # SHARED EXPERTS (if any) fold into `residual` HERE, before returning, so
     # their compute overlaps the stage-2 all-to-all dispatch of routed tokens:
     #   residual = residual + self.mlp.shared_experts(hidden_states)
-    topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states)
+    topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states, replay_idx)
     return hidden_states, residual, topk_idx, topk_weight, lb_loss
 
 def forward_stage1(self, hidden_states, rotary_posemb, cu_seqlens=None):
+    # Resolve any routing replay in eager, so the compiled region receives the indices as an input.
+    replay_idx = replay_indices(self.mlp.gate, hidden_states, self.mlp.num_experts_per_tok)
     hidden_states, residual, topk_idx, topk_weight, lb_loss = self.forward_stage1_compute(
-        hidden_states, rotary_posemb, cu_seqlens
+        hidden_states, rotary_posemb, cu_seqlens, replay_idx
     )
     if lb_loss is not None:
         MoELoadBalanceLossTracker.add(lb_loss)
@@ -253,7 +255,7 @@ The router class (`gate` on Qwen3 / DeepSeek-V2, `router` on GPT-OSS - match HF'
   topk_weight = MoELoadBalanceLossInjector.apply(topk_weight, lb_loss * topk_weight.shape[0])
   return topk_idx, topk_weight, lb_loss
   ```
-- `self.router_replay` initialised to `None` (used to force a recorded routing during correctness validation).
+- `self.router_replay` initialised to `None`. When set, it is a callable `(num_tokens, top_k) -> [num_tokens, top_k]` expert indices, used to force recorded routes (RL rollout routing replay, benchmark force-balancing). The router never calls it: the layer resolves it in eager with `replay_indices(gate, hidden_states, top_k)` and passes the result as `forward`'s `replay_idx` argument, which is `None` when no replay is installed. When `replay_idx` is given, `forward` uses it as `topk_idx` and takes the weights of those experts from its own scores (`scores.gather(-1, replay_idx)`), so gradients still reach the router.
 
 The router's `forward` returns `(topk_idx, topk_weight, lb_loss)`. The layer calls `MoELoadBalanceLossTracker.add(lb_loss)` when `lb_loss is not None` (see `forward_stage1` above). `setup_model` locates the router by trying both attribute names:
 

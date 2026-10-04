@@ -25,7 +25,7 @@ These are not recommendations. They are enforced by the framework: test failures
 
 ```python
 @torch.compile(fullgraph=True)
-def forward_stage1_compute(self, hidden_states, rotary_posemb, cu_seqlens=None):
+def forward_stage1_compute(self, hidden_states, rotary_posemb, cu_seqlens=None, replay_idx=None):
     residual = hidden_states
     hidden_states = self.input_layernorm(hidden_states)
     hidden_states = self.self_attn(hidden_states, rotary_posemb, cu_seqlens)
@@ -38,11 +38,11 @@ def forward_stage1_compute(self, hidden_states, rotary_posemb, cu_seqlens=None):
     if hasattr(self.mlp, "shared_experts"):
         residual = residual + self.mlp.shared_experts(hidden_states)
 
-    topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states)
+    topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states, replay_idx)
     return hidden_states, residual, topk_idx, topk_weight, lb_loss
 ```
 
-The `MoELoadBalanceLossTracker.add(lb_loss)` call and the dispatch prep stay in the *eager* `forward_stage1` wrapper - see `protocol.md`.
+The `MoELoadBalanceLossTracker.add(lb_loss)` call, the dispatch prep and the routing-replay lookup stay in the *eager* `forward_stage1` wrapper - see `protocol.md`. The wrapper resolves `replay_idx = replay_indices(self.mlp.gate, hidden_states, top_k)` and passes it in, so the compiled region sees replayed routes as a tensor input rather than tracing the Python state behind `router_replay`; with no replay installed it is `None` and the graph is unchanged.
 
 ### Region 2 (optional): router / gate `forward`
 
@@ -51,10 +51,13 @@ GPT-OSS compiles its router; if you follow that pattern, the whole method must t
 ```python
 class <Prefix>TopKRouter(nn.Module):   # or <Prefix>Gate - match HF
     @torch.compile(fullgraph=True)
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, replay_idx=None):
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         logits = F.linear(hidden_states, self.weight, self.bias)  # bias optional
         topk_logits, topk_idx = torch.topk(logits, k=self.num_experts_per_tok, dim=-1, sorted=True)
+        if replay_idx is not None:  # resolved in eager by the caller, see Region 1
+            topk_idx = replay_idx
+            topk_logits = logits.gather(-1, topk_idx)
         topk_weight = F.softmax(topk_logits, dim=-1, dtype=torch.float32)
 
         if self.load_balance_loss_fn is None:
