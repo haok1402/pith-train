@@ -296,10 +296,7 @@ def main(model_name: str):
             chunk_l = label_scale * torch.randn(micro_batch_size, seqlen, vocab_size, dtype=dtype)
             chunk_cu = None
             if packed:
-                # Split each sample into documents and check the block-diagonal cu_seqlens path
-                # against the reference (attention only; the MSE loss is unaffected). Under
-                # ragged the document count varies too, so each micro-batch carries a
-                # differently sized cu_seqlens.
+                # Ragged batches vary the document count as well as the token count.
                 num_docs = 2 + (j % 2) if ragged else 3
                 bounds = [round(seqlen * k / num_docs) for k in range(num_docs + 1)]
                 chunk_cu = torch.tensor(bounds, dtype=torch.int32)

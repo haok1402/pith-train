@@ -19,7 +19,7 @@ from pithtrain.operators.cp_sequence import (
     zigzag_to_contiguous,
 )
 from pithtrain.operators.ep_dispatch import prepare_dispatch
-from pithtrain.operators.flash_attn_v4 import flash_attn_func
+from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
 from pithtrain.operators.gated_delta_rule import gated_delta_rule
 from pithtrain.operators.ring_attention import ring_attention_func
 from pithtrain.operators.silu_mul import silu_mul
@@ -30,6 +30,14 @@ from pithtrain.operators.token_scatter import (
 )
 from pithtrain.pipeline.dualpipev import layer_partition
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
+
+
+def document_positions(cu_seqlens: torch.Tensor, S: int) -> torch.Tensor:
+    """
+    Per-document token positions without a host sync or data-dependent output shape.
+    """
+    idx = torch.arange(S, device=cu_seqlens.device, dtype=cu_seqlens.dtype)
+    return idx - cu_seqlens[torch.searchsorted(cu_seqlens, idx, right=True) - 1]
 
 
 class Qwen35MoeRMSNorm(nn.Module):
@@ -98,7 +106,9 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.out_proj = training.Linear(self.value_dim, self.hidden_size, bias=False)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None
+    ) -> torch.Tensor:
         B, S, _ = hidden_states.shape
         mixed_qkv = self.in_proj_qkv(hidden_states)
         z = self.in_proj_z(hidden_states).reshape(B, S, -1, self.head_v_dim)
@@ -109,8 +119,15 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         if distributed.cp_size > 1:
             offset = self.conv_kernel_size - 1
             mixed_qkv = prepend_conv_state(mixed_qkv, offset, distributed.cp_group)
-        conv_out = self.conv1d(mixed_qkv.transpose(1, 2))[..., offset : offset + S]
-        mixed_qkv = F.silu(conv_out).transpose(1, 2)
+        if cu_seqlens is None:
+            conv_out = self.conv1d(mixed_qkv.transpose(1, 2))[..., offset : offset + S]
+        else:
+            # Mask taps crossing document boundaries. Round after SiLU to match Inductor's
+            # fused conv/SiLU; an intermediate bf16 cast makes eager and compiled results differ.
+            k, pos = self.conv_kernel_size, document_positions(cu_seqlens, S)
+            x, w = F.pad(mixed_qkv.transpose(1, 2).float(), (k - 1, 0)), self.conv1d.weight.float()
+            conv_out = sum(x[..., i : i + S] * w[..., i] * (pos >= k - 1 - i) for i in range(k))
+        mixed_qkv = F.silu(conv_out).to(mixed_qkv.dtype).transpose(1, 2)
         query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)  # fmt: skip
         query = F.normalize(query.reshape(B, S, -1, self.head_k_dim), dim=-1)
         key = F.normalize(key.reshape(B, S, -1, self.head_k_dim), dim=-1)
@@ -118,6 +135,10 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         beta = b.sigmoid()
         # .float() on A_log guards against -inf when loaded in low precision.
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
+        if cu_seqlens is not None:
+            # exp(-128) underflows fp32 to zero, resetting state at document boundaries.
+            # A finite gate avoids FLA's inf-inf; its magnitude preserves chunk-cumsum precision.
+            g = torch.where(pos[:, None] == 0, -128.0, g)
         if self.num_v_heads // self.num_k_heads > 1:
             repeats = self.num_v_heads // self.num_k_heads
             query = query.repeat_interleave(repeats, dim=2)
@@ -168,7 +189,10 @@ class Qwen35MoeAttention(nn.Module):
         return q_embed, k_embed
 
     def forward(
-        self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]
+        self,
+        hidden_states: torch.Tensor,
+        rotary_posemb: tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, S, _ = hidden_states.size()
         query_states, gate = torch.chunk(self.q_proj(hidden_states).view(B, S, -1, self.head_dim * 2), 2, dim=-1)  # fmt: skip
@@ -179,6 +203,8 @@ class Qwen35MoeAttention(nn.Module):
         query_states, key_states = self.apply_rotary_posemb(query_states, key_states, rotary_posemb)
         if distributed.cp_size > 1:
             attn_output = ring_attention_func(query_states, key_states, value_states, sm_scale=self.scaling, cp_group=distributed.cp_group)  # fmt: skip
+        elif cu_seqlens is not None:
+            attn_output = flash_attn_varlen_func(query_states.squeeze(0), key_states.squeeze(0), value_states.squeeze(0), cu_seqlens, S, softmax_scale=self.scaling, causal=True).unsqueeze(0)  # fmt: skip
         else:
             attn_output = flash_attn_func(query_states, key_states, value_states, softmax_scale=self.scaling, causal=True)  # fmt: skip
         attn_output = attn_output.reshape(B, S, -1)
@@ -313,6 +339,7 @@ class Qwen35MoeDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         rotary_posemb: tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor | None = None,
         replay_idx: torch.Tensor | None = None,
     ):
         if self.to_contiguous:
@@ -320,9 +347,9 @@ class Qwen35MoeDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         if self.is_linear:
-            hidden_states = self.linear_attn(hidden_states)
+            hidden_states = self.linear_attn(hidden_states, cu_seqlens)
         else:
-            hidden_states = self.self_attn(hidden_states, rotary_posemb)
+            hidden_states = self.self_attn(hidden_states, rotary_posemb, cu_seqlens)
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -336,9 +363,8 @@ class Qwen35MoeDecoderLayer(nn.Module):
         rotary_posemb: tuple[torch.Tensor, torch.Tensor],
         cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, RoutingInfo | None]:
-        assert cu_seqlens is None, "packed sequences are not yet implemented for Gated DeltaNet"
         replay_idx = replay_indices(self.mlp.gate, hidden_states, self.mlp.num_experts_per_tok)
-        hidden_states, residual, topk_idx, topk_weight, lb_loss = self.forward_stage1_compute(hidden_states, rotary_posemb, replay_idx)  # fmt: skip
+        hidden_states, residual, topk_idx, topk_weight, lb_loss = self.forward_stage1_compute(hidden_states, rotary_posemb, cu_seqlens, replay_idx)  # fmt: skip
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
         dispatch_tokens, routing = prepare_dispatch(hidden_states, topk_idx, topk_weight, self.mlp.num_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)  # fmt: skip
@@ -380,16 +406,19 @@ class Qwen35MoeDecoderLayer(nn.Module):
         return hidden_states
 
     def reference_forward(
-        self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]
+        self,
+        hidden_states: torch.Tensor,
+        rotary_posemb: tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.to_contiguous:
             hidden_states = zigzag_to_contiguous(hidden_states, distributed.cp_group)
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         if self.is_linear:
-            hidden_states = self.linear_attn(hidden_states)
+            hidden_states = self.linear_attn(hidden_states, cu_seqlens)
         else:
-            hidden_states = self.self_attn(hidden_states, rotary_posemb)
+            hidden_states = self.self_attn(hidden_states, rotary_posemb, cu_seqlens)
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -436,8 +465,12 @@ class Qwen35MoeModel(nn.Module):
     def forward_posemb(
         self, S: int, cu_seqlens: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert cu_seqlens is None
         device = distributed.device
+        assert cu_seqlens is None or distributed.cp_size == 1
+        if cu_seqlens is not None:
+            position_ids = document_positions(cu_seqlens, S)
+            cos, sin = self.rotary_emb(S)
+            return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
         cp_size = distributed.cp_size
         spans = zigzag_spans(distributed.cp_rank, cp_size, S * cp_size)
         position_ids = torch.cat([torch.arange(s.start, s.stop, device=device) for s in spans])
@@ -459,12 +492,11 @@ class Qwen35MoeModel(nn.Module):
     def reference_forward(
         self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None
     ) -> torch.Tensor:
-        assert cu_seqlens is None, "packed sequences are not yet implemented for Gated DeltaNet"
         if self.stage_index == 0:
             hidden_states = self.forward_prolog(hidden_states)
         rotary_posemb = self.forward_posemb(hidden_states.shape[1], cu_seqlens)
         for _, layer in self.layers.items():
-            hidden_states = layer.reference_forward(hidden_states, rotary_posemb)
+            hidden_states = layer.reference_forward(hidden_states, rotary_posemb, cu_seqlens)
         if self.stage_index == self.stage_count - 1:
             hidden_states = self.forward_epilog(hidden_states)
         return hidden_states
