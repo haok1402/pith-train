@@ -137,6 +137,10 @@ class DualPipeV(nn.Module):
         post_backward invocation after the loop).
       - FP8 weight caching across micro-batches via FP8WeightCacheControl.
       - Pre-allocated ChunkRecord for zero-allocation pipeline execution.
+
+    Data parallelism is ZeRO-1, following DeepSeek-V3: every rank holds the full weights and
+    accumulates full-size gradients for the whole step, and each FSDP group reduce-scatters its
+    gradients once at the end of the step.
     """
 
     def __init__(self, modules: Tuple[nn.Module, nn.Module]) -> None:
@@ -570,19 +574,17 @@ class DualPipeV(nn.Module):
         """
         self.forward_only = not torch.is_grad_enabled()
 
-        # Disable reshard and gradient sync after backward for FSDP
+        # ZeRO-1 for the step: no resharding or gradient sync after backward, and no root
+        # post-backward callback per backward; the end of step() runs both once.
         for module in self.module:
             if isinstance(module, FSDPModule):
                 module.set_is_last_backward(False)
                 module.set_reshard_after_backward(False)
                 module.set_requires_gradient_sync(False)
-                # Suppress FSDP's root post-backward callback during the pipeline
-                # loop. Each run_backward() would otherwise queue this callback,
-                # which iterates ALL FSDP states (~150-250 us CPU overhead per
-                # backward stage). The flag resets when run_post_backward() calls
-                # _root_post_backward_final_callback() directly after the loop.
                 if not self.forward_only:
-                    fully_shard.state(module)._state_ctx.post_backward_final_callback_queued = True
+                    state_ctx = fully_shard.state(module)._state_ctx
+                    assert hasattr(state_ctx, "post_backward_final_callback_queued")
+                    state_ctx.post_backward_final_callback_queued = True
 
         pp_rank, pp_size = distributed.pp_rank, distributed.pp_size
 
@@ -680,30 +682,23 @@ class DualPipeV(nn.Module):
         # Release FP8 weight caches so the memory is available for optimizer.step().
         FP8WeightCacheControl.clear(*self.module)
 
-        def run_post_backward(fsdp_module: FSDPModule) -> None:
-            fsdp_module.set_is_last_backward(True)
-            fsdp_module.set_reshard_after_backward(True)
-            fsdp_module.set_requires_gradient_sync(True)
-            fsdp_state = fully_shard.state(fsdp_module)  # type: ignore[attr-defined]
+        # End of the ZeRO-1 step: fold the bf16 gradients into the fp32 buffers, reduce-scatter
+        # each group once, reshard its weights, and run the root callback skipped above.
+        for module in self.module:
+            if not isinstance(module, FSDPModule):
+                continue
+            module.set_is_last_backward(True)
+            module.set_reshard_after_backward(True)
+            module.set_requires_gradient_sync(True)
+            fsdp_state = fully_shard.state(module)
             for state in fsdp_state._state_ctx.all_states:
                 if state._fsdp_param_group:
-                    # Fold wgrad-delay's trailing param_dtype write into the
-                    # reduce_dtype accumulator so foreach_reduce sees uniform
-                    # dtype. accumulate first (to_accumulated would otherwise
-                    # clobber prior fp32 contributions).
                     for fsdp_param in state._fsdp_param_group.fsdp_params:
                         if hasattr(fsdp_param, "_unsharded_param"):
                             fsdp_param.accumulate_unsharded_grad_if_needed()
                             fsdp_param.to_accumulated_grad_if_needed()
                     state._fsdp_param_group.post_backward()
-
-            # Pipeline backward bypasses .backward(), so FSDP's autograd hooks never fire. Call its
-            # post-backward callback manually to sync grad reduction ops back to the default stream.
             fsdp_state._root_post_backward_final_callback()
-
-        for module in self.module:
-            if isinstance(module, FSDPModule):
-                run_post_backward(module)
 
         return objective_outputs
 
