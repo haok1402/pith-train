@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    import torch.nn as nn
     from torch.optim import Optimizer
     from torch.optim.lr_scheduler import LRScheduler
 
@@ -32,7 +31,7 @@ This and the two class bindings below are read from module constructors and kern
 configuration object, so they live here rather than being passed down.
 """
 
-Linear: type[nn.Linear | linear.FP8Linear]
+Linear: type[linear.BF16Linear | linear.FP8Linear]
 """
 The dense linear class the models construct.
 """

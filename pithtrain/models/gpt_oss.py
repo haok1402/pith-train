@@ -21,6 +21,7 @@ from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen
 from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
 from pithtrain.operators.grouped_linear import FP8GroupedLinearFunc, GroupedLinearFunc
 from pithtrain.operators.indexed_bias_add import indexed_bias_add
+from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
     precompute_group_indices,
@@ -390,7 +391,7 @@ class GptOssModel(nn.Module):
             self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         if stage_index == stage_count - 1:
             self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            self.lm_head = BF16Linear(config.hidden_size, config.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
             {
                 str(i): GptOssDecoderLayer(config, i)

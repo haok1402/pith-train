@@ -30,7 +30,8 @@ from pithtrain.models.qwen35_moe import Qwen35MoeModel
 from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
 from pithtrain.modules.optimizer import Muon
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
-from pithtrain.operators.linear import FP8Linear
+from pithtrain.operators.linear import BF16Linear, FP8Linear
+from pithtrain.operators.wgrad_accumulation import install_wgrad_accumulation
 from pithtrain.pipeline import DualPipeV
 
 from .distributed import DistributedCfg
@@ -377,7 +378,7 @@ def setup_model(
     distributed_cfg: DistributedCfg,
 ) -> None:
     training.fp8 = cfg.fp8
-    training.Linear = FP8Linear if cfg.fp8 else nn.Linear
+    training.Linear = FP8Linear if cfg.fp8 else BF16Linear
     training.GroupedLinear = FP8GroupedLinear if cfg.fp8 else GroupedLinear
 
     cp_size = distributed.cp_size
@@ -418,6 +419,8 @@ def setup_model(
 
     modules = nn.Sequential(*modules)
     apply_fsdp(modules, distributed_cfg.hsdp_replica)
+    if not cfg.fp8:
+        install_wgrad_accumulation(modules)
 
     # The two V-chunks build identical read-only rotary caches; share one to save memory.
     if hasattr(modules[0], "rotary_emb") and hasattr(modules[1], "rotary_emb"):

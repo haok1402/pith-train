@@ -17,6 +17,7 @@ from pithtrain.modules.load_balance import (
 from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
+from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.ring_attention import mla_ring_attention_func
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
@@ -412,7 +413,7 @@ class DeepSeekV2Model(nn.Module):
             self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         if stage_index == stage_count - 1:
             self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            self.lm_head = BF16Linear(config.hidden_size, config.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
             {
                 str(i): DeepSeekV2DecoderLayer(config, i)
