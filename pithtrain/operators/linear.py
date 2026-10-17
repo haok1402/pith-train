@@ -1,17 +1,21 @@
 """
-FP8 linear layer (DeepGEMM) and the shared FP8 GEMM recipe.
+BF16 linear layer, FP8 linear layer (DeepGEMM) and the shared FP8 GEMM recipe.
 
 ``FP8Linear`` is a drop-in ``nn.Linear`` replacement backed by DeepGEMM's Float8 E4M3 GEMM with
 per-block (128-element) E8M0 power-of-2 scales -- native (MXFP8 PTX) on Blackwell (SM100+) and
 emulated on Hopper (SM90). ``fp8_act_weight_gemm`` / ``fp8_dgrad_wgrad`` own the forward/backward
 GEMM convention and are shared with the MLA pass-latent ring attention.
+
+BF16Linear accumulates its weight gradient into an fp32 main_grad when one is set.
 """
 
-from typing import Tuple
+from typing import Any, Optional, Tuple
 
 import deep_gemm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch._inductor.lowering import fallback_handler, register_lowering
 
 from pithtrain.operators.deepgemm_quantize import (
     fp8cast_blockwise_transpose,
@@ -206,3 +210,72 @@ class FP8Linear(nn.Linear):
         if self.bias is not None:
             output = output + self.bias
         return output
+
+
+# Inductor has no single-GEMM lowering for addmm with out_dtype, so the fused GEMM is its own op.
+_lib = torch.library.Library("pithtrain", "FRAGMENT")
+_lib.define("wgrad_accumulate_(Tensor(a!) main_grad, Tensor a, Tensor b) -> ()")
+
+
+def _wgrad_accumulate_cuda(main_grad: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> None:
+    torch.addmm(main_grad, a, b, out_dtype=torch.float32, out=main_grad)
+
+
+def _wgrad_accumulate_meta(main_grad: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> None:
+    return None
+
+
+_lib.impl("wgrad_accumulate_", _wgrad_accumulate_cuda, "CUDA")
+_lib.impl("wgrad_accumulate_", _wgrad_accumulate_meta, "Meta")
+_addmm_dtype_out = fallback_handler(torch.ops.aten.addmm.dtype_out, add_to_fallback_set=False)
+
+
+@register_lowering(torch.ops.pithtrain.wgrad_accumulate_.default, type_promotion_kind=None)
+def _lower_wgrad_accumulate(main_grad: Any, a: Any, b: Any) -> None:
+    _addmm_dtype_out(main_grad, a, b, torch.float32, beta=1, alpha=1, out=main_grad)
+
+
+class BF16LinearFunc(torch.autograd.Function):
+    """
+    BF16 linear whose backward accumulates the weight gradient into main_grad in one GEMM.
+
+    main_grad stays on ctx rather than in saved tensors, as other micro-batches update it in between.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        main_grad: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(input, weight)
+        ctx.main_grad = main_grad
+        return F.linear(input, weight)
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
+    ) -> Tuple[torch.Tensor, None, None]:
+        input, weight = ctx.saved_tensors
+        main_grad = ctx.main_grad
+        grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
+        input_2d = input.reshape(-1, input.shape[-1])
+        grad_input = (grad_output_2d @ weight).view(*input.shape)
+        torch.ops.pithtrain.wgrad_accumulate_(main_grad, grad_output_2d.t(), input_2d)
+        return grad_input, None, None
+
+
+class BF16Linear(nn.Linear):
+    """
+    BF16 linear layer. With main_grad set, the weight gradient accumulates into it in fp32 instead
+    of a .grad; without it, the layer is nn.Linear.
+    """
+
+    main_grad: Optional[torch.Tensor] = None
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if self.main_grad is None or not torch.is_grad_enabled():
+            return F.linear(input, self.weight, self.bias)
+        output = BF16LinearFunc.apply(input, self.weight, self.main_grad)
+        return output if self.bias is None else output + self.bias

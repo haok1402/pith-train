@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Optional
+from typing import List, Optional
 
 import deep_gemm
 import torch
@@ -34,17 +34,26 @@ class GroupedLinearFunc(torch.autograd.Function):
         input: torch.Tensor,
         weight: torch.Tensor,
         grouped_mm_offs: torch.Tensor,
+        main_grad: Optional[torch.Tensor] = None,
+        ks: Optional[List[int]] = None,
+        ks_tensor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         output = F.grouped_mm(input, weight.transpose(1, 2), offs=grouped_mm_offs)
         ctx.save_for_backward(input, weight, grouped_mm_offs)
+        ctx.main_grad, ctx.ks, ctx.ks_tensor = main_grad, ks, ks_tensor
         return output
 
     @staticmethod
     def backward(ctx, dy):
         input, weight, offs = ctx.saved_tensors
         dgrad = F.grouped_mm(dy, weight, offs=offs)
+        main_grad, ks, ks_tensor = ctx.main_grad, ctx.ks, ctx.ks_tensor
 
-        def wgrad_fn(dy, x, offs):
+        def wgrad_fn(dy: torch.Tensor, x: torch.Tensor, offs: torch.Tensor) -> None:
+            if main_grad is not None:
+                dy, x = dy.contiguous(), x.contiguous()
+                deep_gemm.k_grouped_bf16_gemm_tn_contiguous(dy, x, main_grad, ks, ks_tensor, c=main_grad)  # fmt: skip
+                return
             wgrad = F.grouped_mm(dy.transpose(0, 1), x, offs=offs)
             weight.grad = wgrad if weight.grad is None else weight.grad.add_(wgrad)
 
@@ -53,7 +62,7 @@ class GroupedLinearFunc(torch.autograd.Function):
         else:
             wgrad_fn(dy, input, offs)
 
-        return dgrad, None, None
+        return dgrad, None, None, None, None, None
 
 
 class GroupedLinear(nn.Module):
@@ -62,6 +71,8 @@ class GroupedLinear(nn.Module):
     linear transformation per group. This is useful for the MLP layers in
     the mixture-of-experts models.
     """
+
+    main_grad: Optional[torch.Tensor] = None
 
     def __init__(self, num_groups: int, in_features: int, out_features: int):
         super().__init__()
@@ -74,7 +85,7 @@ class GroupedLinear(nn.Module):
         self,
         input: torch.Tensor,
         grouped_mm_offs: torch.Tensor,
-        ks: Optional[list] = None,
+        ks: Optional[List[int]] = None,
         ks_tensor: Optional[torch.Tensor] = None,
         group_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -82,7 +93,11 @@ class GroupedLinear(nn.Module):
             # Use a matmul instead of new_empty to preserve the autograd graph.
             # With 0 tokens the result is (0, out_features) and gradients are zero,
             # but the grad_fn must exist so that run_backward does not crash.
-            return input @ self.weight[0].T
+            weight = self.weight[0] if self.main_grad is None else self.weight[0].detach()
+            return input @ weight.T
+        if self.main_grad is not None and torch.is_grad_enabled():
+            assert ks is not None and ks_tensor is not None
+            return GroupedLinearFunc.apply(input, self.weight, grouped_mm_offs, self.main_grad, ks, ks_tensor)  # fmt: skip
         return GroupedLinearFunc.apply(input, self.weight, grouped_mm_offs)
 
 
