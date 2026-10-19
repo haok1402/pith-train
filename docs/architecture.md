@@ -119,7 +119,7 @@ FP8 matmuls are backed by DeepSeek's [DeepGEMM](https://github.com/deepseek-ai/D
 A whole model flips between FP8 and BF16 through one flag, `TrainingCfg.fp8`. At training setup (`pithtrain/modules/training.py`) it binds the linear classes the models build with, published on the `training` context:
 
 ```python
-training.Linear        = FP8Linear        if cfg.fp8 else nn.Linear
+training.Linear        = FP8Linear        if cfg.fp8 else BF16Linear
 training.GroupedLinear = FP8GroupedLinear if cfg.fp8 else GroupedLinear
 ```
 

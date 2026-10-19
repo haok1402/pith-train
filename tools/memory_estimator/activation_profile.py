@@ -322,7 +322,7 @@ class ActivationEstimator:
             all_autograd.add(f"p{phase}.c{chunk_id}.epilog.ag.norm_input", (B, S, H), "bf16")
             # Autograd: lm_head input (= norm output)
             all_autograd.add(f"p{phase}.c{chunk_id}.epilog.ag.lm_head_input", (B, S, H), "bf16")
-            # Note: nn.Linear saves weight for backward (F.linear grad_weight),
+            # Note: the lm_head BF16Linear saves its weight for backward (for grad_input),
             # but lm_head weight is already counted in static params_unsharded
             # (module[1] params).  Not counted here to avoid double-counting.
 

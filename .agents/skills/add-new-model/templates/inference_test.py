@@ -56,6 +56,7 @@ from pithtrain.pipeline import DualPipeV, Microbatch
 from pithtrain.models.hf_prefix import HFPrefixModel
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.operators.grouped_linear import GroupedLinear
+from pithtrain.operators.linear import BF16Linear
 from pithtrain.tasks.convert_checkpoint import ConvertCheckpointCfg
 from pithtrain.tasks.convert_checkpoint import launch as convert_launch
 
@@ -168,7 +169,7 @@ def build_dualpipev(config, dtype: torch.dtype) -> DualPipeV:
     # These models build training.Linear / training.GroupedLinear at construction time;
     # bind the BF16 backend (setup_model normally does this).
     training.fp8 = False
-    training.Linear = nn.Linear
+    training.Linear = BF16Linear
     training.GroupedLinear = GroupedLinear
 
     modules = [
