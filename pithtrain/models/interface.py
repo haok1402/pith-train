@@ -15,6 +15,9 @@ class RoutingInfo(NamedTuple):
     expand_idx: Optional[torch.Tensor] = None
     dispatch_splits: Optional[AllToAllSplits] = None
     combine_splits: Optional[AllToAllSplits] = None
+    expert_counts: Optional[list[int]] = None
+    """Rows routed to each local expert, on the host, when dispatch already knows them; lets stage 3
+    size its grouped GEMMs without another device-to-host sync."""
 
 
 class MLPProtocol(Protocol):
@@ -63,6 +66,7 @@ class LayerProtocol(Protocol):
         gathered_tokens: torch.Tensor,
         expert_idxs: Optional[torch.Tensor] = None,
         expand_idx: Optional[torch.Tensor] = None,
+        expert_counts: Optional[list[int]] = None,
     ) -> torch.Tensor:
         """
         Stage 3, the expert compute (runs after the stage-2 dispatch and before the stage-4 combine).

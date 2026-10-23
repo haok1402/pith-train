@@ -222,6 +222,8 @@ def test_grouped_linear_module():
 
     # Create module
     module = GroupedLinear(num_groups, in_features, out_features).to(device).to(dtype)
+    # The weight is allocated with torch.empty; reused allocator memory can hold NaN.
+    torch.nn.init.normal_(module.weight, std=0.02)
 
     # Create packed input
     M_total = sum(group_sizes)

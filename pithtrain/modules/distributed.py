@@ -73,6 +73,40 @@ def setup_torch_runtime() -> None:
     torch._dynamo.config.recompile_limit = 64
 
 
+def _cpulist(text: str) -> list[int]:
+    cpus = []
+    for part in text.strip().split(","):
+        if part:
+            lo, _, hi = part.partition("-")
+            cpus.extend(range(int(lo), int(hi or lo) + 1))
+    return cpus
+
+
+def bind_cpu_affinity(device_id: int) -> None:
+    """
+    Pin this process to every CPU local to its GPU (its socket), before any thread (NCCL, OpenMP,
+    Inductor) is started, so every thread inherits the set.
+
+    The training step is host-bound: one Python thread per rank issues every kernel, and left to
+    the OS scheduler it migrates across sockets, away from its GPU's PCIe root and from the memory
+    it allocated. A process already restricted to fewer CPUs than its GPU's local set (srun
+    --cpu-bind, numactl, taskset) keeps the binding it was given. Only the CPU placement changes,
+    never any GPU work.
+    """
+    p = torch.cuda.get_device_properties(device_id)
+    path = "/sys/bus/pci/devices/%04x:%02x:%02x.0/local_cpulist" % (
+        p.pci_domain_id, p.pci_bus_id, p.pci_device_id
+    )  # fmt: skip
+    try:
+        with open(path) as f:
+            cpus = _cpulist(f.read())
+    except OSError:
+        return
+    if not cpus or not set(cpus) <= os.sched_getaffinity(0):
+        return
+    os.sched_setaffinity(0, cpus)
+
+
 def setup_default_process_group(cfg: DistributedCfg, device_id: int) -> None:
     """
     Create and own the default process group, and register its teardown at exit.
@@ -160,5 +194,6 @@ def setup_distributed(cfg: object) -> None:
     assert hasattr(cfg, "distributed") and isinstance(cfg.distributed, DistributedCfg)
     setup_torch_runtime()
     device_id = int(os.environ["LOCAL_RANK"])
+    bind_cpu_affinity(device_id)
     setup_default_process_group(cfg.distributed, device_id)
     setup_device_mesh(cfg.distributed, device_id)

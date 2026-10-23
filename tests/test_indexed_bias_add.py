@@ -186,3 +186,22 @@ def test_indexed_bias_add_realistic_gpt_oss_shape():
     torch.testing.assert_close(out_cu, x + bias[group_ids], atol=0.0, rtol=0.0)
     # bias.grad within bf16-atomic tolerance of the fp32 GT.
     torch.testing.assert_close(b_cu.grad.float(), bias_grad_gt, atol=5e-1, rtol=5e-2)
+
+
+@pytest.mark.parametrize("offs_len", [0, 8])
+def test_indexed_bias_add_no_rows(offs_len):
+    """
+    Regression: an EP rank that receives no tokens (M == 0, offsets empty or all zero) must get a
+    bias-shaped zero gradient, not a (0, H) one (autograd raised "invalid gradient at index 1").
+    """
+    device = "cuda"
+    E, H = 8, 2880
+    x = torch.zeros(0, H, dtype=torch.bfloat16, device=device, requires_grad=True)
+    bias = torch.randn(E, H, dtype=torch.bfloat16, device=device, requires_grad=True)
+    group_ids = torch.zeros(0, dtype=torch.int64, device=device)
+    offs = torch.zeros(offs_len, dtype=torch.int32, device=device)
+    out = indexed_bias_add(x, bias, group_ids, offs)
+    out.sum().backward()
+    assert bias.grad is not None and bias.grad.shape == bias.shape
+    assert torch.count_nonzero(bias.grad) == 0
+    assert x.grad.shape == x.shape

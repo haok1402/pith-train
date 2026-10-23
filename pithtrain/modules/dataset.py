@@ -9,6 +9,7 @@ TODO: if the shuffled index array exceeds GPU memory, implement block-wise shuff
 """
 
 import os
+import time
 from pathlib import Path
 from typing import List, Tuple
 
@@ -44,29 +45,41 @@ class MemmapDataset:
         return tokens, labels
 
 
+def _save_atomic(path: Path, array: np.ndarray) -> None:
+    """
+    np.save through a private temporary file and a rename, so a concurrent run sharing the corpus
+    directory never maps a partly written file. Same-key writers write identical bytes.
+    """
+    tmp = path.with_name("%s.%d.%d.tmp.npy" % (path.stem, os.getpid(), time.time_ns()))
+    np.save(tmp, array)
+    os.replace(tmp, path)
+
+
 class ConcatDataset:
     """Concatenates multiple MemmapDatasets with global shuffling."""
-
-    OFFSETS = "offsets.npy"
-    INDICES = "indices.npy"
 
     def __init__(self, memmap_datasets: List[MemmapDataset], seed: int):
         self.memmap_datasets = memmap_datasets
         root = os.path.commonpath([str(d.root) for d in memmap_datasets])
-        offsets_path = Path(root, ConcatDataset.OFFSETS)
-        indices_path = Path(root, ConcatDataset.INDICES)
-        # The first rank on each node computes offsets and shuffled indices.
-        # All other ranks wait at the barrier until the results are ready for mmap.
-        if int(os.environ["LOCAL_RANK"]) == 0:
+        # Both files depend on the sequence length (it sets each shard's sample count) and the
+        # shuffle on the seed, and runs with different settings share one corpus directory, so
+        # the names carry both.
+        tag = "s%d-seed%d" % (memmap_datasets[0].sequence_length, seed)
+        offsets_path = Path(root, "offsets-%s.npy" % tag)
+        indices_path = Path(root, "indices-%s.npy" % tag)
+        # Global rank 0 computes offsets and shuffled indices; every other rank waits at the
+        # barrier and maps the same files. One writer, because nodes renaming the same names in a
+        # shared directory race each other.
+        if torch.distributed.get_rank() == 0:
             offsets = np.cumsum([len(ds) for ds in memmap_datasets])
-            np.save(offsets_path, offsets)
+            _save_atomic(offsets_path, offsets)
             kwargs = dict()
             kwargs["device"] = torch.cuda.current_device()
             generator = torch.Generator(kwargs["device"])
             generator = generator.manual_seed(seed)
             kwargs["generator"] = generator
             indices = torch.randperm(offsets[-1], **kwargs)
-            np.save(indices_path, indices.cpu().numpy())
+            _save_atomic(indices_path, indices.cpu().numpy())
         torch.distributed.barrier()
         self.offsets = np.load(offsets_path, mmap_mode="r")
         self.indices = np.load(indices_path, mmap_mode="r")

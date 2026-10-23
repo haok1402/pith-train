@@ -256,90 +256,68 @@ def test_fused_dedup_dispatch_m_zero():
 # -- Unit tests for post-all-to-all fused kernels --
 
 
-@pytest.mark.parametrize("ms,k,num_experts,ep_size", CONFIGS)
-@pytest.mark.parametrize("seed", [0, 42])
-def test_adjust_expand_idx(ms, k, num_experts, ep_size, seed):
-    """Compare fused adjust_expand_idx against PyTorch reference."""
-    from pithtrain.operators.ep_dispatch import adjust_expand_idx
-
-    torch.manual_seed(seed)
-    device = "cuda"
-
-    # Generate realistic inputs: simulate received data from ep_size senders
-    dedup_tokens_from_each_gpu = torch.randint(1, max(ms, 2), (ep_size,), device=device)
-    output_splits_tensor = torch.randint(1, max(ms * k // ep_size, 2), (ep_size,), device=device)
-    total = output_splits_tensor.sum().item()
-    total_dedup = dedup_tokens_from_each_gpu.sum().item()
-
-    received_expand_idx = torch.randint(0, max(total_dedup, 1), (total,), device=device)
-
-    # Reference (PyTorch)
-    dedup_starts = dedup_tokens_from_each_gpu.cumsum(0) - dedup_tokens_from_each_gpu
-    offset_adj = dedup_starts.repeat_interleave(output_splits_tensor)
-    ref = received_expand_idx + offset_adj
-
-    # Fused kernel
-    result = adjust_expand_idx(
-        received_expand_idx, dedup_tokens_from_each_gpu, output_splits_tensor
-    )
-
-    assert torch.equal(result, ref), "adjust_expand_idx mismatch"
+def _recv_meta(tpe: torch.Tensor, dedup: torch.Tensor) -> torch.Tensor:
+    """Interleaved received metadata: per sender, its per-expert counts then its dedup count."""
+    return torch.cat([tpe, dedup[:, None]], dim=1).reshape(-1).contiguous()
 
 
 @pytest.mark.parametrize("ms,k,num_experts,ep_size", CONFIGS)
 @pytest.mark.parametrize("seed", [0, 42])
-def test_build_expert_idxs(ms, k, num_experts, ep_size, seed):
-    """Compare fused build_expert_idxs against PyTorch reference."""
-    from pithtrain.operators.ep_dispatch import build_expert_idxs
-
-    torch.manual_seed(seed)
-    experts_per_rank = num_experts // ep_size
-    device = "cuda"
-
-    # Generate realistic tokens_per_expert_group
-    tokens_per_expert_group = torch.randint(0, max(ms, 2), (num_experts,), device=device)
-
-    # Reference (PyTorch)
-    ref_expert_idxs = (
-        torch.arange(num_experts, device=device) % experts_per_rank
-    ).repeat_interleave(tokens_per_expert_group)
-
-    total = int(tokens_per_expert_group.sum())
-    expert_idxs = build_expert_idxs(tokens_per_expert_group, experts_per_rank, total)
-
-    assert expert_idxs.numel() == total, "one entry per received token slot"
-    assert torch.equal(expert_idxs, ref_expert_idxs), "expert_idxs mismatch"
-
-
-def test_build_expert_idxs_does_not_write_past_its_buffer():
-    """The store mask must come from the allocation, not from a device-side sum.
-
-    The kernel fills ``sum(tokens_per_expert_group)`` entries but is launched over whole
-    BLOCK-sized CTAs, so the last CTA covers offsets past the end. Sizing the output from
-    the same number the mask uses is what keeps that tail masked off. The previous version
-    took the mask bound from ``tokens_per_expert_group`` and the size from the caller, so
-    whenever the caller guessed low it wrote the difference into the next allocation --
-    which in practice was ``output_splits_tensor``, i.e. it corrupted the all-to-all split
-    sizes rather than any tensor the MoE math would notice.
+def test_expert_and_expand_idx(ms, k, num_experts, ep_size, seed):
     """
-    from pithtrain.operators.ep_dispatch import build_expert_idxs
+    The fused post-all-to-all kernel against the PyTorch references of the two kernels it replaced:
+    each slot's local expert (slots are sender-major, expert-minor) and its expand_idx made global
+    by adding the dedup counts of the preceding senders.
+    """
+    from pithtrain.operators.ep_dispatch import expert_and_expand_idx
+
+    torch.manual_seed(seed)
+    device = "cuda"
+    experts_per_rank = num_experts // ep_size
+    tpe = torch.randint(0, max(ms, 2), (ep_size, experts_per_rank), device=device)
+    dedup = torch.randint(1, max(ms, 2) + 1, (ep_size,), device=device)
+    splits = tpe.sum(dim=1)
+    total = int(splits.sum())
+    sender = torch.arange(ep_size, device=device).repeat_interleave(splits)
+    received_expand_idx = (torch.rand(total, device=device) * dedup[sender]).long()
+
+    ref_expert = torch.arange(experts_per_rank, device=device).repeat(ep_size)
+    ref_expert = ref_expert.repeat_interleave(tpe.reshape(-1))
+    dedup_starts = dedup.cumsum(0) - dedup
+    ref_expand = received_expand_idx + dedup_starts.repeat_interleave(splits)
+
+    expert_idxs, expand_idx = expert_and_expand_idx(
+        _recv_meta(tpe, dedup), received_expand_idx, ep_size, experts_per_rank
+    )
+    assert expert_idxs.numel() == total, "one entry per received token slot"
+    assert torch.equal(expert_idxs, ref_expert), "expert_idxs mismatch"
+    assert torch.equal(expand_idx, ref_expand), "expand_idx mismatch"
+
+
+def test_expert_and_expand_idx_does_not_write_past_its_buffer():
+    """
+    The store mask must come from the allocation (the received slot count), not from a device-side
+    sum: the kernel is launched over whole BLOCK-sized CTAs, so the last CTA covers offsets past the
+    end, and a mask bound that disagrees with the allocation writes into the next tensor.
+    """
+    from pithtrain.operators.ep_dispatch import expert_and_expand_idx
 
     device = "cuda"
     ep_size, experts_per_rank = 8, 16
-    num_experts = ep_size * experts_per_rank
+    total = 5501  # not a multiple of the kernel's BLOCK, so the last CTA has a tail
+    tpe = torch.full((ep_size, experts_per_rank), total // (ep_size * experts_per_rank), device=device)  # fmt: skip
+    tpe.view(-1)[: total % (ep_size * experts_per_rank)] += 1
+    assert int(tpe.sum()) == total
+    dedup = torch.full((ep_size,), 64, device=device)
 
-    # Not a multiple of the kernel's BLOCK, so the last CTA really does have a tail.
-    total = 5501
-    counts = torch.full((num_experts,), total // num_experts, dtype=torch.int64, device=device)
-    counts[: total % num_experts] += 1
-    assert int(counts.sum()) == total
-
-    # Canary slab behind the output, so an overrun is observable rather than left to
-    # whatever the caching allocator happened to hand out next.
-    slab = torch.full((total + 4096,), -1, dtype=torch.int64, device=device)
-    slab[:total] = build_expert_idxs(counts, experts_per_rank, total)
+    slab = torch.full((2 * (total + 4096),), -1, dtype=torch.int64, device=device)
+    expand_in = torch.zeros(total, dtype=torch.int64, device=device)
+    expert_idxs, expand_idx = expert_and_expand_idx(_recv_meta(tpe, dedup), expand_in, ep_size, experts_per_rank)  # fmt: skip
+    slab[:total] = expert_idxs
+    slab[total + 4096 : 2 * total + 4096] = expand_idx
     torch.cuda.synchronize()
-    assert int((slab[total:] != -1).sum()) == 0, "kernel wrote past the end of expert_idxs"
+    assert int((slab[total : total + 4096] != -1).sum()) == 0, "wrote past expert_idxs"
+    assert int((slab[2 * total + 4096 :] != -1).sum()) == 0, "wrote past expand_idx"
 
 
 def _ragged_dispatch_worker(rank, world_size, tokens_per_rank, out):

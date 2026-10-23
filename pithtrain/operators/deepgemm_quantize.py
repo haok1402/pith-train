@@ -259,7 +259,7 @@ def fp8cast_rowwise_colwise(
     return out_tok, scale_tok, out_ch, scale_ch
 
 
-def fp8cast_rowwise_kmajor(
+def _fp8cast_rowwise_kmajor_triton(
     x: torch.Tensor,
     grouped_mm_offs: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -426,7 +426,7 @@ def _fp8cast_rowwise_transpose_kernel(
     tl.store(scale_t_ptrs, t_scale, mask=scale_t_mask)
 
 
-def fp8cast_rowwise_transpose(
+def _fp8cast_rowwise_transpose_triton(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused rowwise FP8 quantization of x *and* x.T (single read of *x*).
@@ -572,7 +572,7 @@ def _fp8cast_rowwise_blockwise_transpose_kernel(
     tl.store(scale_blk_t_ptr + scale_blk_t_offset, blk_scale)
 
 
-def fp8cast_rowwise_blockwise_transpose(
+def _fp8cast_rowwise_blockwise_transpose_triton(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused rowwise FP8 quant of *x* and blockwise FP8 quant of *x*.T.
@@ -897,3 +897,49 @@ def fp8cast_blockwise_transpose_batched(
     )
 
     return out, scale, out_t, scale_t
+
+
+# ---------------------------------------------------------------------------
+# Dispatch: CuTe-DSL ports (pithtrain/operators/fp8_cute/) on SM90, bit-identical to the Triton
+# kernels above, faster on the GPU and cheaper to launch from the host.
+# ---------------------------------------------------------------------------
+
+
+def _use_cute() -> bool:
+    """The CuTe-DSL ports are written and verified bit-exact for SM90; elsewhere Triton runs."""
+    return ARCH_MAJOR == 9
+
+
+def fp8cast_rowwise_kmajor(
+    x: torch.Tensor, grouped_mm_offs: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """See _fp8cast_rowwise_kmajor_triton."""
+    if _use_cute():
+        from pithtrain.operators.fp8_cute.rowwise_kmajor import fp8cast_rowwise_kmajor as impl
+
+        return impl(x, grouped_mm_offs)
+    return _fp8cast_rowwise_kmajor_triton(x, grouped_mm_offs)
+
+
+def fp8cast_rowwise_transpose(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """See _fp8cast_rowwise_transpose_triton."""
+    if _use_cute():
+        from pithtrain.operators.fp8_cute.rowwise_transpose import fp8cast_rowwise_transpose as impl
+
+        return impl(x)
+    return _fp8cast_rowwise_transpose_triton(x)
+
+
+def fp8cast_rowwise_blockwise_transpose(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """See _fp8cast_rowwise_blockwise_transpose_triton."""
+    if _use_cute():
+        from pithtrain.operators.fp8_cute.rowwise_blockwise_transpose import (
+            fp8cast_rowwise_blockwise_transpose as impl,
+        )
+
+        return impl(x)
+    return _fp8cast_rowwise_blockwise_transpose_triton(x)

@@ -24,7 +24,7 @@ Stage Mapping:
 """
 
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.cuda.nvtx as nvtx
@@ -61,15 +61,15 @@ from pithtrain.pipeline.execution import (
     stage5_f,
     stage5_stage1_f,
 )
+from pithtrain.pipeline.guard_skip import GuardSkip
 
 
-def layer_partition(num_layers: int, stage_count: int, stage_index: int) -> range:
+def layer_sizes(num_layers: int, stage_count: int) -> list[int]:
     """
-    Return the layer ids that pipeline stage stage_index owns.
+    The number of layers each pipeline stage owns, in stage order.
 
     Layers are spread across the stages as evenly as possible, with the two edges
     kept slightly lighter since they also carry embed_tokens and norm plus lm_head.
-    Each stage owns a contiguous block, and this returns the block for stage_index.
     """
     base, remainder = divmod(num_layers, stage_count)
     layers = [base] * stage_count
@@ -79,9 +79,25 @@ def layer_partition(num_layers: int, stage_count: int, stage_index: int) -> rang
         if best is None:
             best = layers.index(min_val)
         layers[best] += 1
-    begin = sum(layers[:stage_index])
-    end = begin + layers[stage_index]
-    return range(begin, end)
+    return layers
+
+
+def layer_partition(
+    num_layers: int, stage_count: int, stage_index: int, sizes: Sequence[int] | None = None
+) -> range:
+    """
+    Return the layer ids that pipeline stage stage_index owns.
+
+    Each stage owns a contiguous block, and this returns the block for stage_index. sizes, when
+    given, overrides layer_sizes; it must cover num_layers, and the two stages a rank holds must
+    differ by at most one layer, which the overlapped schedule requires.
+    """
+    if sizes is None:
+        sizes = layer_sizes(num_layers, stage_count)
+    assert len(sizes) == stage_count and sum(sizes) == num_layers, sizes
+    assert all(abs(sizes[i] - sizes[stage_count - 1 - i]) <= 1 for i in range(stage_count)), sizes
+    begin = sum(sizes[:stage_index])
+    return range(begin, begin + sizes[stage_index])
 
 
 def min_chunks(pp_size: int) -> int:
@@ -143,6 +159,12 @@ class DualPipeV(nn.Module):
     gradients once at the end of the step.
     """
 
+    reduce_on_compute_stream: bool = True
+    """
+    Run FSDP's end-of-step reduce-scatter copies on the compute stream (see step()). Numerics are
+    unchanged; it only decides which caching-allocator pool the reduce buffers come from.
+    """
+
     def __init__(self, modules: Tuple[nn.Module, nn.Module]) -> None:
         super().__init__()
 
@@ -164,6 +186,7 @@ class DualPipeV(nn.Module):
         self.cu_seqlens_chunks: Optional[List[torch.Tensor]] = None
 
         self.forward_only = False
+        self.guard_skip = GuardSkip()
         self._reset_states()
 
     def _ensure_chunk_records_allocated(self, num_chunks: int) -> None:
@@ -572,6 +595,11 @@ class DualPipeV(nn.Module):
             detached in place after its backward, so return loss.detach() if the value is needed
             once the step is done.
         """
+        # A step whose signature already ran with full Dynamo guards runs without evaluating
+        # them again (see guard_skip.py for what that hides and why it is safe).
+        return self.guard_skip.run(self, microbatches, self._step, microbatches, objective)
+
+    def _step(self, microbatches: List[Microbatch], objective: Optional[Callable]) -> List[Any]:
         self.forward_only = not torch.is_grad_enabled()
 
         # ZeRO-1 for the step: no resharding or gradient sync after backward, and no root
@@ -687,6 +715,13 @@ class DualPipeV(nn.Module):
         for module in self.module:
             if not isinstance(module, FSDPModule):
                 continue
+            if self.reduce_on_compute_stream:
+                # Nothing overlaps the end-of-step reduce, so run its copies on the compute
+                # stream: buffers then come from the compute stream's allocator pool, which the
+                # pipeline has just emptied, instead of a reduce-scatter pool per root that stays
+                # reserved (and unusable by the pipeline) through the whole next step.
+                comm_ctx = fully_shard.state(module)._comm_ctx
+                comm_ctx.reduce_scatter_stream = torch.cuda.current_stream()
             module.set_is_last_backward(True)
             module.set_reshard_after_backward(True)
             module.set_requires_gradient_sync(True)
@@ -888,6 +923,7 @@ def overlapped_forward_backward(
             gathered_tokens,
             routing.expert_idxs if routing is not None else None,
             routing.expand_idx if routing is not None else None,
+            routing.expert_counts if routing is not None else None,
         )
         chunk_record0.layers[layer_idx0].stage3.args = record.args
         chunk_record0.layers[layer_idx0].stage3.outs = record.outs
