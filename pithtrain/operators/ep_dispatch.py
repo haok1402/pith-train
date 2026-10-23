@@ -25,12 +25,17 @@ Key algorithmic improvements over the PyTorch version:
   - tl.histogram replaces global atomic bincount (zero contention)
 """
 
+from dataclasses import dataclass
+
 import torch
 import torch.distributed as dist
 import triton
 import triton.language as tl
 
 from pithtrain.models.interface import AllToAllSplits, RoutingInfo
+from pithtrain.operators import dispatch_cute
+from pithtrain.operators.all_to_all import all_to_all_sync
+from pithtrain.operators.dispatch_cute import dispatch_index as cute_index
 from pithtrain.operators.token_scatter import get_pinned_buffer, padded_index_gather
 
 
@@ -268,11 +273,52 @@ def _dedup_scatter_expand_kernel(
         tl.store(expand_idx_ptr + sorted_idx, local_pos, mask=mask)
 
 
-def fused_dedup_prepare_dispatch(
+# Scratch of fused_dedup_prepare_dispatch, one int64 allocation per shape and stream, sliced once.
+# Only true temporaries live here: every one is written and consumed by the dispatch kernels (and
+# the metadata all-to-all, which the current stream waits for) before the call returns, so the
+# next call on the same stream may reuse it. Outputs that outlive the call (dispatch_token_idxs,
+# idxs, expand_idx, the metadata) are freshly allocated every time.
+_scratch: dict[tuple, tuple[torch.Tensor, ...]] = {}
+_SCRATCH_ENTRIES = 8
+
+
+def _dispatch_scratch(
+    device: torch.device,
+    m: int,
+    num_ctas: int,
+    ne_padded: int,
+    ep_padded: int,
+    num_experts: int,
+    ep_size: int,
+    experts_per_rank: int,
+) -> tuple[torch.Tensor, ...]:
+    key = (device, torch.cuda.current_stream(device).cuda_stream, m, num_experts, ep_size)
+    views = _scratch.get(key)
+    if views is None:
+        sizes = (
+            num_ctas * ne_padded,  # per_cta_expert_hist
+            num_ctas * ep_padded,  # per_cta_gpu_hist
+            num_experts,  # expert_starts
+            ep_size,  # gpu_starts
+            ep_size,  # dedup_counters
+            num_experts,  # sort_counters
+            ep_size * (experts_per_rank + 1),  # send_meta
+            m * ep_size,  # dedup_local_pos
+        )
+        flat = torch.empty(sum(sizes), dtype=torch.int64, device=device)
+        views = tuple(flat.split(sizes))
+        if len(_scratch) >= _SCRATCH_ENTRIES:
+            _scratch.clear()
+        _scratch[key] = views
+    return views
+
+
+def fused_dedup_prepare_dispatch_triton(
     topk_ids: torch.Tensor,
     num_experts: int,
     ep_size: int,
     experts_per_rank: int,
+    meta_out: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,  # tokens_per_ep_rank: (ep_size,) int64
     torch.Tensor,  # dedup_tokens_per_gpu: (ep_size,) int64
@@ -299,7 +345,8 @@ def fused_dedup_prepare_dispatch(
         expand_idx: (m * k,) - for each sorted slot, the local position within
             that token's dedup chunk (used to reconstruct full layout from
             deduplicated tokens after all-to-all).
-        send_meta: (ep_size * (experts_per_rank + 1),) - interleaved metadata
+        send_meta: (ep_size * (experts_per_rank + 1),) - scratch, valid until the next call
+            on the same stream; interleaved metadata
             for a single all-to-all that piggybacks dedup counts alongside
             per-expert token counts.  Viewed as (ep_size, experts_per_rank + 1):
               [:, :experts_per_rank]  = tokens_per_expert per rank
@@ -311,9 +358,12 @@ def fused_dedup_prepare_dispatch(
 
     if m == 0:
         send_meta = torch.zeros(ep_size * (experts_per_rank + 1), dtype=torch.int64, device=device)
+        if meta_out is None:
+            meta_out = torch.empty(2 * ep_size, dtype=torch.int64, device=device)
+        meta_out[: 2 * ep_size].zero_()
         return (
-            torch.zeros(ep_size, dtype=torch.int64, device=device),
-            torch.zeros(ep_size, dtype=torch.int64, device=device),
+            meta_out[:ep_size],
+            meta_out[ep_size : 2 * ep_size],
             torch.empty(0, dtype=torch.int64, device=device),
             torch.empty(0, dtype=torch.int64, device=device),
             torch.empty(0, dtype=torch.int64, device=device),
@@ -331,8 +381,16 @@ def fused_dedup_prepare_dispatch(
     ne_padded = triton.next_power_of_2(num_experts + 1)
     ep_padded = triton.next_power_of_2(ep_size + 1)
 
-    per_cta_expert_hist = torch.empty(num_ctas * ne_padded, dtype=torch.int64, device=device)
-    per_cta_gpu_hist = torch.empty(num_ctas * ep_padded, dtype=torch.int64, device=device)
+    (
+        per_cta_expert_hist,
+        per_cta_gpu_hist,
+        expert_starts,
+        gpu_starts,
+        dedup_counters,
+        sort_counters,
+        send_meta,
+        dedup_local_pos,
+    ) = _dispatch_scratch(device, m, num_ctas, ne_padded, ep_padded, num_experts, ep_size, experts_per_rank)  # fmt: skip
 
     _dedup_bincount_kernel[(num_ctas,)](
         # inputs:
@@ -352,13 +410,9 @@ def fused_dedup_prepare_dispatch(
     )
 
     # -- Kernel 2: reduce histograms, prefix sums, send_meta (single CTA) --
-    dedup_tokens_per_gpu = torch.empty(ep_size, dtype=torch.int64, device=device)
-    tokens_per_ep_rank = torch.empty(ep_size, dtype=torch.int64, device=device)
-    expert_starts = torch.empty(num_experts, dtype=torch.int64, device=device)
-    gpu_starts = torch.empty(ep_size, dtype=torch.int64, device=device)
-    dedup_counters = torch.empty(ep_size, dtype=torch.int64, device=device)
-    sort_counters = torch.empty(num_experts, dtype=torch.int64, device=device)
-    send_meta = torch.empty(ep_size * (experts_per_rank + 1), dtype=torch.int64, device=device)
+    if meta_out is None:
+        meta_out = torch.empty(2 * ep_size, dtype=torch.int64, device=device)
+    tokens_per_ep_rank, dedup_tokens_per_gpu = meta_out[:ep_size], meta_out[ep_size : 2 * ep_size]
 
     _reduce_and_prefix_sum_kernel[(1,)](
         # inputs:
@@ -382,7 +436,6 @@ def fused_dedup_prepare_dispatch(
     )
 
     dispatch_token_idxs = torch.empty(m * ep_size, dtype=torch.int64, device=device)
-    dedup_local_pos = torch.empty(m * ep_size, dtype=torch.int64, device=device)
     idxs = torch.empty(m * k, dtype=torch.int64, device=device)
     expand_idx = torch.empty(m * k, dtype=torch.int64, device=device)
 
@@ -420,146 +473,256 @@ def fused_dedup_prepare_dispatch(
     )
 
 
-# -- Post-all-to-all kernels --
+# -- Post-all-to-all kernel --
 
 
 @triton.jit
-def _build_expert_idxs_kernel(
-    tokens_per_expert_group_ptr,  # [NUM_EXPERTS] int64
+def _expert_and_expand_idx_kernel(
+    recv_meta_ptr,  # [EP_SIZE * (EXPERTS_PER_RANK + 1)] int64, the received metadata
+    received_expand_idx_ptr,  # [total] int64, input
     expert_idxs_ptr,  # [total] int64, output
+    expand_idx_ptr,  # [total] int64, output
     total,
-    NUM_EXPERTS: tl.constexpr,
+    EP_SIZE: tl.constexpr,
     EXPERTS_PER_RANK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Build local expert index for each received token slot.
+    """Per received token slot: its local expert index, and its expand_idx made global.
 
-    Reads tokens_per_expert_group (NUM_EXPERTS,) and produces:
-      expert_idxs          - local expert index (expert_id % experts_per_rank)
-                             for each token slot, via segmented fill.
+    The received slots are laid out sender-major, expert-minor, with recv_meta holding, per sender,
+    the per-expert counts followed by that sender's dedup count. For each slot this finds the
+    (sender, expert) segment it falls in by a segmented scan over the counts, writes the expert
+    index within this rank, and adds to the received expand_idx (a position local to the sender's
+    dedup chunk) the exclusive cumsum of dedup counts over the preceding senders, so it indexes the
+    concatenated dedup buffer.
 
     ``total`` is a kernel argument rather than a device-side sum so that the store mask
     and the caller's allocation are the same number. Masking a store to one tensor with a
     length read out of a different tensor writes out of bounds whenever the two disagree.
     """
     pid = tl.program_id(0)
-
-    # Parallel fill: each thread determines which expert segment it belongs to.
-    # We compute expert starts inline via a running accumulator,
-    # and check if each position falls in [start, start + count).
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < total
 
     expert_idx = tl.zeros([BLOCK], dtype=tl.int64)
+    offset = tl.zeros([BLOCK], dtype=tl.int64)
     start = tl.zeros([], dtype=tl.int64)
-    for e in tl.static_range(NUM_EXPERTS):
-        count_e = tl.load(tokens_per_expert_group_ptr + e)
-        expert_idx = tl.where(mask & (offs >= start), e, expert_idx)
-        start += count_e
+    dedup_start = tl.zeros([], dtype=tl.int64)
+    for g in tl.static_range(EP_SIZE):
+        for e in tl.static_range(EXPERTS_PER_RANK):
+            count = tl.load(recv_meta_ptr + g * (EXPERTS_PER_RANK + 1) + e)
+            in_seg = (offs >= start) & (offs < start + count)
+            expert_idx = tl.where(in_seg, e, expert_idx)
+            offset = tl.where(in_seg, dedup_start, offset)
+            start += count
+        dedup_start += tl.load(recv_meta_ptr + g * (EXPERTS_PER_RANK + 1) + EXPERTS_PER_RANK)
 
-    # Map to local expert index within EP rank
-    local_idx = expert_idx % EXPERTS_PER_RANK
-    tl.store(expert_idxs_ptr + offs, local_idx, mask=mask)
+    expand_val = tl.load(received_expand_idx_ptr + offs, mask=mask)
+    tl.store(expert_idxs_ptr + offs, expert_idx, mask=mask)
+    tl.store(expand_idx_ptr + offs, expand_val + offset, mask=mask)
 
 
-def build_expert_idxs(
-    tokens_per_expert_group: torch.Tensor,
+def fused_dedup_prepare_dispatch(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    ep_size: int,
     experts_per_rank: int,
-    total: int,
-) -> torch.Tensor:
-    """Fused expert_idxs, replacing arange + mod + repeat_interleave.
-
-    ``total`` must equal ``tokens_per_expert_group.sum()`` - the number of token slots
-    this rank received. It is a host int because the caller already reads those counts
-    back to build the all-to-all splits; deriving the size from anything local (this
-    rank's own token count) is wrong, because the senders decide how many slots arrive.
+    meta_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
     """
-    num_experts = tokens_per_expert_group.shape[0]
-    device = tokens_per_expert_group.device
+    The outputs of :func:`fused_dedup_prepare_dispatch_triton`. On SM90 one CuTe launch computes
+    them with stable placement (token order within each bucket); elsewhere, or for inputs the CuTe
+    kernel does not cover, the Triton kernels do.
+    """
+    if dispatch_cute.use_cute() and cute_index.supports_index(topk_ids, ep_size, experts_per_rank):
+        return cute_index.dispatch_index(
+            topk_ids, num_experts, ep_size, experts_per_rank, meta_out
+        )[:6]
+    return fused_dedup_prepare_dispatch_triton(
+        topk_ids, num_experts, ep_size, experts_per_rank, meta_out
+    )
 
-    expert_idxs = torch.empty(total, dtype=torch.int64, device=device)
+
+def expert_and_expand_idx(
+    recv_meta: torch.Tensor,
+    received_expand_idx: torch.Tensor,
+    ep_size: int,
+    experts_per_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    (expert_idxs, expand_idx) of the received token slots, from the received metadata and the
+    received sender-local expand_idx. The slot count is ``received_expand_idx``'s length, which the
+    senders decide. On SM90 the CuTe kernel computes them; elsewhere, or for inputs it does not
+    cover, :func:`expert_and_expand_idx_triton`.
+    """
+    if dispatch_cute.use_cute() and cute_index.supports_expand(
+        received_expand_idx, ep_size, experts_per_rank
+    ):
+        return cute_index.expert_and_expand_idx(
+            recv_meta, received_expand_idx, ep_size, experts_per_rank
+        )
+    return expert_and_expand_idx_triton(recv_meta, received_expand_idx, ep_size, experts_per_rank)
+
+
+def expert_and_expand_idx_triton(
+    recv_meta: torch.Tensor,
+    received_expand_idx: torch.Tensor,
+    ep_size: int,
+    experts_per_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The Triton path of :func:`expert_and_expand_idx`; see _expert_and_expand_idx_kernel."""
+    # the Triton kernel indexes both inputs with unit stride
+    recv_meta, received_expand_idx = recv_meta.contiguous(), received_expand_idx.contiguous()
+    total = received_expand_idx.shape[0]
+    expert_idxs = torch.empty_like(received_expand_idx)
+    expand_idx = torch.empty_like(received_expand_idx)
     if total == 0:
-        return expert_idxs
-
+        return expert_idxs, expand_idx
     BLOCK = 1024
-    grid = (triton.cdiv(total, BLOCK),)
-    _build_expert_idxs_kernel[grid](
-        tokens_per_expert_group,
+    _expert_and_expand_idx_kernel[(triton.cdiv(total, BLOCK),)](
+        recv_meta,
+        received_expand_idx,
         expert_idxs,
+        expand_idx,
         total,
-        NUM_EXPERTS=num_experts,
+        EP_SIZE=ep_size,
         EXPERTS_PER_RANK=experts_per_rank,
         BLOCK=BLOCK,
     )
-    return expert_idxs
+    return expert_idxs, expand_idx
 
 
-@triton.jit
-def _adjust_expand_idx_kernel(
-    received_expand_idx_ptr,  # [N] int64, input
-    out_ptr,  # [N] int64, output
-    dedup_tokens_from_each_gpu_ptr,  # [EP_SIZE] int64, possibly strided
-    output_splits_tensor_ptr,  # [EP_SIZE] int64
-    N,
-    DEDUP_STRIDE: tl.constexpr,
-    EP_SIZE: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """Adjust received expand_idx by adding per-sender dedup offsets.
+# The two all-to-alls of the dispatch metadata, through the lean process-group call.
+_a2a = all_to_all_sync
 
-    Reads received_expand_idx (N,) containing local positions from each sender,
-    dedup_tokens_from_each_gpu (EP_SIZE,) and output_splits_tensor (EP_SIZE,).
-    For each element, determines its sender rank via output_splits boundaries
-    and adds the exclusive cumsum of dedup counts, so positions become global
-    indices into the concatenated dedup buffer.
+# At most one deferred dispatch is outstanding per process: its metadata lands in the single
+# pinned buffer below, which the next issue would overwrite.
+_outstanding: list["PendingDispatch"] = []
+
+
+@dataclass(slots=True, eq=False)
+class PendingDispatch:
     """
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < N
+    A dispatch whose device work has been issued but whose host-side split arithmetic, expand_idx
+    all-to-all and token gather have not run yet; finish() completes it.
 
-    expand_val = tl.load(received_expand_idx_ptr + offs, mask=mask)
+    Between prepare_dispatch_issue() and finish() the host is free to enqueue independent GPU
+    work. finish() then waits on an event that fires once the metadata reached the pinned buffer,
+    rather than on the whole stream.
+    """
 
-    # For each element, find sender rank via linear scan over cumulative output_splits,
-    # and add the corresponding exclusive cumsum of dedup counts.
-    # EP_SIZE is tiny (<=32), so linear scan is fine.
-    offset = tl.zeros([BLOCK], dtype=tl.int64)
-    boundary = tl.zeros([], dtype=tl.int64)
-    dedup_start = tl.zeros([], dtype=tl.int64)
-    for g in tl.static_range(EP_SIZE):
-        split_g = tl.load(output_splits_tensor_ptr + g)
-        next_boundary = boundary + split_g
-        in_rank = (offs >= boundary) & (offs < next_boundary)
-        offset = tl.where(in_rank, dedup_start, offset)
-        boundary = next_boundary
-        dedup_start += tl.load(dedup_tokens_from_each_gpu_ptr + g * DEDUP_STRIDE)
+    hidden_states: torch.Tensor
+    topk_weight: torch.Tensor
+    dispatch_token_idxs: torch.Tensor
+    idxs: torch.Tensor
+    expand_idx: torch.Tensor
+    meta: torch.Tensor
+    meta_cpu: torch.Tensor
+    done: torch.cuda.Event
+    ep_size: int
+    experts_per_rank: int
+    ep_group: dist.ProcessGroup
+    finished: bool = False
 
-    tl.store(out_ptr + offs, expand_val + offset, mask=mask)
+    @torch.compiler.disable
+    def finish(self) -> tuple[torch.Tensor, RoutingInfo]:
+        """
+        Complete the dispatch on the current stream: (dispatch_tokens, RoutingInfo).
+        """
+        assert not self.finished, "finish() called twice on the same pending dispatch"
+        self.finished = True
+        assert _outstanding and _outstanding[-1] is self
+        ep_size, experts_per_rank, ep_group = self.ep_size, self.experts_per_rank, self.ep_group
+        self.done.synchronize()
+        host = self.meta_cpu.tolist()
+        _outstanding.pop()
+        stride = experts_per_rank + 1
+        input_splits = host[:ep_size]
+        dedup_input_splits = host[ep_size : 2 * ep_size]
+        recv = host[2 * ep_size :]
+        dedup_output_splits = recv[experts_per_rank::stride]
+        # Rows this rank receives from each sender (summed over its local experts), and rows per
+        # local expert summed over senders: what stage 3 groups its GEMMs by, known here for free
+        # so the scatter there need not sync again.
+        output_splits = [sum(recv[i * stride : i * stride + experts_per_rank]) for i in range(ep_size)]  # fmt: skip
+        expert_counts = [sum(recv[e::stride][:ep_size]) for e in range(experts_per_rank)]
+
+        # -- expand_idx all-to-all, then expert_idxs + global expand_idx in one kernel --
+        # One entry per received token slot; stage 3 indexes the gathered rows by expand_idx, so
+        # the row count is decided by the senders, never by this rank's own token count.
+        expand_idx = self.expand_idx
+        received_expand_idx = expand_idx.new_empty(sum(output_splits))
+        _a2a(received_expand_idx, expand_idx, output_splits, input_splits, ep_group)
+        recv_meta = self.meta[2 * ep_size :]
+        expert_idxs, expand_idx = expert_and_expand_idx(
+            recv_meta, received_expand_idx, ep_size, experts_per_rank
+        )
+
+        # Trim + gather dedup tokens for dispatch
+        total_dedup = sum(dedup_input_splits)
+        index = self.dispatch_token_idxs[:total_dedup]
+        dispatch_tokens = padded_index_gather(self.hidden_states, index)
+
+        return dispatch_tokens, RoutingInfo(
+            self.topk_weight,
+            expert_idxs,
+            self.idxs,
+            expand_idx,
+            AllToAllSplits(dedup_input_splits, dedup_output_splits),
+            AllToAllSplits(input_splits, output_splits),
+            expert_counts,
+        )
 
 
-def adjust_expand_idx(
-    received_expand_idx: torch.Tensor,
-    dedup_tokens_from_each_gpu: torch.Tensor,
-    output_splits_tensor: torch.Tensor,
-) -> torch.Tensor:
-    """Fused expand_idx adjustment replacing cumsum + repeat_interleave + add."""
-    N = received_expand_idx.shape[0]
-    ep_size = dedup_tokens_from_each_gpu.shape[0]
-    out = torch.empty_like(received_expand_idx)
-    if N == 0:
-        return out
-    BLOCK = 1024
-    grid = (triton.cdiv(N, BLOCK),)
-    _adjust_expand_idx_kernel[grid](
-        received_expand_idx,
-        out,
-        dedup_tokens_from_each_gpu,
-        output_splits_tensor,
-        N,
-        DEDUP_STRIDE=dedup_tokens_from_each_gpu.stride(0),
-        EP_SIZE=ep_size,
-        BLOCK=BLOCK,
-    )
-    return out
+@torch.compiler.disable
+def prepare_dispatch_issue(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weight: torch.Tensor,
+    num_experts: int,
+    ep_size: int,
+    experts_per_rank: int,
+    ep_group: dist.ProcessGroup,
+) -> PendingDispatch:
+    """
+    Issue the device side of an expert-parallel dispatch (ep_size > 1) without blocking the host:
+    the dedup kernels, the metadata all-to-all and the device-to-host copy of the metadata, all on
+    the current stream. Returns a PendingDispatch whose finish() completes the dispatch.
+    """
+    assert ep_size > 1
+    assert not _outstanding, "a deferred dispatch is still outstanding"
+    hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+
+    # One int64 buffer holds everything the host needs, so one device-to-host copy fetches it:
+    # [tokens_per_ep_rank (ep) | dedup_tokens_per_gpu (ep) | recv_meta (ep * (epr + 1))], the last
+    # being, per sender, its token count for each local expert followed by its dedup count.
+    stride = experts_per_rank + 1
+    meta = torch.empty(2 * ep_size + ep_size * stride, dtype=torch.int64, device=topk_ids.device)
+    (
+        tokens_per_ep_rank,
+        dedup_tokens_per_gpu,
+        dispatch_token_idxs,
+        idxs,
+        expand_idx,
+        send_meta,  # (ep_size, experts_per_rank + 1) interleaved: [tpe_0..., dedup_0, ...]
+    ) = fused_dedup_prepare_dispatch(topk_ids, num_experts, ep_size, experts_per_rank, meta)
+
+    # -- Metadata all-to-all (piggyback dedup counts alongside per-expert token counts) --
+    recv_meta = meta[2 * ep_size :]
+    _a2a(recv_meta, send_meta, group=ep_group)
+
+    # -- One device-to-host copy, completion marked by an event --
+    meta_cpu = get_pinned_buffer("dispatch_meta", meta.shape[0], meta.dtype)
+    done = torch.cuda.Event()
+    meta_cpu.copy_(meta, non_blocking=True)
+    done.record()
+
+    pending = PendingDispatch(
+        hidden_states, topk_weight, dispatch_token_idxs, idxs, expand_idx, meta, meta_cpu, done,
+        ep_size, experts_per_rank, ep_group,
+    )  # fmt: skip
+    _outstanding.append(pending)
+    return pending
 
 
 @torch.compiler.disable
@@ -581,84 +744,15 @@ def prepare_dispatch(
     replicates each token once per selected expert.
     """
 
-    hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
     k = topk_ids.shape[1]
     expert_idxs = topk_ids.view(-1)
 
     if ep_size == 1:
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         dispatch_tokens = (
             hidden_states.unsqueeze(1).expand(-1, k, -1).reshape(-1, hidden_states.shape[-1])
         )
         return dispatch_tokens, RoutingInfo(topk_weight, expert_idxs)
 
-    (
-        tokens_per_ep_rank,
-        dedup_tokens_per_gpu,
-        dispatch_token_idxs,
-        idxs,
-        expand_idx,
-        send_meta,  # (ep_size, experts_per_rank + 1) interleaved: [tpe_0..., dedup_0, ...]
-    ) = fused_dedup_prepare_dispatch(topk_ids, num_experts, ep_size, experts_per_rank)
-
-    # -- Metadata all-to-all (piggyback dedup counts alongside per-expert token counts) --
-    recv_meta = send_meta.new_empty(send_meta.shape[0])
-    torch.compiler.disable(dist.all_to_all_single)(recv_meta, send_meta, group=ep_group)
-    recv_meta_2d = recv_meta.view(ep_size, experts_per_rank + 1)
-    tokens_per_expert_group = recv_meta_2d[:, :experts_per_rank].reshape(-1)
-    dedup_tokens_from_each_gpu = recv_meta_2d[:, experts_per_rank]  # (ep_size,)
-
-    # Per-sender grouped sum over this rank's local experts. Reduced here rather than
-    # inside build_expert_idxs because its host copy, taken by the D-to-H batch below, is
-    # what sizes expert_idxs - so it has to exist before that call.
-    output_splits_tensor = tokens_per_expert_group.view(ep_size, experts_per_rank).sum(dim=1)
-
-    # -- Batch D-to-H copies on main stream --
-    dedup_input_splits_cpu = get_pinned_buffer(
-        "dedup_input_splits", ep_size, dedup_tokens_per_gpu.dtype
-    )
-    dedup_output_splits_cpu = get_pinned_buffer(
-        "dedup_output_splits", ep_size, dedup_tokens_from_each_gpu.dtype
-    )
-    input_splits_cpu = get_pinned_buffer("input_splits", ep_size, tokens_per_ep_rank.dtype)
-    output_splits_cpu = get_pinned_buffer("output_splits", ep_size, output_splits_tensor.dtype)
-    dedup_input_splits_cpu.copy_(dedup_tokens_per_gpu, non_blocking=True)
-    dedup_output_splits_cpu.copy_(dedup_tokens_from_each_gpu, non_blocking=True)
-    input_splits_cpu.copy_(tokens_per_ep_rank, non_blocking=True)
-    output_splits_cpu.copy_(output_splits_tensor, non_blocking=True)
-    torch.cuda.current_stream(hidden_states.device).synchronize()
-    dedup_input_splits = dedup_input_splits_cpu.tolist()
-    dedup_output_splits = dedup_output_splits_cpu.tolist()
-    input_splits = input_splits_cpu.tolist()
-    output_splits = output_splits_cpu.tolist()
-
-    # One entry per received token slot. expand_idx below has the same length, and stage 3
-    # indexes the gathered rows by it, so all three must agree exactly: the row count is
-    # decided by the senders, never by this rank's own token count.
-    total_output = sum(output_splits)
-    expert_idxs = build_expert_idxs(tokens_per_expert_group, experts_per_rank, total_output)
-
-    # -- expand_idx all-to-all + adjustment --
-    received_expand_idx = expand_idx.new_empty(total_output)
-    torch.compiler.disable(dist.all_to_all_single)(
-        received_expand_idx,
-        expand_idx,
-        output_splits,
-        input_splits,
-        ep_group,
-    )
-    expand_idx = adjust_expand_idx(
-        received_expand_idx, dedup_tokens_from_each_gpu, output_splits_tensor
-    )
-
-    # Trim + gather dedup tokens for dispatch
-    total_dedup = sum(dedup_input_splits)
-    dispatch_tokens = padded_index_gather(hidden_states, dispatch_token_idxs[:total_dedup])
-
-    return dispatch_tokens, RoutingInfo(
-        topk_weight,
-        expert_idxs,
-        idxs,
-        expand_idx,
-        AllToAllSplits(dedup_input_splits, dedup_output_splits),
-        AllToAllSplits(input_splits, output_splits),
-    )
+    args = (hidden_states, topk_ids, topk_weight, num_experts, ep_size, experts_per_rank, ep_group)
+    return prepare_dispatch_issue(*args).finish()

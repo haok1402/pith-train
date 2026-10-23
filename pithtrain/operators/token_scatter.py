@@ -173,7 +173,9 @@ class ScatterForGroupedGemm(torch.autograd.Function):
         return ScatterForGroupedGemm._copy_stream, ScatterForGroupedGemm._copy_event
 
     @staticmethod
-    def forward(ctx, input_tokens, expert_idxs, num_groups, padding_alignment=128):
+    def forward(
+        ctx, input_tokens, expert_idxs, num_groups, padding_alignment=128, group_counts=None
+    ):
         m = input_tokens.shape[0]
         hidden_size = input_tokens.shape[1]
         device = input_tokens.device
@@ -262,12 +264,18 @@ class ScatterForGroupedGemm(torch.autograd.Function):
         # so this size is sufficient for BF16 grouped GEMM AND for DeepGEMM's
         # FP8 ``k_grouped_fp8_gemm_tn_contiguous`` which asserts the data row
         # count equals ``sum(ks)`` exactly.
-        ks_cpu = get_pinned_buffer("ks", num_groups, torch.int32)
-        with torch.cuda.stream(copy_stream):
-            copy_stream.wait_event(copy_event)
-            ks_cpu.copy_(ks_tensor, non_blocking=True)
-        copy_stream.synchronize()
-        ks = ks_cpu.tolist()
+        if group_counts is not None:
+            # The caller knows the counts on the host (EP dispatch synced them already), so the
+            # padded sizes follow without a device-to-host round trip.
+            a = padding_alignment
+            ks = [(c + a - 1) // a * a for c in group_counts]
+        else:
+            ks_cpu = get_pinned_buffer("ks", num_groups, torch.int32)
+            with torch.cuda.stream(copy_stream):
+                copy_stream.wait_event(copy_event)
+                ks_cpu.copy_(ks_tensor, non_blocking=True)
+            copy_stream.synchronize()
+            ks = ks_cpu.tolist()
         actual_M = sum(ks)
         output_tokens = output_tokens[:actual_M]
 
@@ -287,7 +295,7 @@ class ScatterForGroupedGemm(torch.autograd.Function):
         # Forward: output_tokens[reverse_shuffle_idxs[i]] = input_tokens[i]
         # Backward: grad_input_tokens[i] = grad_output_tokens[reverse_shuffle_idxs[i]]
         grad_input_tokens = grad_output_tokens[reverse_shuffle_idxs]
-        return grad_input_tokens, None, None, None
+        return grad_input_tokens, None, None, None, None
 
 
 class _PaddedIndexGather(torch.autograd.Function):
@@ -347,6 +355,7 @@ def scatter_for_grouped_gemm(
     expert_idxs: torch.Tensor,  # [m] int64, values in [0, num_groups-1]
     num_groups: int,
     padding_alignment: int = 128,
+    group_counts: Optional[list[int]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
     """
     Fused MoE token scatter: computes output tokens grouped by expert,
@@ -358,6 +367,8 @@ def scatter_for_grouped_gemm(
         expert_idxs: [m] expert assignment for each token (int64, values in [0, num_groups-1])
         num_groups: number of expert groups
         padding_alignment: pad each group's row count to this alignment (default 128)
+        group_counts: rows per group on the host, if the caller already has them; skips the
+            device-to-host copy of the padded sizes that otherwise blocks the host
 
     Returns:
         output_tokens: [actual_M, hidden_size] tokens reordered by expert with zero-padding,
@@ -368,7 +379,9 @@ def scatter_for_grouped_gemm(
         ks_tensor: [num_groups] int32, per-group padded sizes
     """
     output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks_tensor, ks = (
-        ScatterForGroupedGemm.apply(input_tokens, expert_idxs, num_groups, padding_alignment)
+        ScatterForGroupedGemm.apply(
+            input_tokens, expert_idxs, num_groups, padding_alignment, group_counts
+        )
     )
     return output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor
 
@@ -383,6 +396,11 @@ def precompute_group_indices(grouped_mm_offs: torch.Tensor, M: int) -> Optional[
     Only needed on Hopper with the DeepGEMM backend; returns None otherwise.
     """
     if training.fp8 and ARCH_MAJOR < 10:
+        from pithtrain.operators import dispatch_cute
+        from pithtrain.operators.dispatch_cute import group_indices as cgi
+
+        if dispatch_cute.use_cute() and cgi.supports_group_indices(grouped_mm_offs, M):
+            return cgi.group_indices(grouped_mm_offs, M)  # same values, one launch
         row_indices = torch.arange(M, device=grouped_mm_offs.device)
         gi = torch.searchsorted(grouped_mm_offs, row_indices, right=True).to(torch.int32)
         gi.clamp_(max=grouped_mm_offs.shape[0] - 1)

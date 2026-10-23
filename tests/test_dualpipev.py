@@ -25,8 +25,9 @@ from pithtrain.models.qwen35_moe import Qwen35MoeModel, Qwen35MoeTopKRouter
 from pithtrain.modules.checkpoint import iter_canonical_parameters
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.operators.cp_sequence import zigzag_varlen_index
-from pithtrain.operators.grouped_linear import GroupedLinear
-from pithtrain.operators.linear import BF16Linear
+from pithtrain.operators.fp8_gptoss_wgrad import install_raw_main_grad
+from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
+from pithtrain.operators.linear import BF16Linear, FP8Linear
 from pithtrain.operators.wgrad_accumulation import install_wgrad_accumulation
 from pithtrain.pipeline import DualPipeV, Microbatch
 
@@ -36,7 +37,7 @@ def fill_weights(module: nn.Module):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
-    elif isinstance(module, GroupedLinear):
+    elif isinstance(module, (GroupedLinear, FP8GroupedLinear)):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
     elif isinstance(module, GptOssExperts):
         # Raw nn.Parameter - the GroupedLinear branch above doesn't reach them.
@@ -111,20 +112,15 @@ def zigzag_shard(x: torch.Tensor, cp_rank: int, cp_size: int) -> torch.Tensor:
     return torch.cat([x[:, front : front + block], x[:, back : back + block]], dim=1)
 
 
-def shard_layers(layers: nn.ModuleDict, stage_id: int, num_stages: int, config):
-    num_local_layers = [config.num_hidden_layers // num_stages for _ in range(num_stages)]
-    layers_per_stage_residual = config.num_hidden_layers % num_stages
-    for i in range(layers_per_stage_residual):
-        num_local_layers[(1 - (i % 2) * 2) * (i // 2) - (i % 2)] += 1
-    layer_id_begin = sum(num_local_layers[:stage_id])
-    layer_id_end = layer_id_begin + num_local_layers[stage_id]
-    return nn.ModuleDict({str(i): layers[str(i)] for i in range(layer_id_begin, layer_id_end)})
+def shard_layers(layers: nn.ModuleDict, local: nn.Module) -> nn.ModuleDict:
+    """The reference layers a pipeline stage owns: the ids the stage model built for itself."""
+    return nn.ModuleDict({i: layers[i] for i in local.layers})
 
 
 def shard_experts(model, ep_rank, ep_size):
     num_experts = None
     for child in model.children():
-        if isinstance(child, GroupedLinear):
+        if isinstance(child, (GroupedLinear, FP8GroupedLinear)):
             num_experts = child.num_groups
             break
     if num_experts is None:
@@ -146,9 +142,9 @@ def shard_experts(model, ep_rank, ep_size):
                 setattr(model, pname, new_param)
 
     for name, child in model.named_children():
-        if isinstance(child, GroupedLinear):
+        if isinstance(child, (GroupedLinear, FP8GroupedLinear)):
             experts_per_ep_rank = child.num_groups // ep_size
-            new_mod = GroupedLinear(experts_per_ep_rank, child.in_features, child.out_features)
+            new_mod = type(child)(experts_per_ep_rank, child.in_features, child.out_features)
             expert_begin = ep_rank * experts_per_ep_rank
             expert_end = (ep_rank + 1) * experts_per_ep_rank
             new_mod.weight.data = child.weight.data[expert_begin:expert_end]
@@ -208,6 +204,10 @@ def apply_fsdp(model, dtype):
                     reshard_after_forward=False,
                     mp_policy=mp,
                 )
+                if hasattr(layer.mlp.experts, "forward_from_tokens"):
+                    torch.distributed.fsdp.register_fsdp_forward_method(
+                        layer.mlp.experts, "forward_from_tokens"
+                    )
             fully_shard(layer, mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage1")
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage3")
@@ -254,6 +254,15 @@ def main(model_name: str):
     training.fp8 = False
     training.Linear = BF16Linear
     training.GroupedLinear = GroupedLinear
+    if os.environ.get("FP8", "0") == "1":
+        # FP8 on both copies: the reference runs the same FP8 layers unpipelined. Expect the expert
+        # weight gradients to differ by a few percent: the 128-row colwise quantization of their
+        # wgrad operands follows token order, which the EP dispatch changes.
+        training.fp8 = True
+        training.Linear = FP8Linear
+        training.GroupedLinear = FP8GroupedLinear
+    # As setup_model: under BF16, stage 1 recomputes its two RMSNorm outputs, unless NORM_RECOMPUTE=0.
+    training.norm_recompute = not training.fp8
 
     packed = os.environ.get("PACKED_SEQLEN", "0") == "1"
     ragged = os.environ.get("RAGGED_MICROBATCH", "0") == "1"
@@ -360,7 +369,6 @@ def main(model_name: str):
     torch.distributed.barrier()
 
     # Shard the full modules whose weights and gradients will be used for checking.
-    num_stages = pp_size * 2
     local_full_modules = []
 
     local_full_modules.append(ModelClass(config, phase=0))
@@ -371,10 +379,8 @@ def main(model_name: str):
         local_full_modules[0].embed_tokens = full_modules.embed_tokens
         local_full_modules[1].norm = full_modules.norm
         local_full_modules[1].lm_head = full_modules.lm_head
-    local_full_modules[0].layers = shard_layers(full_modules.layers, pp_rank, num_stages, config)
-    local_full_modules[1].layers = shard_layers(
-        full_modules.layers, num_stages - 1 - pp_rank, num_stages, config
-    )
+    local_full_modules[0].layers = shard_layers(full_modules.layers, local_full_modules[0])
+    local_full_modules[1].layers = shard_layers(full_modules.layers, local_full_modules[1])
     if ep_size > 1:
         shard_experts(local_full_modules[0], ep_rank=ep_rank, ep_size=ep_size)
         shard_experts(local_full_modules[1], ep_rank=ep_rank, ep_size=ep_size)
@@ -392,6 +398,7 @@ def main(model_name: str):
     local_modules.zero_grad()
     apply_fsdp(local_modules, dtype)
     install_wgrad_accumulation(local_modules)
+    install_raw_main_grad(local_modules)
 
     # Wrap the modules with DualPipeV.
     dualpipev_model = DualPipeV(local_modules)
@@ -510,6 +517,27 @@ def main(model_name: str):
         # their tiny grads accumulate over it and are dominated by non-deterministic bf16
         # scatter-add / all-to-all ordering, varying run-to-run (~0.005-0.016) past the eps.
         param_eps = 3e-2 if n.endswith(("linear_attn.A_log", "linear_attn.dt_bias")) else eps
+        # Under FP8 the expert wgrad quantization follows token order, which EP changes (~0.065
+        # measured on Qwen3-30B-A3B); a broken accumulation shows up as diff near 1 or above.
+        if training.fp8 and ".experts." in n:
+            param_eps = 0.1
+        # Qwen3.5 under FP8: FP8 rounding in every dense projection is amplified through the
+        # gated-delta-net recurrence (~0.065 measured on every non-expert weight, unchanged by
+        # switching any single group of layers back to BF16), not one broken layer.
+        if training.fp8 and config.model_type == "qwen3_5_moe_text":
+            param_eps = max(param_eps, 0.1)
+            # The decay parameters already need 3e-2 under BF16 (above); FP8 noise is ~6x the
+            # BF16 noise on every dense weight, and these read 0.11-0.17 on the round-3 code too.
+            if n.endswith(("linear_attn.A_log", "linear_attn.dt_bias")):
+                param_eps = 0.3
+        # DeepSeek-V2 under FP8: on this fixture (8 layers, 128-token sequences, ~18 rows per
+        # expert per micro-batch) a +-1 ulp BF16 perturbation of the embedding alone moves the FP8
+        # gradients by 0.04 mean / 0.11 max on dense weights and 0.19 / 0.29 on experts (BF16:
+        # 0.001 / 0.009). Pipelined vs reference measures 0.019 / 0.035 dense and up to 0.22 (CP1)
+        # / 0.53 (CP2) on experts, the same on one GPU with pp=ep=cp=1, and no single group of
+        # layers carries it. A broken dense layer or accumulation reads ~1.
+        if training.fp8 and config.model_type == "deepseek_v2":
+            param_eps = max(param_eps, 0.6 if ".experts." in n else 0.05)
         if diff > param_eps:
             failed = True
             print(

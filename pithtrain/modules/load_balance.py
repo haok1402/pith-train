@@ -163,12 +163,13 @@ class SequenceLevelLoadBalanceLoss:
         self.cp_size = cp_group.size() if cp_group is not None else 1
 
     def _all_reduce_expert_counts(self, tokens_per_expert: torch.Tensor) -> torch.Tensor:
-        """All-reduce expert counts across CP ranks (noop when cp_group is None).
+        """All-reduce expert counts across CP ranks (noop without CP: a sum over a group of one
+        is the identity, so no collective is issued for it).
 
         Uses the functional collective (not in-place ``torch.distributed.all_reduce``) so the
         gate's ``compute`` stays traceable under ``torch.compile(fullgraph=True)`` even with CP
         active -- counts are non-differentiable, so the reduce never enters the backward."""
-        if self.cp_group is not None:
+        if self.cp_size > 1:
             tokens_per_expert = funcol.all_reduce(tokens_per_expert, "sum", self.cp_group)
         return tokens_per_expert
 

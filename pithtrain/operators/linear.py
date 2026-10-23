@@ -22,9 +22,19 @@ from pithtrain.operators.deepgemm_quantize import (
     fp8cast_rowwise_blockwise_transpose,
     fp8cast_rowwise_transpose,
 )
+from pithtrain.operators.fp8_cute.scale_layout import mn_major_scale
 from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
 
 ARCH_MAJOR, _ = torch.cuda.get_device_capability()
+
+
+def _act_scale_like(mn: int, sf_k: int, device: torch.device) -> torch.Tensor:
+    """Fake of a 1x128 activation scale with the strides the quantization kernels return: on SM90
+    the CuTe kernels write it MN-major (``fp8_cute.scale_layout``) so DeepGEMM skips its
+    transpose_fp32; elsewhere the Triton kernels write it row-major."""
+    if ARCH_MAJOR == 9:
+        return mn_major_scale(mn, sf_k, device)
+    return torch.empty((mn, sf_k), dtype=torch.float32, device=device)
 
 
 def _fp8_gemm_nt(
@@ -39,7 +49,9 @@ def _fp8_gemm_nt(
 ) -> torch.Tensor:
     """``out[m, n] = a @ b.T`` via the DeepGEMM fp8 NT GEMM. The single place that owns the
     allocate-then-``fp8_fp4_gemm_nt`` convention shared by the FP8 linear layer and the MLA
-    pass-latent ring decompress."""
+    pass-latent ring decompress. ``a_scale`` (1x128) is used as is when MN-major, as the SM90
+    quantization kernels return it, and transposed by DeepGEMM otherwise; ``b_scale`` (128x128)
+    is always used as is."""
     out = torch.empty((m, n), device=device, dtype=dtype)
     deep_gemm.fp8_fp4_gemm_nt((a_fp8, a_scale), (b_fp8, b_scale), out)
     return out
@@ -171,13 +183,86 @@ def _fp8_linear_backward(ctx, grad_output, grad_input_t_fp8, grad_scale_input_t)
 _fp8_linear_fwd.register_autograd(_fp8_linear_backward, setup_context=_fp8_linear_setup_context)
 
 
+@torch.library.custom_op("pithtrain::fp8_quantize_activation", mutates_args=())
+def _fp8_quantize_activation(
+    input_2d: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    The activation quantization of ``fp8_act_weight_gemm`` on its own, so projections that share
+    an input (q/k/v) quantize it once: (input_fp8, scale_input, input_t_fp8, scale_input_t).
+    """
+    return fp8cast_rowwise_blockwise_transpose(input_2d)
+
+
+@_fp8_quantize_activation.register_fake
+def _(input_2d):
+    M, K = input_2d.shape
+    dev = input_2d.device
+    input_fp8 = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=dev)
+    scale_input = _act_scale_like(M, (K + 127) // 128, dev)
+    input_t_fp8 = torch.empty((K, M), dtype=torch.float8_e4m3fn, device=dev)
+    scale_input_t = torch.empty(((K + 127) // 128, (M + 127) // 128), dtype=torch.float32, device=dev)  # fmt: skip
+    return input_fp8, scale_input, input_t_fp8, scale_input_t
+
+
+@torch.library.custom_op("pithtrain::fp8_linear_fwd_prequantized", mutates_args=())
+def _fp8_linear_fwd_prequantized(
+    input_2d: torch.Tensor,
+    weight: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    scale_weight: torch.Tensor,
+    weight_t_fp8: torch.Tensor,
+    scale_weight_t: torch.Tensor,
+    input_fp8: torch.Tensor,
+    scale_input: torch.Tensor,
+    input_t_fp8: torch.Tensor,
+    scale_input_t: torch.Tensor,
+) -> torch.Tensor:
+    """
+    ``_fp8_linear_fwd`` for an activation already quantized by ``_fp8_quantize_activation``.
+    input_2d and weight are taken only to give them gradients; the GEMM reads the FP8 operands.
+    """
+    m, n = input_fp8.shape[0], weight_fp8.shape[0]
+    return _fp8_gemm_nt(
+        input_fp8, scale_input, weight_fp8, scale_weight, m, n, input_2d.device, input_2d.dtype
+    )
+
+
+@_fp8_linear_fwd_prequantized.register_fake
+def _(input_2d, weight, weight_fp8, scale_weight, weight_t_fp8, scale_weight_t, *quantized_input):
+    M, N = input_2d.shape[0], weight.shape[0]
+    return torch.empty((M, N), dtype=input_2d.dtype, device=input_2d.device)
+
+
+def _fp8_linear_prequantized_setup_context(ctx, inputs, output):
+    input_2d, _, _, _, weight_t_fp8, scale_weight_t, _, _, input_t_fp8, scale_input_t = inputs
+    ctx.save_for_backward(weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t)
+    ctx.K = input_2d.shape[1]
+
+
+def _fp8_linear_prequantized_backward(ctx, grad_output):
+    weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t = ctx.saved_tensors
+    grad_input, weight_grad = _fp8_linear_bwd(
+        grad_output, weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t, ctx.K
+    )
+    return grad_input, weight_grad, None, None, None, None, None, None, None, None
+
+
+_fp8_linear_fwd_prequantized.register_autograd(
+    _fp8_linear_prequantized_backward, setup_context=_fp8_linear_prequantized_setup_context
+)
+
+
 class FP8Linear(nn.Linear):
     """
     Drop-in replacement for ``nn.Linear`` using FP8 GEMM via DeepGEMM.
 
     Weights are stored in BF16 and quantized to MXFP8 on-the-fly each forward pass.
     Quantized weights are cached and reused across micro-batches within a single pipeline step.
+    With fp8_param_gather set (see ``fp8_param``), the weight arrives already quantized.
     """
+
+    fp8_param_gather: bool = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -187,6 +272,8 @@ class FP8Linear(nn.Linear):
     def _get_quantized_weight(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.fp8_param_gather:
+            return self.weight_fp8, self.weight_scale, self.weight_t_fp8, self.weight_scale_t
         if torch.compiler.is_compiling():
             return fp8cast_blockwise_transpose(self.weight)
         ver = FP8WeightCacheControl.version
@@ -197,15 +284,34 @@ class FP8Linear(nn.Linear):
         self._wq_version = ver
         return result
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def quantize_input(input: torch.Tensor) -> Optional[Tuple[torch.Tensor, ...]]:
+        """
+        Quantize an activation once for several FP8Linear layers that read it (q/k/v), to pass to
+        each as quantized_input. The bytes are the same as each layer quantizing it itself.
+        """
+        if input.numel() == 0:
+            return None
+        # Not differentiable: each layer still takes input itself, which carries the gradient.
+        return _fp8_quantize_activation(input.detach().flatten(0, -2))
+
+    def forward(
+        self, input: torch.Tensor, quantized_input: Optional[Tuple[torch.Tensor, ...]] = None
+    ) -> torch.Tensor:
         if input.numel() == 0:
             return torch.nn.functional.linear(input, self.weight, self.bias)
         quantized_weight = self._get_quantized_weight()
         weight_fp8, scale_weight, weight_t_fp8, scale_weight_t = quantized_weight
         input_2d = input.flatten(0, -2)
-        output_2d, _, _ = _fp8_linear_fwd(
-            input_2d, self.weight, weight_fp8, scale_weight, weight_t_fp8, scale_weight_t
-        )
+        if quantized_input is not None:
+            output_2d = _fp8_linear_fwd_prequantized(
+                input_2d, self.weight, weight_fp8, scale_weight, weight_t_fp8, scale_weight_t,
+                *quantized_input,
+            )  # fmt: skip
+        else:
+            output_2d, _, _ = _fp8_linear_fwd(
+                input_2d, self.weight, weight_fp8, scale_weight, weight_t_fp8, scale_weight_t
+            )
         output = output_2d.view(*input.shape[:-1], self.weight.shape[0])
         if self.bias is not None:
             output = output + self.bias
@@ -274,7 +380,12 @@ class BF16Linear(nn.Linear):
 
     main_grad: Optional[torch.Tensor] = None
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def quantize_input(input: torch.Tensor) -> None:
+        """BF16 has nothing to share across layers; the FP8Linear counterpart quantizes once."""
+        return None
+
+    def forward(self, input: torch.Tensor, quantized_input: None = None) -> torch.Tensor:
         if self.main_grad is None or not torch.is_grad_enabled():
             return F.linear(input, self.weight, self.bias)
         output = BF16LinearFunc.apply(input, self.weight, self.main_grad)

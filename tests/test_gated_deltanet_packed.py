@@ -10,6 +10,7 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5Moe
 
 from pithtrain.contexts import training
 from pithtrain.modules.distributed import DistributedCfg
+from pithtrain.operators.linear import BF16Linear
 from tests.utilities import launch
 
 
@@ -31,7 +32,7 @@ def verify_packed(req: PackedRequest) -> None:
     # Imported here: the model module needs a GPU at import, and collection must not.
     from pithtrain.models.qwen35_moe import Qwen35MoeGatedDeltaNet
 
-    training.Linear = nn.Linear
+    training.Linear, training.fp8 = BF16Linear, False  # what setup_model binds for BF16
     device = torch.cuda.current_device()
     config = Qwen3_5MoeTextConfig(
         hidden_size=512,

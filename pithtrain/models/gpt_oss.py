@@ -14,14 +14,22 @@ from pithtrain.modules.load_balance import (
     MoELoadBalanceLossTracker,
     replay_indices,
 )
+from pithtrain.operators import bf16_cute
 from pithtrain.operators.clamped_swiglu import clamped_swiglu
 from pithtrain.operators.deepgemm_quantize import fp8cast_blockwise_transpose_batched
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
+from pithtrain.operators.fp8_gptoss import fp8_clamped_swiglu_experts
+from pithtrain.operators.fp8_gptoss_param import fp8_param_operands
+from pithtrain.operators.fp8_gptoss_wgrad import raw_main_grad
 from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
-from pithtrain.operators.grouped_linear import FP8GroupedLinearFunc, GroupedLinearFunc
+from pithtrain.operators.grouped_linear import (
+    FP8GroupedLinearFunc,
+    GroupedLinearFunc,
+    fp8_scatter_quant,
+)
 from pithtrain.operators.indexed_bias_add import indexed_bias_add
-from pithtrain.operators.linear import BF16Linear
+from pithtrain.operators.linear import ARCH_MAJOR, BF16Linear
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
     precompute_group_indices,
@@ -29,6 +37,43 @@ from pithtrain.operators.token_scatter import (
 )
 from pithtrain.pipeline.dualpipev import layer_partition
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
+
+# Inductor's C++ wrapper launches the compiled regions' kernels from C++ instead of a generated
+# Python function: the same kernels and bits, less host time per call on a host-bound step (as in
+# qwen3_moe.py).
+COMPILE_OPTIONS = {"cpp_wrapper": True}
+EDGE_LAYER_COST = 3.5
+"""
+Step time of the stage-edge work (embedding, final norm, BF16 lm_head and cross-entropy) in units
+of one FP8 decoder layer, both edges together. Measured with torch.profiler on gpt-oss-20b (seq
+4096, FP8 experts): the edges cost ~195 ms of compute per step against ~55 ms per layer.
+"""
+
+
+def gpt_oss_layer_partition(
+    num_layers: int, stage_count: int, stage_index: int, edge_light: bool
+) -> range:
+    """
+    layer_partition, except that with edge_light and more than one pipeline rank the rank holding
+    the two edge stages gets fewer layers, so that its layers plus the edge work (EDGE_LAYER_COST)
+    match the other ranks. Each rank's layers are split evenly between its two V-chunks (rank r
+    holds stages r and stage_count - 1 - r): DualPipeV overlaps one chunk's forward with the
+    other's backward layer by layer and needs their layer counts within one of each other. Layer
+    ids stay global and in order.
+    """
+    pp_size = stage_count // 2
+    if not edge_light or pp_size < 2:
+        return layer_partition(num_layers, stage_count, stage_index)
+    first = max(2, round((num_layers + EDGE_LAYER_COST) / pp_size - EDGE_LAYER_COST))
+    base, extra = divmod(num_layers - first, pp_size - 1)
+    if base < 2:
+        return layer_partition(num_layers, stage_count, stage_index)
+    per_rank = [first] + [base + (r <= extra) for r in range(1, pp_size)]
+    layers = [0] * stage_count
+    for r, n in enumerate(per_rank):
+        layers[r], layers[stage_count - 1 - r] = (n + 1) // 2, n // 2
+    begin = sum(layers[:stage_index])
+    return range(begin, begin + layers[stage_index])
 
 
 class GptOssRotaryEmbedding(nn.Module):
@@ -98,12 +143,16 @@ class GptOssRotaryEmbedding(nn.Module):
 
 
 class GptOssExperts(nn.Module):
+    fp8_raw_params = ("gate_up_proj", "down_proj")
+    """Raw expert weights fp8_gptoss_param may all-gather in FP8 (with fp8_param_gather)."""
+
     def __init__(self, config: GptOssConfig, num_experts: int):
         super().__init__()
         hidden_size = config.hidden_size
         intermediate_size = config.intermediate_size
         self.num_experts = num_experts
         self.swiglu_limit = float(config.swiglu_limit)
+        self.top_k = getattr(config, "num_experts_per_tok", num_experts)
         self.gate_up_proj = nn.Parameter(torch.empty(num_experts, 2 * intermediate_size, hidden_size))  # fmt: skip
         self.gate_up_proj_bias = nn.Parameter(torch.zeros(num_experts, 2 * intermediate_size))
         self.down_proj = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
@@ -114,6 +163,8 @@ class GptOssExperts(nn.Module):
         self._wq_version: int = -1
 
     def _quantized_weight(self, name: str, weight: torch.Tensor) -> tuple:
+        if (gathered := fp8_param_operands(self, name)) is not None:
+            return gathered
         if torch.compiler.is_compiling():
             return fp8cast_blockwise_transpose_batched(weight)
         ver = FP8WeightCacheControl.version
@@ -147,7 +198,23 @@ class GptOssExperts(nn.Module):
         grouped_mm_offs: torch.Tensor,
         ks: list | None = None,
         ks_tensor: torch.Tensor | None = None,
+        quantized_input: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
+        if training.fp8 and ARCH_MAJOR == 9 and x.shape[0]:
+            # Hopper FP8: bias + clamped SwiGLU fused into the quantization of the neighbouring
+            # GEMMs (operators/fp8_gptoss.py); bit-identical to the unfused path below.
+            gi = precompute_group_indices(grouped_mm_offs, x.shape[0])
+            q_gu = self._quantized_weight("gate_up_proj", self.gate_up_proj)
+            q_down = self._quantized_weight("down_proj", self.down_proj)
+            args = (grouped_mm_offs, ks, ks_tensor, gi, q_gu, q_down, 1.702, self.swiglu_limit)
+            weights = (
+                self.gate_up_proj,
+                self.gate_up_proj_bias,
+                self.down_proj,
+                self.down_proj_bias,
+            )
+            mgs = (raw_main_grad(self, "gate_up_proj"), raw_main_grad(self, "down_proj"))
+            return fp8_clamped_swiglu_experts(x, *weights, *args, quantized_input, mgs)
         group_ids = torch.searchsorted(
             grouped_mm_offs.to(torch.int64),
             torch.arange(x.shape[0], device=x.device, dtype=torch.int64),
@@ -160,6 +227,36 @@ class GptOssExperts(nn.Module):
         out = self._group_linear(activated, self.down_proj, "down_proj", grouped_mm_offs, ks, ks_tensor, gi)  # fmt: skip
         out = indexed_bias_add(out, self.down_proj_bias, group_ids, grouped_mm_offs)
         return out
+
+    def uses_bf16_cute(self) -> bool:
+        """Whether BF16 stage 3 runs as the fused CuTe experts (bf16_cute) in this process."""
+        return bf16_cute.enabled() and self.num_experts <= bf16_cute.MAX_GROUPS
+
+    def forward_from_tokens(
+        self,
+        gathered: torch.Tensor,
+        expert_idxs: torch.Tensor,
+        expand_idx: torch.Tensor | None,
+        expert_counts: list[int] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        Hopper stage 3 from the received tokens. FP8: expand, scatter by expert and quantize in one
+        pass (fp8_scatter_quant), then the experts; returns (expert outputs in grouped order,
+        reverse_shuffle_idxs). BF16 (uses_bf16_cute): the fused CuTe experts with the biases and
+        the clamped SwiGLU in their epilogues, which read the received tokens through an index and
+        return the outputs in slot order, with None. A forward method of its own, registered with
+        FSDP, so the quantized input never crosses the FSDP boundary, whose mixed-precision cast
+        would turn it to bf16.
+        """
+        if not training.fp8:
+            from pithtrain.operators.bf16_cute.experts import bf16_clamped_swiglu_experts
+
+            args = (gathered, expert_idxs, expand_idx, expert_counts, self.top_k)
+            out = bf16_clamped_swiglu_experts(self, *args, 1.702, self.swiglu_limit)
+            return out, None
+        x, rsi, offs, ks, ks_tensor, xq = fp8_scatter_quant(gathered, expert_idxs, self.num_experts, expand_idx, expert_counts)  # fmt: skip
+        # self.forward, not self(...): calling the module re-enters FSDP's input cast.
+        return self.forward(x, offs, ks=ks, ks_tensor=ks_tensor, quantized_input=xq), rsi
 
 
 class GptOssTopKRouter(nn.Module):
@@ -174,7 +271,7 @@ class GptOssTopKRouter(nn.Module):
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size)), requires_grad=True)
         self.bias = nn.Parameter(torch.zeros(num_experts))
 
-    @torch.compile(fullgraph=True)
+    @torch.compile(fullgraph=True, options=COMPILE_OPTIONS)
     def forward(
         self, hidden_states: torch.Tensor, replay_idx: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -260,9 +357,11 @@ class GptOssAttention(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, S, _ = hidden_states.size()
-        query_states = self.q_proj(hidden_states).view(B, S, self.num_heads, self.head_dim)
-        key_states = self.k_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim)
-        value_states = self.v_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim)
+        # q/k/v read the same input; under FP8 it is quantized once for all three.
+        xq = training.Linear.quantize_input(hidden_states)
+        query_states = self.q_proj(hidden_states, xq).view(B, S, self.num_heads, self.head_dim)
+        key_states = self.k_proj(hidden_states, xq).view(B, S, self.num_kv_heads, self.head_dim)
+        value_states = self.v_proj(hidden_states, xq).view(B, S, self.num_kv_heads, self.head_dim)
         query_states, key_states = self.apply_rotary_posemb(query_states, key_states, rotary_posemb)
         window_size = (self.sliding_window - 1, 0) if self.is_sliding else (None, None)
         sinks = self.sinks.to(query_states.dtype)
@@ -285,7 +384,7 @@ class GptOssDecoderLayer(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    @torch.compile(fullgraph=True)
+    @torch.compile(fullgraph=True, options=COMPILE_OPTIONS)
     def forward_stage1_compute(
         self,
         hidden_states: torch.Tensor,
@@ -314,20 +413,41 @@ class GptOssDecoderLayer(nn.Module):
         dispatch_tokens, routing = prepare_dispatch(hidden_states, topk_idx, topk_weight, self.mlp.num_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)  # fmt: skip
         return dispatch_tokens, residual, routing
 
+    def keeps_stage3_input(self) -> bool:
+        """
+        Whether forward_stage3 keeps gathered_tokens for the backward, so the pipeline must not
+        free its storage after the forward: the fused BF16 CuTe experts read the received tokens
+        again in their weight gradient.
+        """
+        return not training.fp8 and self.mlp.experts.uses_bf16_cute()
+
     def forward_stage3(
         self,
         gathered_tokens: torch.Tensor,
         expert_idxs: torch.Tensor | None = None,
         expand_idx: torch.Tensor | None = None,
+        expert_counts: list[int] | None = None,
     ) -> torch.Tensor:
+        if training.fp8 and ARCH_MAJOR == 9:
+            # Expand, scatter by expert and quantize in one pass; the bf16 expert input is never
+            # written, and x inside only carries its gradient.
+            expand = expand_idx if distributed.ep_size > 1 else None
+            outs, rsi = self.mlp.experts.forward_from_tokens(gathered_tokens, expert_idxs, expand, expert_counts)  # fmt: skip
+            del gathered_tokens
+            return padded_index_gather(outs, rsi)
+        if self.keeps_stage3_input():
+            # BF16 on SM90: the fused CuTe experts read the received tokens in place (kept for
+            # the weight gradient, see keeps_stage3_input) and return the outputs in slot order.
+            expand = expand_idx if distributed.ep_size > 1 else None
+            return self.mlp.experts.forward_from_tokens(gathered_tokens, expert_idxs, expand, expert_counts)[0]  # fmt: skip
         if distributed.ep_size > 1:
             gathered_tokens = padded_index_gather(gathered_tokens, expand_idx)
-        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = scatter_for_grouped_gemm(gathered_tokens, expert_idxs, self.mlp.experts_per_rank)  # fmt: skip
+        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = scatter_for_grouped_gemm(gathered_tokens, expert_idxs, self.mlp.experts_per_rank, group_counts=expert_counts)  # fmt: skip
         del gathered_tokens
         outs = self.mlp.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
         return padded_index_gather(outs, reverse_shuffle_idxs)
 
-    @torch.compile(fullgraph=True)
+    @torch.compile(fullgraph=True, options=COMPILE_OPTIONS)
     def forward_stage5(
         self,
         moe_outs: torch.Tensor,
@@ -392,10 +512,14 @@ class GptOssModel(nn.Module):
         if stage_index == stage_count - 1:
             self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.lm_head = BF16Linear(config.hidden_size, config.vocab_size, bias=False)
+        # The edge cost is that of FP8 layers; BF16 layers cost more next to the same edges (and
+        # hold more memory), so BF16 keeps the even partition.
         self.layers = nn.ModuleDict(
             {
                 str(i): GptOssDecoderLayer(config, i)
-                for i in layer_partition(config.num_hidden_layers, stage_count, stage_index)
+                for i in gpt_oss_layer_partition(
+                    config.num_hidden_layers, stage_count, stage_index, training.fp8
+                )
             }
         )
 

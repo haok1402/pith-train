@@ -14,10 +14,18 @@ from pithtrain.modules.load_balance import (
     MoELoadBalanceLossTracker,
     replay_indices,
 )
+from pithtrain.operators import bf16_cute
 from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
-from pithtrain.operators.linear import BF16Linear
+from pithtrain.operators.fp8_dsv2_mlp import fp8_swiglu_mlp
+from pithtrain.operators.fp8_dsv2_mlp import fusable as fp8_mlp_fusable
+from pithtrain.operators.grouped_linear import (
+    fp8_scatter_quant,
+    fp8_swiglu_experts,
+    quantize_grouped_input,
+)
+from pithtrain.operators.linear import ARCH_MAJOR, BF16Linear
 from pithtrain.operators.ring_attention import mla_ring_attention_func
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
@@ -27,6 +35,11 @@ from pithtrain.operators.token_scatter import (
 )
 from pithtrain.pipeline.dualpipev import layer_partition
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
+
+# Inductor's C++ wrapper launches the compiled regions' kernels from C++ instead of a generated
+# Python function: the same kernels and bits, less host time per call on a host-bound step (as in
+# qwen3_moe.py).
+COMPILE_OPTIONS = {"cpp_wrapper": True}
 
 
 class DeepSeekV2RotaryEmbedding(nn.Module):
@@ -104,8 +117,13 @@ class DeepSeekV2MLP(nn.Module):
         self.down_proj = training.Linear(intermediate_size, hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        g = self.gate_proj(x)
-        u = self.up_proj(x)
+        if training.fp8 and ARCH_MAJOR == 9 and fp8_mlp_fusable(x):
+            # One op: x quantized once, dg/du quantized straight from dh (fp8_dsv2_mlp.py).
+            return fp8_swiglu_mlp(self.gate_proj, self.up_proj, self.down_proj, x)
+        # gate_proj and up_proj read the same input; under FP8 it is quantized once for both.
+        xq = training.Linear.quantize_input(x)
+        g = self.gate_proj(x, xq)
+        u = self.up_proj(x, xq)
         return self.down_proj(silu_mul(g, u))
 
     def reference_forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -117,6 +135,7 @@ class DeepSeekV2Experts(nn.Module):
         super().__init__()
         hidden_size = config.hidden_size
         intermediate_size = config.moe_intermediate_size
+        self.top_k = getattr(config, "num_experts_per_tok", num_experts)
         self.gate_proj = training.GroupedLinear(num_experts, hidden_size, intermediate_size)
         self.up_proj = training.GroupedLinear(num_experts, hidden_size, intermediate_size)
         self.down_proj = training.GroupedLinear(num_experts, intermediate_size, hidden_size)
@@ -127,12 +146,49 @@ class DeepSeekV2Experts(nn.Module):
         grouped_mm_offs: torch.Tensor,
         ks: list | None = None,
         ks_tensor: torch.Tensor | None = None,
+        quantized_input: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
         gi = precompute_group_indices(grouped_mm_offs, x.shape[0])
+        if training.fp8 and gi is not None and x.shape[0]:
+            # Hopper FP8: SwiGLU fused into the quantization of its neighbouring GEMMs.
+            args = (x, grouped_mm_offs, ks, ks_tensor, gi, quantized_input)
+            return fp8_swiglu_experts(self.gate_proj, self.up_proj, self.down_proj, *args)
         kwargs = dict(grouped_mm_offs=grouped_mm_offs, ks=ks, ks_tensor=ks_tensor, group_indices=gi)
-        g = self.gate_proj(x, **kwargs)
-        u = self.up_proj(x, **kwargs)
+        # gate_proj and up_proj read the same input, so under FP8 it is quantized once for both.
+        share = training.fp8 and x.shape[0]
+        xq = quantize_grouped_input(x.detach(), grouped_mm_offs) if share else None
+        g = self.gate_proj(x, **kwargs, quantized_input=xq)
+        u = self.up_proj(x, **kwargs, quantized_input=xq)
         return self.down_proj(silu_mul(g, u), **kwargs)
+
+    def uses_bf16_cute(self) -> bool:
+        """Whether BF16 stage 3 runs as the fused CuTe experts (bf16_cute) in this process."""
+        return bf16_cute.enabled() and self.gate_proj.num_groups <= bf16_cute.MAX_GROUPS
+
+    def forward_from_tokens(
+        self,
+        gathered: torch.Tensor,
+        expert_idxs: torch.Tensor,
+        expand_idx: torch.Tensor | None,
+        expert_counts: list[int] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        Hopper stage 3 from the received tokens. FP8: expand, scatter by expert and quantize in one
+        pass (fp8_scatter_quant), then the experts; returns (expert outputs in grouped order,
+        reverse_shuffle_idxs). BF16 (uses_bf16_cute): the fused CuTe experts, which read the
+        received tokens through an index and return the outputs in slot order, with None. A
+        forward method of its own, registered with FSDP, so the quantized input never crosses the
+        FSDP boundary, whose mixed-precision cast would turn it to bf16.
+        """
+        if not training.fp8:
+            from pithtrain.operators.bf16_cute.experts import bf16_swiglu_experts
+
+            args = (gathered, expert_idxs, expand_idx, self.top_k)
+            return bf16_swiglu_experts(self.gate_proj, self.up_proj, self.down_proj, *args), None
+        G = self.gate_proj.num_groups
+        x, rsi, offs, ks, ks_tensor, xq = fp8_scatter_quant(gathered, expert_idxs, G, expand_idx, expert_counts)  # fmt: skip
+        # self.forward, not self(...): calling the module re-enters FSDP's input cast.
+        return self.forward(x, offs, ks=ks, ks_tensor=ks_tensor, quantized_input=xq), rsi
 
 
 class DeepSeekV2MoEGate(nn.Module):
@@ -260,13 +316,16 @@ class DeepSeekV2Attention(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, S, _ = hidden_states.size()
-        if self.q_lora_rank is None:
-            q = self.q_proj(hidden_states)
-        else:
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+        # q_proj (or q_a_proj) and kv_a_proj_with_mqa read the same input; under FP8 it is
+        # quantized once for both.
+        q_in = self.q_proj if self.q_lora_rank is None else self.q_a_proj
+        xq = training.Linear.quantize_input(hidden_states)
+        q = q_in(hidden_states, xq)
+        compressed_kv = self.kv_a_proj_with_mqa(hidden_states, xq)
+        if self.q_lora_rank is not None:
+            q = self.q_b_proj(self.q_a_layernorm(q))
         q = q.view(B, S, self.num_heads, self.q_head_dim)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
         compressed_kv, k_pe = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)  # fmt: skip
         k_pe = k_pe.view(B, S, 1, self.qk_rope_head_dim)
         normed_kv = self.kv_a_layernorm(compressed_kv)
@@ -298,7 +357,7 @@ class DeepSeekV2DecoderLayer(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    @torch.compile(fullgraph=True)
+    @torch.compile(fullgraph=True, options=COMPILE_OPTIONS)
     def forward_stage1_compute(
         self,
         hidden_states: torch.Tensor,
@@ -335,22 +394,45 @@ class DeepSeekV2DecoderLayer(nn.Module):
         dispatch_tokens, routing = prepare_dispatch(hidden_states, topk_idx, topk_weight, self.mlp.n_routed_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)  # fmt: skip
         return dispatch_tokens, residual, routing
 
+    def keeps_stage3_input(self) -> bool:
+        """
+        Whether forward_stage3 keeps gathered_tokens for the backward, so the pipeline must not
+        free its storage after the forward: the fused BF16 CuTe experts read the received tokens
+        again in their weight gradient.
+        """
+        return (
+            not training.fp8 and hasattr(self.mlp, "experts") and self.mlp.experts.uses_bf16_cute()
+        )
+
     def forward_stage3(
         self,
         gathered_tokens: torch.Tensor,
         expert_idxs: torch.Tensor | None = None,
         expand_idx: torch.Tensor | None = None,
+        expert_counts: list[int] | None = None,
     ) -> torch.Tensor:
         if isinstance(self.mlp, DeepSeekV2MLP):
             return self.mlp(gathered_tokens)
+        if training.fp8 and ARCH_MAJOR == 9:
+            # Expand, scatter by expert and quantize in one pass; the bf16 expert input is never
+            # written, and x below only carries its gradient.
+            expand = expand_idx if distributed.ep_size > 1 else None
+            outs, rsi = self.mlp.experts.forward_from_tokens(gathered_tokens, expert_idxs, expand, expert_counts)  # fmt: skip
+            del gathered_tokens
+            return padded_index_gather(outs, rsi)
+        if self.keeps_stage3_input():
+            # BF16 on SM90: the fused CuTe experts read the received tokens in place (kept for
+            # the weight gradient, see keeps_stage3_input) and return the outputs in slot order.
+            expand = expand_idx if distributed.ep_size > 1 else None
+            return self.mlp.experts.forward_from_tokens(gathered_tokens, expert_idxs, expand, None)[0]  # fmt: skip
         if distributed.ep_size > 1:
             gathered_tokens = padded_index_gather(gathered_tokens, expand_idx)
-        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = scatter_for_grouped_gemm(gathered_tokens, expert_idxs, self.mlp.experts_per_rank)  # fmt: skip
+        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = scatter_for_grouped_gemm(gathered_tokens, expert_idxs, self.mlp.experts_per_rank, group_counts=expert_counts)  # fmt: skip
         del gathered_tokens
         outs = self.mlp.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
         return padded_index_gather(outs, reverse_shuffle_idxs)
 
-    @torch.compile(fullgraph=True)
+    @torch.compile(fullgraph=True, options=COMPILE_OPTIONS)
     def forward_stage5(
         self,
         moe_outs: torch.Tensor,

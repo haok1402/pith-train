@@ -27,8 +27,12 @@ from pithtrain.models.deepseek_v2 import DeepSeekV2Model
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel
+from pithtrain.modules.fsdp_forward import install_lean_hooks, register_fsdp_forward_method
 from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
 from pithtrain.modules.optimizer import Muon
+from pithtrain.operators.fp8_gptoss_param import install_raw_fp8_param_gather
+from pithtrain.operators.fp8_gptoss_wgrad import install_raw_main_grad
+from pithtrain.operators.fp8_param import install_fp8_param_gather
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
 from pithtrain.operators.linear import BF16Linear, FP8Linear
 from pithtrain.operators.wgrad_accumulation import install_wgrad_accumulation
@@ -80,10 +84,10 @@ def make_muon_optimizer(cfg: TrainingCfg, *, weight_decay: float = 0.1) -> tuple
 
 def make_adamw_optimizer(cfg: TrainingCfg, *, weight_decay: float = 0.1) -> tuple[Optimizer, ...]:
     """
-    AdamW over all parameters.
+    AdamW over all parameters, its update as one fused kernel per device and dtype (fused=True).
     """
     kwargs = dict(lr=cfg.lr, weight_decay=weight_decay)
-    return (AdamW(training.model.parameters(), **kwargs),)
+    return (AdamW(training.model.parameters(), fused=True, **kwargs),)
 
 
 def make_wsd_scheduler(
@@ -340,6 +344,7 @@ def apply_fsdp(model, hsdp_replica: int = 1):
         output_dtype=None,
         cast_forward_inputs=True,
     )
+    install_lean_hooks()
     # FSDP recommends shard models from the bottom to the top.
     for i in range(2):
         assert isinstance(model[i], PIPELINE_STAGE_MODELS)
@@ -356,10 +361,12 @@ def apply_fsdp(model, hsdp_replica: int = 1):
                     reshard_after_forward=False,
                     mp_policy=mp,
                 )
+                if hasattr(layer.mlp.experts, "forward_from_tokens"):
+                    register_fsdp_forward_method(layer.mlp.experts, "forward_from_tokens")
             fully_shard(layer, mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
-            torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage1")
-            torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage3")
-            torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage5")
+            register_fsdp_forward_method(layer, "forward_stage1")
+            register_fsdp_forward_method(layer, "forward_stage3")
+            register_fsdp_forward_method(layer, "forward_stage5")
         fully_shard(model[i], mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
 
     # Sum gradients instead of the FSDP2 default average. The two classes reduce over groups of
@@ -370,6 +377,12 @@ def apply_fsdp(model, hsdp_replica: int = 1):
     for module in model.modules():
         if isinstance(module, FSDPModule):
             module.set_gradient_divide_factor(1.0)
+
+    if training.fp8_param_gather:
+        install_fp8_param_gather(model, (FP8Linear, FP8GroupedLinear))
+        # gpt-oss keeps its routed experts as raw parameters; after the call above, which resets
+        # fp8_param's registry.
+        install_raw_fp8_param_gather(model)
     return model
 
 
@@ -378,6 +391,10 @@ def setup_model(
     distributed_cfg: DistributedCfg,
 ) -> None:
     training.fp8 = cfg.fp8
+    # FP8 weights are always all-gathered in FP8, as Megatron-LM's --fp8-param-gather does: the
+    # operands are bit-identical to quantizing the gathered bf16 weight (see fp8_param.py).
+    training.fp8_param_gather = cfg.fp8
+    training.norm_recompute = not cfg.fp8  # BF16: recompute the RMSNorm outputs (recompute.py)
     training.Linear = FP8Linear if cfg.fp8 else BF16Linear
     training.GroupedLinear = FP8GroupedLinear if cfg.fp8 else GroupedLinear
 
@@ -419,8 +436,8 @@ def setup_model(
 
     modules = nn.Sequential(*modules)
     apply_fsdp(modules, distributed_cfg.hsdp_replica)
-    if not cfg.fp8:
-        install_wgrad_accumulation(modules)
+    install_wgrad_accumulation(modules)
+    install_raw_main_grad(modules)  # gpt-oss raw expert weights; no-op elsewhere
 
     # The two V-chunks build identical read-only rotary caches; share one to save memory.
     if hasattr(modules[0], "rotary_emb") and hasattr(modules[1], "rotary_emb"):

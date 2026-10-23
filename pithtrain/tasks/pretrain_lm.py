@@ -24,10 +24,11 @@ from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
-from pithtrain.modules.optimizer import clip_grad_norm
+from pithtrain.modules.optimizer import clip_grad_norm, local_grads, scale_grads_
 from pithtrain.modules.training import TrainingCfg, setup_training
 from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.cross_entropy import cross_entropy
+from pithtrain.operators.fp8_param import precompute_fp8_param_scales
 from pithtrain.pipeline import Microbatch
 
 
@@ -217,9 +218,7 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     # is the local count times dp * cp, which holds only while every rank counts the same number
     # of tokens: true for pretraining, not for packed data with -100 masks.
     scale = 1.0 / (num_tokens * distributed.dp_size * distributed.cp_size)
-    for p in model.parameters():
-        if p.grad is not None:
-            p.grad.mul_(scale)
+    scale_grads_(local_grads(model), scale)
 
     # Clip the gradients.
     gradient_norm = clip_grad_norm(
@@ -231,6 +230,8 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
+    if training.fp8_param_gather:
+        precompute_fp8_param_scales()
     MoELoadBalanceLossTracker.reset()
 
     # Measure the elapsed time in seconds.
@@ -335,7 +336,13 @@ def launch(cfg: PretrainLMCfg) -> None:
     step = find_checkpoint(cfg.training.save_location)
     if step is not None:
         load_checkpoint(cfg.training.save_location, step)
+        if training.fp8_param_gather:
+            precompute_fp8_param_scales()
     step = step or 0
+    # Freeze the startup heap (model, datasets, compiled graphs) out of the collector, so the
+    # per-step gc.collect() in train_step scans only what the step allocated.
+    gc.collect()
+    gc.freeze()
     gc.disable()
     while step < cfg.training.max_steps:
         train_step(cfg, dataset, step)

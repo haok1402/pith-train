@@ -27,7 +27,7 @@ from torch.autograd import Variable
 
 from pithtrain.contexts import distributed
 from pithtrain.models.interface import AllToAllSplits, LayerProtocol, ModelProtocol, RoutingInfo
-from pithtrain.operators.all_to_all import direct_all_to_all
+from pithtrain.operators.all_to_all import all_to_all_async, direct_all_to_all
 
 # fmt: off
 
@@ -104,6 +104,23 @@ class ExecutionCtx:
     Stage 2 / Stage 4). The subsequent stage that waits on fwd_comm_work drains and frees
     this list automatically.
     """
+
+
+def comm_all_to_all(ctx: ExecutionCtx, input: torch.Tensor, output_splits: List[int], input_splits: List[int]):
+    """
+    Asynchronous all-to-all over the EP group issued from the comm stream: (output, work).
+
+    Equivalent to running direct_all_to_all under `with torch.cuda.stream(ctx.comm_stream)` (the
+    output is allocated from the comm stream's pool and NCCL orders itself after the comm
+    stream), with the stream switched by two direct calls instead of a StreamContext.
+    """
+    stream = ctx.comm_stream
+    prev = torch._C._cuda_getCurrentStream(stream.device_index)
+    torch._C._cuda_setStream(stream.stream_id, stream.device_index, stream.device_type)
+    try:
+        return all_to_all_async(input, output_splits, input_splits, distributed.ep_group)
+    finally:
+        torch._C._cuda_setStream(*prev)
 
 
 # ------------------------------------------------------------
@@ -189,13 +206,9 @@ def stage2_f(ctx: ExecutionCtx, layer: LayerProtocol, dispatch_tokens: torch.Ten
     dispatch_tokens = dispatch_tokens.detach()
     record.splits = dispatch_splits
     if dispatch_splits is not None:
-        with torch.cuda.stream(ctx.comm_stream):
-            gathered_tokens = direct_all_to_all(dispatch_tokens, dispatch_splits.output_splits, dispatch_splits.input_splits, distributed.ep_group)
+        gathered_tokens, ctx.fwd_comm_work = comm_all_to_all(ctx, dispatch_tokens, dispatch_splits.output_splits, dispatch_splits.input_splits)
     else:
-        gathered_tokens = dispatch_tokens
-
-    ctx.fwd_comm_work = getattr(gathered_tokens, "comm_work", None)
-    setattr(gathered_tokens, "comm_work", None)
+        gathered_tokens, ctx.fwd_comm_work = dispatch_tokens, None
 
     nvtx.range_pop()
     return record, gathered_tokens
@@ -210,10 +223,7 @@ def stage2_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage2Record, grad
     ctx.comm_stream.wait_event(ctx.bwd_event)
 
     if record.splits is not None:
-        with torch.cuda.stream(ctx.comm_stream):
-            dispatch_tokens_grad = direct_all_to_all(grad_tensors[0], record.splits.input_splits, record.splits.output_splits, distributed.ep_group)
-        ctx.bwd_comm_work = dispatch_tokens_grad.comm_work
-        dispatch_tokens_grad.comm_work = None
+        dispatch_tokens_grad, ctx.bwd_comm_work = comm_all_to_all(ctx, grad_tensors[0], record.splits.input_splits, record.splits.output_splits)
     else:
         dispatch_tokens_grad = grad_tensors[0]
         ctx.bwd_comm_work = None
@@ -250,7 +260,13 @@ def _drain_deferred_free(ctx: ExecutionCtx) -> None:
     ctx.fwd_comm_deferred_free.clear()
 
 
-def stage3_f(ctx: ExecutionCtx, layer: LayerProtocol, gathered_tokens: torch.Tensor, expert_idxs: Optional[torch.Tensor], expand_idx: Optional[torch.Tensor] = None):
+def _keeps_stage3_input(layer: LayerProtocol) -> bool:
+    """Whether the layer's stage 3 saves its input for the backward (see keeps_stage3_input)."""
+    keeps = getattr(layer, "keeps_stage3_input", None)
+    return keeps is not None and keeps()
+
+
+def stage3_f(ctx: ExecutionCtx, layer: LayerProtocol, gathered_tokens: torch.Tensor, expert_idxs: Optional[torch.Tensor], expand_idx: Optional[torch.Tensor] = None, expert_counts: Optional[list[int]] = None):
     """
     Stage3 forward.
     """
@@ -264,12 +280,13 @@ def stage3_f(ctx: ExecutionCtx, layer: LayerProtocol, gathered_tokens: torch.Ten
         ctx.fwd_comm_work.wait()
     _drain_deferred_free(ctx)
 
-    moe_outs = layer.forward_stage3(gathered_tokens, expert_idxs, expand_idx)
+    moe_outs = layer.forward_stage3(gathered_tokens, expert_idxs, expand_idx, expert_counts)
     record.outs = Stage3Outs(moe_outs)
     # Free the args storage - only safe for MoE layers with EP where
     # padded_index_gather is the first consumer and doesn't save the input.
     # When ep_size==1, gathered_tokens shares storage with dispatch_tokens.
-    if expert_idxs is not None and ctx.fwd_comm_work is not None:
+    # Layers whose experts read the tokens again in backward keep them (keeps_stage3_input).
+    if expert_idxs is not None and ctx.fwd_comm_work is not None and not _keeps_stage3_input(layer):
         gathered_tokens.untyped_storage().resize_(0)
 
     ctx.comp_stream.record_event(ctx.fwd_event)
@@ -333,11 +350,9 @@ def stage4_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, co
 
     record.splits = combine_splits
     if combine_splits is not None:
-        with torch.cuda.stream(ctx.comm_stream):
-            moe_outs = direct_all_to_all(moe_outs, combine_splits.input_splits, combine_splits.output_splits, distributed.ep_group)
-
-    ctx.fwd_comm_work = getattr(moe_outs, "comm_work", None)
-    setattr(moe_outs, "comm_work", None)
+        moe_outs, ctx.fwd_comm_work = comm_all_to_all(ctx, moe_outs, combine_splits.input_splits, combine_splits.output_splits)
+    else:
+        ctx.fwd_comm_work = None
 
     nvtx.range_pop()
     return record, moe_outs
@@ -352,10 +367,7 @@ def stage4_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage4Record, grad
     ctx.comm_stream.wait_event(ctx.bwd_event)
 
     if record.splits is not None:
-        with torch.cuda.stream(ctx.comm_stream):
-            moe_outs_grad = direct_all_to_all(grad_tensors[0], record.splits.output_splits, record.splits.input_splits, distributed.ep_group)
-        ctx.bwd_comm_work = moe_outs_grad.comm_work
-        moe_outs_grad.comm_work = None
+        moe_outs_grad, ctx.bwd_comm_work = comm_all_to_all(ctx, grad_tensors[0], record.splits.output_splits, record.splits.input_splits)
     else:
         moe_outs_grad = grad_tensors[0]
         ctx.bwd_comm_work = None
@@ -450,9 +462,13 @@ def stage5_stage1_f(ctx: ExecutionCtx, prev_layer: LayerProtocol, next_layer: La
     _drain_deferred_free(ctx)
 
     moe_local_idxs = routing.moe_local_idxs if routing is not None else None
-    hidden_states = prev_layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
-
-    dispatch_tokens, next_residual, next_routing = next_layer.forward_stage1(hidden_states, rotary_posemb, cu_seqlens)
+    fused = getattr(next_layer, "forward_stage5_stage1", None)
+    if fused is not None:
+        # One compiled region for prev_layer's stage 5 and next_layer's stage 1 (model opt-in).
+        dispatch_tokens, next_residual, next_routing = fused(prev_layer, moe_outs, moe_local_idxs, topk_weight, residual, rotary_posemb, cu_seqlens)
+    else:
+        hidden_states = prev_layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
+        dispatch_tokens, next_residual, next_routing = next_layer.forward_stage1(hidden_states, rotary_posemb, cu_seqlens)
     ctx.comp_stream.record_event(ctx.fwd_event)
 
     next_topk_weight = next_routing.topk_weight if next_routing is not None else None
@@ -680,14 +696,14 @@ def layer_forward(
     if has_experts and fwd_comm_work is not None:
         dispatch_tokens.untyped_storage().resize_(0)
 
-    moe_outs = layer.forward_stage3(gathered_tokens, routing.expert_idxs if has_experts else None, routing.expand_idx if has_experts else None)
+    moe_outs = layer.forward_stage3(gathered_tokens, routing.expert_idxs if has_experts else None, routing.expand_idx if has_experts else None, routing.expert_counts if has_experts else None)
 
     record.outs = Stage3Outs(moe_outs)
     # Free args storage - values no longer needed, only .grad is read after backward.
     # Only safe for MoE layers with EP: padded_index_gather is the first consumer and
     # doesn't save the input.  For dense layers or ep_size==1, gate_proj/up_proj may
     # save gathered_tokens directly, or it shares storage with dispatch_tokens.
-    if has_experts and fwd_comm_work is not None:
+    if has_experts and fwd_comm_work is not None and not _keeps_stage3_input(layer):
         gathered_tokens.untyped_storage().resize_(0)
     layer_record.stage3 = record
     nvtx.range_pop()

@@ -214,6 +214,33 @@ class Muon(torch.optim.Optimizer):
         p.add_(orth, alpha=-lr)
 
 
+def local_grads(model: torch.nn.Module) -> list[torch.Tensor]:
+    """
+    The local shard of every parameter gradient, in model.parameters() order.
+    """
+    grads = []
+    for p in model.parameters():
+        if p.grad is None:
+            continue
+        g = p.grad
+        grads.append(g._local_tensor if isinstance(g, DTensor) else g)
+    return grads
+
+
+@torch.no_grad()
+def scale_grads_(grads: list[torch.Tensor], scale: torch.Tensor) -> None:
+    """
+    Multiply every gradient in place by the 0-d tensor scale: one foreach launch per device and
+    dtype instead of one DTensor op per parameter, and the same elementwise multiply as
+    grad.mul_(scale), so every element gets the same bits.
+    """
+    groups: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
+    for g in grads:
+        groups.setdefault((g.device, g.dtype), []).append(g)
+    for group in groups.values():
+        torch._foreach_mul_(group, scale)
+
+
 @torch.no_grad()
 def clip_grad_norm(
     model: torch.nn.Module, max_norm: float, norm_type: float = 2.0, hsdp_replica: int = 1
@@ -225,15 +252,12 @@ def clip_grad_norm(
     The world-wide sum counts each gradient element once, since every element lives on a single
     rank. At hsdp_replica above 1 each element sits on that many ranks, so the summed square is
     divided by the same count.
+
+    The coefficient stays on the device: rather than branching on clip_coef < 1.0 (a host sync),
+    the gradients are always multiplied, by 1.0 when no clipping is due, which leaves every bit
+    as it was. A NaN norm also maps to 1.0, as the comparison was False for it.
     """
-    grads = []
-    for p in model.parameters():
-        if p.grad is None:
-            continue
-        g = p.grad
-        if isinstance(g, DTensor):
-            g = g.to_local()
-        grads.append(g)
+    grads = local_grads(model)
     if not grads:
         first_param = next(model.parameters(), None)
         device = first_param.device if first_param is not None else torch.device("cpu")
@@ -245,8 +269,6 @@ def clip_grad_norm(
     local_norm_sq = local_norm_sq / hsdp_replica
     total_norm = (local_norm_sq ** (1.0 / norm_type)).clamp(min=1e-6)
     clip_coef = (max_norm / total_norm).clamp(max=1.0)
-    if clip_coef < 1.0:
-        for p in model.parameters():
-            if p.grad is not None:
-                p.grad.mul_(clip_coef)
+    clip_coef = torch.where(clip_coef < 1.0, clip_coef, torch.ones_like(clip_coef))
+    scale_grads_(grads, clip_coef)
     return total_norm
