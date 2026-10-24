@@ -8,25 +8,23 @@ from torch import nn
 from transformers.models.deepseek_v2.configuration_deepseek_v2 import DeepseekV2Config
 
 from pithtrain.contexts import distributed, training
-from pithtrain.models.interface import RoutingInfo
+from pithtrain.kernels import bf16_expert_support
+from pithtrain.kernels.arch import ARCH_MAJOR
+from pithtrain.kernels.fp8_gemm import quantize_grouped_input
 from pithtrain.modules.load_balance import (
     MoELoadBalanceLossInjector,
     MoELoadBalanceLossTracker,
     replay_indices,
 )
-from pithtrain.operators import bf16_cute
 from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
-from pithtrain.operators.fp8_dsv2_mlp import fp8_swiglu_mlp
-from pithtrain.operators.fp8_dsv2_mlp import fusable as fp8_mlp_fusable
-from pithtrain.operators.grouped_linear import (
-    fp8_scatter_quant,
-    fp8_swiglu_experts,
-    quantize_grouped_input,
-)
-from pithtrain.operators.linear import ARCH_MAJOR, BF16Linear
+from pithtrain.operators.fp8_experts import fp8_scatter_quant, fp8_swiglu_experts
+from pithtrain.operators.fp8_swiglu_mlp import fp8_swiglu_mlp
+from pithtrain.operators.fp8_swiglu_mlp import fusable as fp8_mlp_fusable
+from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.ring_attention import mla_ring_attention_func
+from pithtrain.operators.routing import RoutingInfo
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
@@ -118,7 +116,7 @@ class DeepSeekV2MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if training.fp8 and ARCH_MAJOR == 9 and fp8_mlp_fusable(x):
-            # One op: x quantized once, dg/du quantized straight from dh (fp8_dsv2_mlp.py).
+            # One op: x quantized once, dg/du quantized straight from dh (fp8_swiglu_mlp.py).
             return fp8_swiglu_mlp(self.gate_proj, self.up_proj, self.down_proj, x)
         # gate_proj and up_proj read the same input; under FP8 it is quantized once for both.
         xq = training.Linear.quantize_input(x)
@@ -162,8 +160,8 @@ class DeepSeekV2Experts(nn.Module):
         return self.down_proj(silu_mul(g, u), **kwargs)
 
     def uses_bf16_cute(self) -> bool:
-        """Whether BF16 stage 3 runs as the fused CuTe experts (bf16_cute) in this process."""
-        return bf16_cute.enabled() and self.gate_proj.num_groups <= bf16_cute.MAX_GROUPS
+        """Whether BF16 stage 3 runs as the fused CuTe experts (operators/bf16_experts.py) in this process."""
+        return not training.fp8 and bf16_expert_support.supported(self.gate_proj.num_groups)
 
     def forward_from_tokens(
         self,
@@ -181,7 +179,7 @@ class DeepSeekV2Experts(nn.Module):
         FSDP boundary, whose mixed-precision cast would turn it to bf16.
         """
         if not training.fp8:
-            from pithtrain.operators.bf16_cute.experts import bf16_swiglu_experts
+            from pithtrain.operators.bf16_experts import bf16_swiglu_experts
 
             args = (gathered, expert_idxs, expand_idx, self.top_k)
             return bf16_swiglu_experts(self.gate_proj, self.up_proj, self.down_proj, *args), None

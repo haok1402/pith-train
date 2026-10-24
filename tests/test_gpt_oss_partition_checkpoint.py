@@ -33,8 +33,8 @@ def reduced_model(out: Path) -> Path:
 def run(mode: str, layout: str, work: Path) -> None:
     from pithtrain.contexts import training
     from pithtrain.modules.checkpoint import load_checkpoint, save_checkpoint
+    from pithtrain.modules.fp8_param_gather import precompute_fp8_param_scales
     from pithtrain.modules.training import make_adamw_optimizer, make_constant_scheduler
-    from pithtrain.operators.fp8_param import precompute_fp8_param_scales
     from pithtrain.tasks import pretrain_lm
 
     if layout == "even":

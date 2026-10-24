@@ -33,7 +33,7 @@ configuration object, so they live here rather than being passed down.
 
 fp8_param_gather: bool = False
 """
-Whether the FP8 linear weights are all-gathered in FP8 (see pithtrain/operators/fp8_param.py).
+Whether the FP8 linear weights are all-gathered in FP8 (see pithtrain/modules/fp8_param_gather.py).
 Always equal to fp8.
 """
 

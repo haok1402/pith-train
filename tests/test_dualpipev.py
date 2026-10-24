@@ -24,11 +24,10 @@ from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel, Qwen35MoeTopKRouter
 from pithtrain.modules.checkpoint import iter_canonical_parameters
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
+from pithtrain.modules.wgrad_accumulation import install_raw_main_grad, install_wgrad_accumulation
 from pithtrain.operators.cp_sequence import zigzag_varlen_index
-from pithtrain.operators.fp8_gptoss_wgrad import install_raw_main_grad
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
 from pithtrain.operators.linear import BF16Linear, FP8Linear
-from pithtrain.operators.wgrad_accumulation import install_wgrad_accumulation
 from pithtrain.pipeline import DualPipeV, Microbatch
 
 

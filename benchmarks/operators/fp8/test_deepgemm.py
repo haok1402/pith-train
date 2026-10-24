@@ -24,8 +24,9 @@ import torch.nn as nn
 from triton.testing import do_bench
 
 from benchmarks.operators.utilities import Metrics
+from pithtrain.kernels.arch import ARCH_MAJOR
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
-from pithtrain.operators.linear import ARCH_MAJOR, FP8Linear
+from pithtrain.operators.linear import FP8Linear
 from pithtrain.operators.token_scatter import scatter_for_grouped_gemm
 
 try:

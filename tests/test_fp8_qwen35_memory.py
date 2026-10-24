@@ -3,7 +3,7 @@ Round-4 memory changes of the Qwen3.5 path, against the code they replace.
 
 - Gated DeltaNet with grouped value attention: gated_delta_rule on unrepeated q / k against
   repeat_interleave'd q / k. The autotuned custom op repeats them itself and the pinned path reads
-  them per group with the repeat's backward order (tests/test_gated_delta_rule_pinned.py), so both
+  them per group with the repeat's backward order (tests/operators/test_gated_delta_rule_pinned_sm90.py), so both
   match bit for bit. (FLA's native GVA backward rounds differently; round 4 kept it out.)
 - The GDN conv and FP8 input projections recomputed in backward (selective checkpoint).
 """

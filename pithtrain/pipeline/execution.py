@@ -10,15 +10,14 @@ micro-batches and overlap the compute of one with the communication of another.
 - Stage 4: combine all-to-all.
 - Stage 5: post-combine compute.
 
-WeightGradStore and run_backward are derived from dualpipe/utils.py in DeepSeek's
-DualPipe project (https://github.com/deepseek-ai/DualPipe), licensed under the MIT License.
-Copyright (c) 2025 DeepSeek. See pithtrain/pipeline/LICENSE for the full license text. The
-five-stage decomposition is an original addition.
+run_backward is derived from dualpipe/utils.py in DeepSeek's DualPipe project
+(https://github.com/deepseek-ai/DualPipe), licensed under the MIT License, as is WeightGradStore
+(pithtrain/contexts/weight_grad_store.py). Copyright (c) 2025 DeepSeek. See pithtrain/pipeline/LICENSE
+for the full license text. The five-stage decomposition is an original addition.
 """
 
-import queue
 from dataclasses import dataclass, field, fields
-from typing import Callable, List, NamedTuple, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.cuda.nvtx as nvtx
@@ -26,41 +25,16 @@ import torch.distributed
 from torch.autograd import Variable
 
 from pithtrain.contexts import distributed
-from pithtrain.models.interface import AllToAllSplits, LayerProtocol, ModelProtocol, RoutingInfo
+from pithtrain.contexts.weight_grad_store import WeightGradStore
+from pithtrain.models.interface import LayerProtocol, ModelProtocol
 from pithtrain.operators.all_to_all import all_to_all_async, direct_all_to_all
+from pithtrain.operators.routing import AllToAllSplits, RoutingInfo
 
 # fmt: off
 
 # ------------------------------------------------------------
 # DEFERRED WEIGHT GRADIENTS / MANUAL BACKWARD
 # ------------------------------------------------------------
-
-
-class WeightGradStore:
-    enabled: bool = False
-    cache: List[Callable] = []
-    funcs_queue = queue.Queue()
-
-    @classmethod
-    def put(cls, func: Callable) -> None:
-        cls.cache.append(func)
-
-    @classmethod
-    def flush(cls) -> None:
-        cls.funcs_queue.put(cls.cache)
-        cls.cache = []
-
-    @classmethod
-    def pop(cls) -> None:
-        assert not cls.funcs_queue.empty(), "Pop empty queue."
-        funcs = cls.funcs_queue.get()
-        for func in funcs:
-            func()
-
-    @classmethod
-    def clear(cls) -> None:
-        cls.cache = []
-        cls.funcs_queue = queue.Queue()
 
 
 def run_backward(tensors: List[torch.Tensor], grad_tensors: List[torch.Tensor]) -> None:

@@ -71,14 +71,11 @@ from torch.distributed import (
 )
 from torch.distributed.distributed_c10d import _resolve_process_group
 
-from pithtrain.operators.deepgemm_quantize import (
-    fp8cast_rowwise_blockwise_transpose,
-)
-
 # FP8 (deep-gemm) shared GEMM recipe + the activation quantizer for the in-ring kv_b
 # decompression; reached only when the caller passes a quantized kv_b weight
 # (i.e. training.fp8 enabled).
-from pithtrain.operators.linear import fp8_act_weight_gemm, fp8_dgrad_wgrad
+from pithtrain.kernels.fp8_gemm import fp8_act_weight_gemm, fp8_dgrad_wgrad
+from pithtrain.kernels.fp8_rowwise_blockwise_transpose import fp8cast_rowwise_blockwise_transpose
 
 
 def post_ring_kv(

@@ -9,11 +9,12 @@ import pytest
 import torch
 
 from pithtrain.contexts import training
-from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
-from pithtrain.operators.grouped_linear import FP8GroupedLinear, fp8_swiglu_experts
-from pithtrain.operators.linear import ARCH_MAJOR
+from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
+from pithtrain.contexts.weight_grad_store import WeightGradStore
+from pithtrain.kernels.arch import ARCH_MAJOR
+from pithtrain.operators.fp8_experts import fp8_swiglu_experts
+from pithtrain.operators.grouped_linear import FP8GroupedLinear
 from pithtrain.operators.token_scatter import precompute_group_indices
-from pithtrain.pipeline.execution import WeightGradStore
 
 pytestmark = pytest.mark.skipif(ARCH_MAJOR != 9, reason="Hopper-only fused path")
 

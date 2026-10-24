@@ -22,11 +22,9 @@ from typing import Tuple
 
 import torch
 
-from pithtrain.operators.deepgemm_quantize import (
-    fp8cast_rowwise_blockwise_transpose,
-    fp8cast_rowwise_transpose,
-)
-from pithtrain.operators.linear import _fp8_gemm_nt, fp8_dgrad_wgrad
+from pithtrain.kernels.fp8_gemm import fp8_dgrad_wgrad, fp8_gemm_nt
+from pithtrain.kernels.fp8_rowwise_blockwise_transpose import fp8cast_rowwise_blockwise_transpose
+from pithtrain.kernels.fp8_rowwise_transpose import fp8cast_rowwise_transpose
 
 
 @torch.library.custom_op("pithtrain::qwen3_qkv_fwd", mutates_args=())
@@ -59,7 +57,7 @@ def _qkv_fwd(
     x_fp8, scale_x, x_t_fp8, scale_x_t = fp8cast_rowwise_blockwise_transpose(x)
     w = torch.cat((wq_fp8, wk_fp8, wv_fp8), dim=0)
     s = torch.cat((sq, sk, sv), dim=0)
-    qkv = _fp8_gemm_nt(x_fp8, scale_x, w, s, m, w.shape[0], x.device, x.dtype)
+    qkv = fp8_gemm_nt(x_fp8, scale_x, w, s, m, w.shape[0], x.device, x.dtype)
     q, k, v = torch.split_with_sizes_copy(qkv, (wq.shape[0], wk.shape[0], wv.shape[0]), dim=1)
     return q, k, v, x_t_fp8, scale_x_t
 
@@ -97,8 +95,8 @@ def _qkv_bwd(
     del grad
     w_t = torch.cat((wq_t_fp8, wk_t_fp8, wv_t_fp8), dim=1)
     s_t = torch.cat((sq_t, sk_t, sv_t), dim=1)
-    dx = _fp8_gemm_nt(g_fp8, scale_g, w_t, s_t, m, k, dq.device, dq.dtype)
-    dw = _fp8_gemm_nt(g_t_fp8, scale_g_t, x_t_fp8, scale_x_t, n, k, dq.device, dq.dtype)
+    dx = fp8_gemm_nt(g_fp8, scale_g, w_t, s_t, m, k, dq.device, dq.dtype)
+    dw = fp8_gemm_nt(g_t_fp8, scale_g_t, x_t_fp8, scale_x_t, n, k, dq.device, dq.dtype)
     return dx, dw
 
 
@@ -163,7 +161,7 @@ def _o_proj_fwd(
     """
     m, n = x.shape[0], w_fp8.shape[0]
     x_fp8, scale_x, _, _ = fp8cast_rowwise_blockwise_transpose(x)
-    return _fp8_gemm_nt(x_fp8, scale_x, w_fp8, s, m, n, x.device, x.dtype)
+    return fp8_gemm_nt(x_fp8, scale_x, w_fp8, s, m, n, x.device, x.dtype)
 
 
 @_o_proj_fwd.register_fake

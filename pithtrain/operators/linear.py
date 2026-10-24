@@ -1,102 +1,27 @@
 """
-BF16 linear layer, FP8 linear layer (DeepGEMM) and the shared FP8 GEMM recipe.
+BF16 linear layer and FP8 linear layer (DeepGEMM).
 
 ``FP8Linear`` is a drop-in ``nn.Linear`` replacement backed by DeepGEMM's Float8 E4M3 GEMM with
 per-block (128-element) E8M0 power-of-2 scales -- native (MXFP8 PTX) on Blackwell (SM100+) and
-emulated on Hopper (SM90). ``fp8_act_weight_gemm`` / ``fp8_dgrad_wgrad`` own the forward/backward
-GEMM convention and are shared with the MLA pass-latent ring attention.
+emulated on Hopper (SM90). The forward / backward GEMM recipes (``fp8_act_weight_gemm`` /
+``fp8_dgrad_wgrad``) live in ``pithtrain/kernels/fp8_gemm.py``, shared with the MLA pass-latent
+ring attention.
 
 BF16Linear accumulates its weight gradient into an fp32 main_grad when one is set.
 """
 
 from typing import Any, Optional, Tuple
 
-import deep_gemm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch._inductor.lowering import fallback_handler, register_lowering
 
-from pithtrain.operators.deepgemm_quantize import (
-    fp8cast_blockwise_transpose,
-    fp8cast_rowwise_blockwise_transpose,
-    fp8cast_rowwise_transpose,
-)
-from pithtrain.operators.fp8_cute.scale_layout import mn_major_scale
-from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
-
-ARCH_MAJOR, _ = torch.cuda.get_device_capability()
-
-
-def _act_scale_like(mn: int, sf_k: int, device: torch.device) -> torch.Tensor:
-    """Fake of a 1x128 activation scale with the strides the quantization kernels return: on SM90
-    the CuTe kernels write it MN-major (``fp8_cute.scale_layout``) so DeepGEMM skips its
-    transpose_fp32; elsewhere the Triton kernels write it row-major."""
-    if ARCH_MAJOR == 9:
-        return mn_major_scale(mn, sf_k, device)
-    return torch.empty((mn, sf_k), dtype=torch.float32, device=device)
-
-
-def _fp8_gemm_nt(
-    a_fp8: torch.Tensor,
-    a_scale: torch.Tensor,
-    b_fp8: torch.Tensor,
-    b_scale: torch.Tensor,
-    m: int,
-    n: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """``out[m, n] = a @ b.T`` via the DeepGEMM fp8 NT GEMM. The single place that owns the
-    allocate-then-``fp8_fp4_gemm_nt`` convention shared by the FP8 linear layer and the MLA
-    pass-latent ring decompress. ``a_scale`` (1x128) is used as is when MN-major, as the SM90
-    quantization kernels return it, and transposed by DeepGEMM otherwise; ``b_scale`` (128x128)
-    is always used as is."""
-    out = torch.empty((m, n), device=device, dtype=dtype)
-    deep_gemm.fp8_fp4_gemm_nt((a_fp8, a_scale), (b_fp8, b_scale), out)
-    return out
-
-
-def fp8_act_weight_gemm(
-    input_2d: torch.Tensor,
-    weight_fp8: torch.Tensor,
-    scale_weight: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """FP8 forward GEMM ``y = x @ W.T``: rowwise-quantize the activation, run the NT GEMM, and
-    return ``(output, input_t_fp8, scale_input_t)`` -- the transposed activation is handed back
-    so a later wgrad can reuse it. Shared by ``_fp8_linear_fwd`` and the MLA ring so the recipe
-    has one source of truth."""
-    m, n = input_2d.shape[0], weight_fp8.shape[0]
-    input_fp8, scale_input, input_t_fp8, scale_input_t = fp8cast_rowwise_blockwise_transpose(
-        input_2d
-    )
-    output = _fp8_gemm_nt(
-        input_fp8, scale_input, weight_fp8, scale_weight, m, n, input_2d.device, input_2d.dtype
-    )
-    return output, input_t_fp8, scale_input_t
-
-
-def fp8_dgrad_wgrad(
-    grad_2d: torch.Tensor,
-    weight_t_fp8: torch.Tensor,
-    scale_weight_t: torch.Tensor,
-    input_t_fp8: torch.Tensor,
-    scale_input_t: torch.Tensor,
-    k: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """FP8 backward GEMMs: ``grad_input = grad @ W`` (via the transposed weight) and
-    ``weight_grad = grad.T @ x`` (via the transposed activation), both returned in ``grad_2d``'s
-    dtype. Shared by ``_fp8_linear_bwd`` and the MLA ring so dgrad/wgrad have one source of
-    truth; the caller supplies ``input_t_fp8`` (saved from the forward, or recomputed)."""
-    m, n = grad_2d.shape
-    grad_fp8, scale_grad, grad_t_fp8, scale_grad_t = fp8cast_rowwise_transpose(grad_2d)
-    grad_input = _fp8_gemm_nt(
-        grad_fp8, scale_grad, weight_t_fp8, scale_weight_t, m, k, grad_2d.device, grad_2d.dtype
-    )
-    weight_grad = _fp8_gemm_nt(
-        grad_t_fp8, scale_grad_t, input_t_fp8, scale_input_t, n, k, grad_2d.device, grad_2d.dtype
-    )
-    return grad_input, weight_grad
+from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
+from pithtrain.kernels.fp8_gemm import fp8_act_weight_gemm, fp8_dgrad_wgrad, fp8_gemm_nt
+from pithtrain.kernels.fp8_rowwise_blockwise_transpose import fp8cast_rowwise_blockwise_transpose
+from pithtrain.kernels.fp8_scale_layout import act_scale_like
+from pithtrain.kernels.fp8_weight_quant import fp8cast_blockwise_transpose
 
 
 @torch.library.custom_op("pithtrain::fp8_linear_fwd", mutates_args=())
@@ -199,7 +124,7 @@ def _(input_2d):
     M, K = input_2d.shape
     dev = input_2d.device
     input_fp8 = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=dev)
-    scale_input = _act_scale_like(M, (K + 127) // 128, dev)
+    scale_input = act_scale_like(M, (K + 127) // 128, dev)
     input_t_fp8 = torch.empty((K, M), dtype=torch.float8_e4m3fn, device=dev)
     scale_input_t = torch.empty(((K + 127) // 128, (M + 127) // 128), dtype=torch.float32, device=dev)  # fmt: skip
     return input_fp8, scale_input, input_t_fp8, scale_input_t
@@ -223,7 +148,7 @@ def _fp8_linear_fwd_prequantized(
     input_2d and weight are taken only to give them gradients; the GEMM reads the FP8 operands.
     """
     m, n = input_fp8.shape[0], weight_fp8.shape[0]
-    return _fp8_gemm_nt(
+    return fp8_gemm_nt(
         input_fp8, scale_input, weight_fp8, scale_weight, m, n, input_2d.device, input_2d.dtype
     )
 

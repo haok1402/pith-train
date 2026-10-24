@@ -36,7 +36,7 @@ from torch import nn
 from pithtrain.contexts import distributed, training
 from pithtrain.pipeline.dualpipev import layer_partition
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
-from pithtrain.models.interface import RoutingInfo
+from pithtrain.operators.routing import RoutingInfo
 from pithtrain.modules.load_balance import (
     MoELoadBalanceLossInjector,
     MoELoadBalanceLossTracker,

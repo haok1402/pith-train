@@ -1,7 +1,7 @@
 """
-_k_grouped_fp8_gemm_nt on shapes whose DeepGEMM SM90 k-grouped call deadlocks when made directly
+k_grouped_fp8_gemm_nt on shapes whose DeepGEMM SM90 k-grouped call deadlocks when made directly
 (an odd tile count: ceil(M / 128) * ceil(N / block_n) odd, M the first operand's channels). The
-guard in _k_grouped_call must make every one finish and equal the product of the dequantized FP8
+guard in fp8_gemm._k_grouped_call must make every one finish and equal the product of the dequantized FP8
 operands. Each case runs in a subprocess under a timeout, so a regression fails instead of hanging
 the test session (a hung kernel cannot be interrupted from Python). Hopper only.
 """
@@ -12,14 +12,14 @@ import sys
 
 import pytest
 
-from pithtrain.operators.linear import ARCH_MAJOR
+from pithtrain.kernels.arch import ARCH_MAJOR
 
 pytestmark = pytest.mark.skipif(ARCH_MAJOR != 9, reason="Hopper k-grouped path")
 
 CASE = r"""
 import sys, torch
-from pithtrain.operators.deepgemm_quantize import fp8cast_rowwise_kmajor
-from pithtrain.operators.grouped_linear import _k_grouped_fp8_gemm_nt
+from pithtrain.kernels.fp8_rowwise_kmajor import fp8cast_rowwise_kmajor
+from pithtrain.kernels.fp8_gemm import k_grouped_fp8_gemm_nt
 N, K = int(sys.argv[1]), int(sys.argv[2])
 ks = [int(v) for v in sys.argv[3].split(",")]
 torch.manual_seed(0)
@@ -31,7 +31,7 @@ a = fp8cast_rowwise_kmajor(dy, offs)[2:]
 b = fp8cast_rowwise_kmajor(x, offs)[2:]
 c = torch.randn(len(ks), N, K, device="cuda", dtype=torch.float32)  # accumulated into
 c0 = c.clone()
-_k_grouped_fp8_gemm_nt(a, b, c, ks, torch.tensor(ks, device="cuda", dtype=torch.int32), c=c)
+k_grouped_fp8_gemm_nt(a, b, c, ks, torch.tensor(ks, device="cuda", dtype=torch.int32), c=c)
 torch.cuda.synchronize()
 
 def deq(q, n):

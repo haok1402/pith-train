@@ -8,28 +8,25 @@ from torch import nn
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
 from pithtrain.contexts import distributed, training
-from pithtrain.models.interface import RoutingInfo
+from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
+from pithtrain.kernels import bf16_expert_support
+from pithtrain.kernels.arch import ARCH_MAJOR
+from pithtrain.kernels.fp8_weight_quant import fp8cast_blockwise_transpose_batched
+from pithtrain.modules.fp8_param_gather import fp8_param_operands
 from pithtrain.modules.load_balance import (
     MoELoadBalanceLossInjector,
     MoELoadBalanceLossTracker,
     replay_indices,
 )
-from pithtrain.operators import bf16_cute
 from pithtrain.operators.clamped_swiglu import clamped_swiglu
-from pithtrain.operators.deepgemm_quantize import fp8cast_blockwise_transpose_batched
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
-from pithtrain.operators.fp8_gptoss import fp8_clamped_swiglu_experts
-from pithtrain.operators.fp8_gptoss_param import fp8_param_operands
-from pithtrain.operators.fp8_gptoss_wgrad import raw_main_grad
-from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
-from pithtrain.operators.grouped_linear import (
-    FP8GroupedLinearFunc,
-    GroupedLinearFunc,
-    fp8_scatter_quant,
-)
+from pithtrain.operators.fp8_experts import fp8_clamped_swiglu_experts, fp8_scatter_quant
+from pithtrain.operators.grouped_linear import FP8GroupedLinearFunc, GroupedLinearFunc
 from pithtrain.operators.indexed_bias_add import indexed_bias_add
-from pithtrain.operators.linear import ARCH_MAJOR, BF16Linear
+from pithtrain.operators.linear import BF16Linear
+from pithtrain.operators.main_grad import raw_main_grad
+from pithtrain.operators.routing import RoutingInfo
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
     precompute_group_indices,
@@ -144,7 +141,7 @@ class GptOssRotaryEmbedding(nn.Module):
 
 class GptOssExperts(nn.Module):
     fp8_raw_params = ("gate_up_proj", "down_proj")
-    """Raw expert weights fp8_gptoss_param may all-gather in FP8 (with fp8_param_gather)."""
+    """Raw expert weights modules/fp8_param_gather.py may all-gather in FP8 (with fp8_param_gather)."""
 
     def __init__(self, config: GptOssConfig, num_experts: int):
         super().__init__()
@@ -202,7 +199,7 @@ class GptOssExperts(nn.Module):
     ) -> torch.Tensor:
         if training.fp8 and ARCH_MAJOR == 9 and x.shape[0]:
             # Hopper FP8: bias + clamped SwiGLU fused into the quantization of the neighbouring
-            # GEMMs (operators/fp8_gptoss.py); bit-identical to the unfused path below.
+            # GEMMs (operators/fp8_experts.py); bit-identical to the unfused path below.
             gi = precompute_group_indices(grouped_mm_offs, x.shape[0])
             q_gu = self._quantized_weight("gate_up_proj", self.gate_up_proj)
             q_down = self._quantized_weight("down_proj", self.down_proj)
@@ -229,8 +226,8 @@ class GptOssExperts(nn.Module):
         return out
 
     def uses_bf16_cute(self) -> bool:
-        """Whether BF16 stage 3 runs as the fused CuTe experts (bf16_cute) in this process."""
-        return bf16_cute.enabled() and self.num_experts <= bf16_cute.MAX_GROUPS
+        """Whether BF16 stage 3 runs as the fused CuTe experts (operators/bf16_experts.py) in this process."""
+        return not training.fp8 and bf16_expert_support.supported(self.num_experts)
 
     def forward_from_tokens(
         self,
@@ -249,7 +246,7 @@ class GptOssExperts(nn.Module):
         would turn it to bf16.
         """
         if not training.fp8:
-            from pithtrain.operators.bf16_cute.experts import bf16_clamped_swiglu_experts
+            from pithtrain.operators.bf16_experts import bf16_clamped_swiglu_experts
 
             args = (gathered, expert_idxs, expand_idx, expert_counts, self.top_k)
             out = bf16_clamped_swiglu_experts(self, *args, 1.702, self.swiglu_limit)

@@ -33,12 +33,12 @@ import torch.nn as nn
 from torch.distributed.fsdp import FSDPModule, fully_shard
 
 from pithtrain.contexts import distributed, training
+from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
+from pithtrain.contexts.weight_grad_store import WeightGradStore
 from pithtrain.models.interface import ModelProtocol
-from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
 from pithtrain.pipeline.execution import (
     ChunkRecord,
     ExecutionCtx,
-    WeightGradStore,
     clear_layer_records,
     create_chunk_record,
     epilog_f,
@@ -153,7 +153,8 @@ class DualPipeV(nn.Module):
         Combine / Aggregate stages for fine-grained computation-communication overlap.
       - FSDP2 integration (hook suppression during the pipeline loop, manual
         post_backward invocation after the loop).
-      - FP8 weight caching across micro-batches via FP8WeightCacheControl.
+      - FP8 weight caching across micro-batches via FP8WeightCacheControl
+        (pithtrain/contexts/fp8_weight_cache.py).
       - Pre-allocated ChunkRecord for zero-allocation pipeline execution.
 
     Data parallelism is ZeRO-1, following DeepSeek-V3: every rank holds the full weights and

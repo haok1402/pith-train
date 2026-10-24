@@ -27,15 +27,16 @@ from pithtrain.models.deepseek_v2 import DeepSeekV2Model
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel
+from pithtrain.modules.fp8_param_gather import (
+    install_fp8_param_gather,
+    install_raw_fp8_param_gather,
+)
 from pithtrain.modules.fsdp_forward import install_lean_hooks, register_fsdp_forward_method
 from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
 from pithtrain.modules.optimizer import Muon
-from pithtrain.operators.fp8_gptoss_param import install_raw_fp8_param_gather
-from pithtrain.operators.fp8_gptoss_wgrad import install_raw_main_grad
-from pithtrain.operators.fp8_param import install_fp8_param_gather
+from pithtrain.modules.wgrad_accumulation import install_raw_main_grad, install_wgrad_accumulation
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
 from pithtrain.operators.linear import BF16Linear, FP8Linear
-from pithtrain.operators.wgrad_accumulation import install_wgrad_accumulation
 from pithtrain.pipeline import DualPipeV
 
 from .distributed import DistributedCfg
@@ -381,7 +382,7 @@ def apply_fsdp(model, hsdp_replica: int = 1):
     if training.fp8_param_gather:
         install_fp8_param_gather(model, (FP8Linear, FP8GroupedLinear))
         # gpt-oss keeps its routed experts as raw parameters; after the call above, which resets
-        # fp8_param's registry.
+        # the gather's registry.
         install_raw_fp8_param_gather(model)
     return model
 
@@ -392,7 +393,7 @@ def setup_model(
 ) -> None:
     training.fp8 = cfg.fp8
     # FP8 weights are always all-gathered in FP8, as Megatron-LM's --fp8-param-gather does: the
-    # operands are bit-identical to quantizing the gathered bf16 weight (see fp8_param.py).
+    # operands are bit-identical to quantizing the gathered bf16 weight (see fp8_param_gather.py).
     training.fp8_param_gather = cfg.fp8
     training.norm_recompute = not cfg.fp8  # BF16: recompute the RMSNorm outputs (recompute.py)
     training.Linear = FP8Linear if cfg.fp8 else BF16Linear

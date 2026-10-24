@@ -1,5 +1,5 @@
 """
-FP8 parameter all-gather under FSDP2 (pithtrain/operators/fp8_param.py).
+FP8 parameter all-gather under FSDP2 (pithtrain/modules/fp8_param_gather.py).
 
 Checks the invariant that the gathered FP8 operands are bit-identical to quantizing the bf16 weight
 FSDP gathers with the flag off, before and after a weight update, plus forward/backward agreement
@@ -19,12 +19,12 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
 from pithtrain.contexts import training
-from pithtrain.operators.deepgemm_quantize import (
+from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
+from pithtrain.kernels.fp8_weight_quant import (
     fp8cast_blockwise_transpose,
     fp8cast_blockwise_transpose_batched,
 )
-from pithtrain.operators.fp8_param import install_fp8_param_gather, precompute_fp8_param_scales
-from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
+from pithtrain.modules.fp8_param_gather import install_fp8_param_gather, precompute_fp8_param_scales
 from pithtrain.operators.grouped_linear import FP8GroupedLinear
 from pithtrain.operators.linear import FP8Linear
 from pithtrain.operators.token_scatter import precompute_group_indices

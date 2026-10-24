@@ -22,21 +22,21 @@ from fla.ops.utils import prepare_chunk_indices
 from torch.distributed import ProcessGroup, get_world_size
 from torch.distributed.distributed_c10d import _resolve_process_group
 
-from pithtrain.operators.gated_delta_rule_pinned import (
-    dense_gated_delta_rule,
+from pithtrain.kernels.gated_delta_rule_pinned_sm90 import (
+    BT,
+    chunk_gdr_bwd_pinned,
+    chunk_gdr_fwd_pinned,
     pinned_launch_supported,
     pinned_shapes,
 )
 
-__all__ = ["gated_delta_rule"]
+__all__ = ["dense_gated_delta_rule", "gated_delta_rule"]
 
 # fmt: off
 # mypy: ignore-errors
 
 # Disable FLA's issue#640 guard: the BK=64 backward miscompile doesn't apply at head_k_dim=128.
 fla.ops.common.chunk_o.TRITON_ABOVE_3_4_0 = False
-
-CHUNK_SIZE = 64  # FLA chunk size (BT) for the gated delta rule
 
 
 @lru_cache(maxsize=None)
@@ -54,7 +54,7 @@ def _cp_state(group_name: Optional[str], seq_len: int) -> Tuple:
     # One global sequence spanning the group, which is the shape FLA merges state over.
     cu_seqlens = torch.tensor([0, seq_len * get_world_size(group)], dtype=torch.int32, device=device)  # fmt: skip
     context = build_cp_context(cu_seqlens, group)
-    chunk_indices = prepare_chunk_indices(context.cu_seqlens, CHUNK_SIZE, cu_seqlens_cpu=context.cu_seqlens_cpu)  # fmt: skip
+    chunk_indices = prepare_chunk_indices(context.cu_seqlens, BT, cu_seqlens_cpu=context.cu_seqlens_cpu)  # fmt: skip
     return context, chunk_indices
 
 
@@ -71,7 +71,7 @@ def _gdr_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor,
 def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, cp_group_name: Optional[str]):
     b, s, hv, vd = v.shape
     o = torch.empty((b, s, hv, vd), dtype=q.dtype, device=q.device)
-    A = torch.empty((b, s, hv, CHUNK_SIZE), dtype=q.dtype, device=q.device)
+    A = torch.empty((b, s, hv, BT), dtype=q.dtype, device=q.device)
     state = [] if cp_group_name is None else [torch.empty((1, hv, q.shape[-1], vd), dtype=torch.float32, device=q.device)]  # fmt: skip
     return o, torch.empty_like(g, dtype=torch.float32), A, state
 
@@ -99,6 +99,77 @@ def _gdr_backward(ctx: torch.autograd.function.FunctionCtx, do: torch.Tensor, *_
 
 _gdr_fwd.register_autograd(_gdr_backward, setup_context=_gdr_setup_context)
 
+# ------------------------------------------------------------
+# DENSE PATH THROUGH THE PINNED FLA LAUNCHES (kernels/gated_delta_rule_pinned_sm90.py)
+# ------------------------------------------------------------
+
+def _key_heads(t: torch.Tensor) -> torch.Tensor:
+    """[b, s, heads, dim], from either that or its [b, s, heads, group, dim] expand over a group."""
+    if t.dim() == 5:
+        t = t[:, :, :, 0]
+    return t if t.is_contiguous() else t.contiguous()
+
+@torch.library.custom_op("pithtrain::gated_delta_rule_dense_fwd", mutates_args=())
+def _dense_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    chunk_gated_delta_rule_fwd, dense: returns the output, the chunk-cumulated gate and the solved
+    WY matrix A, the two forward intermediates the backward reads. v, g and beta have HV heads;
+    q and k have HV too, or H with HV a multiple of H, given as their [b, s, H, HV // H, dim]
+    expand (grouped value heads share a key head).
+    """
+    return chunk_gdr_fwd_pinned(_key_heads(q), _key_heads(k), v, g, beta)
+
+@_dense_fwd.register_fake
+def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor):
+    B, T, HV = g.shape
+    A = torch.empty(B, T, HV, BT, device=k.device, dtype=k.dtype)
+    return torch.empty_like(v), torch.empty_like(g, dtype=torch.float), A
+
+@torch.library.custom_op("pithtrain::gated_delta_rule_dense_bwd", mutates_args=())
+def _dense_bwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cum: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    chunk_gated_delta_rule_bwd, dense: (dq, dk, dv, dg, dbeta), dg w.r.t. the raw gate.
+
+    With grouped value heads the q / k gradients are returned per value head, shaped like the
+    [b, s, H, HV // H, dim] expands q and k came in as, and autograd's backward of the expand sums
+    them over each group: the same reduction, at the same point, as the backward of a
+    repeat_interleave of q / k ahead of an H == HV call. (FLA's own wrappers instead reduce each of
+    dk's two terms over the group before adding them, a different rounding.)
+    """
+    dq, dk, dv, dg, db = chunk_gdr_bwd_pinned(_key_heads(q), _key_heads(k), v, g_cum, beta, A, do)
+    return dq.view(q.shape), dk.view(k.shape), dv, dg, db
+
+@_dense_bwd.register_fake
+def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cum: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor):
+    cf = torch.contiguous_format
+    return tuple(torch.empty_like(t, memory_format=cf) for t in (q, k, v, g_cum, beta))
+
+def _dense_setup_context(ctx, inputs, output) -> None:
+    q, k, v, _, beta = inputs
+    _, g_cum, A = output
+    ctx.save_for_backward(q, k, v, g_cum, beta, A)
+
+def _dense_backward(ctx, do: torch.Tensor, *_unused) -> tuple:
+    q, k, v, g_cum, beta, A = ctx.saved_tensors
+    return _dense_bwd(q, k, v, g_cum, beta, A, do.contiguous())
+
+_dense_fwd.register_autograd(_dense_backward, setup_context=_dense_setup_context)
+
+def dense_gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+    """
+    Chunked gated delta rule: q / k [b, s, heads, dim], v [b, s, value_heads, value_dim], g and
+    beta [b, s, value_heads], value_heads a multiple of heads, through the pinned FLA launches
+    (kernels/gated_delta_rule_pinned_sm90.py).
+    """
+    q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
+    B, S, H, K = k.shape
+    group = v.shape[2] // H
+    if group > 1:
+        # A view, not a copy: the kernels read each key head once per group by index.
+        q, k = (t.unsqueeze(3).expand(B, S, H, group, K) for t in (q, k))
+    o, _, _ = _dense_fwd(q, k, v, g, beta)
+    return o
+
 def _fold_batch(t: torch.Tensor) -> torch.Tensor:
     """
     [b, s, heads, ...] -> [1, s, b * heads, ...]; a view at batch 1, else a copy.
@@ -113,7 +184,7 @@ def gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch
 
     With a cp_group the recurrence is sharded over it, s is the rank-local length, and the
     caller must already hold the contiguous layout. pinned routes the dense path (no cp_group)
-    through FLA's kernels launched with their autotuned configs pinned (gated_delta_rule_pinned),
+    through FLA's kernels launched with their autotuned configs pinned (dense_gated_delta_rule),
     which also reads grouped q / k without repeating them; bit-identical and far cheaper on the
     host, where the installed versions, GPU and call geometry match the recorded configs. The other paths
     repeat_interleave grouped q / k first.

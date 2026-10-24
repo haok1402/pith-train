@@ -22,13 +22,13 @@ from pithtrain.modules.checkpoint import (
 )
 from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
+from pithtrain.modules.fp8_param_gather import precompute_fp8_param_scales
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
 from pithtrain.modules.optimizer import clip_grad_norm, local_grads, scale_grads_
 from pithtrain.modules.training import TrainingCfg, setup_training
 from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.cross_entropy import cross_entropy
-from pithtrain.operators.fp8_param import precompute_fp8_param_scales
 from pithtrain.pipeline import Microbatch
 
 

@@ -5,9 +5,10 @@ import torch
 from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
 
 import pithtrain.operators.flash_attn_v4 as fa
+from pithtrain.kernels import flash_attn_memoize as memo
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not fa._FAST_PATH, reason="needs a GPU and the pinned FA4"
+    not torch.cuda.is_available() or not memo.FAST_PATH, reason="needs a GPU and the pinned FA4"
 )
 
 # (batch, seq, q heads, kv heads, qk dim, v dim, causal, window, sink): the attention shapes of
@@ -37,7 +38,7 @@ def fwd_args(q, k, v, s_, scale, causal, window):
 
 
 def plan_for(kind, inputs, scalars):
-    return fa._plans.get(fa._signature(kind, inputs, *scalars), fa._MISSING)
+    return memo.plans.get(memo.signature(kind, inputs, *scalars), memo.MISSING)
 
 
 @pytest.mark.parametrize("case", list(CASES))
@@ -48,14 +49,14 @@ def test_forward_bitwise_and_plan(case):
     scalars = (scale, causal, window[0], window[1])
     outs = [fa._mha_fwd(*args) for _ in range(4)]  # plain, recorded, replayed, replayed
     plan = plan_for("fwd", inputs, scalars)
-    assert isinstance(plan, fa._Plan), "no plan was recorded for this signature"
+    assert isinstance(plan, memo._Plan), "no plan was recorded for this signature"
     ref = _flash_attn_fwd(q, k, v, softmax_scale=scale, causal=causal, window_size_left=window[0],
                           window_size_right=window[1], learnable_sink=s_, return_lse=True)  # fmt: skip
     for o, lse in outs:
         assert torch.equal(o, ref[0]) and torch.equal(lse, ref[1])
     # The plan recorded from a fresh call of FA4's entry is the same: same compiled kernels,
     # argument layout, scalars, allocation shapes / strides / dtypes and zero-filling.
-    _, again = fa._record(lambda: tuple(fa._flash_attn_fwd(q, k, v, softmax_scale=scale, causal=causal, window_size_left=window[0], window_size_right=window[1], learnable_sink=s_, return_lse=True)[:2]), inputs)  # fmt: skip
+    _, again = memo._record(lambda: tuple(fa._flash_attn_fwd(q, k, v, softmax_scale=scale, causal=causal, window_size_left=window[0], window_size_right=window[1], learnable_sink=s_, return_lse=True)[:2]), inputs)  # fmt: skip
     assert again == plan
 
 
@@ -68,14 +69,14 @@ def test_backward_same_launches(case):
     scalars = (scale, causal, window[0], window[1])
     grads = [fa._mha_bwd(*bargs) for _ in range(4)]
     plan = plan_for("bwd", inputs, scalars)
-    assert isinstance(plan, fa._Plan)
+    assert isinstance(plan, memo._Plan)
 
     def entry():
         return tuple(_flash_attn_bwd(q, k, v, o, do, lse, softmax_scale=scale, causal=causal,
                                      window_size_left=window[0], window_size_right=window[1],
                                      learnable_sink=s_))  # fmt: skip
 
-    _, again = fa._record(entry, inputs)
+    _, again = memo._record(entry, inputs)
     assert again == plan
     # FA4 accumulates dQ (and dK/dV under GQA) with atomics, so its backward is not
     # bit-reproducible run to run:
@@ -107,11 +108,11 @@ def test_unseen_signature_and_varlen_fall_through():
     k2, v2 = k[:, :512].contiguous(), v[:, :512].contiguous()
     inputs = dict(q=q2, k=k2, v=v2, learnable_sink=None)
     scalars = (scale, causal, None, None)
-    fa._plans.pop(fa._signature("fwd", inputs, *scalars), None)
+    memo.plans.pop(memo.signature("fwd", inputs, *scalars), None)
     fa._mha_fwd(q2, k2, v2, scale, causal, None, None, None)
-    assert plan_for("fwd", inputs, scalars) is fa._SEEN  # first call: FA4's entry only
+    assert plan_for("fwd", inputs, scalars) is memo._SEEN  # first call: FA4's entry only
     # Packed sequences take the varlen op, which never goes through the memo.
     cu = torch.tensor([0, 300, 1024], dtype=torch.int32, device="cuda")
-    before = len(fa._plans)
+    before = len(memo.plans)
     fa.flash_attn_varlen_func(q[0], k[0], v[0], cu, 1024, softmax_scale=scale, causal=True)
-    assert len(fa._plans) == before
+    assert len(memo.plans) == before

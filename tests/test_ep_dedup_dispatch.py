@@ -107,7 +107,7 @@ def _reference_dispatch_token_idxs(topk_ids_cpu, ep_size, experts_per_rank):
 @pytest.mark.parametrize("seed", [0, 42, 123])
 def test_fused_dedup_dispatch(ms, k, num_experts, ep_size, seed):
     """Compare fused Triton kernel outputs against the PyTorch reference."""
-    from pithtrain.operators.ep_dispatch import fused_dedup_prepare_dispatch
+    from pithtrain.kernels.ep_dispatch import fused_dedup_prepare_dispatch
 
     torch.manual_seed(seed)
     experts_per_rank = num_experts // ep_size
@@ -175,7 +175,7 @@ def test_fused_dedup_dispatch(ms, k, num_experts, ep_size, seed):
 @pytest.mark.parametrize("seed", [0, 42])
 def test_fused_dedup_end_to_end(ms, k, num_experts, ep_size, seed):
     """Full sender->receiver pipeline using fused kernel, verifying expanded == reference."""
-    from pithtrain.operators.ep_dispatch import fused_dedup_prepare_dispatch
+    from pithtrain.kernels.ep_dispatch import fused_dedup_prepare_dispatch
 
     torch.manual_seed(seed)
     experts_per_rank = num_experts // ep_size
@@ -233,7 +233,7 @@ def test_fused_dedup_end_to_end(ms, k, num_experts, ep_size, seed):
 
 def test_fused_dedup_dispatch_m_zero():
     """Edge case: m=0 should return empty tensors."""
-    from pithtrain.operators.ep_dispatch import fused_dedup_prepare_dispatch
+    from pithtrain.kernels.ep_dispatch import fused_dedup_prepare_dispatch
 
     topk_ids = torch.empty((0, 4), dtype=torch.int64, device="cuda")
     (
@@ -269,7 +269,7 @@ def test_expert_and_expand_idx(ms, k, num_experts, ep_size, seed):
     each slot's local expert (slots are sender-major, expert-minor) and its expand_idx made global
     by adding the dedup counts of the preceding senders.
     """
-    from pithtrain.operators.ep_dispatch import expert_and_expand_idx
+    from pithtrain.kernels.ep_dispatch import expert_and_expand_idx
 
     torch.manual_seed(seed)
     device = "cuda"
@@ -300,7 +300,7 @@ def test_expert_and_expand_idx_does_not_write_past_its_buffer():
     sum: the kernel is launched over whole BLOCK-sized CTAs, so the last CTA covers offsets past the
     end, and a mask bound that disagrees with the allocation writes into the next tensor.
     """
-    from pithtrain.operators.ep_dispatch import expert_and_expand_idx
+    from pithtrain.kernels.ep_dispatch import expert_and_expand_idx
 
     device = "cuda"
     ep_size, experts_per_rank = 8, 16

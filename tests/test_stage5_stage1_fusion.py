@@ -13,8 +13,9 @@ import pytest
 import torch
 
 from pithtrain.contexts import distributed, training
+from pithtrain.kernels.arch import ARCH_MAJOR
 from pithtrain.operators.grouped_linear import FP8GroupedLinear
-from pithtrain.operators.linear import ARCH_MAJOR, FP8Linear
+from pithtrain.operators.linear import FP8Linear
 
 pytestmark = pytest.mark.skipif(ARCH_MAJOR != 9, reason="Hopper FP8 paths")
 

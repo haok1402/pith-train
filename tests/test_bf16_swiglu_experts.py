@@ -1,5 +1,5 @@
 """
-BF16SwiGLUExpertsFunc (bf16_cute.experts: the fused CuTe stage 3 from the received tokens) against
+BF16SwiGLUExpertsFunc (operators.bf16_experts: the fused CuTe stage 3 from the received tokens) against
 the unfused path (padded_index_gather -> scatter_for_grouped_gemm -> GroupedLinear gate/up
 -> silu_mul -> GroupedLinear down -> padded_index_gather) and an fp32 reference, on EP-dedup
 routings: the output, the received tokens' gradient and the three weight gradients accumulated
@@ -12,11 +12,12 @@ import torch
 import torch.nn.functional as F
 
 from pithtrain.contexts import training
-from pithtrain.operators.bf16_cute import QUACK_VERSION, _quack_version
+from pithtrain.contexts.weight_grad_store import WeightGradStore
+from pithtrain.kernels.bf16_expert_support import QUACK_VERSION
+from pithtrain.kernels.bf16_expert_support import quack_version as _quack_version
 from pithtrain.operators.grouped_linear import GroupedLinear
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import padded_index_gather, scatter_for_grouped_gemm
-from pithtrain.pipeline.execution import WeightGradStore
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -67,7 +68,7 @@ def run_r5base(mods, gathered, expert_idxs, expand_idx, dout):
 
 
 def run_fused(mods, gathered, expert_idxs, expand_idx, dout, k, deferred=False):
-    from pithtrain.operators.bf16_cute.experts import bf16_swiglu_experts
+    from pithtrain.operators.bf16_experts import bf16_swiglu_experts
 
     src = gathered.detach().requires_grad_()
     out = bf16_swiglu_experts(*mods, src, expert_idxs, expand_idx, k)
@@ -156,7 +157,7 @@ def test_without_main_grad_adds_to_grad():
 def test_fused_gate_up_layout_vs_r5base_and_fp32():
     """qwen3.5's experts: one gate_up_proj whose rows are [gate; up] (up_proj=None), read in place
     as the pair; its main_grad gets both halves."""
-    from pithtrain.operators.bf16_cute.experts import bf16_swiglu_experts
+    from pithtrain.operators.bf16_experts import bf16_swiglu_experts
 
     G, H, inter, k = 64, 2048, 512, 8
     expert_idxs, expand_idx, T = ep_routing(G, 4, 400, k, seed=3)
@@ -217,7 +218,7 @@ def gptoss_experts(G, H, inter, limit, seed=0):
 def test_gptoss_vs_r5base_and_fp32(limit):
     """gpt-oss experts: interleaved gate_up rows, biases in the epilogues, the clamped SwiGLU of
     the configured swiglu_limit (a non-default limit catches a hard-coded clamp)."""
-    from pithtrain.operators.bf16_cute.experts import bf16_clamped_swiglu_experts
+    from pithtrain.operators.bf16_experts import bf16_clamped_swiglu_experts
 
     G, H, inter, k = 8, 2880, 2880, 4
     expert_idxs, expand_idx, T = ep_routing(G, 4, 600, k, seed=4)
