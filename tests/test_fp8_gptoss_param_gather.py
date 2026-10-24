@@ -1,5 +1,5 @@
 """
-FP8 parameter all-gather of gpt-oss's raw expert weights (pithtrain/operators/fp8_gptoss_param.py).
+FP8 parameter all-gather of gpt-oss's raw expert weights (install_raw_fp8_param_gather in pithtrain/modules/fp8_param_gather.py).
 
 The gathered FP8 operands of gate_up_proj / down_proj must be bit-identical to quantizing the bf16
 weights FSDP gathers with the flag off, before and after an update; the expert forward must be
@@ -20,11 +20,15 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
 from pithtrain.contexts import training
+from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
+from pithtrain.kernels.fp8_weight_quant import fp8cast_blockwise_transpose_batched
 from pithtrain.models.gpt_oss import GptOssExperts
-from pithtrain.operators.deepgemm_quantize import fp8cast_blockwise_transpose_batched
-from pithtrain.operators.fp8_gptoss_param import fp8_param_operands, install_raw_fp8_param_gather
-from pithtrain.operators.fp8_param import install_fp8_param_gather, precompute_fp8_param_scales
-from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
+from pithtrain.modules.fp8_param_gather import (
+    fp8_param_operands,
+    install_fp8_param_gather,
+    install_raw_fp8_param_gather,
+    precompute_fp8_param_scales,
+)
 from pithtrain.operators.grouped_linear import FP8GroupedLinear
 from pithtrain.operators.linear import FP8Linear
 

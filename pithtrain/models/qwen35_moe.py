@@ -11,13 +11,14 @@ from torch.utils.checkpoint import (
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
 
 from pithtrain.contexts import distributed, training
-from pithtrain.models.interface import RoutingInfo
+from pithtrain.kernels import bf16_expert_support
+from pithtrain.kernels.arch import ARCH_MAJOR
 from pithtrain.modules.load_balance import (
     MoELoadBalanceLossInjector,
     MoELoadBalanceLossTracker,
     replay_indices,
 )
-from pithtrain.operators import bf16_cute
+from pithtrain.operators.causal_conv1d import causal_conv1d
 from pithtrain.operators.cp_sequence import (
     contiguous_to_zigzag,
     prepend_conv_state,
@@ -26,12 +27,11 @@ from pithtrain.operators.cp_sequence import (
 )
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
-from pithtrain.operators.fp8_qwen35_conv import causal_conv1d
-from pithtrain.operators.fp8_qwen35_experts import fp8_swiglu_gate_up_experts
+from pithtrain.operators.fp8_experts import fp8_scatter_quant, fp8_swiglu_gate_up_experts
 from pithtrain.operators.gated_delta_rule import gated_delta_rule
-from pithtrain.operators.grouped_linear import fp8_scatter_quant
-from pithtrain.operators.linear import ARCH_MAJOR, BF16Linear
+from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.ring_attention import ring_attention_func
+from pithtrain.operators.routing import RoutingInfo
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
@@ -174,7 +174,7 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
 
     def conv_qkv(self, mixed_qkv: torch.Tensor, offset: int) -> tuple[torch.Tensor, ...]:
         """
-        Causal conv + SiLU + split_qkv for unpacked rows. The channels-last conv (fp8_qwen35_conv)
+        Causal conv + SiLU + split_qkv for unpacked rows. The channels-last conv (operators/causal_conv1d)
         is bit-identical to self.conv1d on the transposed input sliced to [offset, offset + S).
         """
         conv_out = causal_conv1d(mixed_qkv, self.conv1d.weight, offset)
@@ -345,8 +345,8 @@ class Qwen35MoeExperts(nn.Module):
         return self.down_proj(silu_mul(gate, up), **kwargs)
 
     def uses_bf16_cute(self) -> bool:
-        """Whether BF16 stage 3 runs as the fused CuTe experts (bf16_cute) in this process."""
-        return bf16_cute.enabled() and self.gate_up_proj.num_groups <= bf16_cute.MAX_GROUPS
+        """Whether BF16 stage 3 runs as the fused CuTe experts (operators/bf16_experts.py) in this process."""
+        return not training.fp8 and bf16_expert_support.supported(self.gate_up_proj.num_groups)
 
     def forward_from_tokens(
         self,
@@ -364,7 +364,7 @@ class Qwen35MoeExperts(nn.Module):
         FSDP boundary, whose mixed-precision cast would turn it to bf16.
         """
         if not training.fp8:
-            from pithtrain.operators.bf16_cute.experts import bf16_swiglu_experts
+            from pithtrain.operators.bf16_experts import bf16_swiglu_experts
 
             args = (gathered, expert_idxs, expand_idx, self.top_k)
             return bf16_swiglu_experts(self.gate_up_proj, None, self.down_proj, *args), None

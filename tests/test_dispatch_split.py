@@ -18,13 +18,11 @@ import torch
 import torch.distributed as dist
 
 import pithtrain.operators.ep_dispatch as ep_dispatch
-from pithtrain.models.interface import AllToAllSplits, RoutingInfo
-from pithtrain.operators.ep_dispatch import (
-    expert_and_expand_idx,
-    prepare_dispatch,
-    prepare_dispatch_issue,
-)
-from pithtrain.operators.token_scatter import get_pinned_buffer, padded_index_gather
+from pithtrain.kernels.ep_dispatch import expert_and_expand_idx
+from pithtrain.kernels.host_transfer import get_pinned_buffer
+from pithtrain.operators.ep_dispatch import prepare_dispatch, prepare_dispatch_issue
+from pithtrain.operators.routing import AllToAllSplits, RoutingInfo
+from pithtrain.operators.token_scatter import padded_index_gather
 
 
 def reference_prepare_dispatch(hidden_states, topk_ids, topk_weight, num_experts, ep_size, experts_per_rank, ep_group):  # fmt: skip

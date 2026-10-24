@@ -1,5 +1,5 @@
 """
-The gpt-oss raw-expert FP8 wgrad into fp32 main_grad (fp8_gptoss._fp8_wgrad) must keep the exact
+The gpt-oss raw-expert FP8 wgrad into fp32 main_grad (fp8_experts.fp8_padded_wgrad) must keep the exact
 temporary-then-add semantics, bit for bit: the k-grouped GEMM accumulates into a zeroed fp32
 temporary and main_grad.add_ adds it once. Accumulating straight into main_grad through DeepGEMM's
 TMA reduce-add is not equivalent for every bit pattern (it may flush subnormal sums), so main_grad
@@ -12,11 +12,15 @@ and results are compared as raw int32 bit patterns.
 import pytest
 import torch
 
-from pithtrain.operators.deepgemm_quantize import fp8cast_rowwise_kmajor
-from pithtrain.operators.fp8_gptoss import _fp8_wgrad, _kgrouped_safe
-from pithtrain.operators.grouped_linear import _k_grouped_fp8_gemm_nt, _pad_k_major_channels
-from pithtrain.operators.linear import ARCH_MAJOR
-from pithtrain.pipeline.execution import WeightGradStore
+from pithtrain.contexts.weight_grad_store import WeightGradStore
+from pithtrain.kernels.arch import ARCH_MAJOR
+from pithtrain.kernels.fp8_gemm import (
+    k_grouped_fp8_gemm_nt,
+    k_grouped_safe_size,
+    pad_k_major_channels,
+)
+from pithtrain.kernels.fp8_rowwise_kmajor import fp8cast_rowwise_kmajor
+from pithtrain.operators.fp8_experts import fp8_padded_wgrad
 
 pytestmark = pytest.mark.skipif(ARCH_MAJOR != 9, reason="Hopper k-grouped FP8 wgrad")
 
@@ -33,9 +37,9 @@ def operands(name, counts, seed):
     a = fp8cast_rowwise_kmajor(torch.randn(M, N, generator=g, device="cuda").to(torch.bfloat16), offs)[2:]  # fmt: skip
     b = fp8cast_rowwise_kmajor(torch.randn(M, K, generator=g, device="cuda").to(torch.bfloat16), offs)[2:]  # fmt: skip
     if padded == "a":
-        a = _pad_k_major_channels(a, counts, _kgrouped_safe(N))
+        a = pad_k_major_channels(a, counts, k_grouped_safe_size(N))
     else:
-        b = _pad_k_major_channels(b, counts, _kgrouped_safe(K))
+        b = pad_k_major_channels(b, counts, k_grouped_safe_size(K))
     return a, b
 
 
@@ -55,11 +59,11 @@ def reference(a, b, counts, kt, main_grad):
     NA, KB = a[1].shape[0], b[1].shape[0]
     if NA % 256 != 0 and KB % 256 == 0:
         c = torch.zeros((G, KB, NA), device="cuda", dtype=torch.float32)
-        _k_grouped_fp8_gemm_nt(b, a, c, counts, kt, c=c)
+        k_grouped_fp8_gemm_nt(b, a, c, counts, kt, c=c)
         main_grad.add_(c[:, :K, :N].transpose(1, 2))
     else:
         c = torch.zeros((G, NA, KB), device="cuda", dtype=torch.float32)
-        _k_grouped_fp8_gemm_nt(a, b, c, counts, kt, c=c)
+        k_grouped_fp8_gemm_nt(a, b, c, counts, kt, c=c)
         main_grad.add_(c[:, :N, :K])
 
 
@@ -75,7 +79,7 @@ def test_wgrad_bit_patterns(name, counts, monkeypatch):
     want = got.clone()
     for mb in range(2):
         a, b = operands(name, counts, seed=100 + mb)
-        _fp8_wgrad(a, b, counts, kt, w, got)
+        fp8_padded_wgrad(a, b, counts, kt, w, got)
         reference(a, b, counts, kt, want)
         assert torch.equal(got.view(torch.int32), want.view(torch.int32)), f"micro-batch {mb}"
     assert w.grad is None

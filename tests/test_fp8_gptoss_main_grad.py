@@ -1,5 +1,5 @@
 """
-fp32 main_grad accumulation of gpt-oss's raw expert weights (pithtrain/operators/fp8_gptoss_wgrad.py)
+fp32 main_grad accumulation of gpt-oss's raw expert weights (install_raw_main_grad in pithtrain/modules/wgrad_accumulation.py)
 under FSDP2 with two micro-batches per step: the reduced gradients must match the default path
 (bf16 .grad per micro-batch, summed by FSDP2 in fp32) up to that path's bf16 rounding, and the
 forward is untouched. Run: torchrun --nproc-per-node=2 tests/test_fp8_gptoss_main_grad.py
@@ -15,9 +15,10 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
 from pithtrain.contexts import training
+from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
 from pithtrain.models.gpt_oss import GptOssExperts
-from pithtrain.operators.fp8_gptoss_wgrad import install_raw_main_grad, raw_main_grad
-from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
+from pithtrain.modules.wgrad_accumulation import install_raw_main_grad
+from pithtrain.operators.main_grad import raw_main_grad
 
 G, H, INTER = 4, 2880, 2880
 

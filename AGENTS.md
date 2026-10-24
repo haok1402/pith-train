@@ -28,15 +28,17 @@ Style: 100-char line length, double quotes, `py312` target. Rules: E, F, I, W (i
 
 ```bash
 # Single-GPU unit tests (kernels, ops, layer protocol)
-pytest tests/operators/test_deepgemm_quantize.py -v
+pytest tests/operators/test_fp8_quantize.py -v
 pytest tests/test_deepgemm_fp8_linear_correctness.py -v
 pytest tests/test_grouped_linear_correctness.py -v
 pytest tests/test_ep_dedup_dispatch.py -v
 pytest tests/test_silu_mul.py tests/test_clamped_swiglu.py tests/test_indexed_bias_add.py -v
 pytest tests/operators/test_ring_attention.py -v
+pytest tests/operators -k sm90 -v      # SM90 kernels, bit-exact against their _sm100 siblings
+pytest tests/test_import_layers.py -v  # import layering and kernel naming (CPU only, AST)
 
 # Single test function
-pytest tests/operators/test_deepgemm_quantize.py::test_name -v
+pytest tests/operators/test_fp8_quantize.py::test_name -v
 
 # Multi-GPU integration test — boots DualPipeV with FSDP, ~4 GPUs, pp=2 ep=2
 bash tests/test_dualpipev.sh
@@ -87,11 +89,11 @@ Stages 1, 3, and 5 are the layer's compute entry points — `forward_stage1`, `f
 
 Key files:
 - `dualpipev.py` — Main scheduler and P2P between pipeline ranks: `DualPipeV.step()` orchestrates overlapped F/B across modules (supports `forward_only=True` for inference), `overlapped_forward_backward()` is the interleaved loop for one pair of micro-batches, plus `layer_partition()`, which distributes decoder layers across pipeline stages — edge stages (which hold `embed_tokens` / `norm`+`lm_head`) get fewer layers to balance memory.
-- `execution.py` — Stage implementations (`stage1_f`, `stage1_b`, etc.), `ExecutionCtx`, the dispatch/combine helpers, and `WeightGradStore` (deferred wgrad for zero-bubble scheduling)
+- `execution.py` — Stage implementations (`stage1_f`, `stage1_b`, etc.), `ExecutionCtx`, and the dispatch/combine helpers; it drives `WeightGradStore` (deferred wgrad for zero-bubble scheduling, `pithtrain/contexts/weight_grad_store.py`)
 
 ### FP8 Training
 
-`TrainingCfg.fp8` selects the linear-layer backend: at training setup it binds `training.Linear` / `training.GroupedLinear` to the FP8 or BF16 classes. The DeepGEMM path (`pithtrain/operators/linear.py`) uses 128-element block scaling with E8M0 scale format, backed by custom Triton quantization kernels in `pithtrain/operators/deepgemm_quantize.py`. The BF16 grouped linear layer is in `pithtrain/operators/grouped_linear.py`.
+`TrainingCfg.fp8` selects the linear-layer backend: at training setup it binds `training.Linear` / `training.GroupedLinear` to the FP8 or BF16 classes. The DeepGEMM path (`pithtrain/operators/linear.py`, `pithtrain/operators/grouped_linear.py`) uses 128-element block scaling with E8M0 scale format. The quantization kernels are per layout in `pithtrain/kernels/fp8_rowwise_*` and `fp8_weight_quant*`: each feature's picker `<feature>.py` chooses the SM90 CuTe-DSL kernel `<feature>_sm90.py` or the Triton kernel `<feature>_sm100.py`. The DeepGEMM launchers and GEMM recipes are in `pithtrain/kernels/fp8_gemm.py`; the FP8 expert ops (activation fused into the quantization) are in `pithtrain/operators/fp8_experts.py`. The BF16 grouped linear layer is in `pithtrain/operators/grouped_linear.py`, and on SM90 the BF16 experts take the fused CuTe-DSL path of `pithtrain/operators/bf16_experts.py` (gate: `kernels/bf16_expert_support.py`).
 
 ### Distributed Parallelism (`pithtrain/modules/distributed.py`)
 
@@ -119,23 +121,51 @@ The pipeline is **BSHD** end to end: hidden states are `(B, S, hidden)` through 
 
 `cu_seqlens` rides on each `Microbatch`, which every pipeline rank receives, and is threaded through the pipeline as an explicit forward argument (a sibling of `rotary_posemb`, not a module attribute), consumed only by attention and the per-document position reset in `forward_posemb`. The packed **data pipeline** — turning a tokenized corpus into `cu_seqlens`-bearing samples, and choosing whole-document packing — is a deferred follow-up; no training entrypoint sets `cu_seqlens` yet, so pretraining is the only live data path.
 
-### Optimized Operators (`pithtrain/operators/`)
+### Operators (`pithtrain/operators/`)
 
+Only what training code calls directly: autograd functions and custom ops with their functional entry points, `nn.Module` layers, and collective wrappers. The kernels they launch live in `pithtrain/kernels/` (below).
+
+- **Linear layers** (`linear.py`, `grouped_linear.py`) — BF16 / FP8 dense and grouped (expert) linear layers, with fp32 main_grad accumulation of the weight gradient
+- **Expert ops** — `fp8_experts.py` (FP8 SwiGLU, fused gate_up SwiGLU and gpt-oss clamped SwiGLU experts as single autograd nodes, plus `fp8_scatter_quant`, the fused stage-3 input), `bf16_experts.py` (SM90-only fused BF16 CuTe experts; models import it lazily after `kernels.bf16_expert_support.supported()`), `fp8_swiglu_mlp.py` (fused FP8 dense SwiGLU MLP), `main_grad.py` (fp32 main_grad of raw expert parameters)
 - **Ring Attention** (`ring_attention.py`) — zigzag ring attention for context parallelism (standard and MLA-aware variants)
 - **CP Sequence** (`cp_sequence.py`) — defines both CP sequence layouts, exposing the zigzag partition as `zigzag_spans`, converts the hidden stream between them, and fetches the conv state a depthwise convolution needs, the tokens before a shard, from the previous rank
-- **FlashAttention v4** (`flash_attn_v4.py`) — Wrapper around the FA4 kernel
+- **FlashAttention v4** (`flash_attn_v4.py`) — custom ops around the FA4 kernel (host-side launch memoization in `kernels/flash_attn_memoize.py`)
 - **MLA** — Multi-head Latent Attention is implemented inside the DeepSeek model (`models/deepseek_v2.py`), with MLA-aware ring attention in `ring_attention.py`
+- **Linear attention** — `gated_delta_rule.py` (Qwen3.5 Gated DeltaNet, including the dense path through FLA's kernels with pinned configs), `causal_conv1d.py` (channels-last causal depthwise conv)
 - **AllToAll** (`all_to_all.py`) — Differentiable collective wrapper
-- **EP Dispatch** (`ep_dispatch.py`) — Fused Triton kernels and orchestration for expert-parallel token dispatch with deduplication
-- **Token Scatter** (`token_scatter.py`) — Triton scatter kernels for grouping tokens by expert ahead of grouped GEMM
-- **FP8 Quantization** (`deepgemm_quantize.py`) — Fused Triton kernels for DeepGEMM-style FP8 quantization, with `fp8_weight_cache.py` holding the per-step version counter that lets the linear layers reuse a quantized weight across micro-batches
-- **Fused activations / heads** — `silu_mul.py`, `clamped_swiglu.py`, `indexed_bias_add.py`, `cross_entropy.py`
+- **EP Dispatch** (`ep_dispatch.py`) — orchestration of expert-parallel token dispatch with deduplication (index math in `kernels/ep_dispatch.py`); `routing.py` holds the `RoutingInfo` / `AllToAllSplits` types
+- **Token Scatter** (`token_scatter.py`) — scatter of tokens by expert ahead of the grouped GEMM, padded index gather, per-row group ids
+- **Fused activations / heads** — `silu_mul.py`, `clamped_swiglu.py`, `indexed_bias_add.py`, `cross_entropy.py`, `qwen3_attention.py` (FP8 q/k/v and o projections)
 
-Each operator ships a PyTorch reference impl for correctness testing.
+Operators keep a PyTorch reference for correctness testing; SM90 kernels are tested bit-exact against their `_sm100` sibling in `tests/operators/test_<feature>_sm90.py`.
+
+### Kernels (`pithtrain/kernels/`)
+
+Raw kernel code: `@triton.jit` and CuTe-DSL kernels, their launchers, tile / config tables, scale layouts and the helper math they share. The layering is `kernels → contexts → operators → {modules, pipeline}`: `kernels/` imports only third-party code and other `kernels/` modules (never `contexts/`, `operators/`, `modules/`, `models/` or `pipeline/`, lazy imports included). `tests/test_import_layers.py` checks this and the naming rules statically.
+
+Naming (SM90 and SM100 are the only supported targets):
+
+1. `kernels/` is flat (no subfolders) and its `__init__.py` is empty, as is `operators/__init__.py`.
+2. A feature with an SM90-specific kernel has exactly two files: `<feature>_sm90.py` (the CuTe-DSL implementation) and `<feature>_sm100.py` (the Triton implementation, kept until a Blackwell kernel replaces it).
+3. `<feature>_sm90.py` imports its `_sm100` sibling only as a documented fallback for inputs it does not cover (dtype, contiguity, shape); the SM90 tests use the sibling as the reference. Named cross-feature edges: the fused SwiGLU / clamped-SwiGLU / scatter quantizations fall back to the plain activation or scatter kernels plus `fp8_rowwise_kmajor_sm90`, which keeps today's SM90 kernels on that path.
+4. Kernels both architectures run unchanged are plain `<feature>.py` (`silu_mul`, `clamped_swiglu`, `cross_entropy`, `segment_sum`, `group_bias_add`, `token_scatter`, `causal_conv1d`, `fp8_rowwise_colwise`, `fp8_gemm`, `flash_attn_memoize`, ...).
+5. Only `kernels/arch.py` checks the device capability (`ARCH_MAJOR`, `NATIVE_E8M0`, `is_sm90`, `is_sm90_device`, `sm_count`). Each feature has one picker, `kernels/<feature>.py`, that calls `is_sm90()` and runs `_sm90` or `_sm100`; `operators/` and `models/` import the picker (or a plain file), never an `_smXX` file.
+6. Shared helpers only SM90 code uses carry the suffix: `cute_ptx_sm90.py` (inline-PTX `dsl_user_op`s), `cute_compile_sm90.py` (fake tensors / stream, `TORCH2CUTE`), `fp8_e8m0_scale_sm90.py` (E8M0 scale math). Arch-neutral shared leaves stay unsuffixed: `arch.py`, `host_transfer.py` (pinned host buffers), `fp8_scale_layout.py`, `fp8_scale.py` (the Triton E8M0 scale).
+7. Tests mirror the names: `tests/operators/test_<feature>_sm90.py` (skipped unless SM90) for SM90 files, unsuffixed names for portable tests.
+
+A picker exports the contract name (`fp8cast_rowwise_kmajor`) and the implementations the same name with the file's suffix (`fp8cast_rowwise_kmajor_sm90`, `fp8cast_rowwise_kmajor_sm100`), so each is unique to grep.
+
+SM90-only features have no `_sm100` file, because SM100 runs no kernel there: `group_indices_sm90` (gate: `fp8_gemm.m_grouped_group_indices`), `bf16_expert_gemm_sm90` and `bf16_expert_slots_sm90` (gate: `bf16_expert_support.supported`), `gated_delta_rule_pinned_sm90` (gate: `pinned_launch_supported`). Exactly two operators import an `_sm90` file directly: `operators/bf16_experts.py` and `operators/gated_delta_rule.py`.
+
+Every `_sm90` module is imported lazily, inside the SM90 branch of its picker or gate: QuACK patches CuTe-DSL globally when imported and cutlass is expensive to import, so importing a picker on SM100 never imports either.
+
+Bit-exactness contracts: each `_sm90` kernel produces the same FP8 bytes and scale values as its `_sm100` sibling (the SM90 branch of the E8M0 scale, `cvt.rn.satfinite` e4m3). The scale strides differ by architecture: the `_sm90` launchers return 1x128 scales MN-major (`fp8_scale_layout.py`, the layout DeepGEMM's SM90 GEMMs read without a transpose), the `_sm100` launchers row-major; each picker's docstring says so.
 
 ### Training Orchestration (`pithtrain/tasks/pretrain_lm.py`)
 
 `PretrainLMCfg` composes `DistributedCfg`, `TrainingCfg` and `LoggingCfg`, plus a `dataset` path of its own. `launch(cfg)` calls `setup_logging`, `setup_distributed` and `setup_training` in turn, each of which populates its runtime context (see Runtime Contexts below). The corpus and the step counter are neither context nor shared config: only a task that reads a corpus has any use for them, so `setup_dataset` lives in `pretrain_lm.py`, returns the dataset, and `launch` owns it alongside the step counter.
+
+The FSDP2 hooks that are neither ops nor kernels live in `pithtrain/modules/`: `fsdp_forward.py` (lean forward hooks), `fp8_param_gather.py` (FP8 parameter all-gather, including gpt-oss's raw expert weights) and `wgrad_accumulation.py` (fp32 main_grad accumulation of the weight gradients, and of raw expert parameters).
 
 ### Task Module Convention (`pithtrain/tasks/`)
 
@@ -153,6 +183,7 @@ Handles checkpoint save/load with resharding between canonical (disk) format and
 - `F.grouped_mm` may write NaN to padding rows (beyond `grouped_mm_offs[-1]`). Always truncate to `[:actual_M]` before comparing outputs.
 - FP8 quantization tests use normalized squared-error (`calc_diff`), threshold typically `< 1e-3`.
 - Multi-GPU tests require `torchrun` (see `tests/test_dualpipev.sh`).
+- SM90 bit-exact kernel tests compare an `_sm90` launcher against its `_sm100` sibling, never against a picker: on SM90 the picker routes to the `_sm90` kernel itself.
 
 ## Config Base Classes
 
@@ -161,6 +192,8 @@ Handles checkpoint save/load with resharding between canonical (disk) format and
 ## Runtime Contexts (`pithtrain/contexts/`)
 
 Process-global runtime state, one module per concern (`distributed`, `training`, `logging`). Each holds values that are set once at startup by the matching `setup_*` function and constant thereafter, so code reads them in-line instead of threading them through every constructor and call. Import the module and read fields off it (`distributed.ep_group`), never the bare names — a field does not exist until its `setup_*` runs, so `from ... import ep_group` fails at import and reading it before setup raises `AttributeError`.
+
+Two per-step stores are the exception to "constant after setup": `weight_grad_store.py` (`WeightGradStore`, the deferred weight-gradient closures of the zero-bubble W phase) and `fp8_weight_cache.py` (`FP8WeightCacheControl`, the version counter that lets FP8 layers reuse a quantized weight across the micro-batches of a step). `DualPipeV.step` drives both; import them by class name.
 
 ## Agent Skills
 

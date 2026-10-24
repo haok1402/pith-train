@@ -12,9 +12,10 @@ import torch
 from transformers.models.deepseek_v2.configuration_deepseek_v2 import DeepseekV2Config
 
 from pithtrain.contexts import distributed, training
-from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
+from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
+from pithtrain.kernels.arch import ARCH_MAJOR
 from pithtrain.operators.grouped_linear import FP8GroupedLinear
-from pithtrain.operators.linear import ARCH_MAJOR, FP8Linear
+from pithtrain.operators.linear import FP8Linear
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
@@ -151,7 +152,7 @@ def test_routed_experts_fused_stage3(fp8_ctx, dedup: bool) -> None:
 
 @pytest.mark.parametrize("inter", [None, 2816])
 def test_mlp_fused_swiglu(fp8_ctx, inter: int | None, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The fused dense SwiGLU op (fp8_dsv2_mlp) against FP8Linear -> silu_mul -> FP8Linear: forward
+    """The fused dense SwiGLU op (fp8_swiglu_mlp) against FP8Linear -> silu_mul -> FP8Linear: forward
     and weight gradients bit-identical, input gradient the same dx_gate + dx_up sum."""
     from pithtrain.models.deepseek_v2 import DeepSeekV2MLP
 

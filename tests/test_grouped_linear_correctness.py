@@ -608,7 +608,7 @@ def test_scatter_then_grouped_mm_end_to_end():
 
 def test_grouped_linear_weight_grad_store():
     """GroupedLinear correctly defers weight gradients via WeightGradStore."""
-    from pithtrain.pipeline.execution import WeightGradStore
+    from pithtrain.contexts.weight_grad_store import WeightGradStore
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -671,8 +671,8 @@ def test_gpt_oss_experts_weight_grad_store_matches_direct(monkeypatch):
     add lives outside GroupedLinearFunc so its grad is computed eagerly via
     autograd on both paths.
     """
+    from pithtrain.contexts.weight_grad_store import WeightGradStore
     from pithtrain.models.gpt_oss import GptOssExperts
-    from pithtrain.pipeline.execution import WeightGradStore
 
     # This standalone BF16 test does not call setup_training. Restore the
     # previous context value (or its absence) when the test finishes.

@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from pithtrain.operators import gated_delta_rule as gdr_module
-from tests.test_gated_delta_rule_pinned import fla_pinned  # noqa: F401  (fixture)
+from tests.operators.test_gated_delta_rule_pinned_sm90 import fla_pinned  # noqa: F401  (fixture)
 
 
 def account(f, args: tuple, grad_seed: int = 1) -> dict:

@@ -13,11 +13,11 @@ from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
 import pithtrain.models.gpt_oss as gpt_oss
 from pithtrain.contexts import training
+from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
+from pithtrain.contexts.weight_grad_store import WeightGradStore
+from pithtrain.kernels.arch import ARCH_MAJOR
 from pithtrain.models.gpt_oss import GptOssExperts
-from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
-from pithtrain.operators.linear import ARCH_MAJOR
 from pithtrain.operators.token_scatter import padded_index_gather, scatter_for_grouped_gemm
-from pithtrain.pipeline.execution import WeightGradStore
 
 pytestmark = pytest.mark.skipif(ARCH_MAJOR != 9, reason="Hopper-only fused path")
 
@@ -60,7 +60,7 @@ def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
 def test_fused_matches_unfused(counts, H, inter, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     At gpt-oss's 2880 widths the unfused path's k-grouped wgrad deadlocks in DeepGEMM (see
-    fp8_gptoss._kgrouped_safe), so there the reference defers and drops its weight gradients and
+    fp8_gemm.k_grouped_safe_size), so there the reference defers and drops its weight gradients and
     the fused ones are checked against a bf16 autograd product instead.
     """
     monkeypatch.setattr(training, "fp8", True, raising=False)
@@ -114,10 +114,10 @@ def test_forward_from_tokens(ntok: int, G: int, monkeypatch: pytest.MonkeyPatch)
 
 @pytest.mark.parametrize("N,K", [(2880, 1024), (1024, 2880)])
 def test_wgrad_layouts(N: int, K: int) -> None:
-    """_fp8_wgrad (operand order / padding chosen to dodge DeepGEMM's odd-tile deadlock) against
+    """fp8_padded_wgrad (operand order / padding chosen to dodge DeepGEMM's odd-tile deadlock) against
     an fp32 product: the error is FP8 quantization only (~3.8% relative for Gaussian data)."""
-    from pithtrain.operators.deepgemm_quantize import fp8cast_rowwise_kmajor
-    from pithtrain.operators.fp8_gptoss import _fp8_wgrad
+    from pithtrain.kernels.fp8_rowwise_kmajor import fp8cast_rowwise_kmajor
+    from pithtrain.operators.fp8_experts import fp8_padded_wgrad
 
     torch.manual_seed(0)
     ks = [512, 1024, 256]
@@ -129,7 +129,7 @@ def test_wgrad_layouts(N: int, K: int) -> None:
     a = fp8cast_rowwise_kmajor(dy, offs)[2:]
     b = fp8cast_rowwise_kmajor(x, offs)[2:]
     w = torch.nn.Parameter(torch.empty(G, N, K, device="cuda", dtype=torch.bfloat16))
-    _fp8_wgrad(a, b, ks, kt, w)
+    fp8_padded_wgrad(a, b, ks, kt, w)
     ref = torch.stack([dy[o - k : o].float().T @ x[o - k : o].float() for o, k in zip(offs.tolist(), ks)])  # fmt: skip
     rel = ((w.grad.float() - ref).norm() / ref.norm()).item()
     assert rel < 0.045, rel
@@ -137,7 +137,7 @@ def test_wgrad_layouts(N: int, K: int) -> None:
 
 def test_recompute_gate_up(monkeypatch: pytest.MonkeyPatch) -> None:
     """RECOMPUTE_GATE_UP gives the same forward output and gradients, bit for bit."""
-    import pithtrain.operators.fp8_gptoss as fg
+    import pithtrain.operators.fp8_experts as fg
 
     monkeypatch.setattr(training, "fp8", True, raising=False)
     counts, H, inter = [0, 128, 256, 0, 640, 128, 1024, 0], 2880, 2880

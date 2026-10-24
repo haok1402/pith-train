@@ -9,16 +9,13 @@ import pytest
 import torch
 
 from pithtrain.contexts import training
-from pithtrain.operators.deepgemm_quantize import fp8cast_rowwise_kmajor
-from pithtrain.operators.fp8_cute.silu_mul_quant import _silu_mul_bwd_reference
-from pithtrain.operators.fp8_qwen35_experts import (
-    fp8_swiglu_gate_up_experts,
-    silu_mul_bwd_quant_gu,
-    silu_mul_quant_gu_fwd,
-)
-from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
-from pithtrain.operators.grouped_linear import FP8GroupedLinear, fp8_scatter_quant
-from pithtrain.operators.linear import ARCH_MAJOR
+from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
+from pithtrain.kernels.arch import ARCH_MAJOR
+from pithtrain.kernels.fp8_rowwise_kmajor import fp8cast_rowwise_kmajor
+from pithtrain.kernels.fp8_silu_mul_quant import silu_mul_bwd_quant_gu, silu_mul_quant_gu_fwd
+from pithtrain.kernels.silu_mul import silu_mul_bwd
+from pithtrain.operators.fp8_experts import fp8_scatter_quant, fp8_swiglu_gate_up_experts
+from pithtrain.operators.grouped_linear import FP8GroupedLinear
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
@@ -54,7 +51,7 @@ def test_kernels_match_unfused(counts: list[int], N: int) -> None:
     dh = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
     g, u = gu[:, :N].contiguous(), gu[:, N:].contiguous()
     _equal(silu_mul_quant_gu_fwd(gu, offs), fp8cast_rowwise_kmajor(silu_mul(g, u), offs))
-    dg, du = _silu_mul_bwd_reference(dh, g, u)
+    dg, du = silu_mul_bwd(dh, g, u)
     _equal(
         silu_mul_bwd_quant_gu(dh, gu, offs), fp8cast_rowwise_kmajor(torch.cat([dg, du], 1), offs)
     )

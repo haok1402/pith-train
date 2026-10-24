@@ -10,13 +10,10 @@ import pytest
 import torch
 
 from pithtrain.contexts import training
-from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
-from pithtrain.operators.grouped_linear import (
-    FP8GroupedLinear,
-    fp8_scatter_quant,
-    fp8_swiglu_experts,
-)
-from pithtrain.operators.linear import ARCH_MAJOR
+from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
+from pithtrain.kernels.arch import ARCH_MAJOR
+from pithtrain.operators.fp8_experts import fp8_scatter_quant, fp8_swiglu_experts
+from pithtrain.operators.grouped_linear import FP8GroupedLinear
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
     precompute_group_indices,
