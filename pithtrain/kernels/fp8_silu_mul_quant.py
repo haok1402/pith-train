@@ -10,19 +10,9 @@ kernels return both scales MN-major (``kernels/fp8_scale_layout.py``), the SM100
 import torch
 
 from pithtrain.kernels.arch import is_sm90
-from pithtrain.kernels.fp8_silu_mul_quant_sm100 import (
-    silu_mul_bwd_quant_gu_sm100,
-    silu_mul_bwd_quant_sm100,
-    silu_mul_quant_fwd_sm100,
-    silu_mul_quant_gu_fwd_sm100,
-)
+from pithtrain.kernels.fp8_silu_mul_quant_sm100 import (silu_mul_bwd_quant_gu_sm100, silu_mul_bwd_quant_sm100, silu_mul_quant_fwd_sm100, silu_mul_quant_gu_fwd_sm100)
 
-__all__ = [
-    "silu_mul_bwd_quant",
-    "silu_mul_bwd_quant_gu",
-    "silu_mul_quant_fwd",
-    "silu_mul_quant_gu_fwd",
-]
+__all__ = ["silu_mul_bwd_quant", "silu_mul_bwd_quant_gu", "silu_mul_quant_fwd", "silu_mul_quant_gu_fwd"]
 
 _BLOCK = 128
 
@@ -41,9 +31,7 @@ def _check_gu(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> None:
     assert grouped_mm_offs.dtype == torch.int32 and grouped_mm_offs.is_contiguous()
 
 
-def silu_mul_quant_fwd(
-    g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def silu_mul_quant_fwd(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     The grouped-GEMM FP8 input of ``h = silu(g) * u``: :func:`quantize_grouped_input`'s 4-tuple
     ``(h_fp8, h_scale, h_ch_fp8, h_ch_scale)`` in its SM90 (K-major) layout, without writing h.
@@ -69,9 +57,7 @@ def silu_mul_quant_fwd(
     return silu_mul_quant_fwd_sm100(g, u, grouped_mm_offs)
 
 
-def silu_mul_bwd_quant(
-    dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor
-) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+def silu_mul_bwd_quant(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
     """
     Backward of ``h = silu(g) * u`` quantized for the gate / up projections' backward GEMMs:
     ``(dg_quant, du_quant)``, each the 4-tuple of :func:`silu_mul_quant_fwd` (same layout) of one
@@ -95,9 +81,7 @@ def silu_mul_bwd_quant(
     return silu_mul_bwd_quant_sm100(dh, g, u, grouped_mm_offs)
 
 
-def silu_mul_quant_gu_fwd(
-    gu: torch.Tensor, grouped_mm_offs: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def silu_mul_quant_gu_fwd(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     :func:`silu_mul_quant_fwd` of the halves of a fused gate_up output: ``g = gu[:, :N]``,
     ``u = gu[:, N:]`` (concatenated, not interleaved).
@@ -117,9 +101,7 @@ def silu_mul_quant_gu_fwd(
     return silu_mul_quant_gu_fwd_sm100(gu, grouped_mm_offs)
 
 
-def silu_mul_bwd_quant_gu(
-    dh: torch.Tensor, gu: torch.Tensor, grouped_mm_offs: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def silu_mul_bwd_quant_gu(dh: torch.Tensor, gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Backward of :func:`silu_mul_quant_gu_fwd`: the 4-tuple of :func:`silu_mul_quant_fwd` (same
     layout) of the ``(M, 2N)`` gate_up gradient ``cat([dg, du], 1)``.

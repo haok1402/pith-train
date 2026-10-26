@@ -11,16 +11,12 @@ kernel row-major. The blockwise scale is row-major on both.
 import torch
 
 from pithtrain.kernels.arch import is_sm90
-from pithtrain.kernels.fp8_rowwise_blockwise_transpose_sm100 import (
-    fp8cast_rowwise_blockwise_transpose_sm100,
-)
+from pithtrain.kernels.fp8_rowwise_blockwise_transpose_sm100 import fp8cast_rowwise_blockwise_transpose_sm100
 
 __all__ = ["fp8cast_rowwise_blockwise_transpose"]
 
 
-def fp8cast_rowwise_blockwise_transpose(
-    x: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8cast_rowwise_blockwise_transpose(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Rowwise 1x128 FP8 of ``x`` and 128x128 blockwise FP8 of ``x.T`` from one read of ``x``:
     ``(x_fp8, x_scale, xt_fp8, xt_scale)``, the activation operands of the dense FP8 linear
@@ -40,9 +36,7 @@ def fp8cast_rowwise_blockwise_transpose(
     the same bytes and scale values; deterministic; fresh outputs.
     """
     if is_sm90():
-        from pithtrain.kernels.fp8_rowwise_blockwise_transpose_sm90 import (
-            fp8cast_rowwise_blockwise_transpose_sm90,
-        )
+        from pithtrain.kernels.fp8_rowwise_blockwise_transpose_sm90 import fp8cast_rowwise_blockwise_transpose_sm90
 
         return fp8cast_rowwise_blockwise_transpose_sm90(x)
     return fp8cast_rowwise_blockwise_transpose_sm100(x)

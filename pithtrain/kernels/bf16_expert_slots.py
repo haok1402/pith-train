@@ -12,20 +12,10 @@ from typing import NamedTuple
 
 import torch
 
-__all__ = [
-    "bf16_expert_gather_rows",
-    "bf16_expert_gather_sum",
-    "bf16_expert_group_slots",
-    "expert_slot_segment_sum",
-]
+__all__ = ["bf16_expert_gather_rows", "bf16_expert_gather_sum", "bf16_expert_group_slots", "expert_slot_segment_sum"]
 
 
-def bf16_expert_group_slots(
-    expert_idxs: torch.Tensor,
-    expand_idx: torch.Tensor | None,
-    num_groups: int,
-    num_tokens: int,
-) -> NamedTuple:
+def bf16_expert_group_slots(expert_idxs: torch.Tensor, expand_idx: torch.Tensor | None, num_groups: int, num_tokens: int) -> NamedTuple:
     """
     Index maps of the grouped expert input (no rows are copied), as an opaque record whose
     fields callers read and pass back to the ``bf16_expert_*`` kernels.
@@ -65,9 +55,7 @@ def bf16_expert_gather_rows(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     return bf16_expert_gather_rows_sm90(x, idx)
 
 
-def bf16_expert_gather_sum(
-    grad: torch.Tensor, maps: NamedTuple, num_groups: int, max_slots: int
-) -> torch.Tensor:
+def bf16_expert_gather_sum(grad: torch.Tensor, maps: NamedTuple, num_groups: int, max_slots: int) -> torch.Tensor:
     """
     The received tokens' gradient from the grouped input gradient: a fresh bf16
     ``(num_tokens, H)`` whose row ``t`` is the sum of the rows of ``grad`` of token ``t``'s slots,
@@ -90,9 +78,7 @@ def bf16_expert_gather_sum(
     return bf16_expert_gather_sum_sm90(grad, maps, num_groups, max_slots)
 
 
-def expert_slot_segment_sum(
-    x: torch.Tensor, cu_host: list[int], cu: torch.Tensor, idx: torch.Tensor | None = None
-) -> torch.Tensor:
+def expert_slot_segment_sum(x: torch.Tensor, cu_host: list[int], cu: torch.Tensor, idx: torch.Tensor | None = None) -> torch.Tensor:
     """
     Per-segment column sums: a fresh fp32 ``(G, N)`` whose row ``g`` sums rows ``r`` in
     ``[cu[g], cu[g + 1])`` of ``x``, read as ``x[idx[r]]`` when ``idx`` is given (the bias

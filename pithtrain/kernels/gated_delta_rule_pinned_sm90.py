@@ -28,15 +28,8 @@ repeat_interleave of q / k would, so the result matches repeating them bit for b
 import fla
 import torch
 import triton
-from fla.ops.common.chunk_delta_h import (
-    chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64,
-    chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
-)
-from fla.ops.common.chunk_o import (
-    chunk_bwd_kernel_dqkwg,
-    chunk_bwd_kernel_dv_local,
-    chunk_fwd_kernel_o,
-)
+from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64, chunk_gated_delta_rule_fwd_kernel_h_blockdim64
+from fla.ops.common.chunk_o import chunk_bwd_kernel_dqkwg, chunk_bwd_kernel_dv_local, chunk_fwd_kernel_o
 from fla.ops.gated_delta_rule.chunk_fwd import chunk_gated_delta_rule_fwd_kkt_solve_kernel
 from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd_kernel, recompute_w_u_fwd_kernel
 from fla.ops.utils.constant import RCP_LN2
@@ -45,14 +38,7 @@ from triton import knobs
 
 from pithtrain.kernels.arch import is_sm90_device
 
-__all__ = [
-    "BT",
-    "chunk_gdr_bwd_pinned",
-    "chunk_gdr_fwd_pinned",
-    "gated_delta_rule_pinned_supported",
-    "pinned_launch_supported",
-    "pinned_shapes",
-]
+__all__ = ["BT", "chunk_gdr_bwd_pinned", "chunk_gdr_fwd_pinned", "gated_delta_rule_pinned_supported", "pinned_launch_supported", "pinned_shapes"]
 
 BT = 64  # chunk size
 BC = 16  # sub-chunk of the fused kkt + triangular solve, fixed by FLA at BT = 64
@@ -317,10 +303,7 @@ def pinned_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Te
     B, _, H, K = k.shape
     HV, V = v.shape[2:]
     bf = torch.bfloat16
-    return (
-        B == 1 and HV == 32 and HV % H == 0 and K == 128 and V == 128 and q.shape == k.shape
-        and q.dtype == k.dtype == v.dtype == beta.dtype == bf and g.dtype == torch.float32
-    )  # fmt: skip
+    return B == 1 and HV == 32 and HV % H == 0 and K == 128 and V == 128 and q.shape == k.shape and q.dtype == k.dtype == v.dtype == beta.dtype == bf and g.dtype == torch.float32  # fmt: skip
 
 
 def gated_delta_rule_pinned_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:  # fmt: skip

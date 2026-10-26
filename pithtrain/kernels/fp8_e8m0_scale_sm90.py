@@ -13,15 +13,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from pithtrain.kernels.cute_ptx_sm90 import asm, asm_args_last, f32_hex, to_ir, unpack
 
-__all__ = [
-    "AMAX_MIN",
-    "FP8_MAX_RCP",
-    "e8m0_scale",
-    "e8m0_scale_bf16x2",
-    "e8m0_scale_f32",
-    "exact_rcp",
-    "quant4_e4m3",
-]
+__all__ = ["AMAX_MIN", "FP8_MAX_RCP", "e8m0_scale", "e8m0_scale_bf16x2", "e8m0_scale_f32", "exact_rcp", "quant4_e4m3"]
 
 
 def _f32_hex(x: float) -> str:
@@ -53,16 +45,13 @@ def e8m0_scale_f32(amax: Float32, *, loc=None, ip=None) -> tuple:
         "mov.b32 e, s;\n"
         "sub.s32 e, 0x7F000000, e;\n"
         "mov.b32 $1, e;\n}",
-        "=f,=f,f",
-        [to_ir(amax, Float32, loc, ip)],
+        "=f,=f,f", [to_ir(amax, Float32, loc, ip)],
     )
     return unpack(res, 2, Float32, loc, ip)
 
 
 @dsl_user_op
-def quant4_e4m3(
-    x0: Float32, x1: Float32, x2: Float32, x3: Float32, r: tuple, *, loc=None, ip=None
-) -> Uint32:
+def quant4_e4m3(x0: Float32, x1: Float32, x2: Float32, x3: Float32, r: tuple, *, loc=None, ip=None) -> Uint32:
     """Four ``cvt.rn.satfinite.e4m3`` of ``x_i * r_i`` packed little-endian into one word."""
     args = [to_ir(v, Float32, loc, ip) for v in (x0, x1, x2, x3)]
     args += [to_ir(v, Float32, loc, ip) for v in r]
@@ -75,8 +64,7 @@ def quant4_e4m3(
             "cvt.rn.satfinite.e4m3x2.f32 lo, y1, y0;\n"
             "cvt.rn.satfinite.e4m3x2.f32 hi, y3, y2;\n"
             "mov.b32 $0, {lo, hi};\n}",
-            "=r,f,f,f,f,f,f,f,f",
-            args,
+            "=r,f,f,f,f,f,f,f,f", args,
         )
     )
 
@@ -95,8 +83,7 @@ def e8m0_scale_bf16x2(amax2: Uint32, hi: Int32, *, loc=None, ip=None) -> tuple:
     """
     st = llvm.StructType.get_literal([T.i32(), T.i32()])
     r = asm(
-        st,
-        [Uint32(amax2).ir_value(loc=loc, ip=ip), Int32(hi).ir_value(loc=loc, ip=ip)],
+        st, [Uint32(amax2).ir_value(loc=loc, ip=ip), Int32(hi).ir_value(loc=loc, ip=ip)],
         "{\n\t.reg .b32 a, b, m, s;\n\t.reg .f32 f;\n\t.reg .pred p, q;\n\t"
         "setp.ne.b32 q, $3, 0;\n\t"
         "and.b32 a, $2, 0xFFFF0000;\n\t"
@@ -115,10 +102,7 @@ def e8m0_scale_bf16x2(amax2: Uint32, hi: Int32, *, loc=None, ip=None) -> tuple:
         "sub.u32 $1, 0x7F000000, s;\n\t}",
         "=r,=r,r,r",
     )
-    return (
-        Uint32(llvm.extractvalue(T.i32(), r, [0], loc=loc, ip=ip)),
-        Uint32(llvm.extractvalue(T.i32(), r, [1], loc=loc, ip=ip)),
-    )
+    return (Uint32(llvm.extractvalue(T.i32(), r, [0], loc=loc, ip=ip)), Uint32(llvm.extractvalue(T.i32(), r, [1], loc=loc, ip=ip)))
 
 
 @dsl_user_op
@@ -130,8 +114,7 @@ def e8m0_scale(amax: Float32, *, loc=None, ip=None) -> Float32:
     non-negative floats an unsigned compare of the bits orders like the float compare.
     """
     res = llvm.inline_asm(
-        T.f32(),
-        [Float32(amax).ir_value(loc=loc, ip=ip)],
+        T.f32(), [Float32(amax).ir_value(loc=loc, ip=ip)],
         "{\n\t"
         ".reg .f32 t;\n\t"
         ".reg .b32 b, m, e;\n\t"
@@ -146,11 +129,7 @@ def e8m0_scale(amax: Float32, *, loc=None, ip=None) -> Float32:
         "max.u32 e, e, 0x00800000;\n\t"
         "mov.b32 $0, e;\n\t"
         "}",
-        "=f,f",
-        has_side_effects=False,
-        is_align_stack=False,
-        loc=loc,
-        ip=ip,
+        "=f,f", has_side_effects=False, is_align_stack=False, loc=loc, ip=ip,
     )
     return Float32(res)
 
@@ -159,8 +138,7 @@ def e8m0_scale(amax: Float32, *, loc=None, ip=None) -> Float32:
 def exact_rcp(scale: Float32, *, loc=None, ip=None) -> Float32:
     """Exact reciprocal of a power of 2 by exponent flip: bits -> (254 << 23) - bits."""
     res = llvm.inline_asm(
-        T.f32(),
-        [Float32(scale).ir_value(loc=loc, ip=ip)],
+        T.f32(), [Float32(scale).ir_value(loc=loc, ip=ip)],
         "{\n\t"
         ".reg .b32 b, c;\n\t"
         "mov.b32 b, $1;\n\t"
@@ -168,10 +146,6 @@ def exact_rcp(scale: Float32, *, loc=None, ip=None) -> Float32:
         "sub.u32 c, c, b;\n\t"
         "mov.b32 $0, c;\n\t"
         "}",
-        "=f,f",
-        has_side_effects=False,
-        is_align_stack=False,
-        loc=loc,
-        ip=ip,
+        "=f,f", has_side_effects=False, is_align_stack=False, loc=loc, ip=ip,
     )
     return Float32(res)

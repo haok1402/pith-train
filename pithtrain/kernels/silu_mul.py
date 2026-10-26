@@ -19,13 +19,7 @@ __all__ = ["BLOCK_SIZE", "silu_mul_bwd", "silu_mul_fwd"]
 
 
 @triton.jit
-def _silu_mul_fwd_kernel(
-    gate_ptr,
-    up_ptr,
-    out_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-):
+def _silu_mul_fwd_kernel(gate_ptr, up_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     """Compute ``out = silu(gate) * up`` element-wise in one pass."""
     block_start = tl.program_id(0).to(tl.int64) * BLOCK_SIZE
     offs = block_start + tl.arange(0, BLOCK_SIZE)
@@ -43,15 +37,7 @@ def _silu_mul_fwd_kernel(
 
 
 @triton.jit
-def _silu_mul_bwd_kernel(
-    grad_out_ptr,
-    gate_ptr,
-    up_ptr,
-    grad_gate_ptr,
-    grad_up_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-):
+def _silu_mul_bwd_kernel(grad_out_ptr, gate_ptr, up_ptr, grad_gate_ptr, grad_up_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     """Compute ``grad_gate`` and ``grad_up`` element-wise in one pass.
 
     With ``s = silu(gate)`` and ``sigma = sigmoid(gate)``:
@@ -105,9 +91,7 @@ def silu_mul_fwd(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def silu_mul_bwd(
-    grad_output: torch.Tensor, gate: torch.Tensor, up: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+def silu_mul_bwd(grad_output: torch.Tensor, gate: torch.Tensor, up: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Gradients of :func:`silu_mul_fwd`: fresh ``(grad_gate, grad_up)`` like ``gate`` / ``up``.
 
@@ -117,12 +101,8 @@ def silu_mul_bwd(
       Deterministic; same kernel on both architectures; :func:`silu_mul_bwd_quant` reproduces
       both bit for bit.
     """
-    assert grad_output.shape == gate.shape, (
-        f"grad_output shape {grad_output.shape} != gate shape {gate.shape}"
-    )
-    assert grad_output.dtype == gate.dtype, (
-        f"grad_output dtype {grad_output.dtype} != gate dtype {gate.dtype}"
-    )
+    assert grad_output.shape == gate.shape, (f"grad_output shape {grad_output.shape} != gate shape {gate.shape}")
+    assert grad_output.dtype == gate.dtype, (f"grad_output dtype {grad_output.dtype} != gate dtype {gate.dtype}")
     assert grad_output.is_contiguous(), "grad_output must be contiguous"
     grad_gate = torch.empty_like(gate)
     grad_up = torch.empty_like(up)

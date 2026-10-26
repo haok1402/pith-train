@@ -50,9 +50,7 @@ def _supported_on(device_index: int) -> bool:
     return False
 
 
-def bf16_experts_supported(
-    num_groups: int | None = None, device: torch.device | None = None
-) -> bool:
+def bf16_experts_supported(num_groups: int | None = None, device: torch.device | None = None) -> bool:
     """
     Whether BF16 routed experts with ``num_groups`` local experts (any count when None) take the
     fused CuTe path (the ``bf16_expert_*`` kernels) on ``device``, the current device by default:

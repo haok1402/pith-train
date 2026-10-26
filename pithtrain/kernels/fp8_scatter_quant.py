@@ -19,19 +19,8 @@ __all__ = ["scatter_quant"]
 
 
 def scatter_quant(
-    gathered: torch.Tensor,
-    expert_idxs: torch.Tensor,
-    num_groups: int,
-    expand_idx: Optional[torch.Tensor] = None,
-    padding_alignment: int = 128,
-    group_counts: Optional[list[int]] = None,
-) -> tuple[
-    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    torch.Tensor,
-    torch.Tensor,
-    list[int],
-    torch.Tensor,
-]:
+    gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor] = None, padding_alignment: int = 128, group_counts: Optional[list[int]] = None
+) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
     """
     The MoE stage-3 FP8 input in one pass: ``x = gathered[expand_idx]`` scattered by expert as
     :func:`scatter_by_expert` does, then quantized as :func:`quantize_grouped_input` does on SM90.
@@ -68,9 +57,5 @@ def scatter_quant(
     if is_sm90():
         from pithtrain.kernels.fp8_scatter_quant_sm90 import scatter_quant_sm90
 
-        return scatter_quant_sm90(
-            gathered, expert_idxs, num_groups, expand_idx, padding_alignment, group_counts
-        )
-    return scatter_quant_sm100(
-        gathered, expert_idxs, num_groups, expand_idx, padding_alignment, group_counts
-    )
+        return scatter_quant_sm90(gathered, expert_idxs, num_groups, expand_idx, padding_alignment, group_counts)
+    return scatter_quant_sm100(gathered, expert_idxs, num_groups, expand_idx, padding_alignment, group_counts)

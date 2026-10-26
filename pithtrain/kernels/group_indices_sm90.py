@@ -67,24 +67,11 @@ _GI: dict = {}
 
 
 def _compile(G: int) -> Callable:
-    return cute.compile(
-        _GroupIndices(G),
-        fake(Int32, (G,), (1,), 4),
-        fake(Int32, (cute.sym_int(),), (1,), 4),
-        fake_stream(),
-        options="--enable-tvm-ffi",
-    )
+    return cute.compile(_GroupIndices(G), fake(Int32, (G,), (1,), 4), fake(Int32, (cute.sym_int(),), (1,), 4), fake_stream(), options="--enable-tvm-ffi")
 
 
 def supports_group_indices(grouped_mm_offs: torch.Tensor, M: int) -> bool:
-    return (
-        grouped_mm_offs.dtype == torch.int32
-        and grouped_mm_offs.dim() == 1
-        and 0 < grouped_mm_offs.shape[0] <= _MAX_GROUPS
-        and grouped_mm_offs.is_contiguous()
-        and 0 <= M < 2**31
-        and not torch.compiler.is_compiling()
-    )
+    return (grouped_mm_offs.dtype == torch.int32 and grouped_mm_offs.dim() == 1 and 0 < grouped_mm_offs.shape[0] <= _MAX_GROUPS and grouped_mm_offs.is_contiguous() and 0 <= M < 2**31 and not torch.compiler.is_compiling())
 
 
 def group_indices(grouped_mm_offs: torch.Tensor, M: int) -> torch.Tensor:

@@ -33,21 +33,11 @@ import torch
 import triton
 import triton.language as tl
 
-__all__ = [
-    "BLOCK_C",
-    "BLOCK_T",
-    "BWD",
-    "causal_conv1d_bwd",
-    "causal_conv1d_fwd",
-    "causal_conv1d_out_like",
-]
+__all__ = ["BLOCK_C", "BLOCK_T", "BWD", "causal_conv1d_bwd", "causal_conv1d_fwd", "causal_conv1d_out_like"]
 
 
 @triton.jit
-def _conv_fwd_kernel(
-    x_ptr, w_ptr, y_ptr, L, S, C, offset, sy_b, sy_t, sy_c,
-    K: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr,
-):  # fmt: skip
+def _conv_fwd_kernel(x_ptr, w_ptr, y_ptr, L, S, C, offset, sy_b, sy_t, sy_c, K: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr):  # fmt: skip
     pid_t, pid_c, b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
     c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
@@ -65,10 +55,7 @@ def _conv_fwd_kernel(
 
 
 @triton.jit
-def _conv_bwd_kernel(
-    g_ptr, x_ptr, w_ptr, dx_ptr, dw_ptr, L, S, C, offset, n_t, sg_b, sg_t, sg_c,
-    K: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr,
-):  # fmt: skip
+def _conv_bwd_kernel(g_ptr, x_ptr, w_ptr, dx_ptr, dw_ptr, L, S, C, offset, n_t, sg_b, sg_t, sg_c, K: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr):  # fmt: skip
     """dx over input rows [pid_t * BLOCK_T, +BLOCK_T) of x, and the partial dw of the outputs
     t in the same row range (one fp32 partial per (b, t block))."""
     pid_t, pid_c, b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -86,11 +73,7 @@ def _conv_bwd_kernel(
         ok = (t >= 0) & (t < S)
         gv = tl.load(g_base + t[:, None] * sg_t + c[None, :] * sg_c, mask=ok[:, None] & c_ok[None, :], other=0.0)  # fmt: skip
         acc = tl.fma(w[None, :], gv.to(tl.float32), acc)
-    tl.store(
-        dx_ptr + b.to(tl.int64) * L * C + r[:, None] * C + c[None, :],
-        acc.to(tl.bfloat16),
-        mask=(r < L)[:, None] & c_ok[None, :],
-    )
+    tl.store(dx_ptr + b.to(tl.int64) * L * C + r[:, None] * C + c[None, :], acc.to(tl.bfloat16), mask=(r < L)[:, None] & c_ok[None, :])
     # dw[c, k] partial = sum over outputs t of this block of g[t] * x[t + offset - (K - 1) + k].
     t_ok = r < S
     gv = tl.load(g_base + r[:, None] * sg_t + c[None, :] * sg_c, mask=t_ok[:, None] & c_ok[None, :], other=0.0)  # fmt: skip
@@ -142,9 +125,7 @@ def causal_conv1d_fwd(x: torch.Tensor, w: torch.Tensor, offset: int) -> torch.Te
     return y
 
 
-def causal_conv1d_bwd(
-    g: torch.Tensor, x: torch.Tensor, w: torch.Tensor, offset: int
-) -> tuple[torch.Tensor, torch.Tensor]:
+def causal_conv1d_bwd(g: torch.Tensor, x: torch.Tensor, w: torch.Tensor, offset: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Gradients of :func:`causal_conv1d_fwd` for the output gradient ``g``: ``(dx, dw)``.
 

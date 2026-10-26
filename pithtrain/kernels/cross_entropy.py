@@ -15,18 +15,7 @@ __all__ = ["cross_entropy_fwd", "cross_entropy_fwd_inplace"]
 
 
 @triton.jit
-def cross_entropy_fwd(
-    X_ptr,
-    X_stride,
-    Y_ptr,
-    Y_stride,
-    loss_ptr,
-    loss_stride,
-    n_cols,
-    n_non_ignore_ptr,
-    ignore_idx,
-    BLOCK_SIZE: tl.constexpr,
-):
+def cross_entropy_fwd(X_ptr, X_stride, Y_ptr, Y_stride, loss_ptr, loss_stride, n_cols, n_non_ignore_ptr, ignore_idx, BLOCK_SIZE: tl.constexpr):
     """
     Fused cross-entropy forward: computes per-row loss and overwrites
     the logit tensor in-place with mean-reduced gradients.
@@ -56,9 +45,7 @@ def cross_entropy_fwd(
     d: tl.float32 = 0.0
     for i in range(0, n_cols, BLOCK_SIZE):
         X_offsets = i + tl.arange(0, BLOCK_SIZE)
-        X_block = tl.load(X_ptr + X_offsets, mask=X_offsets < n_cols, other=float("-inf")).to(
-            tl.float32
-        )
+        X_block = tl.load(X_ptr + X_offsets, mask=X_offsets < n_cols, other=float("-inf")).to(tl.float32)
         block_max = tl.max(X_block)
         m_new = tl.maximum(m, block_max)
         d = d * tl.exp(m - m_new) + tl.sum(tl.exp(X_block - m_new))
@@ -78,9 +65,7 @@ def cross_entropy_fwd(
     tl.store(loss_ptr + row * loss_stride, loss)
 
 
-def cross_entropy_fwd_inplace(
-    inp: torch.Tensor, target: torch.Tensor, ignore_index: int
-) -> tuple[torch.Tensor, torch.Tensor]:
+def cross_entropy_fwd_inplace(inp: torch.Tensor, target: torch.Tensor, ignore_index: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Mean cross-entropy of the ``(N, V)`` logits ``inp`` against ``target``, overwriting the logits
     with the gradient of that mean. Returns ``(loss, grad)``.
@@ -114,17 +99,7 @@ def cross_entropy_fwd_inplace(
     BLOCK_SIZE = min(65536 // 2, triton.next_power_of_2(n_cols))
 
     cross_entropy_fwd[(n_rows,)](
-        X_ptr=inp,
-        X_stride=inp.stride(-2),
-        Y_ptr=target,
-        Y_stride=target.stride(-1),
-        loss_ptr=loss_1d,
-        loss_stride=loss_1d.stride(-1),
-        n_cols=n_cols,
-        n_non_ignore_ptr=n_non_ignore,
-        ignore_idx=ignore_index,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=32,
+        X_ptr=inp, X_stride=inp.stride(-2), Y_ptr=target, Y_stride=target.stride(-1), loss_ptr=loss_1d, loss_stride=loss_1d.stride(-1), n_cols=n_cols, n_non_ignore_ptr=n_non_ignore, ignore_idx=ignore_index, BLOCK_SIZE=BLOCK_SIZE, num_warps=32
     )
 
     loss = loss_1d.sum() / n_non_ignore.float().squeeze()

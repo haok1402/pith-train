@@ -31,18 +31,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from pithtrain.kernels.cute_compile_sm90 import fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import (
-    asm,
-    ld_b32,
-    ld_v4,
-    lds_b32,
-    max_u16x2,
-    prmt,
-    selp,
-    st_b32,
-    st_v2,
-    sts_b32,
-)
+from pithtrain.kernels.cute_ptx_sm90 import asm, ld_b32, ld_v4, lds_b32, max_u16x2, prmt, selp, st_b32, st_v2, sts_b32
 from pithtrain.kernels.fp8_e8m0_scale_sm90 import e8m0_scale_bf16x2
 from pithtrain.kernels.fp8_rowwise_kmajor_sm100 import fp8cast_rowwise_kmajor_sm100
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale, mn_pad, to_mn_major
@@ -76,19 +65,11 @@ def _qblock(words: list, rr: list, cr: list, *, loc=None, ip=None) -> tuple:
     for r in range(4):  # rowwise
         for c in range(4):
             L.append(f"mul.rn.f32 y{c}, x{r * 4 + c}, ${16 + r};")
-        L += [
-            "cvt.rn.satfinite.e4m3x2.f32 l, y1, y0;",
-            "cvt.rn.satfinite.e4m3x2.f32 h, y3, y2;",
-            f"mov.b32 ${r}, {{l, h}};",
-        ]
+        L += ["cvt.rn.satfinite.e4m3x2.f32 l, y1, y0;", "cvt.rn.satfinite.e4m3x2.f32 h, y3, y2;", f"mov.b32 ${r}, {{l, h}};"]
     for c in range(4):  # K-major
         for r in range(4):
             L.append(f"mul.rn.f32 y{r}, x{r * 4 + c}, ${20 + c};")
-        L += [
-            "cvt.rn.satfinite.e4m3x2.f32 l, y1, y0;",
-            "cvt.rn.satfinite.e4m3x2.f32 h, y3, y2;",
-            f"mov.b32 ${4 + c}, {{l, h}};",
-        ]
+        L += ["cvt.rn.satfinite.e4m3x2.f32 l, y1, y0;", "cvt.rn.satfinite.e4m3x2.f32 h, y3, y2;", f"mov.b32 ${4 + c}, {{l, h}};"]
     L.append("}")
     st = llvm.StructType.get_literal([T.i32()] * 8)
     args = [Uint32(x).ir_value(loc=loc, ip=ip) for x in list(words) + list(rr) + list(cr)]
@@ -121,41 +102,15 @@ class RowwiseKmajor:
         self.num_groups = num_groups
 
     @cute.jit
-    def __call__(
-        self,
-        mX: cute.Tensor,
-        mOffs: cute.Tensor,
-        mTok: cute.Tensor,
-        mTokScale: cute.Tensor,
-        mKm: cute.Tensor,
-        mKmScale: cute.Tensor,
-        stream,
-    ) -> None:
+    def __call__(self, mX: cute.Tensor, mOffs: cute.Tensor, mTok: cute.Tensor, mTokScale: cute.Tensor, mKm: cute.Tensor, mKmScale: cute.Tensor, stream) -> None:
         mb = mX.shape[0] // TILE
-        self.kernel(mX, mOffs, mTok, mTokScale, mKm, mKmScale).launch(
-            grid=[self.nb, mb, 1], block=[THREADS, 1, 1], stream=stream
-        )
+        self.kernel(mX, mOffs, mTok, mTokScale, mKm, mKmScale).launch(grid=[self.nb, mb, 1], block=[THREADS, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(
-        self,
-        mX: cute.Tensor,
-        mOffs: cute.Tensor,
-        mTok: cute.Tensor,
-        mTokScale: cute.Tensor,
-        mKm: cute.Tensor,
-        mKmScale: cute.Tensor,
-    ) -> None:
+    def kernel(self, mX: cute.Tensor, mOffs: cute.Tensor, mTok: cute.Tensor, mTokScale: cute.Tensor, mKm: cute.Tensor, mKmScale: cute.Tensor) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         pid_col, pid_row, _ = cute.arch.block_idx()
-        gp = (
-            mX.iterator.toint(),
-            mOffs.iterator.toint(),
-            mTok.iterator.toint(),
-            mTokScale.iterator.toint(),
-            mKm.iterator.toint(),
-            mKmScale.iterator.toint(),
-        )
+        gp = (mX.iterator.toint(), mOffs.iterator.toint(), mTok.iterator.toint(), mTokScale.iterator.toint(), mKm.iterator.toint(), mKmScale.iterator.toint())
         smem = cutlass.memory.SmemAllocator()
         s_red = smem.allocate_tensor(Uint32, cute.make_layout(self.RED_WORDS), 16)
 
@@ -216,10 +171,7 @@ class RowwiseKmajor:
         # row amax over this thread's 8 columns: rp[p] packs rows (2p, 2p + 1)
         rp = []
         for p in range(4):
-            r0, r1 = (
-                max_u16x2(max_u16x2(a[i][0], a[i][1]), max_u16x2(a[i][2], a[i][3]))
-                for i in (2 * p, 2 * p + 1)
-            )
+            r0, r1 = (max_u16x2(max_u16x2(a[i][0], a[i][1]), max_u16x2(a[i][2], a[i][3])) for i in (2 * p, 2 * p + 1))
             rp.append(max_u16x2(prmt(r0, r1, 0x5410), prmt(r0, r1, 0x7632)))
 
         # in-warp butterflies: lane bits 0-2 run along cv, bits 3-4 along rb
@@ -250,23 +202,12 @@ class RowwiseKmajor:
 
         # ---- scales: one lane per (warp, row) / (warp, column), broadcast by shuffle ----
         # this lane: row rb * 8 + cl (half cl % 2 of rp[cl // 2]), columns rl and rl + 4
-        rsel = selp(
-            Int32(cl < 4),
-            selp(Int32(cl < 2), rp[0], rp[1]),
-            selp(Int32(cl < 6), rp[2], rp[3]),
-        )
+        rsel = selp(Int32(cl < 4), selp(Int32(cl < 2), rp[0], rp[1]), selp(Int32(cl < 6), rp[2], rp[3]))
         r_sc, r_rc = e8m0_scale_bf16x2(rsel, Int32(cl % 2))
         ca_sc, ca_rc = e8m0_scale_bf16x2(selp(Int32(rl < 2), cp[0], cp[1]), Int32(rl % 2))
         cb_sc, cb_rc = e8m0_scale_bf16x2(selp(Int32(rl < 2), cp[2], cp[3]), Int32(rl % 2))
-        row_rcp = [
-            Uint32(cute.arch.shuffle_sync(Int32(r_rc), offset=(lane & 24) | i)) for i in range(8)
-        ]
-        col_rcp = [
-            Uint32(
-                cute.arch.shuffle_sync(Int32(ca_rc if j < 4 else cb_rc), offset=(j % 4) * 8 + cl)
-            )
-            for j in range(8)
-        ]
+        row_rcp = [Uint32(cute.arch.shuffle_sync(Int32(r_rc), offset=(lane & 24) | i)) for i in range(8)]
+        col_rcp = [Uint32(cute.arch.shuffle_sync(Int32(ca_rc if j < 4 else cb_rc), offset=(j % 4) * 8 + cl)) for j in range(8)]
 
         # MN-major scales: tok_scale[r, j] at j * M + r, km_scale[c, b] at b * align(N, 4) + c
         st_b32(tok_scale_base + (Int64(pid_col) * M + row0 + cl) * 4, r_sc, Int32(warp % 2 == 0))
@@ -312,48 +253,21 @@ def _compile(n: int, num_groups: int) -> Callable:
     tok_scale = fake(cutlass.Float32, (m, nb), stride=(1, cute.sym_int64()), assumed_align=16)
     km = fake(cutlass.Float8E4M3FN, (mn,), stride=(1,), assumed_align=16)
     km_scale = fake(cutlass.Float32, (n, mb), stride=(1, mn_pad(n)), assumed_align=16)
-    return cute.compile(
-        RowwiseKmajor(n, num_groups),
-        x,
-        offs,
-        tok,
-        tok_scale,
-        km,
-        km_scale,
-        fake_stream(),
-        options="--enable-tvm-ffi",
-    )
+    return cute.compile(RowwiseKmajor(n, num_groups), x, offs, tok, tok_scale, km, km_scale, fake_stream(), options="--enable-tvm-ffi")
 
 
-def _empty_outputs(
-    x: torch.Tensor, M: int, N: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def _empty_outputs(x: torch.Tensor, M: int, N: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     dev = x.device
-    return (
-        torch.empty((M, N), dtype=torch.float8_e4m3fn, device=dev),
-        mn_major_scale(M, (N + TILE - 1) // TILE, dev),
-        torch.empty(M * N, dtype=torch.float8_e4m3fn, device=dev),
-        mn_major_scale(N, M // TILE, dev),
-    )
+    return (torch.empty((M, N), dtype=torch.float8_e4m3fn, device=dev), mn_major_scale(M, (N + TILE - 1) // TILE, dev), torch.empty(M * N, dtype=torch.float8_e4m3fn, device=dev), mn_major_scale(N, M // TILE, dev))
 
 
 def supports_rowwise_kmajor(x: torch.Tensor, grouped_mm_offs: torch.Tensor) -> bool:
     """Whether the CuTe kernel covers this input: a contiguous, 16-byte aligned BF16 ``x`` with
     ``N % 8 == 0`` and non-empty, contiguous int32 ``grouped_mm_offs``."""
-    return not (
-        x.dtype != torch.bfloat16
-        or x.shape[1] % 8 != 0
-        or not x.is_contiguous()
-        or x.data_ptr() % 16 != 0
-        or grouped_mm_offs.dtype != torch.int32
-        or grouped_mm_offs.shape[0] == 0
-        or not grouped_mm_offs.is_contiguous()
-    )
+    return not (x.dtype != torch.bfloat16 or x.shape[1] % 8 != 0 or not x.is_contiguous() or x.data_ptr() % 16 != 0 or grouped_mm_offs.dtype != torch.int32 or grouped_mm_offs.shape[0] == 0 or not grouped_mm_offs.is_contiguous())
 
 
-def fp8cast_rowwise_kmajor_sm90(
-    x: torch.Tensor, grouped_mm_offs: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8cast_rowwise_kmajor_sm90(x: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused rowwise + K-major colwise FP8 quantization (single read of *x*).
 
     Drop-in for :func:`pithtrain.kernels.fp8_rowwise_kmajor_sm100.fp8cast_rowwise_kmajor_sm100`: same
@@ -365,9 +279,7 @@ def fp8cast_rowwise_kmajor_sm90(
     take the Triton kernel ``fp8cast_rowwise_kmajor_sm100``, with its scales converted to the same
     layout.
     """
-    assert x.ndim == 2 and x.shape[0] % 128 == 0, (
-        f"Expected 2D tensor with M%128==0, got shape {x.shape}"
-    )
+    assert x.ndim == 2 and x.shape[0] % 128 == 0, (f"Expected 2D tensor with M%128==0, got shape {x.shape}")
     M, N = x.shape
     if M == 0:
         return _empty_outputs(x, M, N)

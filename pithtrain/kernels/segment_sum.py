@@ -21,14 +21,7 @@ __all__ = ["block_segment_sum", "segment_sum_along_rows"]
 
 
 @triton.jit
-def _segment_sum_kernel(
-    x_ptr,
-    offs_padded_ptr,
-    out_ptr,
-    H: tl.constexpr,
-    HEAD_BLOCK: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-):
+def _segment_sum_kernel(x_ptr, offs_padded_ptr, out_ptr, H: tl.constexpr, HEAD_BLOCK: tl.constexpr, BLOCK_M: tl.constexpr):
     """
     One block reduces rows [start, end) of group g for a HEAD_BLOCK-wide
     slab of the hidden dim.  Accumulation is in fp32 for numerical
@@ -70,16 +63,7 @@ def _segment_tile(offs_padded_ptr, E, BLOCK_M: tl.constexpr, BLOCK_E: tl.constex
 
 
 @triton.jit
-def _segment_tile_sum_kernel(
-    x_ptr,
-    offs_padded_ptr,
-    part_ptr,
-    E,
-    H: tl.constexpr,
-    HEAD_BLOCK: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_E: tl.constexpr,
-):
+def _segment_tile_sum_kernel(x_ptr, offs_padded_ptr, part_ptr, E, H: tl.constexpr, HEAD_BLOCK: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_E: tl.constexpr):
     """
     Column sums (fp32) of one BLOCK_M x HEAD_BLOCK tile of x, written to row t of part. The tile
     is a group's BLOCK_M-row tile as a sequential per-group loop would take it, so its sum has the
@@ -106,16 +90,7 @@ def _segment_tile_sum_kernel(
 
 
 @triton.jit
-def _segment_tile_reduce_kernel(
-    part_ptr,
-    offs_padded_ptr,
-    out_ptr,
-    E,
-    H: tl.constexpr,
-    HEAD_BLOCK: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_E: tl.constexpr,
-):
+def _segment_tile_reduce_kernel(part_ptr, offs_padded_ptr, out_ptr, E, H: tl.constexpr, HEAD_BLOCK: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_E: tl.constexpr):
     """
     out[g] = the tile sums of group g added in row order, starting from zero (fp32).
     """
@@ -134,11 +109,7 @@ def _segment_tile_reduce_kernel(
     tl.store(out_ptr + g * H + h_offs, acc, mask=h_mask)
 
 
-def segment_sum_along_rows(
-    x: torch.Tensor,
-    grouped_mm_offs: torch.Tensor,
-    out_dtype: torch.dtype,
-) -> torch.Tensor:
+def segment_sum_along_rows(x: torch.Tensor, grouped_mm_offs: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     """
     Per-group column sums of rows already sorted by group (the bias gradient of
     ``x + bias[group_ids]``): a fresh ``(G, H)`` tensor of ``out_dtype``, row ``g`` the sum of
@@ -200,14 +171,10 @@ def _block_segment_sum_kernel(part_ptr, offs_ptr, out_ptr, H, BLOCK_H: tl.conste
     tl.store(out_ptr + g * H + h, acc.to(out_ptr.dtype.element_ty), mask=mask)
 
 
-def block_segment_sum(
-    partials: torch.Tensor, grouped_mm_offs: torch.Tensor, dtype: torch.dtype
-) -> torch.Tensor:
+def block_segment_sum(partials: torch.Tensor, grouped_mm_offs: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """(G, H) per-expert sums of the (M / 128, H) fp32 partials of 128-row blocks, in row order,
     in dtype. Experts are 128-aligned row ranges given by grouped_mm_offs."""
     G, H = grouped_mm_offs.shape[0], partials.shape[1]
     out = torch.empty((G, H), dtype=dtype, device=partials.device)
-    _block_segment_sum_kernel[(G, triton.cdiv(H, 512))](
-        partials, grouped_mm_offs, out, H, BLOCK_H=512
-    )
+    _block_segment_sum_kernel[(G, triton.cdiv(H, 512))](partials, grouped_mm_offs, out, H, BLOCK_H=512)
     return out

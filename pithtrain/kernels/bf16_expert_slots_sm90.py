@@ -30,32 +30,9 @@ from cutlass import Int32, Int64, Uint32
 
 from pithtrain.kernels.bf16_expert_support import MAX_GROUPS
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import (
-    bf16x2_to_f32,
-    ctz64,
-    f32_bits,
-    f32x2_to_bf16x2,
-    lanemask_lt,
-    ld_b32,
-    ld_b64,
-    ld_v4,
-    lds_b32,
-    match_any,
-    red_add_shared,
-    red_or_u64,
-    st_b32,
-    st_b64,
-    st_v4,
-    sts_b32,
-)
+from pithtrain.kernels.cute_ptx_sm90 import (bf16x2_to_f32, ctz64, f32_bits, f32x2_to_bf16x2, lanemask_lt, ld_b32, ld_b64, ld_v4, lds_b32, match_any, red_add_shared, red_or_u64, st_b32, st_b64, st_v4, sts_b32)
 
-__all__ = [
-    "SlotMaps",
-    "bf16_expert_group_slots_sm90",
-    "bf16_expert_gather_rows_sm90",
-    "bf16_expert_gather_sum_sm90",
-    "expert_slot_segment_sum_sm90",
-]
+__all__ = ["SlotMaps", "bf16_expert_group_slots_sm90", "bf16_expert_gather_rows_sm90", "bf16_expert_gather_sum_sm90", "expert_slot_segment_sum_sm90"]
 
 _THREADS = 512
 _WARPS = _THREADS // 32
@@ -243,9 +220,7 @@ class _GatherSum:
     @cute.jit
     def __call__(self, mGrad, mMask, mTab, mOut, stream) -> None:
         n = (mOut.shape[0] + _SUM_TOKENS - 1) // _SUM_TOKENS
-        self.kernel(mGrad, mMask, mTab, mOut).launch(
-            grid=[n, 1, 1], block=[_SUM_THREADS, 1, 1], stream=stream
-        )
+        self.kernel(mGrad, mMask, mTab, mOut).launch(grid=[n, 1, 1], block=[_SUM_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, mGrad, mMask, mTab, mOut) -> None:
@@ -265,9 +240,7 @@ class _GatherSum:
             for j in cutlass.range_constexpr(K):
                 ok = Int32(mask != Int64(0))
                 e = ctz64(mask)
-                rows.append(
-                    ld_b32(mTab.iterator.toint() + (Int64(t) * G + Int64(e)) * 4, ok, Int32(0))
-                )
+                rows.append(ld_b32(mTab.iterator.toint() + (Int64(t) * G + Int64(e)) * 4, ok, Int32(0)))
                 valid.append(ok)
                 mask = mask & (mask - Int64(1))
             for q in cutlass.range_constexpr((V + _SUM_THREADS - 1) // _SUM_THREADS):
@@ -305,12 +278,7 @@ def _vec(dtype: type, align: int) -> object:
     return fake(dtype, (cute.sym_int(),), (1,), align)
 
 
-def bf16_expert_group_slots_sm90(
-    expert_idxs: torch.Tensor,
-    expand_idx: torch.Tensor | None,
-    num_groups: int,
-    num_tokens: int,
-) -> SlotMaps:
+def bf16_expert_group_slots_sm90(expert_idxs: torch.Tensor, expand_idx: torch.Tensor | None, num_groups: int, num_tokens: int) -> SlotMaps:
     """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_slots.bf16_expert_group_slots` (its contract)."""
     G = num_groups
     S = expert_idxs.shape[0]
@@ -338,14 +306,8 @@ def bf16_expert_group_slots_sm90(
     if fns is None:
         i32 = lambda: _vec(Int32, 4)  # noqa: E731
         fns = _GROUP[(G, has_expand)] = (
-            cute.compile(
-                _Hist(G), _vec(Int64, 8), i32(), _vec(Int64, 8), fake_stream(),
-                options="--enable-tvm-ffi",
-            ),
-            cute.compile(
-                _Group(G, has_expand), _vec(Int64, 8), _vec(Int64, 8), i32(), i32(), i32(),
-                i32(), i32(), _vec(Int64, 8), i32(), fake_stream(), options="--enable-tvm-ffi",
-            ),
+            cute.compile(_Hist(G), _vec(Int64, 8), i32(), _vec(Int64, 8), fake_stream(), options="--enable-tvm-ffi"),
+            cute.compile(_Group(G, has_expand), _vec(Int64, 8), _vec(Int64, 8), i32(), i32(), i32(), i32(), i32(), _vec(Int64, 8), i32(), fake_stream(), options="--enable-tvm-ffi"),
         )  # fmt: skip
     fns[0](expert_idxs, hist, mask if has_expand else expert_idxs[:0])
     if has_expand:
@@ -355,9 +317,7 @@ def bf16_expert_group_slots_sm90(
     return SlotMaps(cu, a_idx, row_of, slot_of, mask, table)
 
 
-def bf16_expert_gather_sum_sm90(
-    grad: torch.Tensor, maps: SlotMaps, num_groups: int, max_slots: int
-) -> torch.Tensor:
+def bf16_expert_gather_sum_sm90(grad: torch.Tensor, maps: SlotMaps, num_groups: int, max_slots: int) -> torch.Tensor:
     """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_slots.bf16_expert_gather_sum` (its contract)."""
     T_ = maps.mask.shape[0]
     H = grad.shape[1]
@@ -368,11 +328,7 @@ def bf16_expert_gather_sum_sm90(
     fn = _SUM.get(key)
     if fn is None:
         bf = cutlass.BFloat16
-        fn = _SUM[key] = cute.compile(
-            _GatherSum(H, num_groups, max_slots), fake(bf, (cute.sym_int(), H), (H, 1)),
-            _vec(Int64, 8), _vec(Int32, 4), fake(bf, (cute.sym_int(), H), (H, 1)), fake_stream(),
-            options="--enable-tvm-ffi",
-        )  # fmt: skip
+        fn = _SUM[key] = cute.compile(_GatherSum(H, num_groups, max_slots), fake(bf, (cute.sym_int(), H), (H, 1)), _vec(Int64, 8), _vec(Int32, 4), fake(bf, (cute.sym_int(), H), (H, 1)), fake_stream(), options="--enable-tvm-ffi")  # fmt: skip
     fn(grad, maps.mask, maps.table, out)
     return out
 
@@ -395,9 +351,7 @@ class _SegmentSum:
     def __call__(self, mX, mIdx, mCu, mChunk, mPart, stream) -> None:
         nchunks = mPart.shape[0]
         cb = (self.N // 8 + _SEG_THREADS - 1) // _SEG_THREADS
-        self.kernel(mX, mIdx, mCu, mChunk, mPart).launch(
-            grid=[nchunks, cb, 1], block=[_SEG_THREADS, 1, 1], stream=stream
-        )
+        self.kernel(mX, mIdx, mCu, mChunk, mPart).launch(grid=[nchunks, cb, 1], block=[_SEG_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, mX, mIdx, mCu, mChunk, mPart) -> None:
@@ -430,9 +384,7 @@ class _SegmentSum:
 _SEG: dict = {}
 
 
-def expert_slot_segment_sum_sm90(
-    x: torch.Tensor, cu_host: list[int], cu: torch.Tensor, idx: torch.Tensor | None = None
-) -> torch.Tensor:
+def expert_slot_segment_sum_sm90(x: torch.Tensor, cu_host: list[int], cu: torch.Tensor, idx: torch.Tensor | None = None) -> torch.Tensor:
     """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_slots.expert_slot_segment_sum` (its contract)."""
     G, N = len(cu_host) - 1, x.shape[1]
     lengths = [-(-(cu_host[g + 1] - cu_host[g]) // _SEG_ROWS) for g in range(G)]
@@ -504,9 +456,6 @@ def bf16_expert_gather_rows_sm90(x: torch.Tensor, idx: torch.Tensor) -> torch.Te
     fn = _ROWS.get(N)
     if fn is None:
         bf = cutlass.BFloat16
-        fn = _ROWS[N] = cute.compile(
-            _GatherRows(N), fake(bf, (cute.sym_int(), N), (N, 1)), _vec(Int32, 4),
-            fake(bf, (cute.sym_int(), N), (N, 1)), fake_stream(), options="--enable-tvm-ffi",
-        )  # fmt: skip
+        fn = _ROWS[N] = cute.compile(_GatherRows(N), fake(bf, (cute.sym_int(), N), (N, 1)), _vec(Int32, 4), fake(bf, (cute.sym_int(), N), (N, 1)), fake_stream(), options="--enable-tvm-ffi")  # fmt: skip
     fn(x, idx, out)
     return out

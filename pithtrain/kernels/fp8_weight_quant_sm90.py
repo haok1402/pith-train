@@ -49,16 +49,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from pithtrain.kernels.cute_compile_sm90 import TORCH2CUTE, fake_stream
 
-__all__ = [
-    "fp8cast_blockwise_transpose_sm90",
-    "fp8cast_blockwise_transpose_batched_sm90",
-    "fp8_shard_amax_sm90",
-    "fp8_shard_cast_sm90",
-    "fp8_scales_sm90",
-    "fp8_pack_transpose_sm90",
-    "fp8_shard_amax_multi_sm90",
-    "fp8_scales_multi_sm90",
-]
+__all__ = ["fp8cast_blockwise_transpose_sm90", "fp8cast_blockwise_transpose_batched_sm90", "fp8_shard_amax_sm90", "fp8_shard_cast_sm90", "fp8_scales_sm90", "fp8_pack_transpose_sm90", "fp8_shard_amax_multi_sm90", "fp8_scales_multi_sm90"]
 
 BLOCK = 128
 # Global-load flavour; plain ld.global measured 2-6% faster than .nc variants on H200.
@@ -78,14 +69,7 @@ FP8_MAX_RCP = 1.0 / 448.0
 
 
 def _asm(res_type, ptx: str, constraints: str, args: list, side_effects: bool = False):
-    return llvm.inline_asm(
-        res_type,
-        [a.ir_value() for a in args],
-        ptx,
-        constraints,
-        has_side_effects=side_effects,
-        is_align_stack=False,
-    )
+    return llvm.inline_asm(res_type, [a.ir_value() for a in args], ptx, constraints, has_side_effects=side_effects, is_align_stack=False)
 
 
 def _struct(res, n: int) -> list:
@@ -101,9 +85,7 @@ def _ld_v4(addr: Int64, pred: Int32, l1: bool = False, *, loc=None, ip=None) -> 
         "{\n.reg .pred p;\nsetp.ne.b32 p, $5, 0;\n"
         "mov.b32 $0, 0;\nmov.b32 $1, 0;\nmov.b32 $2, 0;\nmov.b32 $3, 0;\n"
         f"@p ld.global{hint}.v4.b32 {{$0, $1, $2, $3}}, [$4];\n}}",
-        "=r,=r,=r,=r,l,r",
-        [Int64(addr), Int32(pred)],
-        side_effects=True,  # keep loads ahead of the stores; pure asm gets sunk to its use
+        "=r,=r,=r,=r,l,r", [Int64(addr), Int32(pred)], side_effects=True,  # keep loads ahead of the stores; pure asm gets sunk to its use
     )
     return _struct(res, 4)
 
@@ -115,9 +97,7 @@ def _ld_v2(addr: Int64, pred: Int32, *, loc=None, ip=None) -> list:
         llvm.StructType.get_literal([T.i32()] * 2),
         "{\n.reg .pred p;\nsetp.ne.b32 p, $3, 0;\nmov.b32 $0, 0;\nmov.b32 $1, 0;\n"
         "@p ld.global.v2.b32 {$0, $1}, [$2];\n}",
-        "=r,=r,l,r",
-        [Int64(addr), Int32(pred)],
-        side_effects=True,  # keep loads ahead of the stores; pure asm gets sunk to its use
+        "=r,=r,l,r", [Int64(addr), Int32(pred)], side_effects=True,  # keep loads ahead of the stores; pure asm gets sunk to its use
     )
     return _struct(res, 2)
 
@@ -130,34 +110,20 @@ def _ld_scalar(addr: Int64, pred: Int32, nbytes: int, *, loc=None, ip=None) -> U
         T.i32(),
         "{\n.reg .pred p;\nsetp.ne.b32 p, $2, 0;\nmov.b32 $0, 0;\n"
         f"@p ld.global.{ty} $0, [$1];\n}}",
-        "=r,l,r",
-        [Int64(addr), Int32(pred)],
-        side_effects=True,  # keep loads ahead of the stores; pure asm gets sunk to its use
+        "=r,l,r", [Int64(addr), Int32(pred)], side_effects=True,  # keep loads ahead of the stores; pure asm gets sunk to its use
     )
     return Uint32(res)
 
 
 @dsl_user_op
 def _st_v2(addr: Int64, a: Uint32, b: Uint32, pred: Int32, *, loc=None, ip=None) -> None:
-    _asm(
-        None,
-        "{\n.reg .pred p;\nsetp.ne.b32 p, $3, 0;\n@p st.global.v2.b32 [$0], {$1, $2};\n}",
-        "l,r,r,r",
-        [Int64(addr), Uint32(a), Uint32(b), Int32(pred)],
-        side_effects=True,
-    )
+    _asm(None, "{\n.reg .pred p;\nsetp.ne.b32 p, $3, 0;\n@p st.global.v2.b32 [$0], {$1, $2};\n}", "l,r,r,r", [Int64(addr), Uint32(a), Uint32(b), Int32(pred)], side_effects=True)
 
 
 @dsl_user_op
 def _st_scalar(addr: Int64, v: Uint32, pred: Int32, nbytes: int, *, loc=None, ip=None) -> None:
     ty = {1: "b8", 4: "b32"}[nbytes]
-    _asm(
-        None,
-        f"{{\n.reg .pred p;\nsetp.ne.b32 p, $2, 0;\n@p st.global.{ty} [$0], $1;\n}}",
-        "l,r,r",
-        [Int64(addr), Uint32(v), Int32(pred)],
-        side_effects=True,
-    )
+    _asm(None, f"{{\n.reg .pred p;\nsetp.ne.b32 p, $2, 0;\n@p st.global.{ty} [$0], $1;\n}}", "l,r,r", [Int64(addr), Uint32(v), Int32(pred)], side_effects=True)
 
 
 @dsl_user_op
@@ -167,25 +133,13 @@ def _sts_v2(addr: Int32, a: Uint32, b: Uint32, *, loc=None, ip=None) -> None:
 
 @dsl_user_op
 def _lds_v4(addr: Int32, *, loc=None, ip=None) -> list:
-    res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,r",
-        [Int32(addr)],
-        side_effects=True,
-    )
+    res = _asm(llvm.StructType.get_literal([T.i32()] * 4), "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];", "=r,=r,=r,=r,r", [Int32(addr)], side_effects=True)
     return _struct(res, 4)
 
 
 @dsl_user_op
 def _st_v4(addr: Int64, w: list, pred: Int32, *, loc=None, ip=None) -> None:
-    _asm(
-        None,
-        "{\n.reg .pred p;\nsetp.ne.b32 p, $5, 0;\n@p st.global.v4.b32 [$0], {$1, $2, $3, $4};\n}",
-        "l,r,r,r,r,r",
-        [Int64(addr), Uint32(w[0]), Uint32(w[1]), Uint32(w[2]), Uint32(w[3]), Int32(pred)],
-        side_effects=True,
-    )
+    _asm(None, "{\n.reg .pred p;\nsetp.ne.b32 p, $5, 0;\n@p st.global.v4.b32 [$0], {$1, $2, $3, $4};\n}", "l,r,r,r,r,r", [Int64(addr), Uint32(w[0]), Uint32(w[1]), Uint32(w[2]), Uint32(w[3]), Int32(pred)], side_effects=True)
 
 
 @dsl_user_op
@@ -205,22 +159,13 @@ def _max_u32(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
 
 @dsl_user_op
 def _redux_max(a: Uint32, *, loc=None, ip=None) -> Uint32:
-    return Uint32(
-        _asm(T.i32(), "redux.sync.max.u32 $0, $1, 0xffffffff;", "=r,r", [a], side_effects=True)
-    )
+    return Uint32(_asm(T.i32(), "redux.sync.max.u32 $0, $1, 0xffffffff;", "=r,r", [a], side_effects=True))
 
 
 @dsl_user_op
 def _f32x2_to_bf16x2(lo: Uint32, hi: Uint32, *, loc=None, ip=None) -> Uint32:
     """Two fp32 bit patterns -> packed bf16x2 (round to nearest even), lo in bits [15:0]."""
-    return Uint32(
-        _asm(
-            T.i32(),
-            "{\n.reg .f32 a, b;\nmov.b32 a, $1;\nmov.b32 b, $2;\ncvt.rn.bf16x2.f32 $0, b, a;\n}",
-            "=r,r,r",
-            [lo, hi],
-        )
-    )
+    return Uint32(_asm(T.i32(), "{\n.reg .f32 a, b;\nmov.b32 a, $1;\nmov.b32 b, $2;\ncvt.rn.bf16x2.f32 $0, b, a;\n}", "=r,r,r", [lo, hi]))
 
 
 @dsl_user_op
@@ -236,8 +181,7 @@ def _cast4(v0: Uint32, v1: Uint32, v2: Uint32, v3: Uint32, rcp: Uint32, *, loc=N
             "cvt.rn.satfinite.e4m3x2.f32 lo, b, a;\n"
             "cvt.rn.satfinite.e4m3x2.f32 hi, d, c;\n"
             "mov.b32 $0, {lo, hi};\n}",
-            "=r,r,r,r,r,r",
-            [v0, v1, v2, v3, rcp],
+            "=r,r,r,r,r,r", [v0, v1, v2, v3, rcp],
         )
     )
 
@@ -260,8 +204,7 @@ def _scale_bits(amax_bits: Uint32, *, loc=None, ip=None) -> Uint32:
             "shl.b32 m, m, 23;\n"
             "add.u32 e, e, m;\n"
             "max.u32 $0, e, 0x00800000;\n}",  # max(scale, 2^-126) on non-negative bits
-            "=r,r",
-            [amax_bits],
+            "=r,r", [amax_bits],
         )
     )
 
@@ -288,17 +231,7 @@ def _thread_coords() -> tuple:
 
 
 @cute.jit
-def _load_rows(
-    base: Int64,
-    row0: Int32,
-    col0: Int32,
-    row_lo: Int32,
-    row_hi: Int32,
-    K: Int32,
-    in_bytes: cutlass.Constexpr[int],
-    round_bf16: cutlass.Constexpr[bool],
-    aligned: cutlass.Constexpr[bool],
-) -> list:
+def _load_rows(base: Int64, row0: Int32, col0: Int32, row_lo: Int32, row_hi: Int32, K: Int32, in_bytes: cutlass.Constexpr[int], round_bf16: cutlass.Constexpr[bool], aligned: cutlass.Constexpr[bool]) -> list:
     """
     Load the thread's 8x8 block, rows row0 + i valid when row_lo <= row0 + i < row_hi.
 
@@ -329,13 +262,7 @@ def _load_rows(
             elif const_expr(in_bytes == 4):
                 words = elems
             else:
-                words = [
-                    elems[4 * q]
-                    | (elems[4 * q + 1] << 8)
-                    | (elems[4 * q + 2] << 16)
-                    | (elems[4 * q + 3] << 24)
-                    for q in range(2)
-                ]
+                words = [elems[4 * q] | (elems[4 * q + 1] << 8) | (elems[4 * q + 2] << 16) | (elems[4 * q + 3] << 24) for q in range(2)]
         if const_expr(in_bytes == 4 and round_bf16):
             words = [_f32x2_to_bf16x2(words[2 * q], words[2 * q + 1]) for q in range(4)]
         rows.append(words)
@@ -409,16 +336,7 @@ def _transpose8(q: list) -> list:
 
 
 @cute.jit
-def _store_rows(
-    base: Int64,
-    q: list,
-    row0: Int32,
-    col0: Int32,
-    row_lo: Int32,
-    row_hi: Int32,
-    K: Int32,
-    aligned: cutlass.Constexpr[bool],
-) -> None:
+def _store_rows(base: Int64, q: list, row0: Int32, col0: Int32, row_lo: Int32, row_hi: Int32, K: Int32, aligned: cutlass.Constexpr[bool]) -> None:
     """Store [row][lo, hi] fp8 words to a row-major (rows, K) byte matrix at base."""
     for i in cutlass.range_constexpr(8):
         row = row0 + i
@@ -453,15 +371,7 @@ def _smem_write_block(base: Int32, q: list, rr0: Int32, cc0: Int32) -> None:
 
 
 @cute.jit
-def _smem_store_tile(
-    base: Int32,
-    gtile: Int64,
-    row_lo: Int32,
-    row_hi: Int32,
-    cols: Int32,
-    ld: Int32,
-    nthreads: cutlass.Constexpr[int] = NUM_THREADS,
-) -> None:
+def _smem_store_tile(base: Int32, gtile: Int64, row_lo: Int32, row_hi: Int32, cols: Int32, ld: Int32, nthreads: cutlass.Constexpr[int] = NUM_THREADS) -> None:
     """
     Store the staged tile with 16-byte stores to the row-major byte matrix whose tile row 0, col
     0 is at gtile (row stride ld); tile row r is valid when row_lo <= r < row_hi, chunk c when
@@ -495,46 +405,17 @@ class _BlockwiseTranspose:
         self.batched = batched
 
     @cute.jit
-    def __call__(
-        self,
-        mX: cute.Tensor,
-        mOut: cute.Tensor,
-        mScale: cute.Tensor,
-        mOutT: cute.Tensor,
-        mScaleT: cute.Tensor,
-        stream: cuda.CUstream,
-    ):
+    def __call__(self, mX: cute.Tensor, mOut: cute.Tensor, mScale: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, stream: cuda.CUstream):
         if const_expr(self.batched):
             G, M, K = mX.shape[0], mX.shape[1], mX.shape[2]
         else:
             G, M, K = 1, mX.shape[0], mX.shape[1]
         rt = (M + BLOCK - 1) // BLOCK
         ct = (K + BLOCK - 1) // BLOCK
-        self.kernel(
-            mX.iterator.toint(),
-            mOut.iterator.toint(),
-            mScale.iterator.toint(),
-            mOutT.iterator.toint(),
-            mScaleT.iterator.toint(),
-            Int32(M),
-            Int32(K),
-            Int32(rt),
-            Int32(ct),
-        ).launch(grid=[rt, ct, G], block=[NUM_THREADS, 1, 1], stream=stream)
+        self.kernel(mX.iterator.toint(), mOut.iterator.toint(), mScale.iterator.toint(), mOutT.iterator.toint(), mScaleT.iterator.toint(), Int32(M), Int32(K), Int32(rt), Int32(ct)).launch(grid=[rt, ct, G], block=[NUM_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(
-        self,
-        x: Int64,
-        out: Int64,
-        scale: Int64,
-        out_t: Int64,
-        scale_t: Int64,
-        M: Int32,
-        K: Int32,
-        rt: Int32,
-        ct: Int32,
-    ):
+    def kernel(self, x: Int64, out: Int64, scale: Int64, out_t: Int64, scale_t: Int64, M: Int32, K: Int32, rt: Int32, ct: Int32):
         bx, by, bz = cute.arch.block_idx()
         tidx, warp, lane, r0, c0 = _thread_coords()
         smem = cutlass.memory.SmemAllocator()
@@ -558,9 +439,7 @@ class _BlockwiseTranspose:
         out_g = out + Int64(bz) * mk
         out_t_g = out_t + Int64(bz) * mk
         if const_expr(self.mode == "smem"):
-            buf = smem.allocate_tensor(
-                Uint32, cute.make_layout(TILE_BYTES // 2), byte_alignment=128
-            )
+            buf = smem.allocate_tensor(Uint32, cute.make_layout(TILE_BYTES // 2), byte_alignment=128)
             base = buf.iterator.toint()
             _smem_write_block(base, q, r0, c0)
             _smem_write_block(base + TILE_BYTES, qt, c0, r0)
@@ -597,14 +476,8 @@ def _compile_blockwise(dtype: torch.dtype, mode: str, batched: bool):
         nd = 3 if batched else 2
         in_bytes = torch.tensor([], dtype=dtype).element_size()
         fn = cute.compile(
-            _BlockwiseTranspose(in_bytes, mode, batched),
-            _fake(TORCH2CUTE[dtype], nd, in_bytes),
-            _fake(cutlass.Float8E4M3FN, nd, 1),
-            _fake(cutlass.Float32, nd, 4),
-            _fake(cutlass.Float8E4M3FN, nd, 1),
-            _fake(cutlass.Float32, nd, 4),
-            fake_stream(),
-            options="--enable-tvm-ffi",
+            _BlockwiseTranspose(in_bytes, mode, batched), _fake(TORCH2CUTE[dtype], nd, in_bytes),
+            _fake(cutlass.Float8E4M3FN, nd, 1), _fake(cutlass.Float32, nd, 4), _fake(cutlass.Float8E4M3FN, nd, 1), _fake(cutlass.Float32, nd, 4), fake_stream(), options="--enable-tvm-ffi",
         )
         _COMPILED[key] = fn
     return fn
@@ -623,9 +496,7 @@ def _store_mode(tiles: int, M: int, K: int, *tensors: torch.Tensor) -> str:
     return mode
 
 
-def fp8cast_blockwise_transpose_sm90(
-    x: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8cast_blockwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused blockwise FP8 quantization of x *and* x.T (single read of *x*).
 
     Same contract as ``fp8cast_blockwise_transpose_sm100``: x is 2D (M, K) bf16/fp32;
@@ -650,9 +521,7 @@ def fp8cast_blockwise_transpose_sm90(
     return out, scale, out_t, scale_t
 
 
-def fp8cast_blockwise_transpose_batched_sm90(
-    x: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8cast_blockwise_transpose_batched_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused blockwise FP8 quantization of x *and* x.transpose(1,2) for batched (G, N, K).
 
     Same contract as ``fp8cast_blockwise_transpose_batched_sm100``.
@@ -686,19 +555,7 @@ def _ld_u64(addr: Int64, *, loc=None, ip=None) -> Int64:
 
 
 @cute.jit
-def _shard_tile(
-    shard: Int64,
-    amax_tile: Int64,
-    out: Int64,
-    local_rows: Int32,
-    K: Int32,
-    tr: Int32,
-    by: Int32,
-    bz: Int32,
-    row_offset: Int32,
-    cast: cutlass.Constexpr[bool],
-    mode: cutlass.Constexpr[str],
-):
+def _shard_tile(shard: Int64, amax_tile: Int64, out: Int64, local_rows: Int32, K: Int32, tr: Int32, by: Int32, bz: Int32, row_offset: Int32, cast: cutlass.Constexpr[bool], mode: cutlass.Constexpr[str]):
     """One 128x128 tile (global tile row tr, column tile by, local group bz) of an fp32 row shard."""
     if const_expr(mode == "row"):
         _shard_tile_row(shard, amax_tile, out, local_rows, K, tr, by, bz, row_offset, cast)
@@ -722,18 +579,7 @@ def _shard_tile(
 
 
 @cute.jit
-def _shard_tile_row(
-    shard: Int64,
-    amax_tile: Int64,
-    out: Int64,
-    local_rows: Int32,
-    K: Int32,
-    tr: Int32,
-    by: Int32,
-    bz: Int32,
-    row_offset: Int32,
-    cast: cutlass.Constexpr[bool],
-):
+def _shard_tile_row(shard: Int64, amax_tile: Int64, out: Int64, local_rows: Int32, K: Int32, tr: Int32, by: Int32, bz: Int32, row_offset: Int32, cast: cutlass.Constexpr[bool]):
     """
     Row-major variant for the shard kernels, which need no transpose: a warp covers one 128-column
     row of the tile (4 fp32 = 16 bytes per lane, one 512-byte load per row), warps take rows
@@ -782,62 +628,24 @@ class _ShardTile:
         self.mode = mode
 
     @cute.jit
-    def __call__(
-        self,
-        mShard: cute.Tensor,
-        mAmax: cute.Tensor,
-        mOut: cute.Tensor,
-        row_offset: Int32,
-        group_offset: Int32,
-        stream: cuda.CUstream,
-    ):
+    def __call__(self, mShard: cute.Tensor, mAmax: cute.Tensor, mOut: cute.Tensor, row_offset: Int32, group_offset: Int32, stream: cuda.CUstream):
         g_local, local_rows, K = mShard.shape[0], mShard.shape[1], mShard.shape[2]
         trs = row_offset // BLOCK
         tre = (row_offset + local_rows + BLOCK - 1) // BLOCK
         ct = (K + BLOCK - 1) // BLOCK
         self.kernel(
-            mShard.iterator.toint(),
-            mAmax.iterator.toint(),
-            mOut.iterator.toint(),
-            Int32(local_rows),
-            Int32(K),
-            Int32(trs),
-            Int32(mAmax.shape[1]),
-            Int32(mAmax.shape[2]),
-            row_offset,
-            group_offset,
+            mShard.iterator.toint(), mAmax.iterator.toint(), mOut.iterator.toint(), Int32(local_rows), Int32(K), Int32(trs), Int32(mAmax.shape[1]), Int32(mAmax.shape[2]), row_offset, group_offset
         ).launch(grid=[tre - trs, ct, g_local], block=[NUM_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(
-        self,
-        shard: Int64,
-        amax: Int64,
-        out: Int64,
-        local_rows: Int32,
-        K: Int32,
-        trs: Int32,
-        R: Int32,
-        C: Int32,
-        row_offset: Int32,
-        group_offset: Int32,
-    ):
+    def kernel(self, shard: Int64, amax: Int64, out: Int64, local_rows: Int32, K: Int32, trs: Int32, R: Int32, C: Int32, row_offset: Int32, group_offset: Int32):
         bx, by, bz = cute.arch.block_idx()
         tr = trs + bx
         a_off = (Int64(group_offset + bz) * Int64(R) + Int64(tr)) * Int64(C) + Int64(by)
-        _shard_tile(
-            shard, amax + a_off * 4, out, local_rows, K, tr, by, bz, row_offset,
-            self.cast, self.mode,
-        )  # fmt: skip
+        _shard_tile(shard, amax + a_off * 4, out, local_rows, K, tr, by, bz, row_offset, self.cast, self.mode)  # fmt: skip
 
 
-def _shard_tiles(
-    shard: torch.Tensor,
-    amax: torch.Tensor,
-    out: Optional[torch.Tensor],
-    row_offset: int,
-    group_offset: int,
-) -> None:
+def _shard_tiles(shard: torch.Tensor, amax: torch.Tensor, out: Optional[torch.Tensor], row_offset: int, group_offset: int) -> None:
     if shard.numel() == 0:
         return
     K = shard.shape[2]
@@ -849,16 +657,7 @@ def _shard_tiles(
     key = ("shard", cast, mode, out.dtype if cast else None)
     fn = _COMPILED.get(key)
     if fn is None:
-        fn = cute.compile(
-            _ShardTile(cast, mode),
-            _fake(cutlass.Float32, 3, 4),
-            _fake(cutlass.Float32, 3, 4),
-            _fake(TORCH2CUTE[out.dtype] if cast else cutlass.Float32, 3, 1),
-            Int32(0),
-            Int32(0),
-            fake_stream(),
-            options="--enable-tvm-ffi",
-        )
+        fn = cute.compile(_ShardTile(cast, mode), _fake(cutlass.Float32, 3, 4), _fake(cutlass.Float32, 3, 4), _fake(TORCH2CUTE[out.dtype] if cast else cutlass.Float32, 3, 1), Int32(0), Int32(0), fake_stream(), options="--enable-tvm-ffi")
         _COMPILED[key] = fn
     fn(shard, amax, out if cast else shard, row_offset, group_offset)
 
@@ -875,17 +674,9 @@ def fp8_shard_cast_sm90(shard: torch.Tensor, amax: torch.Tensor, out: torch.Tens
 
 class _Scales:
     @cute.jit
-    def __call__(
-        self, mAmax: cute.Tensor, mScale: cute.Tensor, mScaleT: cute.Tensor, stream: cuda.CUstream
-    ):
+    def __call__(self, mAmax: cute.Tensor, mScale: cute.Tensor, mScaleT: cute.Tensor, stream: cuda.CUstream):
         G, R, C = mAmax.shape[0], mAmax.shape[1], mAmax.shape[2]
-        self.kernel(
-            mAmax.iterator.toint(),
-            mScale.iterator.toint(),
-            mScaleT.iterator.toint(),
-            Int32(R),
-            Int32(C),
-        ).launch(grid=[(R * C + NUM_THREADS - 1) // NUM_THREADS, G, 1], block=[NUM_THREADS, 1, 1], stream=stream)  # fmt: skip
+        self.kernel(mAmax.iterator.toint(), mScale.iterator.toint(), mScaleT.iterator.toint(), Int32(R), Int32(C)).launch(grid=[(R * C + NUM_THREADS - 1) // NUM_THREADS, G, 1], block=[NUM_THREADS, 1, 1], stream=stream)  # fmt: skip
 
     @cute.kernel
     def kernel(self, amax: Int64, scale: Int64, scale_t: Int64, R: Int32, C: Int32):
@@ -927,13 +718,7 @@ class _PackTranspose:
     @cute.jit
     def __call__(self, mX: cute.Tensor, mOut: cute.Tensor, stream: cuda.CUstream):
         G, N, K = mX.shape[0], mX.shape[1], mX.shape[2]
-        self.kernel(
-            mX.iterator.toint(), mOut.iterator.toint(), Int32(N), Int32(K), Int32(G)
-        ).launch(
-            grid=[(N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK, G],
-            block=[self.nthreads, 1, 1],
-            stream=stream,
-        )
+        self.kernel(mX.iterator.toint(), mOut.iterator.toint(), Int32(N), Int32(K), Int32(G)).launch(grid=[(N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK, G], block=[self.nthreads, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, x: Int64, out: Int64, N: Int32, K: Int32, G: Int32):
@@ -1009,13 +794,7 @@ def fp8_pack_transpose_sm90(x: torch.Tensor, out: torch.Tensor) -> None:
     key = ("pack", mode, x.dtype, out.dtype)
     fn = _COMPILED.get(key)
     if fn is None:
-        fn = cute.compile(
-            _PackTranspose(mode),
-            _fake(TORCH2CUTE[x.dtype], 3, 1),
-            _fake(TORCH2CUTE[out.dtype], 1, 1),
-            fake_stream(),
-            options="--enable-tvm-ffi",
-        )
+        fn = cute.compile(_PackTranspose(mode), _fake(TORCH2CUTE[x.dtype], 3, 1), _fake(TORCH2CUTE[out.dtype], 1, 1), fake_stream(), options="--enable-tvm-ffi")
         _COMPILED[key] = fn
     fn(x, out)
 
@@ -1034,9 +813,7 @@ class _ShardAmaxMulti:
 
     @cute.jit
     def __call__(self, mTable: cute.Tensor, n: Int32, total: Int32, stream: cuda.CUstream):
-        self.kernel(mTable.iterator.toint(), n).launch(
-            grid=[total, 1, 1], block=[NUM_THREADS, 1, 1], stream=stream
-        )
+        self.kernel(mTable.iterator.toint(), n).launch(grid=[total, 1, 1], block=[NUM_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, table: Int64, n: Int32):
@@ -1079,13 +856,7 @@ class FP8ShardAmaxGroup:
     shards; anything else falls back to one launch per tensor.
     """
 
-    def __init__(
-        self,
-        shards: Sequence[torch.Tensor],
-        amaxes: Sequence[torch.Tensor],
-        row_offsets: Sequence[int],
-        group_offsets: Sequence[int],
-    ) -> None:
+    def __init__(self, shards: Sequence[torch.Tensor], amaxes: Sequence[torch.Tensor], row_offsets: Sequence[int], group_offsets: Sequence[int]) -> None:
         self.args = list(zip(shards, amaxes, row_offsets, group_offsets))
         rows = []
         first = 0
@@ -1110,14 +881,7 @@ class FP8ShardAmaxGroup:
         self.table = torch.tensor(rows or [[0] * _DESC], dtype=torch.int64, device=dev)
         fn = _COMPILED.get("amax_multi")
         if fn is None:
-            fn = cute.compile(
-                _ShardAmaxMulti(),
-                _fake(cutlass.Int64, 2, 8),
-                Int32(0),
-                Int32(0),
-                fake_stream(),
-                options="--enable-tvm-ffi",
-            )
+            fn = cute.compile(_ShardAmaxMulti(), _fake(cutlass.Int64, 2, 8), Int32(0), Int32(0), fake_stream(), options="--enable-tvm-ffi")
             _COMPILED["amax_multi"] = fn
         self.fn = fn
 
@@ -1131,9 +895,7 @@ class FP8ShardAmaxGroup:
 class _ScalesMulti:
     @cute.jit
     def __call__(self, mTable: cute.Tensor, n: Int32, total: Int32, stream: cuda.CUstream):
-        self.kernel(mTable.iterator.toint(), n).launch(
-            grid=[total, 1, 1], block=[NUM_THREADS, 1, 1], stream=stream
-        )
+        self.kernel(mTable.iterator.toint(), n).launch(grid=[total, 1, 1], block=[NUM_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, table: Int64, n: Int32):
@@ -1161,12 +923,7 @@ class _ScalesMulti:
 class FP8ScalesGroup:
     """One launch computing ``fp8_scales`` for a fixed list of (amax, scale, scale_t) triples."""
 
-    def __init__(
-        self,
-        amaxes: Sequence[torch.Tensor],
-        scales: Sequence[torch.Tensor],
-        scales_t: Sequence[torch.Tensor],
-    ) -> None:
+    def __init__(self, amaxes: Sequence[torch.Tensor], scales: Sequence[torch.Tensor], scales_t: Sequence[torch.Tensor]) -> None:
         rows = []
         first = 0
         for amax, scale, scale_t in zip(amaxes, scales, scales_t):
@@ -1179,14 +936,7 @@ class FP8ScalesGroup:
         self.table = torch.tensor(rows, dtype=torch.int64, device=amaxes[0].device)
         fn = _COMPILED.get("scales_multi")
         if fn is None:
-            fn = cute.compile(
-                _ScalesMulti(),
-                _fake(cutlass.Int64, 2, 8),
-                Int32(0),
-                Int32(0),
-                fake_stream(),
-                options="--enable-tvm-ffi",
-            )
+            fn = cute.compile(_ScalesMulti(), _fake(cutlass.Int64, 2, 8), Int32(0), Int32(0), fake_stream(), options="--enable-tvm-ffi")
             _COMPILED["scales_multi"] = fn
         self.fn = fn
 
@@ -1195,20 +945,11 @@ class FP8ScalesGroup:
             self.fn(self.table, self.n, self.total)
 
 
-def fp8_shard_amax_multi_sm90(
-    shards: Sequence[torch.Tensor],
-    amaxes: Sequence[torch.Tensor],
-    row_offsets: Sequence[int],
-    group_offsets: Sequence[int],
-) -> FP8ShardAmaxGroup:
+def fp8_shard_amax_multi_sm90(shards: Sequence[torch.Tensor], amaxes: Sequence[torch.Tensor], row_offsets: Sequence[int], group_offsets: Sequence[int]) -> FP8ShardAmaxGroup:
     """Build (once) a single-launch amax over a list of shards; call the result to launch."""
     return FP8ShardAmaxGroup(shards, amaxes, row_offsets, group_offsets)
 
 
-def fp8_scales_multi_sm90(
-    amaxes: Sequence[torch.Tensor],
-    scales: Sequence[torch.Tensor],
-    scales_t: Sequence[torch.Tensor],
-) -> FP8ScalesGroup:
+def fp8_scales_multi_sm90(amaxes: Sequence[torch.Tensor], scales: Sequence[torch.Tensor], scales_t: Sequence[torch.Tensor]) -> FP8ScalesGroup:
     """Build (once) a single-launch scales computation over a list of grids."""
     return FP8ScalesGroup(amaxes, scales, scales_t)

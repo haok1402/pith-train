@@ -33,34 +33,10 @@ from cutlass import Int32, Int64, Uint32
 
 from pithtrain.kernels.arch import sm_count
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import (
-    atom_add_u64,
-    atom_add_u64_pred,
-    fence_gpu,
-    lanemask_lt,
-    ld_b32,
-    ld_relaxed,
-    lds_b32,
-    red_add_shared,
-    red_or_shared,
-    spin_epoch,
-    st_b32,
-    st_b64,
-    sts_b32,
-)
-from pithtrain.kernels.ep_dispatch_sm100 import (
-    expert_and_expand_idx_sm100,
-    fused_dedup_prepare_dispatch_sm100,
-)
+from pithtrain.kernels.cute_ptx_sm90 import (atom_add_u64, atom_add_u64_pred, fence_gpu, lanemask_lt, ld_b32, ld_relaxed, lds_b32, red_add_shared, red_or_shared, spin_epoch, st_b32, st_b64, sts_b32)
+from pithtrain.kernels.ep_dispatch_sm100 import expert_and_expand_idx_sm100, fused_dedup_prepare_dispatch_sm100
 
-__all__ = [
-    "dispatch_index",
-    "expand_index",
-    "expert_and_expand_idx_sm90",
-    "fused_dedup_prepare_dispatch_sm90",
-    "supports_expand",
-    "supports_index",
-]
+__all__ = ["dispatch_index", "expand_index", "expert_and_expand_idx_sm90", "fused_dedup_prepare_dispatch_sm90", "supports_expand", "supports_index"]
 
 _THREADS = 256
 _WARPS = _THREADS // 32
@@ -133,21 +109,11 @@ class _DispatchIndex:
         assert self.NB <= _MAX_BINS and ep_size <= 32
 
     @cute.jit
-    def __call__(
-        self,
-        mE: cute.Tensor,
-        mOut: cute.Tensor,
-        mCounts: cute.Tensor,
-        mHist: cute.Tensor,
-        mCtr: cute.Tensor,
-        stream,
-    ) -> None:
+    def __call__(self, mE: cute.Tensor, mOut: cute.Tensor, mCounts: cute.Tensor, mHist: cute.Tensor, mCtr: cute.Tensor, stream) -> None:
         C = (mE.shape[0] + _CHUNK - 1) // _CHUNK
         G = cutlass.min(C, self.max_ctas)
         # cooperative: the runtime guarantees all G CTAs are co-resident (the grid barrier needs it)
-        self.kernel(mE, mOut, mCounts, mHist, mCtr).launch(
-            grid=[G, 1, 1], block=[_THREADS, 1, 1], stream=stream, cooperative=True
-        )
+        self.kernel(mE, mOut, mCounts, mHist, mCtr).launch(grid=[G, 1, 1], block=[_THREADS, 1, 1], stream=stream, cooperative=True)
 
     def _load_ids(self, mE: cute.Tensor, c: Int32, tid: Int32) -> tuple:
         """Expert ids of this thread's tokens (``_ROUNDS`` x ``K``) and the first-visit flags."""
@@ -174,14 +140,7 @@ class _DispatchIndex:
         return ids, firsts, oks, toks
 
     @cute.kernel
-    def kernel(
-        self,
-        mE: cute.Tensor,
-        mOut: cute.Tensor,
-        mCounts: cute.Tensor,
-        mHist: cute.Tensor,
-        mCtr: cute.Tensor,
-    ) -> None:
+    def kernel(self, mE: cute.Tensor, mOut: cute.Tensor, mCounts: cute.Tensor, mHist: cute.Tensor, mCtr: cute.Tensor) -> None:
         NE, NB, EP, EPR, K = self.NE, self.NB, self.EP, self.EPR, self.K
         NBJ = (NB + _THREADS - 1) // _THREADS
         tid, _, _ = cute.arch.thread_idx()
@@ -347,9 +306,7 @@ class _ExpertAndExpandIdx:
     def __call__(self, mMeta: cute.Tensor, mRecv: cute.Tensor, mOut: cute.Tensor, stream) -> None:
         per_cta = _THREADS * _SLOTS_PER_THREAD
         grid = (mRecv.shape[0] + per_cta - 1) // per_cta
-        self.kernel(mMeta, mRecv, mOut).launch(
-            grid=[grid, 1, 1], block=[_THREADS, 1, 1], stream=stream
-        )
+        self.kernel(mMeta, mRecv, mOut).launch(grid=[grid, 1, 1], block=[_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, mMeta: cute.Tensor, mRecv: cute.Tensor, mOut: cute.Tensor) -> None:
@@ -434,35 +391,16 @@ def _scratch(device: torch.device, chunks: int, bins: int) -> _Scratch:
 def _compile_index(k: int, ep_size: int, experts_per_rank: int, max_ctas: int) -> Callable:
     i32, i64 = Int32, Int64
     return cute.compile(
-        _DispatchIndex(k, ep_size, experts_per_rank, max_ctas),
-        fake(i64, (cute.sym_int(), k), (cute.sym_int64(), 1), 8),
-        fake(i64, (cute.sym_int(),), (1,), 8),
-        fake(i64, (2 * ep_size,), (1,), 8),
-        fake(i32, (cute.sym_int(),), (1,), 4),
-        fake(i64, (1,), (1,), 8),
-        fake_stream(),
-        options="--enable-tvm-ffi",
+        _DispatchIndex(k, ep_size, experts_per_rank, max_ctas), fake(i64, (cute.sym_int(), k), (cute.sym_int64(), 1), 8), fake(i64, (cute.sym_int(),), (1,), 8), fake(i64, (2 * ep_size,), (1,), 8), fake(i32, (cute.sym_int(),), (1,), 4),
+        fake(i64, (1,), (1,), 8), fake_stream(), options="--enable-tvm-ffi",
     )
 
 
 def supports_index(topk_ids: torch.Tensor, ep_size: int, experts_per_rank: int) -> bool:
-    return (
-        topk_ids.dtype == torch.int64
-        and topk_ids.dim() == 2
-        and topk_ids.stride(1) == 1
-        and ep_size <= 32
-        and ep_size * (experts_per_rank + 1) <= _MAX_BINS
-        and topk_ids.shape[0] * max(topk_ids.shape[1], ep_size) < 2**31
-    )
+    return (topk_ids.dtype == torch.int64 and topk_ids.dim() == 2 and topk_ids.stride(1) == 1 and ep_size <= 32 and ep_size * (experts_per_rank + 1) <= _MAX_BINS and topk_ids.shape[0] * max(topk_ids.shape[1], ep_size) < 2**31)
 
 
-def dispatch_index(
-    topk_ids: torch.Tensor,
-    num_experts: int,
-    ep_size: int,
-    experts_per_rank: int,
-    meta_out: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, ...]:
+def dispatch_index(topk_ids: torch.Tensor, num_experts: int, ep_size: int, experts_per_rank: int, meta_out: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
     """
     The contract of :func:`pithtrain.kernels.ep_dispatch.fused_dedup_prepare_dispatch` with
     stable placement, plus ``inv_idxs`` ``(m * k,)`` (``inv_idxs[idxs[p]] == p``) as a seventh
@@ -488,45 +426,19 @@ def dispatch_index(
             fn = _INDEX[key] = _compile_index(*key)
         sc = _scratch(dev, (m + _CHUNK - 1) // _CHUNK, num_experts + ep_size)
         fn(topk_ids, out, counts, sc.hist, sc.ctr)
-    return (
-        counts[:ep_size],
-        counts[ep_size:],
-        out[3 * mk : 3 * mk + m * ep_size],
-        out[:mk],
-        out[mk : 2 * mk],
-        send_meta,
-        out[2 * mk : 3 * mk],
-    )
+    return (counts[:ep_size], counts[ep_size:], out[3 * mk : 3 * mk + m * ep_size], out[:mk], out[mk : 2 * mk], send_meta, out[2 * mk : 3 * mk])
 
 
 def _compile_expand(ep_size: int, experts_per_rank: int) -> Callable:
     i64 = Int64
-    return cute.compile(
-        _ExpertAndExpandIdx(ep_size, experts_per_rank),
-        fake(i64, (ep_size * (experts_per_rank + 1),), (1,), 8),
-        fake(i64, (cute.sym_int(),), (1,), 8),
-        fake(i64, (cute.sym_int(),), (1,), 8),
-        fake_stream(),
-        options="--enable-tvm-ffi",
-    )
+    return cute.compile(_ExpertAndExpandIdx(ep_size, experts_per_rank), fake(i64, (ep_size * (experts_per_rank + 1),), (1,), 8), fake(i64, (cute.sym_int(),), (1,), 8), fake(i64, (cute.sym_int(),), (1,), 8), fake_stream(), options="--enable-tvm-ffi")
 
 
 def supports_expand(received_expand_idx: torch.Tensor, ep_size: int, experts_per_rank: int) -> bool:
-    return (
-        0 < ep_size * experts_per_rank <= _MAX_SEGMENTS
-        and ep_size <= 32
-        and received_expand_idx.shape[0] < 2**31
-        and received_expand_idx.dtype == torch.int64
-        and received_expand_idx.is_contiguous()
-    )
+    return (0 < ep_size * experts_per_rank <= _MAX_SEGMENTS and ep_size <= 32 and received_expand_idx.shape[0] < 2**31 and received_expand_idx.dtype == torch.int64 and received_expand_idx.is_contiguous())
 
 
-def expand_index(
-    recv_meta: torch.Tensor,
-    received_expand_idx: torch.Tensor,
-    ep_size: int,
-    experts_per_rank: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+def expand_index(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
     (expert_idxs, expand_idx) of the received token slots; the contract of
     :func:`pithtrain.kernels.ep_dispatch.expert_and_expand_idx`. Both outputs share one int64
@@ -544,13 +456,7 @@ def expand_index(
     return out[:total], out[total:]
 
 
-def fused_dedup_prepare_dispatch_sm90(
-    topk_ids: torch.Tensor,
-    num_experts: int,
-    ep_size: int,
-    experts_per_rank: int,
-    meta_out: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, ...]:
+def fused_dedup_prepare_dispatch_sm90(topk_ids: torch.Tensor, num_experts: int, ep_size: int, experts_per_rank: int, meta_out: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
     """
     The outputs of ``fused_dedup_prepare_dispatch_sm100``, computed by one CuTe launch with stable
     placement (token order within each bucket); inputs the CuTe kernel does not cover
@@ -558,17 +464,10 @@ def fused_dedup_prepare_dispatch_sm90(
     """
     if supports_index(topk_ids, ep_size, experts_per_rank):
         return dispatch_index(topk_ids, num_experts, ep_size, experts_per_rank, meta_out)[:6]
-    return fused_dedup_prepare_dispatch_sm100(
-        topk_ids, num_experts, ep_size, experts_per_rank, meta_out
-    )
+    return fused_dedup_prepare_dispatch_sm100(topk_ids, num_experts, ep_size, experts_per_rank, meta_out)
 
 
-def expert_and_expand_idx_sm90(
-    recv_meta: torch.Tensor,
-    received_expand_idx: torch.Tensor,
-    ep_size: int,
-    experts_per_rank: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+def expert_and_expand_idx_sm90(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
     (expert_idxs, expand_idx) of the received token slots by the CuTe kernel (:func:`expand_index`);
     inputs it does not cover (:func:`supports_expand`) take ``expert_and_expand_idx_sm100``.

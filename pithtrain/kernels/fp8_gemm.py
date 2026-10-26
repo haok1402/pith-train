@@ -32,34 +32,12 @@ from pithtrain.kernels.fp8_rowwise_kmajor import fp8cast_rowwise_kmajor
 from pithtrain.kernels.fp8_rowwise_transpose import fp8cast_rowwise_transpose
 
 __all__ = [
-    "K_GROUPED_MAX_ROWS",
-    "fp8_act_weight_gemm",
-    "fp8_dgrad_wgrad",
-    "fp8_fused_experts_supported",
-    "fp8_gemm_nt",
-    "fp8_grouped_wgrad_buffer",
-    "fp8_m_grouped_gemm",
-    "k_grouped_fp8_gemm",
-    "k_grouped_fp8_gemm_nt",
-    "k_grouped_runs_transposed",
-    "k_grouped_safe_size",
-    "m_grouped_fp8_gemm_nt",
-    "m_grouped_group_indices",
-    "pad_k_major_channels",
-    "quantize_grouped_input",
+    "K_GROUPED_MAX_ROWS", "fp8_act_weight_gemm", "fp8_dgrad_wgrad", "fp8_fused_experts_supported", "fp8_gemm_nt", "fp8_grouped_wgrad_buffer", "fp8_m_grouped_gemm", "k_grouped_fp8_gemm",
+    "k_grouped_fp8_gemm_nt", "k_grouped_runs_transposed", "k_grouped_safe_size", "m_grouped_fp8_gemm_nt", "m_grouped_group_indices", "pad_k_major_channels", "quantize_grouped_input"
 ]
 
 
-def fp8_gemm_nt(
-    a_fp8: torch.Tensor,
-    a_scale: torch.Tensor,
-    b_fp8: torch.Tensor,
-    b_scale: torch.Tensor,
-    m: int,
-    n: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
+def fp8_gemm_nt(a_fp8: torch.Tensor, a_scale: torch.Tensor, b_fp8: torch.Tensor, b_scale: torch.Tensor, m: int, n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     """
     ``out = a @ b.T`` into a fresh ``(m, n)`` tensor of ``dtype`` on ``device``, through DeepGEMM's
     ``fp8_fp4_gemm_nt`` (fp32 accumulation, one rounding to ``dtype``). ``dtype`` must be bf16:
@@ -80,11 +58,7 @@ def fp8_gemm_nt(
     return out
 
 
-def fp8_act_weight_gemm(
-    input_2d: torch.Tensor,
-    weight_fp8: torch.Tensor,
-    scale_weight: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8_act_weight_gemm(input_2d: torch.Tensor, weight_fp8: torch.Tensor, scale_weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Forward FP8 linear ``y = x @ W.T``: ``(output, input_t_fp8, scale_input_t)``.
 
@@ -102,23 +76,12 @@ def fp8_act_weight_gemm(
     :func:`fp8_gemm_nt`.
     """
     m, n = input_2d.shape[0], weight_fp8.shape[0]
-    input_fp8, scale_input, input_t_fp8, scale_input_t = fp8cast_rowwise_blockwise_transpose(
-        input_2d
-    )
-    output = fp8_gemm_nt(
-        input_fp8, scale_input, weight_fp8, scale_weight, m, n, input_2d.device, input_2d.dtype
-    )
+    input_fp8, scale_input, input_t_fp8, scale_input_t = fp8cast_rowwise_blockwise_transpose(input_2d)
+    output = fp8_gemm_nt(input_fp8, scale_input, weight_fp8, scale_weight, m, n, input_2d.device, input_2d.dtype)
     return output, input_t_fp8, scale_input_t
 
 
-def fp8_dgrad_wgrad(
-    grad_2d: torch.Tensor,
-    weight_t_fp8: torch.Tensor,
-    scale_weight_t: torch.Tensor,
-    input_t_fp8: torch.Tensor,
-    scale_input_t: torch.Tensor,
-    k: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def fp8_dgrad_wgrad(grad_2d: torch.Tensor, weight_t_fp8: torch.Tensor, scale_weight_t: torch.Tensor, input_t_fp8: torch.Tensor, scale_input_t: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Backward FP8 linear of ``y = x @ W.T``: ``(grad_input, weight_grad)``.
 
@@ -137,12 +100,8 @@ def fp8_dgrad_wgrad(
     """
     m, n = grad_2d.shape
     grad_fp8, scale_grad, grad_t_fp8, scale_grad_t = fp8cast_rowwise_transpose(grad_2d)
-    grad_input = fp8_gemm_nt(
-        grad_fp8, scale_grad, weight_t_fp8, scale_weight_t, m, k, grad_2d.device, grad_2d.dtype
-    )
-    weight_grad = fp8_gemm_nt(
-        grad_t_fp8, scale_grad_t, input_t_fp8, scale_input_t, n, k, grad_2d.device, grad_2d.dtype
-    )
+    grad_input = fp8_gemm_nt(grad_fp8, scale_grad, weight_t_fp8, scale_weight_t, m, k, grad_2d.device, grad_2d.dtype)
+    weight_grad = fp8_gemm_nt(grad_t_fp8, scale_grad_t, input_t_fp8, scale_input_t, n, k, grad_2d.device, grad_2d.dtype)
     return grad_input, weight_grad
 
 
@@ -153,14 +112,7 @@ def m_grouped_fp8_gemm_nt(a, b, d, grouped_mm_offs, M, group_indices=None):
     projections of a layer), else computed here with :func:`m_grouped_group_indices`.
     """
     if ARCH_MAJOR >= 10:
-        deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
-            a,
-            b,
-            d,
-            grouped_mm_offs,
-            use_psum_layout=True,
-            expected_m_for_psum_layout=M,
-        )
+        deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, grouped_mm_offs, use_psum_layout=True, expected_m_for_psum_layout=M)
     else:
         if group_indices is None:
             group_indices = m_grouped_group_indices(grouped_mm_offs, M)
@@ -175,9 +127,7 @@ imbalanced routing reaches (an EP rank receiving ~3.5x its share), so larger cal
 """
 
 
-def pad_k_major_channels(
-    x: tuple[torch.Tensor, torch.Tensor], ks: list, channels: int
-) -> tuple[torch.Tensor, torch.Tensor]:
+def pad_k_major_channels(x: tuple[torch.Tensor, torch.Tensor], ks: list, channels: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
     A K-major grouped operand (flat data of (n, k_g) row-major blocks, scales (n, rows/128) with
     any strides) re-laid out with ``channels`` >= n channels; the extra channels are zero data
@@ -208,13 +158,7 @@ def k_grouped_runs_transposed(m: int, n: int) -> bool:
     return -(-m // 128) % 2 == 1 and -(-n // 128) % 2 == 0
 
 
-def _k_grouped_call(
-    a: tuple[torch.Tensor, torch.Tensor],
-    b: tuple[torch.Tensor, torch.Tensor],
-    d: torch.Tensor,
-    ks: list,
-    ks_tensor: torch.Tensor,
-) -> None:
+def _k_grouped_call(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tensor, torch.Tensor], d: torch.Tensor, ks: list, ks_tensor: torch.Tensor) -> None:
     """
     One deep_gemm.k_grouped_fp8_gemm_nt_contiguous call accumulating into d (c is d), made safe
     from a DeepGEMM SM90 deadlock: the kernel runs 2-CTA clusters along M (block_m = 128,
@@ -247,14 +191,7 @@ def _k_grouped_call(
         d.copy_(dp[:, :m])
 
 
-def k_grouped_fp8_gemm_nt(
-    a: tuple[torch.Tensor, torch.Tensor],
-    b: tuple[torch.Tensor, torch.Tensor],
-    d: torch.Tensor,
-    ks: list,
-    ks_tensor: torch.Tensor,
-    c: torch.Tensor,
-) -> None:
+def k_grouped_fp8_gemm_nt(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tensor, torch.Tensor], d: torch.Tensor, ks: list, ks_tensor: torch.Tensor, c: torch.Tensor) -> None:
     """
     deep_gemm.k_grouped_fp8_gemm_nt_contiguous with c accumulated into d (d is c), split into calls
     of at most K_GROUPED_MAX_ROWS rows, each made through _k_grouped_call (deadlock guard). Each group's operand is a (channels, k) row-major block of
@@ -301,13 +238,7 @@ def k_grouped_fp8_gemm_nt(
         call(g0, len(ks), row0, row, None)
 
 
-def k_grouped_fp8_gemm(
-    a: tuple[torch.Tensor, torch.Tensor],
-    b: tuple[torch.Tensor, torch.Tensor],
-    d: torch.Tensor,
-    ks: list,
-    ks_tensor: torch.Tensor,
-) -> None:
+def k_grouped_fp8_gemm(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tensor, torch.Tensor], d: torch.Tensor, ks: list, ks_tensor: torch.Tensor) -> None:
     """
     The FP8 grouped weight gradient, accumulated in place: ``d[g] += a_g^T b_g`` in fp32 for each
     group ``g`` of ``ks`` rows.
@@ -370,9 +301,7 @@ def fp8_fused_experts_supported() -> bool:
     return is_sm90()
 
 
-def quantize_grouped_input(
-    input: torch.Tensor, grouped_mm_offs: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def quantize_grouped_input(input: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     The FP8 operands of a grouped-GEMM input from one read of ``input``: ``(x_fp8, x_scale,
     x_ch_fp8, x_ch_scale)``.
@@ -398,13 +327,7 @@ def quantize_grouped_input(
     return fp8cast_rowwise_kmajor(input, grouped_mm_offs)
 
 
-def fp8_m_grouped_gemm(
-    a: tuple[torch.Tensor, torch.Tensor],
-    b: tuple[torch.Tensor, torch.Tensor],
-    n: int,
-    grouped_mm_offs: torch.Tensor,
-    group_indices: torch.Tensor | None = None,
-) -> torch.Tensor:
+def fp8_m_grouped_gemm(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tensor, torch.Tensor], n: int, grouped_mm_offs: torch.Tensor, group_indices: torch.Tensor | None = None) -> torch.Tensor:
     """
     m-grouped FP8 GEMM into a fresh bf16 ``(M, n)`` tensor: rows ``[offs[g-1], offs[g])`` of the
     output are ``a_g @ b[g].T``, fp32 accumulation.

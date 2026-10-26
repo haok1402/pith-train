@@ -17,20 +17,8 @@ __all__ = ["fp8cast_rowwise_blockwise_transpose_sm100"]
 
 @triton.jit
 def _fp8cast_rowwise_blockwise_transpose_kernel(
-    x_ptr,
-    out_tok_ptr,
-    scale_tok_ptr,
-    out_blk_t_ptr,
-    scale_blk_t_ptr,
-    M,
-    K,
-    stride_x_row,
-    stride_x_col,
-    stride_out_tok_row,
-    stride_scale_tok_row,
-    stride_out_blk_t_row,
-    scale_blk_t_cols,
-    NATIVE_E8M0: tl.constexpr,
+    x_ptr, out_tok_ptr, scale_tok_ptr, out_blk_t_ptr, scale_blk_t_ptr, M, K, stride_x_row, stride_x_col, stride_out_tok_row, stride_scale_tok_row, stride_out_blk_t_row, scale_blk_t_cols,
+    NATIVE_E8M0: tl.constexpr
 ):
     """Fused rowwise quantization of x and blockwise quantization of x.T.
 
@@ -88,9 +76,7 @@ def _fp8cast_rowwise_blockwise_transpose_kernel(
     # Store transposed FP8 data: rows [col_start..+128), cols [row_start..+128)
     t_row_offs = col_start + tl.arange(0, BLOCK)
     t_col_offs = row_start + tl.arange(0, BLOCK)
-    out_blk_t_ptrs = (
-        out_blk_t_ptr + t_row_offs[:, None] * stride_out_blk_t_row + t_col_offs[None, :]
-    )
+    out_blk_t_ptrs = (out_blk_t_ptr + t_row_offs[:, None] * stride_out_blk_t_row + t_col_offs[None, :])
     t_mask = (t_row_offs[:, None] < K) & (t_col_offs[None, :] < M)
     tl.store(out_blk_t_ptrs, blk_fp8_t, mask=t_mask)
 
@@ -100,9 +86,7 @@ def _fp8cast_rowwise_blockwise_transpose_kernel(
     tl.store(scale_blk_t_ptr + scale_blk_t_offset, blk_scale)
 
 
-def fp8cast_rowwise_blockwise_transpose_sm100(
-    x: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8cast_rowwise_blockwise_transpose_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused rowwise FP8 quant of *x* and blockwise FP8 quant of *x*.T.
 
     Args:
@@ -126,32 +110,13 @@ def fp8cast_rowwise_blockwise_transpose_sm100(
     out_tok = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=x.device)
     scale_tok = torch.empty((M, scale_tok_cols), dtype=torch.float32, device=x.device)
     out_blk_t = torch.empty((K, M), dtype=torch.float8_e4m3fn, device=x.device)
-    scale_blk_t = torch.empty(
-        (scale_blk_t_rows, scale_blk_t_cols), dtype=torch.float32, device=x.device
-    )
+    scale_blk_t = torch.empty((scale_blk_t_rows, scale_blk_t_cols), dtype=torch.float32, device=x.device)
 
-    grid = (
-        (M + BLOCK - 1) // BLOCK,
-        (K + BLOCK - 1) // BLOCK,
-    )
+    grid = ((M + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK)
 
     _fp8cast_rowwise_blockwise_transpose_kernel[grid](
-        x_ptr=x,
-        out_tok_ptr=out_tok,
-        scale_tok_ptr=scale_tok,
-        out_blk_t_ptr=out_blk_t,
-        scale_blk_t_ptr=scale_blk_t,
-        M=M,
-        K=K,
-        stride_x_row=x.stride(0),
-        stride_x_col=x.stride(1),
-        stride_out_tok_row=K,
-        stride_scale_tok_row=scale_tok_cols,
-        stride_out_blk_t_row=M,
-        scale_blk_t_cols=scale_blk_t_cols,
-        NATIVE_E8M0=NATIVE_E8M0,
-        num_warps=4,
-        num_stages=2,
+        x_ptr=x, out_tok_ptr=out_tok, scale_tok_ptr=scale_tok, out_blk_t_ptr=out_blk_t, scale_blk_t_ptr=scale_blk_t, M=M, K=K, stride_x_row=x.stride(0), stride_x_col=x.stride(1),
+        stride_out_tok_row=K, stride_scale_tok_row=scale_tok_cols, stride_out_blk_t_row=M, scale_blk_t_cols=scale_blk_t_cols, NATIVE_E8M0=NATIVE_E8M0, num_warps=4, num_stages=2
     )
 
     return out_tok, scale_tok, out_blk_t, scale_blk_t

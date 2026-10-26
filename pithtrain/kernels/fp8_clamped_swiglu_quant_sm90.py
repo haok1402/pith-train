@@ -56,48 +56,16 @@ from pithtrain.kernels.arch import sm_count
 from pithtrain.kernels.clamped_swiglu import clamped_swiglu_fwd
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
 from pithtrain.kernels.cute_ptx_sm90 import (
-    abs2,
-    asm_args_last,
-    bf16_hi,
-    bf16_lo,
-    bf16_sel,
-    cp_async8,
-    cp_async16,
-    f32_as_u32,
-    ld_b32_coherent,
-    lds_b32_pred,
-    lds_v2,
-    lds_v4,
-    max2,
-    pack_bf16,
-    prmt_args_last,
-    selp_args_last,
-    st_f32,
-    st_v2_args_last,
-    st_v4_args_last,
-    sts_b32_nopred,
-    sts_v4,
-    to_ir,
-    u32_as_f32,
-    unpack,
+    abs2, asm_args_last, bf16_hi, bf16_lo, bf16_sel, cp_async8, cp_async16, f32_as_u32, ld_b32_coherent, lds_b32_pred, lds_v2, lds_v4, max2, pack_bf16, prmt_args_last, selp_args_last, st_f32, st_v2_args_last, st_v4_args_last, sts_b32_nopred, sts_v4, to_ir,
+    u32_as_f32, unpack,
 )
-from pithtrain.kernels.fp8_clamped_swiglu_quant_sm100 import (
-    biased_gate_up,
-    clamped_swiglu_bwd_biased,
-)
+from pithtrain.kernels.fp8_clamped_swiglu_quant_sm100 import biased_gate_up, clamped_swiglu_bwd_biased
 from pithtrain.kernels.fp8_e8m0_scale_sm90 import e8m0_scale_f32, quant4_e4m3
 from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import fp8cast_rowwise_kmajor_sm90
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale, mn_pad
 from pithtrain.kernels.segment_sum import block_segment_sum
 
-__all__ = [
-    "ClampedSwiGLUQuant",
-    "clamped_swiglu_bwd_quant_sm90",
-    "clamped_swiglu_quant_fusable",
-    "clamped_swiglu_quant_fwd_sm90",
-    "clamped_swiglu_quant_kmajor_sm90",
-    "clamped_swiglu_quant_rowwise_sm90",
-]
+__all__ = ["ClampedSwiGLUQuant", "clamped_swiglu_bwd_quant_sm90", "clamped_swiglu_quant_fusable", "clamped_swiglu_quant_fwd_sm90", "clamped_swiglu_quant_kmajor_sm90", "clamped_swiglu_quant_rowwise_sm90"]
 
 _BLOCK = 128  # rows per quantization group and output columns per CTA tile
 _THREADS = 512
@@ -260,17 +228,7 @@ class ClampedSwiGLUQuant:
     ``dh`` slot then a 16-byte gate_up slot per (row, thread).
     """
 
-    def __init__(
-        self,
-        N: int,
-        backward: bool,
-        alpha: float,
-        limit: float,
-        num_ctas: int,
-        KP: int,
-        rowwise: bool = True,
-        kmajor: bool = True,
-    ):
+    def __init__(self, N: int, backward: bool, alpha: float, limit: float, num_ctas: int, KP: int, rowwise: bool = True, kmajor: bool = True):
         self.N = N
         self.backward = backward
         self.NO = 2 * N if backward else N
@@ -287,25 +245,9 @@ class ClampedSwiGLUQuant:
         self.bwd_op = _make_bwd_op(alpha, limit)
 
     @cute.jit
-    def __call__(
-        self,
-        mDh: cute.Tensor,
-        mGU: cute.Tensor,
-        mBias: cute.Tensor,
-        mOffs: cute.Tensor,
-        mTok: cute.Tensor,
-        mTokS: cute.Tensor,
-        mKm: cute.Tensor,
-        mKmS: cute.Tensor,
-        mPart: cute.Tensor,
-        stream,
-    ):
+    def __call__(self, mDh: cute.Tensor, mGU: cute.Tensor, mBias: cute.Tensor, mOffs: cute.Tensor, mTok: cute.Tensor, mTokS: cute.Tensor, mKm: cute.Tensor, mKmS: cute.Tensor, mPart: cute.Tensor, stream):
         total = (mGU.shape[0] // _BLOCK) * self.NB
-        self.kernel(mDh, mGU, mBias, mOffs, mTok, mTokS, mKm, mKmS, mPart).launch(
-            grid=[cutlass.min(total, self.num_ctas), 1, 1],
-            block=[_THREADS, 1, 1],
-            stream=stream,
-        )
+        self.kernel(mDh, mGU, mBias, mOffs, mTok, mTokS, mKm, mKmS, mPart).launch(grid=[cutlass.min(total, self.num_ctas), 1, 1], block=[_THREADS, 1, 1], stream=stream)
 
     def _tile(self, t: Int32) -> tuple:
         """Tile ``t`` -> (row block, column block); column blocks of a row block adjacent."""
@@ -325,40 +267,19 @@ class ClampedSwiGLUQuant:
             dh_off = (Int64(r) * N + c // 2) * 2 * Int64(ok)
             gu_off = (Int64(r) * (2 * N) + c) * 2 * Int64(ok)
             for k in range(4):
-                cp_async8(
-                    stage_addr + (k * _THREADS + tid) * 8, dh_base + dh_off + k * N * 2, ok * 8
-                )
+                cp_async8(stage_addr + (k * _THREADS + tid) * 8, dh_base + dh_off + k * N * 2, ok * 8)
             for k in range(4):
-                cp_async16(
-                    stage_addr + 4 * _THREADS * 8 + (k * _THREADS + tid) * 16,
-                    gu_base + gu_off + k * (2 * N) * 2,
-                    ok * 16,
-                )
+                cp_async16(stage_addr + 4 * _THREADS * 8 + (k * _THREADS + tid) * 16, gu_base + gu_off + k * (2 * N) * 2, ok * 16)
         else:
             # gate_up columns 2c .. 2c+15 as two 16-byte chunks.
             gu_off = (Int64(r) * (2 * N) + 2 * c) * 2 * Int64(ok)
             for q in range(2):
                 for k in range(4):
-                    cp_async16(
-                        stage_addr + ((q * 4 + k) * _THREADS + tid) * 16,
-                        gu_base + gu_off + k * (2 * N) * 2 + q * 16,
-                        ok * 16,
-                    )
+                    cp_async16(stage_addr + ((q * 4 + k) * _THREADS + tid) * 16, gu_base + gu_off + k * (2 * N) * 2 + q * 16, ok * 16)
         cute.arch.cp_async_commit_group()
 
     @cute.kernel
-    def kernel(
-        self,
-        mDh: cute.Tensor,
-        mGU: cute.Tensor,
-        mBias: cute.Tensor,
-        mOffs: cute.Tensor,
-        mTok: cute.Tensor,
-        mTokS: cute.Tensor,
-        mKm: cute.Tensor,
-        mKmS: cute.Tensor,
-        mPart: cute.Tensor,
-    ):
+    def kernel(self, mDh: cute.Tensor, mGU: cute.Tensor, mBias: cute.Tensor, mOffs: cute.Tensor, mTok: cute.Tensor, mTokS: cute.Tensor, mKm: cute.Tensor, mKmS: cute.Tensor, mPart: cute.Tensor):
         N, NO, NB = self.N, self.NO, self.NB
         S = self.stages
         even_n = cutlass.const_expr(NO % _BLOCK == 0)
@@ -429,9 +350,7 @@ class ClampedSwiGLUQuant:
             if cutlass.const_expr(self.backward):
                 bw = _ld_v4(bias_row + Int64(col) * 2, col_ok)
             else:
-                bw = _ld_v4(bias_row + Int64(col) * 4, col_ok) + _ld_v4(
-                    bias_row + Int64(col) * 4 + 16, col_ok
-                )
+                bw = _ld_v4(bias_row + Int64(col) * 4, col_ok) + _ld_v4(bias_row + Int64(col) * 4 + 16, col_ok)
 
             cute.arch.cp_async_wait_group(S - 1)
             # h[k][m]: output columns 2m, 2m+1 of row k, two BF16 packed in one word.
@@ -477,12 +396,8 @@ class ClampedSwiGLUQuant:
                 # -- bias-gradient column sums of the BF16 gradient, same staging as cm --
                 ps = [None] * 8
                 for m in cutlass.range_constexpr(4):
-                    lo = ((bf16_lo(h[0][m]) + bf16_lo(h[1][m])) + bf16_lo(h[2][m])) + bf16_lo(
-                        h[3][m]
-                    )
-                    hi = ((bf16_hi(h[0][m]) + bf16_hi(h[1][m])) + bf16_hi(h[2][m])) + bf16_hi(
-                        h[3][m]
-                    )
+                    lo = ((bf16_lo(h[0][m]) + bf16_lo(h[1][m])) + bf16_lo(h[2][m])) + bf16_lo(h[3][m])
+                    hi = ((bf16_hi(h[0][m]) + bf16_hi(h[1][m])) + bf16_hi(h[2][m])) + bf16_hi(h[3][m])
                     lo = lo + cute.arch.shuffle_sync_bfly(lo, offset=16)
                     hi = hi + cute.arch.shuffle_sync_bfly(hi, offset=16)
                     ps[2 * m] = f32_as_u32(lo)
@@ -507,21 +422,13 @@ class ClampedSwiGLUQuant:
                 # -- rowwise scale: lane cv < 4 of each row group owns row rg*4 + cv --
                 r_amax = bf16_sel(Int32(cv % 2), selp_args_last(Int32(cv < 2), rw[0], rw[1]))
                 r_sc, r_rc = e8m0_scale_f32(r_amax)
-                st_f32(
-                    mTokS.iterator.toint() + (Int64(cb) * M + row0 + rg * 4 + cv) * 4,
-                    r_sc,
-                    Int32(cv < 4),
-                )
+                st_f32(mTokS.iterator.toint() + (Int64(cb) * M + row0 + rg * 4 + cv) * 4, r_sc, Int32(cv < 4))
                 for k in cutlass.range_constexpr(4):
                     rc = cute.arch.shuffle_sync(r_rc, offset=(lane & 16) | k)
                     rr = (rc, rc, rc, rc)
                     hv = h[k]
-                    q0 = quant4_e4m3(
-                        bf16_lo(hv[0]), bf16_hi(hv[0]), bf16_lo(hv[1]), bf16_hi(hv[1]), rr
-                    )
-                    q1 = quant4_e4m3(
-                        bf16_lo(hv[2]), bf16_hi(hv[2]), bf16_lo(hv[3]), bf16_hi(hv[3]), rr
-                    )
+                    q0 = quant4_e4m3(bf16_lo(hv[0]), bf16_hi(hv[0]), bf16_lo(hv[1]), bf16_hi(hv[1]), rr)
+                    q1 = quant4_e4m3(bf16_lo(hv[2]), bf16_hi(hv[2]), bf16_lo(hv[3]), bf16_hi(hv[3]), rr)
                     r = row0 + rg * 4 + k
                     st_v2_args_last(mTok.iterator.toint() + Int64(r) * NO + col, q0, q1, col_ok)
 
@@ -532,20 +439,14 @@ class ClampedSwiGLUQuant:
                 if tid < _BLOCK:
                     cw = Uint32(0)
                     for wi in cutlass.range_constexpr(_THREADS // 32):
-                        v = lds_b32_pred(
-                            s_cm + (wi * 16 + tid // 8) * 16 + ((tid % 8) // 2) * 4,
-                            Int32(1),
-                            Int32(0),
-                        )
+                        v = lds_b32_pred(s_cm + (wi * 16 + tid // 8) * 16 + ((tid % 8) // 2) * 4, Int32(1), Int32(0))
                         cw = max2(cw, Uint32(v))
                     c_sc, c_rc = e8m0_scale_f32(bf16_sel(Int32(tid % 2), cw))
                     c = col0 + tid
                     c_ok = Int32(1)
                     if cutlass.const_expr(not even_n):
                         c_ok = Int32(c < NO)
-                    st_f32(
-                        mKmS.iterator.toint() + (Int64(rb) * mn_pad(self.KP) + c) * 4, c_sc, c_ok
-                    )
+                    st_f32(mKmS.iterator.toint() + (Int64(rb) * mn_pad(self.KP) + c) * 4, c_sc, c_ok)
                     sts_b32_nopred(s_rcp + tid * 4, Uint32(f32_as_u32(c_rc)))
                     if cutlass.const_expr(self.backward):
                         acc = Float32(0.0)
@@ -588,16 +489,7 @@ class ClampedSwiGLUQuant:
 _compiled: dict = {}
 
 
-def _get_kernel(
-    N: int,
-    backward: bool,
-    alpha: float,
-    limit: float,
-    device: torch.device,
-    KP: int,
-    rowwise: bool = True,
-    kmajor: bool = True,
-):
+def _get_kernel(N: int, backward: bool, alpha: float, limit: float, device: torch.device, KP: int, rowwise: bool = True, kmajor: bool = True):
     """Compiled kernel for (N, direction, alpha, limit, device); M and the group count stay
     dynamic."""
     key = (N, backward, alpha, limit, device.index, _STAGES[backward], KP, rowwise, kmajor)
@@ -611,12 +503,7 @@ def _get_kernel(
         gu = fake(bf, (m, 2 * N), (2 * N, 1))
         dh = fake(bf, (m, N), (N, 1)) if backward else None
         bias = fake(bf, (cute.sym_int(), 2 * N), (2 * N, 1))
-        outs = (
-            fake(fp8, (m, NO), (NO, 1)),
-            fake(Float32, (m, nb), (1, cute.sym_int64()), 16),
-            fake(fp8, (cute.sym_int(),), (1,)),
-            fake(Float32, (KP, cute.sym_int()), (1, mn_pad(KP)), 16),
-        )
+        outs = (fake(fp8, (m, NO), (NO, 1)), fake(Float32, (m, nb), (1, cute.sym_int64()), 16), fake(fp8, (cute.sym_int(),), (1,)), fake(Float32, (KP, cute.sym_int()), (1, mn_pad(KP)), 16))
         if not rowwise:
             outs = (None, None) + outs[2:]
         if not kmajor:
@@ -624,39 +511,20 @@ def _get_kernel(
         part = fake(Float32, (cute.sym_int(), NO), (NO, 1)) if backward else None
         offs = fake(Int32, (cute.sym_int(),), (1,), 4)
         num_sms = sm_count(device)
-        fn = cute.compile(
-            ClampedSwiGLUQuant(N, backward, alpha, limit, num_sms, KP, rowwise, kmajor),
-            dh,
-            gu,
-            bias,
-            offs,
-            *outs,
-            part,
-            fake_stream(),
-            options="--enable-tvm-ffi",
-        )
+        fn = cute.compile(ClampedSwiGLUQuant(N, backward, alpha, limit, num_sms, KP, rowwise, kmajor), dh, gu, bias, offs, *outs, part, fake_stream(), options="--enable-tvm-ffi")
         _compiled[key] = fn
     return fn
 
 
-def _alloc(
-    M: int, N: int, device: torch.device, KP: int | None = None
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def _alloc(M: int, N: int, device: torch.device, KP: int | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The four outputs of ``fp8cast_rowwise_kmajor`` for an (M, N) input, the K-major pair with
     KP >= N channels."""
     nb = (N + _BLOCK - 1) // _BLOCK
     KP = N if KP is None else KP
-    return (
-        torch.empty((M, N), dtype=torch.float8_e4m3fn, device=device),
-        mn_major_scale(M, nb, device),
-        torch.empty(M * KP, dtype=torch.float8_e4m3fn, device=device),
-        mn_major_scale(KP, M // _BLOCK, device),
-    )
+    return (torch.empty((M, N), dtype=torch.float8_e4m3fn, device=device), mn_major_scale(M, nb, device), torch.empty(M * KP, dtype=torch.float8_e4m3fn, device=device), mn_major_scale(KP, M // _BLOCK, device))
 
 
-def clamped_swiglu_quant_fusable(
-    gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor
-) -> bool:
+def clamped_swiglu_quant_fusable(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor) -> bool:
     """Inputs the fused kernel handles; others take the (bit-identical) unfused path."""
     N = gate_up.shape[1] // 2
     return (
@@ -673,14 +541,7 @@ def clamped_swiglu_quant_fusable(
     )
 
 
-def clamped_swiglu_quant_fwd_sm90(
-    gate_up: torch.Tensor,
-    bias: torch.Tensor,
-    grouped_mm_offs: torch.Tensor,
-    alpha: float,
-    limit: float,
-    kmajor_channels: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def clamped_swiglu_quant_fwd_sm90(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``fp8cast_rowwise_kmajor(clamped_swiglu(gate_up + bias[group], alpha, limit), offs)``
     without materializing the biased gate_up or h.
 
@@ -714,13 +575,7 @@ def clamped_swiglu_quant_fwd_sm90(
     return out
 
 
-def clamped_swiglu_quant_rowwise_sm90(
-    gate_up: torch.Tensor,
-    bias: torch.Tensor,
-    grouped_mm_offs: torch.Tensor,
-    alpha: float,
-    limit: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+def clamped_swiglu_quant_rowwise_sm90(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float) -> tuple[torch.Tensor, torch.Tensor]:
     """Only the rowwise pair (tok_fp8, tok_scale) of :func:`clamped_swiglu_quant_fwd_sm90`, the same
     bytes, for a forward whose K-major copy of h is recomputed in backward
     (:func:`clamped_swiglu_quant_kmajor_sm90`)."""
@@ -734,14 +589,7 @@ def clamped_swiglu_quant_rowwise_sm90(
     return tok, tok_scale
 
 
-def clamped_swiglu_quant_kmajor_sm90(
-    gate_up: torch.Tensor,
-    bias: torch.Tensor,
-    grouped_mm_offs: torch.Tensor,
-    alpha: float,
-    limit: float,
-    kmajor_channels: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+def clamped_swiglu_quant_kmajor_sm90(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """Only the K-major pair (kmajor_fp8, kmajor_scale) of :func:`clamped_swiglu_quant_fwd_sm90`, the
     same bytes, without writing the rowwise pair: for recomputing h's wgrad operand in backward
     instead of keeping it from forward."""
@@ -788,9 +636,7 @@ def clamped_swiglu_bwd_quant_sm90(
     if not (clamped_swiglu_quant_fusable(gate_up, bias, grouped_mm_offs) and dh.dtype == torch.bfloat16 and dh.is_contiguous()):  # fmt: skip
         dgu = clamped_swiglu_bwd_biased(dh, gate_up, bias, grouped_mm_offs, alpha, limit)
         partials = dgu.float().view(M // _BLOCK, _BLOCK, 2 * N).sum(1)
-        return fp8cast_rowwise_kmajor_sm90(dgu, grouped_mm_offs), block_segment_sum(
-            partials, grouped_mm_offs, bias.dtype
-        )
+        return fp8cast_rowwise_kmajor_sm90(dgu, grouped_mm_offs), block_segment_sum(partials, grouped_mm_offs, bias.dtype)
     KP = 2 * N if kmajor_channels is None else kmajor_channels
     assert KP >= 2 * N
     out = _alloc(M, 2 * N, gate_up.device, KP)

@@ -15,30 +15,12 @@ from typing import Any, Optional, Sequence
 import torch
 
 from pithtrain.kernels.arch import is_sm90
-from pithtrain.kernels.fp8_weight_quant_sm100 import (
-    fp8_pack_transpose_sm100,
-    fp8_scales_sm100,
-    fp8_shard_amax_sm100,
-    fp8_shard_cast_sm100,
-    fp8cast_blockwise_transpose_batched_sm100,
-    fp8cast_blockwise_transpose_sm100,
-)
+from pithtrain.kernels.fp8_weight_quant_sm100 import (fp8_pack_transpose_sm100, fp8_scales_sm100, fp8_shard_amax_sm100, fp8_shard_cast_sm100, fp8cast_blockwise_transpose_batched_sm100, fp8cast_blockwise_transpose_sm100)
 
-__all__ = [
-    "fp8_pack_transpose",
-    "fp8_scales",
-    "fp8_scales_multi",
-    "fp8_shard_amax",
-    "fp8_shard_amax_multi",
-    "fp8_shard_cast",
-    "fp8cast_blockwise_transpose",
-    "fp8cast_blockwise_transpose_batched",
-]
+__all__ = ["fp8_pack_transpose", "fp8_scales", "fp8_scales_multi", "fp8_shard_amax", "fp8_shard_amax_multi", "fp8_shard_cast", "fp8cast_blockwise_transpose", "fp8cast_blockwise_transpose_batched"]
 
 
-def fp8cast_blockwise_transpose(
-    x: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8cast_blockwise_transpose(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     128x128 blockwise FP8 of a weight and of its transpose from one read: ``(w_fp8, w_scale,
     wt_fp8, wt_scale)``.
@@ -58,9 +40,7 @@ def fp8cast_blockwise_transpose(
     return fp8cast_blockwise_transpose_sm100(x)
 
 
-def fp8cast_blockwise_transpose_batched(
-    x: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8cast_blockwise_transpose_batched(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     :func:`fp8cast_blockwise_transpose` of each expert of a grouped weight: ``x`` 3-D
     ``(G, N, K)`` bf16 (fp32 also accepted; unit stride along K, as in the 2-D op) gives
@@ -146,12 +126,7 @@ def fp8_pack_transpose(x: torch.Tensor, out: torch.Tensor) -> None:
     fp8_pack_transpose_sm100(x, out)
 
 
-def fp8_shard_amax_multi(
-    shards: Sequence[torch.Tensor],
-    amaxes: Sequence[torch.Tensor],
-    row_offsets: Sequence[int],
-    group_offsets: Sequence[int],
-) -> Optional[Any]:
+def fp8_shard_amax_multi(shards: Sequence[torch.Tensor], amaxes: Sequence[torch.Tensor], row_offsets: Sequence[int], group_offsets: Sequence[int]) -> Optional[Any]:
     """
     A callable that runs :func:`fp8_shard_amax` for every ``(shard, amax, row_offset,
     group_offset)`` of the lists in one launch (with a separate launch per shard it cannot take:
@@ -168,11 +143,7 @@ def fp8_shard_amax_multi(
     return None
 
 
-def fp8_scales_multi(
-    amaxes: Sequence[torch.Tensor],
-    scales: Sequence[torch.Tensor],
-    scales_t: Sequence[torch.Tensor],
-) -> Optional[Any]:
+def fp8_scales_multi(amaxes: Sequence[torch.Tensor], scales: Sequence[torch.Tensor], scales_t: Sequence[torch.Tensor]) -> Optional[Any]:
     """
     A callable that runs :func:`fp8_scales` for every ``(amax, scale, scale_t)`` of the lists in
     one launch, or None on SM100, where the caller loops over :func:`fp8_scales` itself.

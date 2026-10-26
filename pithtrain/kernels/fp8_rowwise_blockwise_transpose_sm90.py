@@ -45,16 +45,7 @@ _SMALL_GRID_TILES = 200
 
 
 def _asm_u32(args: list, asm: str, constraints: str, loc=None, ip=None) -> Uint32:
-    res = llvm.inline_asm(
-        T.i32(),
-        [a.ir_value(loc=loc, ip=ip) for a in args],
-        asm,
-        constraints,
-        has_side_effects=False,
-        is_align_stack=False,
-        loc=loc,
-        ip=ip,
-    )
+    res = llvm.inline_asm(T.i32(), [a.ir_value(loc=loc, ip=ip) for a in args], asm, constraints, has_side_effects=False, is_align_stack=False, loc=loc, ip=ip)
     return Uint32(res)
 
 
@@ -85,16 +76,7 @@ def _amax_f32(acc: Uint32, kind: str, *, loc=None, ip=None) -> Float32:
             ".reg .b16 l, h, m;\n\tmov.b32 {l, h}, $1;\n\t"
             f"max.{ty} m, l, h;\n\tcvt.f32.{ty} $0, m;"
         )
-    res = llvm.inline_asm(
-        T.f32(),
-        [Uint32(acc).ir_value(loc=loc, ip=ip)],
-        "{\n\t" + body + "\n\t}",
-        "=f,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        loc=loc,
-        ip=ip,
-    )
+    res = llvm.inline_asm(T.f32(), [Uint32(acc).ir_value(loc=loc, ip=ip)], "{\n\t" + body + "\n\t}", "=f,r", has_side_effects=False, is_align_stack=False, loc=loc, ip=ip)
     return Float32(res)
 
 
@@ -123,11 +105,7 @@ def _q4(words: list, sel: list, kind: str, rcp: Float32, *, loc=None, ip=None) -
         else:
             lines.append(f"mov.b32 f{k}, {w};")
         lines.append(f"mul.rn.f32 f{k}, f{k}, {rcp_op};")
-    lines += [
-        "cvt.rn.satfinite.e4m3x2.f32 q0, f1, f0;",
-        "cvt.rn.satfinite.e4m3x2.f32 q1, f3, f2;",
-        "mov.b32 $0, {q0, q1};",
-    ]
+    lines += ["cvt.rn.satfinite.e4m3x2.f32 q0, f1, f0;", "cvt.rn.satfinite.e4m3x2.f32 q1, f3, f2;", "mov.b32 $0, {q0, q1};"]
     asm = "{\n\t" + "\n\t".join(lines) + "\n\t}"
     constraints = "=r," + ",".join(["r"] * n) + ",f"
     args = [Uint32(w) for w in words] + [Float32(rcp)]
@@ -159,34 +137,15 @@ class RowwiseBlockwiseTranspose:
         self.vec_m = vec_m
 
     @cute.jit
-    def __call__(
-        self,
-        mX: cute.Tensor,
-        mQ: cute.Tensor,
-        mS: cute.Tensor,
-        mQT: cute.Tensor,
-        mST: cute.Tensor,
-        stream,
-    ) -> None:
+    def __call__(self, mX: cute.Tensor, mQ: cute.Tensor, mS: cute.Tensor, mQT: cute.Tensor, mST: cute.Tensor, stream) -> None:
         M = mX.shape[0]
         K = mX.shape[1]
         grid_m = (M + _BLOCK - 1) // _BLOCK
         grid_k = (K + _BLOCK - 1) // _BLOCK
-        self.kernel(mX, mQ, mS, mQT, mST).launch(
-            grid=[grid_m, grid_k, 1],
-            block=[self.threads, 1, 1],
-            stream=stream,
-        )
+        self.kernel(mX, mQ, mS, mQT, mST).launch(grid=[grid_m, grid_k, 1], block=[self.threads, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(
-        self,
-        mX: cute.Tensor,
-        mQ: cute.Tensor,
-        mS: cute.Tensor,
-        mQT: cute.Tensor,
-        mST: cute.Tensor,
-    ) -> None:
+    def kernel(self, mX: cute.Tensor, mQ: cute.Tensor, mS: cute.Tensor, mQT: cute.Tensor, mST: cute.Tensor) -> None:
         VK = const_expr(self.vec_k)
         VM = const_expr(self.vec_m)
         R = const_expr(self.rows)
@@ -225,13 +184,8 @@ class RowwiseBlockwiseTranspose:
                     if r < M:
                         if c < K:
                             off = Int64(r) * sx + Int64(c)
-                            src = cute.make_tensor(
-                                _gptr(mX.iterator, off, esize, self.dtype, VK * esize),
-                                cute.make_layout(VK),
-                            )
-                            dst = cute.make_tensor(
-                                xr.iterator + (i * 16 + h * 8 + p * VK), cute.make_layout(VK)
-                            )
+                            src = cute.make_tensor(_gptr(mX.iterator, off, esize, self.dtype, VK * esize), cute.make_layout(VK))
+                            dst = cute.make_tensor(xr.iterator + (i * 16 + h * 8 + p * VK), cute.make_layout(VK))
                             cute.autovec_copy(src, dst)
         xw = cute.recast_tensor(xr, Uint32)
 
@@ -254,10 +208,7 @@ class RowwiseBlockwiseTranspose:
             rcp = exact_rcp(scale)
             if r < M:
                 if cl == i:
-                    stile = cute.make_tensor(
-                        _gptr(mS.iterator, Int64(bk) * s_ld + Int64(r), 4, Float32, 4),
-                        cute.make_layout(1),
-                    )
+                    stile = cute.make_tensor(_gptr(mS.iterator, Int64(bk) * s_ld + Int64(r), 4, Float32, 4), cute.make_layout(1))
                     stile[0] = scale
                 for h in cutlass.range_constexpr(2):
                     for g in cutlass.range_constexpr(2):
@@ -266,10 +217,7 @@ class RowwiseBlockwiseTranspose:
                     for p in cutlass.range_constexpr(8 // VK):
                         c = col_base + h * 64 + p * VK
                         if c < K:
-                            dst = cute.make_tensor(
-                                _gptr(mQ.iterator, Int64(r) * Int64(K) + Int64(c), 1, Uint8, VK),
-                                cute.make_layout(VK),
-                            )
+                            dst = cute.make_tensor(_gptr(mQ.iterator, Int64(r) * Int64(K) + Int64(c), 1, Uint8, VK), cute.make_layout(VK))
                             src = cute.make_tensor(qb.iterator + p * VK, cute.make_layout(VK))
                             cute.autovec_copy(src, dst)
 
@@ -291,10 +239,7 @@ class RowwiseBlockwiseTranspose:
         bscale = e8m0_scale(bmax)
         brcp = exact_rcp(bscale)
         if tidx == 0:
-            st = cute.make_tensor(
-                _gptr(mST.iterator, Int64(bk) * Int64(nmb) + Int64(bm), 4, Float32, 4),
-                cute.make_layout(1),
-            )
+            st = cute.make_tensor(_gptr(mST.iterator, Int64(bk) * Int64(nmb) + Int64(bm), 4, Float32, 4), cute.make_layout(1))
             st[0] = bscale
 
         # ---- transposed store: column c of x becomes row c of blk_t ----
@@ -305,16 +250,12 @@ class RowwiseBlockwiseTranspose:
                     c = col_base + h * 64 + e
                     if c < K:
                         for g in cutlass.range_constexpr(R // 4):
-                            qw[g] = self._quant4(
-                                xw, [(4 * g + k) * 16 + h * 8 + e for k in range(4)], brcp
-                            )
+                            qw[g] = self._quant4(xw, [(4 * g + k) * 16 + h * 8 + e for k in range(4)], brcp)
                         for p in cutlass.range_constexpr(R // VM):
                             r = row0 + p * VM
                             if r < M:
                                 off = Int64(c) * Int64(M) + Int64(r)
-                                dst = cute.make_tensor(
-                                    _gptr(mQT.iterator, off, 1, Uint8, VM), cute.make_layout(VM)
-                                )
+                                dst = cute.make_tensor(_gptr(mQT.iterator, off, 1, Uint8, VM), cute.make_layout(VM))
                                 src = cute.make_tensor(qb.iterator + p * VM, cute.make_layout(VM))
                                 cute.autovec_copy(src, dst)
 
@@ -349,26 +290,12 @@ def _compile(dtype: type, vec_k: int, vec_m: int, rows: int) -> Callable:
     m_sym, k_sym, kb_sym, mb_sym = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
     esize = dtype.width // 8
     fake = cute.runtime.make_fake_tensor
-    x = fake(
-        dtype,
-        (m_sym, k_sym),
-        stride=(cute.sym_int64(divisibility=vec_k), 1),
-        assumed_align=vec_k * esize,
-    )
+    x = fake(dtype, (m_sym, k_sym), stride=(cute.sym_int64(divisibility=vec_k), 1), assumed_align=vec_k * esize)
     q = fake(cutlass.Float8E4M3FN, (m_sym, k_sym), stride=(k_sym, 1), assumed_align=16)
     s = fake(Float32, (m_sym, kb_sym), stride=(1, cute.sym_int64()), assumed_align=16)
     qt = fake(cutlass.Float8E4M3FN, (k_sym, m_sym), stride=(m_sym, 1), assumed_align=16)
     st = fake(Float32, (kb_sym, mb_sym), stride=(mb_sym, 1), assumed_align=16)
-    return cute.compile(
-        RowwiseBlockwiseTranspose(dtype, vec_k, vec_m, rows),
-        x,
-        q,
-        s,
-        qt,
-        st,
-        fake_stream(),
-        options="--enable-tvm-ffi",
-    )
+    return cute.compile(RowwiseBlockwiseTranspose(dtype, vec_k, vec_m, rows), x, q, s, qt, st, fake_stream(), options="--enable-tvm-ffi")
 
 
 _DISPATCH: dict[tuple, tuple] = {}
@@ -398,9 +325,7 @@ def _resolve(dtype: torch.dtype, M: int, K: int, sx: int, ptr: int) -> tuple:
     return fn, nkb, nmb
 
 
-def fp8cast_rowwise_blockwise_transpose_sm90(
-    x: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8cast_rowwise_blockwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused rowwise FP8 quant of *x* and blockwise FP8 quant of *x*.T.
 
     Drop-in replacement for ``fp8cast_rowwise_blockwise_transpose_sm100``.

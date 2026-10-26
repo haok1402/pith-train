@@ -206,10 +206,7 @@ def _record(entry: Callable[[], Tuple[torch.Tensor, ...]], inputs: Dict[str, tor
 
 
 def _replay(plan: _Plan, inputs: Dict[str, torch.Tensor], device: torch.device) -> Tuple[torch.Tensor, ...]:
-    allocs = [
-        torch.zeros(shape, dtype=dtype, device=device) if zeroed else torch.empty_strided(shape, stride, dtype=dtype, device=device)
-        for shape, stride, dtype, zeroed in plan.allocs
-    ]
+    allocs = [torch.zeros(shape, dtype=dtype, device=device) if zeroed else torch.empty_strided(shape, stride, dtype=dtype, device=device) for shape, stride, dtype, zeroed in plan.allocs]
     detached = {name: t.detach() for name, t in inputs.items() if t is not None}
     for fn, consts, slots in plan.fast_calls:
         args = list(consts)
@@ -232,10 +229,7 @@ plans: Dict[Tuple, Optional[_Plan]] = {}
 def signature(kind: str, inputs: Dict[str, Optional[torch.Tensor]], *scalars) -> Tuple:
     # Plans pass inputs through whole, so their layout and alignment (FA4 copies misaligned ones)
     # are all that matters; how inputs alias each other does not.
-    return (kind, scalars, inputs["q"].device, tuple(
-        None if t is None else (t.shape, t.stride(), t.dtype, t.data_ptr() % 16)
-        for t in inputs.values()
-    ))
+    return (kind, scalars, inputs["q"].device, tuple(None if t is None else (t.shape, t.stride(), t.dtype, t.data_ptr() % 16) for t in inputs.values()))
 
 
 def memoized_launch(kind: str, inputs: Dict[str, Optional[torch.Tensor]], scalars: Tuple, entry: Callable[[], Tuple[torch.Tensor, ...]]) -> Tuple[torch.Tensor, ...]:

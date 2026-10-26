@@ -31,14 +31,7 @@ def compute_fp8_scale(amax, NATIVE_E8M0: tl.constexpr):
 
     if NATIVE_E8M0:
         # SM100: native PTX cvt.rp (round-positive = ceil) to E8M0
-        scale_e8m0_biased = tl.inline_asm_elementwise(
-            asm="cvt.rp.satfinite.ue8m0x2.f32 $0, 0.0, $1;",
-            constraints="=h,r",
-            args=[scale_input],
-            dtype=tl.uint16,
-            is_pure=True,
-            pack=1,
-        ).to(tl.uint8)
+        scale_e8m0_biased = tl.inline_asm_elementwise(asm="cvt.rp.satfinite.ue8m0x2.f32 $0, 0.0, $1;", constraints="=h,r", args=[scale_input], dtype=tl.uint16, is_pure=True, pack=1).to(tl.uint8)
 
         scale_fp = (scale_e8m0_biased.to(tl.int32) << 23).to(tl.float32, bitcast=True)
     else:
@@ -47,9 +40,7 @@ def compute_fp8_scale(amax, NATIVE_E8M0: tl.constexpr):
         # the exponent if the value wasn't already an exact power of 2.
         bits = scale_input.to(tl.int32, bitcast=True)
         mantissa = bits & 0x007FFFFF
-        scale_fp = ((bits & 0x7F800000) + tl.where(mantissa != 0, 0x00800000, 0)).to(
-            tl.float32, bitcast=True
-        )
+        scale_fp = ((bits & 0x7F800000) + tl.where(mantissa != 0, 0x00800000, 0)).to(tl.float32, bitcast=True)
 
     # Common tail for both modes: clamp + exact reciprocal
     fp32_min_normal = tl.exp2(-126.0)

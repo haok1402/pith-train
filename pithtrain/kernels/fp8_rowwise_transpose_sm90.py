@@ -206,11 +206,7 @@ def _ir(v):  # noqa: ANN001, ANN202 - DSL value -> MLIR value
 
 
 def _asm_u32(ptx: str, constraints: str, args: list) -> Uint32:
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(), args, ptx, constraints, has_side_effects=False, is_align_stack=False
-        )
-    )
+    return Uint32(llvm.inline_asm(T.i32(), args, ptx, constraints, has_side_effects=False, is_align_stack=False))
 
 
 def _asm_store(ptx: str, constraints: str, args: list) -> None:
@@ -230,14 +226,7 @@ def _scale_bits(amax_f32_bits: Uint32) -> Uint32:
 
 
 def _qrow(words: list, rcp: Uint32) -> tuple:
-    res = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32()] * 2),
-        [_ir(w) for w in words] + [_ir(rcp)],
-        _QROW_PTX,
-        "=&r,=&r,r,r,r,r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-    )
+    res = llvm.inline_asm(llvm.StructType.get_literal([T.i32()] * 2), [_ir(w) for w in words] + [_ir(rcp)], _QROW_PTX, "=&r,=&r,r,r,r,r,r", has_side_effects=False, is_align_stack=False)
     return tuple(Uint32(llvm.extractvalue(T.i32(), res, [i])) for i in range(2))
 
 
@@ -250,14 +239,7 @@ def _qcol(words: list, rcp: Uint32, half: int) -> Uint32:
 
 
 def _ld_v4(addr: Int64, pred: Int32) -> list:
-    res = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        [_ir(addr), _ir(pred)],
-        _LD_V4_PTX,
-        "=r,=r,=r,=r,l,r",
-        has_side_effects=False,
-        is_align_stack=False,
-    )
+    res = llvm.inline_asm(llvm.StructType.get_literal([T.i32()] * 4), [_ir(addr), _ir(pred)], _LD_V4_PTX, "=r,=r,=r,=r,l,r", has_side_effects=False, is_align_stack=False)
     return [Uint32(llvm.extractvalue(T.i32(), res, [i])) for i in range(4)]
 
 
@@ -278,14 +260,7 @@ def _st_b8(addr: Int64, w: Uint32, pred: Int32) -> None:
 
 
 def _ld8_any(addr: Int64, pred: Int32) -> list:
-    res = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        [_ir(addr), _ir(pred)],
-        _LD8_ANY_PTX,
-        "=r,=r,=r,=r,l,r",
-        has_side_effects=False,
-        is_align_stack=False,
-    )
+    res = llvm.inline_asm(llvm.StructType.get_literal([T.i32()] * 4), [_ir(addr), _ir(pred)], _LD8_ANY_PTX, "=r,=r,=r,=r,l,r", has_side_effects=False, is_align_stack=False)
     return [Uint32(llvm.extractvalue(T.i32(), res, [i])) for i in range(4)]
 
 
@@ -298,23 +273,12 @@ def _b(cond) -> Int32:  # noqa: ANN001 - DSL Boolean -> Int32 predicate for inli
 
 
 def _ld_shared_v4(addr: Int32) -> list:
-    res = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        [_ir(addr)],
-        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-    )
+    res = llvm.inline_asm(llvm.StructType.get_literal([T.i32()] * 4), [_ir(addr)], "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];", "=r,=r,=r,=r,r", has_side_effects=True, is_align_stack=False)
     return [Uint32(llvm.extractvalue(T.i32(), res, [i])) for i in range(4)]
 
 
 def _st_shared_v4(addr: Int32, w: list, pred: Int32) -> None:
-    _asm_store(
-        "{\n.reg .pred p;\nsetp.ne.b32 p, $5, 0;\n@p st.shared.v4.b32 [$0], {$1, $2, $3, $4};\n}",
-        "r,r,r,r,r,r",
-        [_ir(addr)] + [_ir(x) for x in w] + [_ir(pred)],
-    )
+    _asm_store("{\n.reg .pred p;\nsetp.ne.b32 p, $5, 0;\n@p st.shared.v4.b32 [$0], {$1, $2, $3, $4};\n}", "r,r,r,r,r,r", [_ir(addr)] + [_ir(x) for x in w] + [_ir(pred)])
 
 
 def _st_shared_v2(addr: Int32, w0: Uint32, w1: Uint32) -> None:
@@ -322,11 +286,7 @@ def _st_shared_v2(addr: Int32, w0: Uint32, w1: Uint32) -> None:
 
 
 def _st_v4(addr: Int64, w: list, pred: Int32) -> None:
-    _asm_store(
-        "{\n.reg .pred p;\nsetp.ne.b32 p, $5, 0;\n@p st.global.v4.b32 [$0], {$1, $2, $3, $4};\n}",
-        "l,r,r,r,r,r",
-        [_ir(addr)] + [_ir(x) for x in w] + [_ir(pred)],
-    )
+    _asm_store("{\n.reg .pred p;\nsetp.ne.b32 p, $5, 0;\n@p st.global.v4.b32 [$0], {$1, $2, $3, $4};\n}", "l,r,r,r,r,r", [_ir(addr)] + [_ir(x) for x in w] + [_ir(pred)])
 
 
 class _Thread:
@@ -359,9 +319,7 @@ def _load_global(x_base: Int64, N64: Int64, tl: _Tile, vec_n: bool) -> list:
     if vec_n:
         for i in range(8):
             pred = tl.rowv[i] & tl.colv[0]
-            off = cutlass.select_(
-                pred != 0, (Int64(tl.row0 + i) * N64 + Int64(tl.col0)) * 2, Int64(0)
-            )
+            off = cutlass.select_(pred != 0, (Int64(tl.row0 + i) * N64 + Int64(tl.col0)) * 2, Int64(0))
             v.append(_ld_v4(x_base + off, pred))
     else:
         # Rows of x are not 16-byte aligned: full 8-column groups take the widest access the
@@ -382,20 +340,7 @@ def _load_global(x_base: Int64, N64: Int64, tl: _Tile, vec_n: bool) -> list:
     return v
 
 
-def _quantize_tile(
-    v: list,
-    th: _Thread,
-    tl: _Tile,
-    sred: Int32,
-    stile: Int32,
-    bases: tuple,
-    M64: Int64,
-    N64: Int64,
-    grid_m: Int32,
-    grid_n: Int32,
-    vec_n: bool,
-    m_align: int,
-) -> None:
+def _quantize_tile(v: list, th: _Thread, tl: _Tile, sred: Int32, stile: Int32, bases: tuple, M64: Int64, N64: Int64, grid_m: Int32, grid_n: Int32, vec_n: bool, m_align: int) -> None:
     """Amax, scales and both FP8 outputs of one tile from the thread's 8x8 block ``v``.
 
     ``sred`` is the 32-bit shared address of a 2 KB scratch for the cross-warp column amax.
@@ -507,15 +452,7 @@ def _quantize_tile(
 
 
 @cute.kernel
-def _rowwise_transpose_kernel(
-    mX: cute.Tensor,
-    mOutTok: cute.Tensor,
-    mScaleTok: cute.Tensor,
-    mOutT: cute.Tensor,
-    mScaleT: cute.Tensor,
-    vec_n: cutlass.Constexpr[bool],
-    m_align: cutlass.Constexpr[int],
-) -> None:
+def _rowwise_transpose_kernel(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, vec_n: cutlass.Constexpr[bool], m_align: cutlass.Constexpr[int]) -> None:
     """One 128x128 tile per CTA."""
     M = mX.shape[0]
     N = mX.shape[1]
@@ -528,35 +465,15 @@ def _rowwise_transpose_kernel(
     sred = smem.allocate_array(Uint32, 8 * 16 * 4, byte_alignment=16).toint()
     stile = smem.allocate_array(cutlass.Uint8, _TILE * _TILE, byte_alignment=128).toint()
     v = _load_global(mX.iterator.toint(), Int64(N), tl, vec_n)
-    bases = (
-        mOutTok.iterator.toint(),
-        mScaleTok.iterator.toint(),
-        mOutT.iterator.toint(),
-        mScaleT.iterator.toint(),
-    )
-    _quantize_tile(
-        v, th, tl, sred, stile, bases, Int64(M), Int64(N), grid_m, grid_n, vec_n, m_align
-    )
+    bases = (mOutTok.iterator.toint(), mScaleTok.iterator.toint(), mOutT.iterator.toint(), mScaleT.iterator.toint())
+    _quantize_tile(v, th, tl, sred, stile, bases, Int64(M), Int64(N), grid_m, grid_n, vec_n, m_align)
 
 
 @cute.jit
-def _launch(
-    mX: cute.Tensor,
-    mOutTok: cute.Tensor,
-    mScaleTok: cute.Tensor,
-    mOutT: cute.Tensor,
-    mScaleT: cute.Tensor,
-    stream,  # noqa: ANN001 - cuda stream (tvm-ffi env stream)
-    vec_n: cutlass.Constexpr[bool],
-    m_align: cutlass.Constexpr[int],
-) -> None:
+def _launch(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, stream, vec_n: cutlass.Constexpr[bool], m_align: cutlass.Constexpr[int]) -> None:  # noqa: ANN001 - cuda stream (tvm-ffi env stream)
     M = mX.shape[0]
     N = mX.shape[1]
-    _rowwise_transpose_kernel(mX, mOutTok, mScaleTok, mOutT, mScaleT, vec_n, m_align).launch(
-        grid=[(N + (_TILE - 1)) // _TILE, (M + (_TILE - 1)) // _TILE, 1],
-        block=[_THREADS, 1, 1],
-        stream=stream,
-    )
+    _rowwise_transpose_kernel(mX, mOutTok, mScaleTok, mOutT, mScaleT, vec_n, m_align).launch(grid=[(N + (_TILE - 1)) // _TILE, (M + (_TILE - 1)) // _TILE, 1], block=[_THREADS, 1, 1], stream=stream)
 
 
 _COMPILED: dict[tuple[bool, int], Callable] = {}
@@ -569,26 +486,13 @@ def _compile(vec_n: bool, m_align: int) -> Callable:
     sm = cute.sym_int()
 
     def fake(dtype, shape, align):  # noqa: ANN001, ANN202
-        return cute.runtime.make_fake_tensor(
-            dtype, shape, stride=(cute.sym_int64(), 1), assumed_align=align
-        )
+        return cute.runtime.make_fake_tensor(dtype, shape, stride=(cute.sym_int64(), 1), assumed_align=align)
 
     def mn_major(rows, cols):  # noqa: ANN001, ANN202 - kernels.fp8_scale_layout (1, align(rows, 4))
-        return cute.runtime.make_fake_tensor(
-            cutlass.Float32, (rows, cols), stride=(1, cute.sym_int64()), assumed_align=16
-        )
+        return cute.runtime.make_fake_tensor(cutlass.Float32, (rows, cols), stride=(1, cute.sym_int64()), assumed_align=16)
 
     return cute.compile(
-        _launch,
-        fake(cutlass.BFloat16, (m, n), 16 if vec_n else 2),
-        fake(cutlass.Float8E4M3FN, (m, n), 16),
-        mn_major(m, sn),
-        fake(cutlass.Float8E4M3FN, (n, m), 16),
-        mn_major(n, sm),
-        fake_stream(),
-        vec_n,
-        m_align,
-        options="--enable-tvm-ffi",
+        _launch, fake(cutlass.BFloat16, (m, n), 16 if vec_n else 2), fake(cutlass.Float8E4M3FN, (m, n), 16), mn_major(m, sn), fake(cutlass.Float8E4M3FN, (n, m), 16), mn_major(n, sm), fake_stream(), vec_n, m_align, options="--enable-tvm-ffi"
     )
 
 
@@ -605,9 +509,7 @@ def supports_rowwise_transpose(x: torch.Tensor) -> bool:
     return x.dtype is torch.bfloat16 and x.is_contiguous() and bool(M) and bool(N)
 
 
-def fp8cast_rowwise_transpose_sm90(
-    x: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8cast_rowwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused rowwise FP8 quantization of x *and* x.T (single read of *x*).
 
     Drop-in for ``fp8cast_rowwise_transpose_sm100``. Non-bf16, non-contiguous or empty inputs are

@@ -22,7 +22,7 @@ ruff format pithtrain/               # format
 pre-commit run --all-files       # run all pre-commit hooks
 ```
 
-Style: 100-char line length, double quotes, `py312` target. Rules: E, F, I, W (ignoring E501, E731). First-party import: `pithtrain`.
+Style: 100-char line length, double quotes, `py312` target. Rules: E, F, I, W (ignoring E501, E731). First-party import: `pithtrain`. `pithtrain/kernels/` is not reformatted (`ruff format` and its pre-commit hook skip it) and its import blocks are not re-sorted (`I001` ignored there), so calls, signatures, imports and tables stay on one line up to 256 columns; multi-line PTX strings stay as written. The rest of the lint rules still apply there.
 
 ### Testing (pytest)
 

@@ -50,28 +50,8 @@ import torch
 from cutlass import Int32, Int64, Uint32
 
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import (
-    atom_add_u64,
-    fence_gpu,
-    lanemask_lt,
-    ld_b32,
-    ld_relaxed,
-    ld_v4,
-    lds_b32,
-    match_any,
-    red_add_shared,
-    spin_until,
-    st_b32,
-    st_b64,
-    st_release,
-    sts_b32,
-)
-from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import (
-    THREADS,
-    TILE,
-    RowwiseKmajor,
-    fp8cast_rowwise_kmajor_sm90,
-)
+from pithtrain.kernels.cute_ptx_sm90 import (atom_add_u64, fence_gpu, lanemask_lt, ld_b32, ld_relaxed, ld_v4, lds_b32, match_any, red_add_shared, spin_until, st_b32, st_b64, st_release, sts_b32)
+from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import THREADS, TILE, RowwiseKmajor, fp8cast_rowwise_kmajor_sm90
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale, mn_pad
 from pithtrain.kernels.host_transfer import get_pinned_buffer
 from pithtrain.kernels.token_scatter import scatter_by_expert
@@ -98,38 +78,13 @@ class Prep:
         self.has_expand = has_expand
 
     @cute.jit
-    def __call__(
-        self,
-        mE: cute.Tensor,
-        mExp: cute.Tensor,
-        mInv: cute.Tensor,
-        mRank: cute.Tensor,
-        mOffs: cute.Tensor,
-        mKs: cute.Tensor,
-        mCnt: cute.Tensor,
-        mFlags: cute.Tensor,
-        mHist: cute.Tensor,
-        mCtr: cute.Tensor,
-        stream,
-    ) -> None:
+    def __call__(self, mE: cute.Tensor, mExp: cute.Tensor, mInv: cute.Tensor, mRank: cute.Tensor, mOffs: cute.Tensor, mKs: cute.Tensor, mCnt: cute.Tensor, mFlags: cute.Tensor, mHist: cute.Tensor, mCtr: cute.Tensor, stream) -> None:
         C = (mE.shape[0] + _PREP_CHUNK - 1) // _PREP_CHUNK
         args = (mE, mExp, mInv, mRank, mOffs, mKs, mCnt, mFlags, mHist, mCtr)
         self.kernel(*args).launch(grid=[C, 1, 1], block=[_PREP_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(
-        self,
-        mE: cute.Tensor,
-        mExp: cute.Tensor,
-        mInv: cute.Tensor,
-        mRank: cute.Tensor,
-        mOffs: cute.Tensor,
-        mKs: cute.Tensor,
-        mCnt: cute.Tensor,
-        mFlags: cute.Tensor,
-        mHist: cute.Tensor,
-        mCtr: cute.Tensor,
-    ) -> None:
+    def kernel(self, mE: cute.Tensor, mExp: cute.Tensor, mInv: cute.Tensor, mRank: cute.Tensor, mOffs: cute.Tensor, mKs: cute.Tensor, mCnt: cute.Tensor, mFlags: cute.Tensor, mHist: cute.Tensor, mCtr: cute.Tensor) -> None:
         G = self.G
         NT = _PREP_THREADS
         NW = _PREP_WARPS
@@ -268,56 +223,20 @@ class ScatterQuant(RowwiseKmajor):
         self.pdl = pdl
 
     @cute.jit
-    def __call__(
-        self,
-        mX: cute.Tensor,
-        mE: cute.Tensor,
-        mRank: cute.Tensor,
-        mInv: cute.Tensor,
-        mCnt: cute.Tensor,
-        mOffs: cute.Tensor,
-        mRsi: cute.Tensor,
-        mTok: cute.Tensor,
-        mTokScale: cute.Tensor,
-        mKm: cute.Tensor,
-        mKmScale: cute.Tensor,
-        stream,
-    ) -> None:
+    def __call__(self, mX: cute.Tensor, mE: cute.Tensor, mRank: cute.Tensor, mInv: cute.Tensor, mCnt: cute.Tensor, mOffs: cute.Tensor, mRsi: cute.Tensor, mTok: cute.Tensor, mTokScale: cute.Tensor, mKm: cute.Tensor, mKmScale: cute.Tensor, stream) -> None:
         mb = mTok.shape[0] // TILE
         args = (mX, mE, mRank, mInv, mCnt, mOffs, mRsi, mTok, mTokScale, mKm, mKmScale)
-        self.kernel(*args).launch(
-            grid=[self.nb, mb, 1], block=[THREADS, 1, 1], stream=stream, use_pdl=self.pdl
-        )
+        self.kernel(*args).launch(grid=[self.nb, mb, 1], block=[THREADS, 1, 1], stream=stream, use_pdl=self.pdl)
 
     @cute.kernel
-    def kernel(
-        self,
-        mX: cute.Tensor,
-        mE: cute.Tensor,
-        mRank: cute.Tensor,
-        mInv: cute.Tensor,
-        mCnt: cute.Tensor,
-        mOffs: cute.Tensor,
-        mRsi: cute.Tensor,
-        mTok: cute.Tensor,
-        mTokScale: cute.Tensor,
-        mKm: cute.Tensor,
-        mKmScale: cute.Tensor,
-    ) -> None:
+    def kernel(self, mX: cute.Tensor, mE: cute.Tensor, mRank: cute.Tensor, mInv: cute.Tensor, mCnt: cute.Tensor, mOffs: cute.Tensor, mRsi: cute.Tensor, mTok: cute.Tensor, mTokScale: cute.Tensor, mKm: cute.Tensor, mKmScale: cute.Tensor) -> None:
         N, G = self.n, self.num_groups
         tidx, _, _ = cute.arch.thread_idx()
         pid_col, pid_row, _ = cute.arch.block_idx()
         m = mRsi.shape[0]
         x_base = mX.iterator.toint()
         offs_base = mOffs.iterator.toint()
-        gp = (
-            x_base,
-            offs_base,
-            mTok.iterator.toint(),
-            mTokScale.iterator.toint(),
-            mKm.iterator.toint(),
-            mKmScale.iterator.toint(),
-        )
+        gp = (x_base, offs_base, mTok.iterator.toint(), mTokScale.iterator.toint(), mKm.iterator.toint(), mKmScale.iterator.toint())
         smem = cutlass.memory.SmemAllocator()
         s_red = smem.allocate_tensor(Uint32, cute.make_layout(self.RED_WORDS), 16)
         if cutlass.const_expr(self.pdl):
@@ -397,19 +316,8 @@ def _compile_prep(G: int, has_expand: bool) -> Callable:
     i32 = Int32
     vec = lambda: fake(i32, (cute.sym_int(),), (1,), 4)  # noqa: E731
     return cute.compile(
-        Prep(G, has_expand),
-        fake(Int64, (cute.sym_int(),), (1,), 8),
-        fake(Int64, (cute.sym_int(),), (1,), 8),
-        vec(),
-        vec(),
-        fake(i32, (G,), (1,), 4),
-        fake(i32, (G,), (1,), 4),
-        fake(i32, (G,), (1,), 4),
-        vec(),
-        vec(),
-        fake(Int64, (1,), (1,), 8),
-        fake_stream(),
-        options="--enable-tvm-ffi",
+        Prep(G, has_expand), fake(Int64, (cute.sym_int(),), (1,), 8), fake(Int64, (cute.sym_int(),), (1,), 8), vec(), vec(), fake(i32, (G,), (1,), 4), fake(i32, (G,), (1,), 4), fake(i32, (G,), (1,), 4), vec(), vec(), fake(Int64, (1,), (1,), 8),
+        fake_stream(), options="--enable-tvm-ffi",
     )
 
 
@@ -418,45 +326,21 @@ def _compile_main(n: int, G: int, pdl: bool) -> Callable:
     nb = (n + TILE - 1) // TILE
     fp8 = cutlass.Float8E4M3FN
     return cute.compile(
-        ScatterQuant(n, G, pdl),
-        fake(cutlass.BFloat16, (cute.sym_int(), n), (n, 1)),
-        fake(Int64, (cute.sym_int(),), (1,), 8),
-        fake(Int32, (cute.sym_int(),), (1,), 4),
-        fake(Int32, (cute.sym_int(),), (1,), 4),
-        fake(Int32, (G,), (1,), 4),
-        fake(Int32, (G,), (1,), 4),
-        fake(Int64, (cute.sym_int(),), (1,), 8),
-        fake(fp8, (mp, n), (n, 1)),
-        fake(cutlass.Float32, (cute.sym_int(), nb), (1, cute.sym_int64())),
-        fake(fp8, (cute.sym_int(),), (1,)),
-        fake(cutlass.Float32, (n, cute.sym_int()), (1, mn_pad(n))),
-        fake_stream(),
-        options="--enable-tvm-ffi",
+        ScatterQuant(n, G, pdl), fake(cutlass.BFloat16, (cute.sym_int(), n), (n, 1)), fake(Int64, (cute.sym_int(),), (1,), 8), fake(Int32, (cute.sym_int(),), (1,), 4), fake(Int32, (cute.sym_int(),), (1,), 4), fake(Int32, (G,), (1,), 4),
+        fake(Int32, (G,), (1,), 4), fake(Int64, (cute.sym_int(),), (1,), 8), fake(fp8, (mp, n), (n, 1)), fake(cutlass.Float32, (cute.sym_int(), nb), (1, cute.sym_int64())), fake(fp8, (cute.sym_int(),), (1,)),
+        fake(cutlass.Float32, (n, cute.sym_int()), (1, mn_pad(n))), fake_stream(), options="--enable-tvm-ffi",
     )
 
 
-def _reference(
-    gathered: torch.Tensor,
-    expert_idxs: torch.Tensor,
-    num_groups: int,
-    expand_idx: Optional[torch.Tensor],
-    group_counts: Optional[list[int]],
-) -> tuple:
+def _reference(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor], group_counts: Optional[list[int]]) -> tuple:
     """The three-step path, for inputs the fused kernels do not cover: the dedup expansion, the
     Triton scatter (``kernels.token_scatter``) and the SM90 K-major quantization."""
     x = gathered if expand_idx is None else gathered[expand_idx]
-    out, rsi, offs, ks_t, ks = scatter_by_expert(
-        x, expert_idxs, num_groups, group_counts=group_counts
-    )
+    out, rsi, offs, ks_t, ks = scatter_by_expert(x, expert_idxs, num_groups, group_counts=group_counts)
     return fp8cast_rowwise_kmajor_sm90(out, offs), rsi, offs, ks, ks_t
 
 
-def supports_scatter_quant(
-    gathered: torch.Tensor,
-    expert_idxs: torch.Tensor,
-    num_groups: int,
-    expand_idx: Optional[torch.Tensor] = None,
-) -> bool:
+def supports_scatter_quant(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor] = None) -> bool:
     """Whether the fused kernels cover these inputs (else :func:`scatter_quant_sm90` runs the
     three-step path)."""
     m, N = expert_idxs.shape[0], gathered.shape[1]
@@ -470,28 +354,13 @@ def supports_scatter_quant(
         or gathered.data_ptr() % 16 != 0
         or expert_idxs.dtype != torch.int64
         or not expert_idxs.is_contiguous()
-        or (
-            expand_idx is not None
-            and (expand_idx.dtype != torch.int64 or not expand_idx.is_contiguous())
-        )
+        or (expand_idx is not None and (expand_idx.dtype != torch.int64 or not expand_idx.is_contiguous()))
     )
 
 
 def scatter_quant_sm90(
-    gathered: torch.Tensor,
-    expert_idxs: torch.Tensor,
-    num_groups: int,
-    expand_idx: Optional[torch.Tensor] = None,
-    padding_alignment: int = 128,
-    group_counts: Optional[list[int]] = None,
-    _pdl: bool = True,
-) -> tuple[
-    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    torch.Tensor,
-    torch.Tensor,
-    list[int],
-    torch.Tensor,
-]:
+    gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor] = None, padding_alignment: int = 128, group_counts: Optional[list[int]] = None, _pdl: bool = True
+) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
     """``fp8cast_rowwise_kmajor(scatter_for_grouped_gemm(gathered[expand_idx], ...))`` fused.
 
     Args:

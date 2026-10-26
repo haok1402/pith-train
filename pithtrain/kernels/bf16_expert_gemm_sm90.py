@@ -150,41 +150,20 @@ class _ScatterRowStore(TileStore):
         assert layout.is_n_major_c()
         setattr(gemm, self._layout_gemm_attr(), layout)
         setattr(gemm, self._dtype_gemm_attr(), tensor.element_type)
-        smem_layout = quack_sm90_utils.make_smem_layout_epi(
-            tensor.element_type, layout, gemm.epi_tile, gemm.epi_stage
-        )
-        return {
-            self._tma_atom_key(): None,
-            self.name: tensor,
-            self._smem_layout_key(): smem_layout,
-            self._epi_tile_key(): gemm.epi_tile,
-            self._dtype_field(): tensor.element_type,
-        }
+        smem_layout = quack_sm90_utils.make_smem_layout_epi(tensor.element_type, layout, gemm.epi_tile, gemm.epi_stage)
+        return {self._tma_atom_key(): None, self.name: tensor, self._smem_layout_key(): smem_layout, self._epi_tile_key(): gemm.epi_tile, self._dtype_field(): tensor.element_type}
 
     def tma_atoms(self, gemm, params):
         return []
 
-    def store_setup(
-        self, gemm, params, smem_tensor, tiled_copy_r2s, tiled_copy_t2r, tile_coord_mnkl,
-        varlen_manager, tidx,
-    ):  # fmt: skip
+    def store_setup(self, gemm, params, smem_tensor, tiled_copy_r2s, tiled_copy_t2r, tile_coord_mnkl, varlen_manager, tidx):  # fmt: skip
         # Per-tile state for store_r2s: after staging a subtile in smem as for a TMA store, all
         # epilogue threads copy its rows to their slots (nothing is left for the store warp).
         tiled_copy = self._make_tiled_copy_r2s(gemm, params, tiled_copy_r2s, tiled_copy_t2r)
         batch = tile_coord_mnkl[3]
         self._st = dict(
-            smem=smem_tensor,
-            out=getattr(params, self.name),
-            idx=getattr(params, self.idx_name),
-            first=varlen_manager.params.cu_seqlens_m[batch],
-            rows=varlen_manager.len_m(batch),
-            m0=tile_coord_mnkl[0] * gemm.cta_tile_shape_mnk[0],
-            n0=tile_coord_mnkl[1] * gemm.cta_tile_shape_mnk[1],
-            layout=cute.make_ordered_layout(
-                cute.ceil_div(gemm.cta_tile_shape_mnk[:2], gemm.epi_tile),
-                order=(0, 1) if gemm.epi_m_major else (1, 0),
-            ),
-            count=0,
+            smem=smem_tensor, out=getattr(params, self.name), idx=getattr(params, self.idx_name), first=varlen_manager.params.cu_seqlens_m[batch], rows=varlen_manager.len_m(batch), m0=tile_coord_mnkl[0] * gemm.cta_tile_shape_mnk[0],
+            n0=tile_coord_mnkl[1] * gemm.cta_tile_shape_mnk[1], layout=cute.make_ordered_layout(cute.ceil_div(gemm.cta_tile_shape_mnk[:2], gemm.epi_tile), order=(0, 1) if gemm.epi_m_major else (1, 0)), count=0,
         )
         tRS_s = tiled_copy.get_slice(tidx).partition_D(smem_tensor)
         return (tiled_copy, tRS_s, lambda src_idx, dst_idx: None, None)
@@ -228,11 +207,7 @@ def _scatter(acc):
     return {"out": acc}
 
 
-@gemm_epilogue(
-    outputs=(_ScatterRowStore("out", "slot"),),
-    ops={"bias": RowVecLoad("bias")},
-    extra_ops=(_IndexArg("slot"),),
-)
+@gemm_epilogue(outputs=(_ScatterRowStore("out", "slot"),), ops={"bias": RowVecLoad("bias")}, extra_ops=(_IndexArg("slot"),))
 def _scatter_bias(acc, bias):
     return {"out": acc + bias}
 
@@ -420,37 +395,24 @@ def _ivec():
 _KINDS = {
     # kind: (entry, epilogue (False, True variant), mint kwargs, gather_A, class attrs, fake args)
     "gated": (_GatedFwd, (_gated, _gated_swapped), dict(paired=True), True, {},
-              lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 3, 2), _fake(BFloat16, 3, 2),
-                       _fake(BFloat16, 2, 1), _fake(BFloat16, 2, 1), _ivec(), _ivec())),
-    "dgated": (_Dgated, (_dgated, _dgated_swapped), dict(c=True, packed=True), True,
-               dict(cd_packed="n", implicit_dtype=BFloat16, b_transposed=True),
-               lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 3, 2), _fake(BFloat16, 2, 1),
-                        _fake(BFloat16, 2, 1), _fake(BFloat16, 2, 1), _ivec(), _ivec())),
+              lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 3, 2), _fake(BFloat16, 3, 2), _fake(BFloat16, 2, 1), _fake(BFloat16, 2, 1), _ivec(), _ivec())),
+    "dgated": (_Dgated, (_dgated, _dgated_swapped), dict(c=True, packed=True), True, dict(cd_packed="n", implicit_dtype=BFloat16, b_transposed=True),
+               lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 3, 2), _fake(BFloat16, 2, 1), _fake(BFloat16, 2, 1), _fake(BFloat16, 2, 1), _ivec(), _ivec())),
     "dgrad": (_Dgrad, (_plain, None), {}, False, {},
-              lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 3, 2), _fake(BFloat16, 3, 2),
-                       _fake(BFloat16, 2, 1), _ivec())),
+              lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 3, 2), _fake(BFloat16, 3, 2), _fake(BFloat16, 2, 1), _ivec())),
     "wgrad_pair": (_WgradPair, (_plain, _pair_swapped), dict(add=True), True, {},
-                   lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 2, 1), _fake(Float32, 3, 2, 4),
-                            _fake(Float32, 3, 2, 4), _ivec(), _ivec())),
+                   lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 2, 1), _fake(Float32, 3, 2, 4), _fake(Float32, 3, 2, 4), _ivec(), _ivec())),
     "wgrad_down": (_WgradDown, (_plain, None), dict(add=True), True, {},
-                   lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 2, 1), _fake(Float32, 3, 2, 4),
-                            _ivec(), _ivec())),
+                   lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 2, 1), _fake(Float32, 3, 2, 4), _ivec(), _ivec())),
     "down_scatter": (_DownScatter, (_scatter, None), {}, False, {},
-                     lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 3, 2), _fake(BFloat16, 2, 1),
-                              _ivec(), _ivec())),
+                     lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 3, 2), _fake(BFloat16, 2, 1), _ivec(), _ivec())),
     "down_bias_scatter": (_DownBiasScatter, (_scatter_bias, None), dict(bias=True), False, {},
-                          lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 3, 2),
-                                   _fake(BFloat16, 2, 1, 4), _fake(BFloat16, 2, 1), _ivec(),
-                                   _ivec())),
+                          lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 3, 2), _fake(BFloat16, 2, 1, 4), _fake(BFloat16, 2, 1), _ivec(), _ivec())),
     # gpt-oss: epilogues built per activation (alpha, limit)
     "gated_oai": (_GatedFwdBias, (_gated_oai, None), dict(paired=True, bias=True), True, {},
-                  lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 3, 2), _fake(BFloat16, 3, 2),
-                           _fake(BFloat16, 2, 1, 4), _fake(BFloat16, 2, 1), _fake(BFloat16, 2, 1),
-                           _ivec(), _ivec())),
-    "dgated_oai": (_Dgated, (_dgated_oai, None), dict(c=True, packed=True), True,
-                   dict(cd_packed="n", implicit_dtype=BFloat16, b_transposed=True),
-                   lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 3, 2), _fake(BFloat16, 2, 1),
-                            _fake(BFloat16, 2, 1), _fake(BFloat16, 2, 1), _ivec(), _ivec())),
+                  lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 3, 2), _fake(BFloat16, 3, 2), _fake(BFloat16, 2, 1, 4), _fake(BFloat16, 2, 1), _fake(BFloat16, 2, 1), _ivec(), _ivec())),
+    "dgated_oai": (_Dgated, (_dgated_oai, None), dict(c=True, packed=True), True, dict(cd_packed="n", implicit_dtype=BFloat16, b_transposed=True),
+                   lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 3, 2), _fake(BFloat16, 2, 1), _fake(BFloat16, 2, 1), _fake(BFloat16, 2, 1), _ivec(), _ivec())),
 }  # fmt: skip
 """kind -> (entry, epilogue (lane order kept, swapped), mint kwargs, gather-A, attrs, fake args);
 an epilogue that is a function takes the activation parameters (alpha, limit)."""
@@ -458,9 +420,7 @@ an epilogue that is a function takes the activation parameters (alpha, limit).""
 _compiled: dict = {}
 
 
-def compiled_gemm(
-    kind: str, swapped: bool, cfg: Config, device: torch.device, act: tuple = ()
-) -> Callable:
+def compiled_gemm(kind: str, swapped: bool, cfg: Config, device: torch.device, act: tuple = ()) -> Callable:
     """The compiled GEMM for (kind, lane variant, config, device, activation parameters)."""
     key = (kind, swapped, cfg, device.index, act)
     fn = _compiled.get(key)
@@ -472,18 +432,11 @@ def compiled_gemm(
         if kind == "wgrad_pair" and swapped:
             mint_kw = dict(mint_kw, paired=True)
         cls = _mint(mod, **mint_kw)
-        gemm = cls(
-            Float32, BFloat16, (cfg.tile_m, cfg.tile_n), (cfg.cluster_m, 1, 1),
-            pingpong=cfg.pingpong, is_persistent=True, gather_A=gather,
-        )  # fmt: skip
+        gemm = cls(Float32, BFloat16, (cfg.tile_m, cfg.tile_n), (cfg.cluster_m, 1, 1), pingpong=cfg.pingpong, is_persistent=True, gather_A=gather)  # fmt: skip
         for name, value in attrs.items():
             setattr(gemm, name, value)
         with torch.cuda.device(device):
-            fn = cute.compile(
-                entry(gemm, cfg.cluster_m), *fakes(),
-                fake_stream(),
-                options="--enable-tvm-ffi",
-            )  # fmt: skip
+            fn = cute.compile(entry(gemm, cfg.cluster_m), *fakes(), fake_stream(), options="--enable-tvm-ffi")  # fmt: skip
         _compiled[key] = fn
     return fn
 
@@ -515,9 +468,7 @@ def bf16_expert_gated_forward_sm90(x, w_gate, w_up, cu, a_idx, bias=None, act=()
         return pre, h
     if act:
         assert not swapped and bias is not None
-        fn = compiled_gemm(
-            "gated_oai", False, config("gated_oai", 2 * inter, x.shape[1]), x.device, act
-        )
+        fn = compiled_gemm("gated_oai", False, config("gated_oai", 2 * inter, x.shape[1]), x.device, act)
         fn(x, w0, w1, bias, pre, h, cu, a_idx)
     else:
         compiled_gemm("gated", swapped, config("gated", 2 * inter, x.shape[1]), x.device)(x, w0, w1, pre, h, cu, a_idx)  # fmt: skip
@@ -581,11 +532,4 @@ def bf16_expert_wgrad_down_sm90(dy, h, mg_down, cu, slot_of):
     compiled_gemm("wgrad_down", False, config("wgrad_down", h.shape[1], dy.shape[1]), dy.device)(dy, h, mg_down, cu, slot_of)  # fmt: skip
 
 
-__all__ = [
-    "bf16_expert_gated_forward_sm90",
-    "bf16_expert_down_forward_scattered_sm90",
-    "bf16_expert_dgated_backward_sm90",
-    "bf16_expert_dgrad_sm90",
-    "bf16_expert_wgrad_gate_up_sm90",
-    "bf16_expert_wgrad_down_sm90",
-]
+__all__ = ["bf16_expert_gated_forward_sm90", "bf16_expert_down_forward_scattered_sm90", "bf16_expert_dgated_backward_sm90", "bf16_expert_dgrad_sm90", "bf16_expert_wgrad_gate_up_sm90", "bf16_expert_wgrad_down_sm90"]

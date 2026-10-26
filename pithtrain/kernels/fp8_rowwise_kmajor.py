@@ -15,9 +15,7 @@ from pithtrain.kernels.fp8_rowwise_kmajor_sm100 import fp8cast_rowwise_kmajor_sm
 __all__ = ["fp8cast_rowwise_kmajor"]
 
 
-def fp8cast_rowwise_kmajor(
-    x: torch.Tensor, grouped_mm_offs: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8cast_rowwise_kmajor(x: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """See fp8cast_rowwise_kmajor_sm100."""
     if is_sm90():
         from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import fp8cast_rowwise_kmajor_sm90

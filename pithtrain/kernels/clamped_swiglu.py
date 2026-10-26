@@ -19,14 +19,7 @@ __all__ = ["BLOCK_SIZE", "clamped_swiglu_bwd", "clamped_swiglu_fwd"]
 
 
 @triton.jit
-def _clamped_swiglu_fwd_kernel(
-    gate_up_ptr,
-    out_ptr,
-    n_elements,
-    alpha,
-    limit,
-    BLOCK_SIZE: tl.constexpr,
-):
+def _clamped_swiglu_fwd_kernel(gate_up_ptr, out_ptr, n_elements, alpha, limit, BLOCK_SIZE: tl.constexpr):
     # offs indexes the flat (M, N) output; interleaved gate_up pulls
     # gate from 2*offs and up from 2*offs + 1.
     block_start = tl.program_id(0).to(tl.int64) * BLOCK_SIZE
@@ -50,15 +43,7 @@ def _clamped_swiglu_fwd_kernel(
 
 
 @triton.jit
-def _clamped_swiglu_bwd_kernel(
-    grad_out_ptr,
-    gate_up_ptr,
-    grad_gate_up_ptr,
-    n_elements,
-    alpha,
-    limit,
-    BLOCK_SIZE: tl.constexpr,
-):
+def _clamped_swiglu_bwd_kernel(grad_out_ptr, gate_up_ptr, grad_gate_up_ptr, n_elements, alpha, limit, BLOCK_SIZE: tl.constexpr):
     # grad_uc = do * glu
     # grad_gc = do * (uc + 1) * sigma * (1 + alpha * gc * (1 - sigma))
     # Clamp-aware: grad_g = grad_gc if g <= L else 0; grad_u = grad_uc if |u| <= L else 0.
@@ -121,15 +106,11 @@ def clamped_swiglu_fwd(gate_up: torch.Tensor, alpha: float, limit: float) -> tor
         return out
 
     grid = (triton.cdiv(n, BLOCK_SIZE),)
-    _clamped_swiglu_fwd_kernel[grid](
-        gate_up, out, n, float(alpha), float(limit), BLOCK_SIZE=BLOCK_SIZE
-    )
+    _clamped_swiglu_fwd_kernel[grid](gate_up, out, n, float(alpha), float(limit), BLOCK_SIZE=BLOCK_SIZE)
     return out
 
 
-def clamped_swiglu_bwd(
-    grad_output: torch.Tensor, gate_up: torch.Tensor, alpha: float, limit: float
-) -> torch.Tensor:
+def clamped_swiglu_bwd(grad_output: torch.Tensor, gate_up: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
     """
     Gradient of :func:`clamped_swiglu_fwd` with respect to the interleaved ``gate_up``: a fresh
     ``(M, 2N)`` tensor like ``gate_up``, gate gradients at the even and up gradients at the odd
@@ -154,13 +135,5 @@ def clamped_swiglu_bwd(
         return grad_gate_up
 
     grid = (triton.cdiv(n, BLOCK_SIZE),)
-    _clamped_swiglu_bwd_kernel[grid](
-        grad_output,
-        gate_up,
-        grad_gate_up,
-        n,
-        float(alpha),
-        float(limit),
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
+    _clamped_swiglu_bwd_kernel[grid](grad_output, gate_up, grad_gate_up, n, float(alpha), float(limit), BLOCK_SIZE=BLOCK_SIZE)
     return grad_gate_up

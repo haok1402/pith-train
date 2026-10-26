@@ -14,9 +14,7 @@ from pithtrain.kernels.fp8_rowwise_transpose_sm100 import fp8cast_rowwise_transp
 __all__ = ["fp8cast_rowwise_transpose"]
 
 
-def fp8cast_rowwise_transpose(
-    x: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8cast_rowwise_transpose(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Rowwise 1x128 FP8 of ``x`` and of ``x.T`` from one read of ``x``: ``(x_fp8, x_scale, xt_fp8,
     xt_scale)``, the grad_output operands of the dense FP8 linear's dgrad and wgrad

@@ -116,17 +116,11 @@ def _scatter_for_grouped_gemm_kernel(
             for i in tl.static_range(NUM_H_BLOCKS):
                 h_offs = i * BLOCK_H + tl.arange(0, BLOCK_H)
                 mask = h_offs < hidden_size
-                tl.store(
-                    output_tokens_ptr + row_base + h_offs,
-                    tl.zeros([BLOCK_H], dtype=input_tokens_ptr.dtype.element_ty),
-                    mask=mask,
-                )
+                tl.store(output_tokens_ptr + row_base + h_offs, tl.zeros([BLOCK_H], dtype=input_tokens_ptr.dtype.element_ty), mask=mask)
 
     # --- Zero rows [actual_M, M_rounded) for GEMM allocation alignment ---
     last_group_end = tl.load(grouped_mm_offs_ptr + num_groups - 1).to(tl.int64)
-    M_rounded = (
-        (last_group_end + GEMM_ALLOC_ALIGNMENT - 1) // GEMM_ALLOC_ALIGNMENT * GEMM_ALLOC_ALIGNMENT
-    )
+    M_rounded = ((last_group_end + GEMM_ALLOC_ALIGNMENT - 1) // GEMM_ALLOC_ALIGNMENT * GEMM_ALLOC_ALIGNMENT)
     align_pad = M_rounded - last_group_end
 
     if align_pad > 0:
@@ -138,11 +132,7 @@ def _scatter_for_grouped_gemm_kernel(
             for i in tl.static_range(NUM_H_BLOCKS):
                 h_offs = i * BLOCK_H + tl.arange(0, BLOCK_H)
                 mask = h_offs < hidden_size
-                tl.store(
-                    output_tokens_ptr + row_base + h_offs,
-                    tl.zeros([BLOCK_H], dtype=input_tokens_ptr.dtype.element_ty),
-                    mask=mask,
-                )
+                tl.store(output_tokens_ptr + row_base + h_offs, tl.zeros([BLOCK_H], dtype=input_tokens_ptr.dtype.element_ty), mask=mask)
 
 
 def _get_copy_stream_and_event(device):
@@ -153,13 +143,7 @@ def _get_copy_stream_and_event(device):
     return _copy_stream, _copy_event
 
 
-def scatter_by_expert(
-    input_tokens: torch.Tensor,
-    expert_idxs: torch.Tensor,
-    num_groups: int,
-    padding_alignment: int = 128,
-    group_counts: Optional[list[int]] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
+def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, padding_alignment: int = 128, group_counts: Optional[list[int]] = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
     """
     Reorder ``input_tokens`` by ``expert_idxs`` into expert-major groups, each padded with zero rows
     to a multiple of ``padding_alignment``: ``(output_tokens, reverse_shuffle_idxs,
@@ -198,15 +182,11 @@ def scatter_by_expert(
 
     # Over-allocate: tight upper bound, no GPU data needed (no .item() sync)
     max_m_padded = m + num_groups * (padding_alignment - 1)
-    max_m_padded = (
-        (max_m_padded + GEMM_ALLOC_ALIGNMENT - 1) // GEMM_ALLOC_ALIGNMENT * GEMM_ALLOC_ALIGNMENT
-    )
+    max_m_padded = ((max_m_padded + GEMM_ALLOC_ALIGNMENT - 1) // GEMM_ALLOC_ALIGNMENT * GEMM_ALLOC_ALIGNMENT)
 
     # Over-allocated output - padding rows zeroed inside the scatter kernel
     # `output_tokens` will be zeroed inside the scatter kernel.
-    output_tokens = torch.empty(
-        (max_m_padded, hidden_size), device=device, dtype=input_tokens.dtype
-    )
+    output_tokens = torch.empty((max_m_padded, hidden_size), device=device, dtype=input_tokens.dtype)
     # Small buffers for prep kernel
     reverse_shuffle_idxs = torch.empty((m,), device=device, dtype=torch.int64)
     grouped_mm_offs = torch.empty((num_groups,), device=device, dtype=torch.int32)
@@ -225,18 +205,7 @@ def scatter_by_expert(
     # Prep kernel: fused bincount + pad + cumsum (1 launch)
     BLOCK = 1024
     num_ctas = min(triton.cdiv(m, BLOCK), 32)
-    _compute_group_offsets_kernel[(num_ctas,)](
-        expert_idxs,
-        group_counts_1,
-        grouped_mm_offs,
-        ks_tensor,
-        completion_counter,
-        m,
-        num_ctas,
-        PADDING_ALIGNMENT=padding_alignment,
-        NUM_GROUPS=num_groups,
-        BLOCK=BLOCK,
-    )
+    _compute_group_offsets_kernel[(num_ctas,)](expert_idxs, group_counts_1, grouped_mm_offs, ks_tensor, completion_counter, m, num_ctas, PADDING_ALIGNMENT=padding_alignment, NUM_GROUPS=num_groups, BLOCK=BLOCK)
 
     # Async D-to-H: ks_tensor is done after the prep kernel; copy it on
     # a separate stream so the memcpy overlaps with the scatter kernel.
@@ -247,21 +216,9 @@ def scatter_by_expert(
     BLOCK_H = 256
     NUM_H_BLOCKS = triton.cdiv(hidden_size, BLOCK_H)
     _scatter_for_grouped_gemm_kernel[(m,)](
-        input_tokens,
-        expert_idxs,
-        grouped_mm_offs,
-        group_counts_2,
-        group_counts_1,  # actual counts from prep kernel
-        output_tokens,
-        reverse_shuffle_idxs,
-        hidden_size,
-        input_tokens.stride(0),
-        output_tokens.stride(0),
-        m,
-        num_groups,
-        BLOCK_H=BLOCK_H,
-        NUM_H_BLOCKS=NUM_H_BLOCKS,
-        GEMM_ALLOC_ALIGNMENT=GEMM_ALLOC_ALIGNMENT,
+        input_tokens, expert_idxs, grouped_mm_offs, group_counts_2, group_counts_1,  # actual counts from prep kernel
+        output_tokens, reverse_shuffle_idxs, hidden_size, input_tokens.stride(0), output_tokens.stride(0), m, num_groups,
+        BLOCK_H=BLOCK_H, NUM_H_BLOCKS=NUM_H_BLOCKS, GEMM_ALLOC_ALIGNMENT=GEMM_ALLOC_ALIGNMENT
     )
 
     # Narrow to actual padded size (removes over-allocated tail).
