@@ -1,4 +1,8 @@
-"""Pipeline layer partition: the default split is unchanged, and Qwen3.5's override stays legal."""
+"""
+Pipeline layer partition (pure functions, no GPU): the default split is unchanged, Qwen3.5's
+override stays legal, and gpt-oss's edge-light split (gpt_oss_layer_partition) keeps the edge rank
+lightest.
+"""
 
 import pytest
 
@@ -46,3 +50,35 @@ def test_qwen35_partition() -> None:
 def test_unbalanced_sizes_rejected() -> None:
     with pytest.raises(AssertionError):
         layer_partition(40, 4, 0, [9, 10, 10, 11])  # rank 0 would hold 9 and 11
+
+
+def gpt_oss_counts(num_layers: int, stage_count: int, edge_light: bool) -> list[int]:
+    from pithtrain.models.gpt_oss import gpt_oss_layer_partition
+
+    ranges = [gpt_oss_layer_partition(num_layers, stage_count, s, edge_light) for s in range(stage_count)]  # fmt: skip
+    # Contiguous, in order, covering every layer once: global ids are unchanged.
+    assert [i for r in ranges for i in r] == list(range(num_layers))
+    return [len(r) for r in ranges]
+
+
+def test_gpt_oss_edge_light() -> None:
+    # gpt-oss-20b at pp=2: rank 0 holds stages 0 (embed) and 3 (lm_head), so fewer layers there.
+    assert gpt_oss_counts(24, 4, edge_light=True) == [5, 7, 7, 5]
+    # BF16 runs (edge_light=False) keep the default partition, and pp=1 is unaffected.
+    for n in (24, 36):
+        assert gpt_oss_counts(n, 4, edge_light=False) == [len(layer_partition(n, 4, s)) for s in range(4)]  # fmt: skip
+        assert gpt_oss_counts(n, 2, edge_light=True) == [len(layer_partition(n, 2, s)) for s in range(2)]  # fmt: skip
+        assert gpt_oss_counts(n, 1, edge_light=True) == [n]
+
+
+@pytest.mark.parametrize("num_layers", [8, 24, 36, 61])
+@pytest.mark.parametrize("pp", [2, 3, 4, 8])
+def test_gpt_oss_edge_rank_is_lightest(num_layers: int, pp: int) -> None:
+    if num_layers < 2 * pp:
+        pytest.skip("fewer layers than stages")
+    c = gpt_oss_counts(num_layers, 2 * pp, edge_light=True)
+    per_rank = [c[r] + c[2 * pp - 1 - r] for r in range(pp)]
+    assert per_rank[0] == min(per_rank)
+    assert all(n >= 1 for n in c)
+    # DualPipeV pairs a rank's two chunks layer by layer: within one layer of each other.
+    assert all(abs(c[r] - c[2 * pp - 1 - r]) <= 1 for r in range(pp))

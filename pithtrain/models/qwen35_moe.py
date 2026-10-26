@@ -527,6 +527,8 @@ class Qwen35MoeDecoderLayer(nn.Module):
         outs = self.mlp.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
         return padded_index_gather(outs, reverse_shuffle_idxs)
 
+    # Not fused with the next layer's forward_stage1 into one compiled region as qwen3_moe does:
+    # for this model the fused region changes the forward bits at its layer boundaries.
     @torch.compile(fullgraph=True)
     def forward_stage5(
         self,
