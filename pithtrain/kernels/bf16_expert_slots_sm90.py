@@ -17,7 +17,7 @@ from cutlass import Int32, Int64, Uint32
 
 from pithtrain.kernels.bf16_expert_support import MAX_GROUPS
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import (bf16x2_to_f32, ctz64, f32_bits, f32x2_to_bf16x2, lanemask_lt, ld_b32, ld_b64, ld_v4, lds_b32, match_any, red_add_shared, red_or_u64, st_b32, st_b64, st_v4, sts_b32)
+from pithtrain.kernels.cute_ptx_sm90 import bf16x2_to_f32, ctz64, f32_bits, f32x2_to_bf16x2, lanemask_lt, ld_b32, ld_b64, ld_v4, lds_b32, match_any, red_add_shared, red_or_u64, st_b32, st_b64, st_v4, sts_b32
 
 __all__ = ["SlotMaps", "bf16_expert_group_slots_sm90", "bf16_expert_gather_rows_sm90", "bf16_expert_gather_sum_sm90", "expert_slot_segment_sum_sm90"]
 
@@ -286,10 +286,7 @@ def bf16_expert_group_slots_sm90(expert_idxs: torch.Tensor, expand_idx: torch.Te
     fns = _GROUP.get((G, has_expand))
     if fns is None:
         i32 = lambda: _vec(Int32, 4)
-        fns = _GROUP[(G, has_expand)] = (
-            cute.compile(_Hist(G), _vec(Int64, 8), i32(), _vec(Int64, 8), fake_stream(), options="--enable-tvm-ffi"),
-            cute.compile(_Group(G, has_expand), _vec(Int64, 8), _vec(Int64, 8), i32(), i32(), i32(), i32(), i32(), _vec(Int64, 8), i32(), fake_stream(), options="--enable-tvm-ffi"),
-        )
+        fns = _GROUP[(G, has_expand)] = (cute.compile(_Hist(G), _vec(Int64, 8), i32(), _vec(Int64, 8), fake_stream(), options="--enable-tvm-ffi"), cute.compile(_Group(G, has_expand), _vec(Int64, 8), _vec(Int64, 8), i32(), i32(), i32(), i32(), i32(), _vec(Int64, 8), i32(), fake_stream(), options="--enable-tvm-ffi"))
     fns[0](expert_idxs, hist, mask if has_expand else expert_idxs[:0])
     if has_expand:
         fns[1](expert_idxs, expand_idx, hist, cu, a_idx, row_of, slot_of, mask, table)
@@ -374,12 +371,7 @@ def expert_slot_segment_sum_sm90(x: torch.Tensor, cu_host: list[int], cu: torch.
     key = (N, idx is not None)
     fn = _SEG.get(key)
     if fn is None:
-        fn = _SEG[key] = cute.compile(
-            _SegmentSum(N, idx is not None), fake(cutlass.BFloat16, (cute.sym_int(), N), (N, 1)),
-            _vec(Int32, 4), _vec(Int32, 4), fake(Int32, (cute.sym_int(), 2), (2, 1), 8),
-            fake(cutlass.Float32, (cute.sym_int(), N), (N, 1)), fake_stream(),
-            options="--enable-tvm-ffi",
-        )
+        fn = _SEG[key] = cute.compile(_SegmentSum(N, idx is not None), fake(cutlass.BFloat16, (cute.sym_int(), N), (N, 1)), _vec(Int32, 4), _vec(Int32, 4), fake(Int32, (cute.sym_int(), 2), (2, 1), 8), fake(cutlass.Float32, (cute.sym_int(), N), (N, 1)), fake_stream(), options="--enable-tvm-ffi")
     fn(x, idx if idx is not None else cu, cu, chunk, part)
     # the chunks of a segment are consecutive; sum them in order (an empty segment sums to 0)
     return torch.segment_reduce(part, "sum", lengths=lengths_t, initial=0.0)

@@ -86,9 +86,7 @@ def cross_entropy_fwd_inplace(inp: torch.Tensor, target: torch.Tensor, ignore_in
     loss_1d = torch.zeros(n_rows, dtype=torch.float32, device=inp.device)
     BLOCK_SIZE = min(65536 // 2, triton.next_power_of_2(n_cols))
 
-    cross_entropy_fwd[(n_rows,)](
-        X_ptr=inp, X_stride=inp.stride(-2), Y_ptr=target, Y_stride=target.stride(-1), loss_ptr=loss_1d, loss_stride=loss_1d.stride(-1), n_cols=n_cols, n_non_ignore_ptr=n_non_ignore, ignore_idx=ignore_index, BLOCK_SIZE=BLOCK_SIZE, num_warps=32
-    )
+    cross_entropy_fwd[(n_rows,)](X_ptr=inp, X_stride=inp.stride(-2), Y_ptr=target, Y_stride=target.stride(-1), loss_ptr=loss_1d, loss_stride=loss_1d.stride(-1), n_cols=n_cols, n_non_ignore_ptr=n_non_ignore, ignore_idx=ignore_index, BLOCK_SIZE=BLOCK_SIZE, num_warps=32)
 
     loss = loss_1d.sum() / n_non_ignore.float().squeeze()
     return loss, inp

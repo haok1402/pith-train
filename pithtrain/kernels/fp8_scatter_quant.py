@@ -8,15 +8,12 @@ from typing import Optional
 
 import torch
 
-from pithtrain.kernels.arch import is_sm90
-from pithtrain.kernels.fp8_scatter_quant_sm100 import scatter_quant_sm100
+from pithtrain.kernels.arch import ARCH_MAJOR
 
 __all__ = ["scatter_quant"]
 
 
-def scatter_quant(
-    gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor] = None, padding_alignment: int = 128, group_counts: Optional[list[int]] = None
-) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
+def scatter_quant(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor] = None, padding_alignment: int = 128, group_counts: Optional[list[int]] = None) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
     """
     The MoE stage-3 FP8 input: x = gathered[expand_idx] scattered by expert as scatter_by_expert does,
     then quantized as quantize_grouped_input does on SM90. Returns ((x_fp8, x_scale, x_ch_fp8,
@@ -43,8 +40,12 @@ def scatter_quant(
     Used where fp8_fused_experts_supported(). On SM100 it returns the same K-major layout with
     row-major scales, which SM100's k_grouped_fp8_gemm does not read. Scale strides are unspecified.
     """
-    if is_sm90():
-        from pithtrain.kernels.fp8_scatter_quant_sm90 import scatter_quant_sm90
-
-        return scatter_quant_sm90(gathered, expert_idxs, num_groups, expand_idx, padding_alignment, group_counts)
-    return scatter_quant_sm100(gathered, expert_idxs, num_groups, expand_idx, padding_alignment, group_counts)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.fp8_scatter_quant_sm90 import scatter_quant_sm90
+            return scatter_quant_sm90(gathered, expert_idxs, num_groups, expand_idx, padding_alignment, group_counts)
+        case 10:
+            from pithtrain.kernels.fp8_scatter_quant_sm100 import scatter_quant_sm100
+            return scatter_quant_sm100(gathered, expert_idxs, num_groups, expand_idx, padding_alignment, group_counts)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")

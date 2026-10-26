@@ -26,7 +26,7 @@ import torch
 from cutlass import Int32, Int64, Uint32
 
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import (atom_add_u64, fence_gpu, lanemask_lt, ld_b32, ld_relaxed, ld_v4, lds_b32, match_any, red_add_shared, spin_until, st_b32, st_b64, st_release, sts_b32)
+from pithtrain.kernels.cute_ptx_sm90 import atom_add_u64, fence_gpu, lanemask_lt, ld_b32, ld_relaxed, ld_v4, lds_b32, match_any, red_add_shared, spin_until, st_b32, st_b64, st_release, sts_b32
 from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import THREADS, TILE, RowwiseKmajor, fp8cast_rowwise_kmajor_sm90
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale, mn_pad
 from pithtrain.kernels.host_transfer import get_pinned_buffer
@@ -277,21 +277,14 @@ def _scratch(device: torch.device, chunks: int, groups: int) -> _Scratch:
 def _compile_prep(G: int, has_expand: bool) -> Callable:
     i32 = Int32
     vec = lambda: fake(i32, (cute.sym_int(),), (1,), 4)
-    return cute.compile(
-        Prep(G, has_expand), fake(Int64, (cute.sym_int(),), (1,), 8), fake(Int64, (cute.sym_int(),), (1,), 8), vec(), vec(), fake(i32, (G,), (1,), 4), fake(i32, (G,), (1,), 4), fake(i32, (G,), (1,), 4), vec(), vec(), fake(Int64, (1,), (1,), 8),
-        fake_stream(), options="--enable-tvm-ffi",
-    )
+    return cute.compile(Prep(G, has_expand), fake(Int64, (cute.sym_int(),), (1,), 8), fake(Int64, (cute.sym_int(),), (1,), 8), vec(), vec(), fake(i32, (G,), (1,), 4), fake(i32, (G,), (1,), 4), fake(i32, (G,), (1,), 4), vec(), vec(), fake(Int64, (1,), (1,), 8), fake_stream(), options="--enable-tvm-ffi")
 
 
 def _compile_main(n: int, G: int, pdl: bool) -> Callable:
     mp = cute.sym_int()
     nb = (n + TILE - 1) // TILE
     fp8 = cutlass.Float8E4M3FN
-    return cute.compile(
-        ScatterQuant(n, G, pdl), fake(cutlass.BFloat16, (cute.sym_int(), n), (n, 1)), fake(Int64, (cute.sym_int(),), (1,), 8), fake(Int32, (cute.sym_int(),), (1,), 4), fake(Int32, (cute.sym_int(),), (1,), 4), fake(Int32, (G,), (1,), 4),
-        fake(Int32, (G,), (1,), 4), fake(Int64, (cute.sym_int(),), (1,), 8), fake(fp8, (mp, n), (n, 1)), fake(cutlass.Float32, (cute.sym_int(), nb), (1, cute.sym_int64())), fake(fp8, (cute.sym_int(),), (1,)),
-        fake(cutlass.Float32, (n, cute.sym_int()), (1, mn_pad(n))), fake_stream(), options="--enable-tvm-ffi",
-    )
+    return cute.compile(ScatterQuant(n, G, pdl), fake(cutlass.BFloat16, (cute.sym_int(), n), (n, 1)), fake(Int64, (cute.sym_int(),), (1,), 8), fake(Int32, (cute.sym_int(),), (1,), 4), fake(Int32, (cute.sym_int(),), (1,), 4), fake(Int32, (G,), (1,), 4), fake(Int32, (G,), (1,), 4), fake(Int64, (cute.sym_int(),), (1,), 8), fake(fp8, (mp, n), (n, 1)), fake(cutlass.Float32, (cute.sym_int(), nb), (1, cute.sym_int64())), fake(fp8, (cute.sym_int(),), (1,)), fake(cutlass.Float32, (n, cute.sym_int()), (1, mn_pad(n))), fake_stream(), options="--enable-tvm-ffi")
 
 
 def _reference(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor], group_counts: Optional[list[int]]) -> tuple:
@@ -304,23 +297,10 @@ def _reference(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: in
 def supports_scatter_quant(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor] = None) -> bool:
     """Whether the fused kernels cover these inputs (else scatter_quant_sm90 runs the unfused path)."""
     m, N = expert_idxs.shape[0], gathered.shape[1]
-    return not (
-        m == 0
-        or N == 0
-        or not 0 < num_groups <= _MAX_GROUPS
-        or gathered.dtype != torch.bfloat16
-        or N % 8 != 0
-        or not gathered.is_contiguous()
-        or gathered.data_ptr() % 16 != 0
-        or expert_idxs.dtype != torch.int64
-        or not expert_idxs.is_contiguous()
-        or (expand_idx is not None and (expand_idx.dtype != torch.int64 or not expand_idx.is_contiguous()))
-    )
+    return not (m == 0 or N == 0 or not 0 < num_groups <= _MAX_GROUPS or gathered.dtype != torch.bfloat16 or N % 8 != 0 or not gathered.is_contiguous() or gathered.data_ptr() % 16 != 0 or expert_idxs.dtype != torch.int64 or not expert_idxs.is_contiguous() or (expand_idx is not None and (expand_idx.dtype != torch.int64 or not expand_idx.is_contiguous())))
 
 
-def scatter_quant_sm90(
-    gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor] = None, padding_alignment: int = 128, group_counts: Optional[list[int]] = None, _pdl: bool = True
-) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
+def scatter_quant_sm90(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor] = None, padding_alignment: int = 128, group_counts: Optional[list[int]] = None, _pdl: bool = True) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
     """
     scatter_quant on SM90 (see the picker for the contract): fused where supports_scatter_quant,
     else the unfused path. Scales are MN-major. _pdl=False launches the main kernel without PDL.

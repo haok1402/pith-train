@@ -30,30 +30,9 @@ BC = 16  # sub-chunk of the fused kkt + triangular solve, fixed by FLA at BT = 6
 # Launch configs FLA's autotuner selects on H200 at H = HV = 32, K = V = 128 (bf16 q/k/v/beta,
 # fp32 gate). The BK / BV the launches below pass explicitly are FLA's own constants on Hopper.
 VERSIONS = {"fla": "0.5.2", "triton": "3.7.1"}
-CONFIGS = {
-    "cumsum_fwd": dict(num_warps=1, num_stages=3),
-    "cumsum_rev": dict(num_warps=1, num_stages=3),
-    "kkt_solve": dict(BK=64, num_warps=1, num_stages=3),
-    "w_u": dict(num_warps=4, num_stages=4),
-    "fwd_h": dict(BV=32, num_warps=4, num_stages=3),
-    "fwd_o": dict(BK=64, BV=64, num_warps=4, num_stages=3),
-    "dv_local": dict(num_warps=2, num_stages=3),
-    "bwd_dhu": dict(BV=32, num_warps=4, num_stages=3),
-    "dqkwg": dict(num_warps=4, num_stages=3),
-    "wy_bwd": dict(num_warps=4, num_stages=4),
-}
+CONFIGS = {"cumsum_fwd": dict(num_warps=1, num_stages=3), "cumsum_rev": dict(num_warps=1, num_stages=3), "kkt_solve": dict(BK=64, num_warps=1, num_stages=3), "w_u": dict(num_warps=4, num_stages=4), "fwd_h": dict(BV=32, num_warps=4, num_stages=3), "fwd_o": dict(BK=64, BV=64, num_warps=4, num_stages=3), "dv_local": dict(num_warps=2, num_stages=3), "bwd_dhu": dict(BV=32, num_warps=4, num_stages=3), "dqkwg": dict(num_warps=4, num_stages=3), "wy_bwd": dict(num_warps=4, num_stages=4)}
 
-KERNELS = {
-    "cumsum": chunk_local_cumsum_scalar_kernel,
-    "kkt_solve": chunk_gated_delta_rule_fwd_kkt_solve_kernel,
-    "w_u": recompute_w_u_fwd_kernel,
-    "fwd_h": chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
-    "fwd_o": chunk_fwd_kernel_o,
-    "dv_local": chunk_bwd_kernel_dv_local,
-    "bwd_dhu": chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64,
-    "dqkwg": chunk_bwd_kernel_dqkwg,
-    "wy_bwd": prepare_wy_repr_bwd_kernel,
-}
+KERNELS = {"cumsum": chunk_local_cumsum_scalar_kernel, "kkt_solve": chunk_gated_delta_rule_fwd_kkt_solve_kernel, "w_u": recompute_w_u_fwd_kernel, "fwd_h": chunk_gated_delta_rule_fwd_kernel_h_blockdim64, "fwd_o": chunk_fwd_kernel_o, "dv_local": chunk_bwd_kernel_dv_local, "bwd_dhu": chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64, "dqkwg": chunk_bwd_kernel_dqkwg, "wy_bwd": prepare_wy_repr_bwd_kernel}
 
 # The parameter lists the launches below are written against.
 SIGNATURES = {
@@ -144,11 +123,7 @@ def _cumsum(s: torch.Tensor, reverse: bool) -> torch.Tensor:
     B, T, H = s.shape
     o = torch.empty_like(s, dtype=torch.float)
     config = CONFIGS["cumsum_rev" if reverse else "cumsum_fwd"]
-    _launch("cumsum", (triton.cdiv(T, BT), B * H),
-        s=s, o=o, scale=None if reverse else RCP_LN2, cu_seqlens=None, chunk_indices=None, T=T,
-        B=B, H=H, BT=BT, REVERSE=reverse, HAS_SCALE=not reverse, IS_VARLEN=False,
-        HEAD_FIRST=False, **config,
-    )
+    _launch("cumsum", (triton.cdiv(T, BT), B * H), s=s, o=o, scale=None if reverse else RCP_LN2, cu_seqlens=None, chunk_indices=None, T=T, B=B, H=H, BT=BT, REVERSE=reverse, HAS_SCALE=not reverse, IS_VARLEN=False, HEAD_FIRST=False, **config)
     return o
 
 
@@ -156,10 +131,7 @@ def _w_u(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, 
     """recompute_w_u_fwd."""
     B, T, H, K, HV, V = *k.shape, *v.shape[2:]
     w, u = k.new_empty(B, T, HV, K), torch.empty_like(v)
-    _launch("w_u", (triton.cdiv(T, BT), B * HV),
-        k=k, v=v, beta=beta, w=w, u=u, A=A, g=g, cu_seqlens=None, chunk_indices=None, T=T, H=H,
-        HV=HV, K=K, V=V, BT=BT, BK=64, BV=64, USE_G=True, IS_VARLEN=False, **CONFIGS["w_u"],
-    )
+    _launch("w_u", (triton.cdiv(T, BT), B * HV), k=k, v=v, beta=beta, w=w, u=u, A=A, g=g, cu_seqlens=None, chunk_indices=None, T=T, H=H, HV=HV, K=K, V=V, BT=BT, BK=64, BV=64, USE_G=True, IS_VARLEN=False, **CONFIGS["w_u"])
     return w, u
 
 
@@ -168,12 +140,7 @@ def _fwd_h(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g: torch.Tensor) -
     B, T, H, K, HV, V = *k.shape, *u.shape[2:]
     h, v_new = k.new_empty(B, triton.cdiv(T, BT), HV, K, V), torch.empty_like(u)
     config = CONFIGS["fwd_h"]
-    _launch("fwd_h", (triton.cdiv(V, config["BV"]), B * HV),
-        k=k, v=u, w=w, v_new=v_new, g=g, gk=None, h=h, h0=None, ht=None, cu_seqlens=None,
-        chunk_offsets=None, T=T, H=H, HV=HV, K=K, V=V, BT=BT, USE_G=True, USE_GK=False,
-        USE_INITIAL_STATE=False, STORE_FINAL_STATE=False, SAVE_NEW_VALUE=True,
-        STATE_V_FIRST=False, IS_VARLEN=False, **config,
-    )
+    _launch("fwd_h", (triton.cdiv(V, config["BV"]), B * HV), k=k, v=u, w=w, v_new=v_new, g=g, gk=None, h=h, h0=None, ht=None, cu_seqlens=None, chunk_offsets=None, T=T, H=H, HV=HV, K=K, V=V, BT=BT, USE_G=True, USE_GK=False, USE_INITIAL_STATE=False, STORE_FINAL_STATE=False, SAVE_NEW_VALUE=True, STATE_V_FIRST=False, IS_VARLEN=False, **config)
     return h, v_new
 
 
@@ -196,19 +163,12 @@ def chunk_gdr_fwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: t
     g_cum = _cumsum(g, reverse=False)
     # The fused kkt + solve stores only the triangular blocks: A must start zeroed.
     A = torch.zeros(B, T, HV, BT, device=k.device, dtype=k.dtype)
-    _launch("kkt_solve", (NT, B * HV),
-        k=k, g=g_cum, beta=beta, A=A, cu_seqlens=None, chunk_indices=None, T=T, H=H, HV=HV, K=K,
-        BT=BT, BC=BC, USE_G=True, IS_VARLEN=False, **CONFIGS["kkt_solve"],
-    )
+    _launch("kkt_solve", (NT, B * HV), k=k, g=g_cum, beta=beta, A=A, cu_seqlens=None, chunk_indices=None, T=T, H=H, HV=HV, K=K, BT=BT, BC=BC, USE_G=True, IS_VARLEN=False, **CONFIGS["kkt_solve"])
     w, u = _w_u(k, v, beta, A, g_cum)
     h, v_new = _fwd_h(k, w, u, g_cum)
     o = torch.empty_like(v_new)
     config = CONFIGS["fwd_o"]
-    _launch("fwd_o", (triton.cdiv(V, config["BV"]), NT, B * HV),
-        q=q, k=k, v=v_new, h=h, g=g_cum, g_gamma=None, o=o, cu_seqlens=None, chunk_indices=None,
-        scale=K**-0.5, T=T, H=H, HV=HV, K=K, V=V, BT=BT, USE_G=True, USE_G_GAMMA=False,
-        STATE_V_FIRST=False, IS_VARLEN=False, **config,
-    )
+    _launch("fwd_o", (triton.cdiv(V, config["BV"]), NT, B * HV), q=q, k=k, v=v_new, h=h, g=g_cum, g_gamma=None, o=o, cu_seqlens=None, chunk_indices=None, scale=K**-0.5, T=T, H=H, HV=HV, K=K, V=V, BT=BT, USE_G=True, USE_G_GAMMA=False, STATE_V_FIRST=False, IS_VARLEN=False, **config)
     return o, g_cum, A
 
 
@@ -230,34 +190,16 @@ def chunk_gdr_bwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cu
     w, u = _w_u(k, v, beta, A, g_cum)
     h, v_new = _fwd_h(k, w, u, g_cum)
     dv_local = torch.empty_like(do)
-    _launch("dv_local", (NT, B * HV),
-        q=q, k=k, g=g_cum, g_gamma=None, A=None, do=do, dv=dv_local, cu_seqlens=None,
-        chunk_indices=None, scale=scale, T=T, H=H, HV=HV, K=K, V=V, BT=BT, BK=128, BV=128,
-        USE_G=True, USE_G_GAMMA=False, USE_A=False, IS_VARLEN=False, **CONFIGS["dv_local"],
-    )
+    _launch("dv_local", (NT, B * HV), q=q, k=k, g=g_cum, g_gamma=None, A=None, do=do, dv=dv_local, cu_seqlens=None, chunk_indices=None, scale=scale, T=T, H=H, HV=HV, K=K, V=V, BT=BT, BK=128, BV=128, USE_G=True, USE_G_GAMMA=False, USE_A=False, IS_VARLEN=False, **CONFIGS["dv_local"])
     dh, du = q.new_empty(B, NT, HV, K, V), torch.empty_like(dv_local)
     config = CONFIGS["bwd_dhu"]
-    _launch("bwd_dhu", (triton.cdiv(V, config["BV"]), B * HV),
-        q=q, k=k, w=w, g=g_cum, gk=None, dht=None, dh0=None, do=do, dh=dh, dv=dv_local, dv2=du,
-        cu_seqlens=None, chunk_offsets=None, scale=scale, T=T, H=H, HV=HV, K=K, V=V, BT=BT,
-        USE_G=True, USE_GK=False, USE_INITIAL_STATE=False, USE_FINAL_STATE_GRADIENT=False,
-        STATE_V_FIRST=False, IS_VARLEN=False, **config,
-    )
+    _launch("bwd_dhu", (triton.cdiv(V, config["BV"]), B * HV), q=q, k=k, w=w, g=g_cum, gk=None, dht=None, dh0=None, do=do, dh=dh, dv=dv_local, dv2=du, cu_seqlens=None, chunk_offsets=None, scale=scale, T=T, H=H, HV=HV, K=K, V=V, BT=BT, USE_G=True, USE_GK=False, USE_INITIAL_STATE=False, USE_FINAL_STATE_GRADIENT=False, STATE_V_FIRST=False, IS_VARLEN=False, **config)
     dq, dk, dw = q.new_empty(B, T, HV, K), k.new_empty(B, T, HV, K), torch.empty_like(w)
     dg_parts = torch.empty(1, *g_cum.shape, dtype=torch.float32, device=g_cum.device)
-    _launch("dqkwg", (1, NT, B * HV),
-        q=q, k=k, v=v_new, g=g_cum, g_gamma=None, h=h, do=do, dh=dh, dq=dq, dk=dk, dw=dw, dv=du,
-        dg=dg_parts, cu_seqlens=None, chunk_indices=None, scale=scale, B=B, T=T, H=H, HV=HV, K=K,
-        V=V, BT=BT, BK=128, BV=128, USE_G=True, USE_G_GAMMA=False, USE_DW=True,
-        STATE_V_FIRST=False, IS_VARLEN=False, **CONFIGS["dqkwg"],
-    )
+    _launch("dqkwg", (1, NT, B * HV), q=q, k=k, v=v_new, g=g_cum, g_gamma=None, h=h, do=do, dh=dh, dq=dq, dk=dk, dw=dw, dv=du, dg=dg_parts, cu_seqlens=None, chunk_indices=None, scale=scale, B=B, T=T, H=H, HV=HV, K=K, V=V, BT=BT, BK=128, BV=128, USE_G=True, USE_G_GAMMA=False, USE_DW=True, STATE_V_FIRST=False, IS_VARLEN=False, **CONFIGS["dqkwg"])
     dg = dg_parts.sum(0)
     dk2, dv, db, dg2 = k.new_empty(B, T, HV, K), torch.empty_like(v), torch.empty_like(beta), torch.empty_like(g_cum)
-    _launch("wy_bwd", (NT, B * HV),
-        k=k, v=v, beta=beta, g=g_cum, A=A, dw=dw, du=du, dk=dk2, dv=dv, db=db, dg=dg2,
-        cu_seqlens=None, chunk_indices=None, T=T, H=H, HV=HV, K=K, V=V, BT=BT, BK=64, BV=64,
-        USE_G=True, IS_VARLEN=False, **CONFIGS["wy_bwd"],
-    )
+    _launch("wy_bwd", (NT, B * HV), k=k, v=v, beta=beta, g=g_cum, A=A, dw=dw, du=du, dk=dk2, dv=dv, db=db, dg=dg2, cu_seqlens=None, chunk_indices=None, T=T, H=H, HV=HV, K=K, V=V, BT=BT, BK=64, BV=64, USE_G=True, IS_VARLEN=False, **CONFIGS["wy_bwd"])
     dk.add_(dk2)
     dg.add_(dg2)
     dg = _cumsum(dg, reverse=True)

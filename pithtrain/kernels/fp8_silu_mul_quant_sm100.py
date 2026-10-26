@@ -15,12 +15,7 @@ _BLOCK = 128
 
 def _empty(M: int, N: int, device: torch.device) -> tuple[torch.Tensor, ...]:
     """The four outputs of fp8cast_rowwise_kmajor_sm100 for an empty (M, N) input."""
-    return (
-        torch.empty((M, N), dtype=torch.float8_e4m3fn, device=device),
-        torch.empty((M, (N + _BLOCK - 1) // _BLOCK), dtype=torch.float32, device=device),
-        torch.empty(M * N, dtype=torch.float8_e4m3fn, device=device),
-        torch.empty((N, M // _BLOCK), dtype=torch.float32, device=device),
-    )
+    return (torch.empty((M, N), dtype=torch.float8_e4m3fn, device=device), torch.empty((M, (N + _BLOCK - 1) // _BLOCK), dtype=torch.float32, device=device), torch.empty(M * N, dtype=torch.float8_e4m3fn, device=device), torch.empty((N, M // _BLOCK), dtype=torch.float32, device=device))
 
 
 def silu_mul_quant_fwd_sm100(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:

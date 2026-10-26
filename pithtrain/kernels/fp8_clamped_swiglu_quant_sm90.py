@@ -27,10 +27,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from pithtrain.kernels.arch import sm_count
 from pithtrain.kernels.clamped_swiglu import clamped_swiglu_fwd
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import (
-    abs2, asm_args_last, bf16_hi, bf16_lo, bf16_sel, cp_async8, cp_async16, f32_as_u32, ld_b32_coherent, lds_b32_pred, lds_v2, lds_v4, max2, pack_bf16, prmt_args_last, selp_args_last, st_f32, st_v2_args_last, st_v4_args_last, sts_b32_nopred, sts_v4, to_ir,
-    u32_as_f32, unpack,
-)
+from pithtrain.kernels.cute_ptx_sm90 import abs2, asm_args_last, bf16_hi, bf16_lo, bf16_sel, cp_async8, cp_async16, f32_as_u32, ld_b32_coherent, lds_b32_pred, lds_v2, lds_v4, max2, pack_bf16, prmt_args_last, selp_args_last, st_f32, st_v2_args_last, st_v4_args_last, sts_b32_nopred, sts_v4, to_ir, u32_as_f32, unpack
 from pithtrain.kernels.fp8_clamped_swiglu_quant_sm100 import biased_gate_up, clamped_swiglu_bwd_biased
 from pithtrain.kernels.fp8_e8m0_scale_sm90 import e8m0_scale_f32, quant4_e4m3
 from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import fp8cast_rowwise_kmajor_sm90
@@ -485,18 +482,7 @@ def _alloc(M: int, N: int, device: torch.device, KP: int | None = None) -> tuple
 def clamped_swiglu_quant_fusable(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor) -> bool:
     """Inputs the fused kernel handles; others take the (bit-identical) unfused path."""
     N = gate_up.shape[1] // 2
-    return (
-        gate_up.dtype == torch.bfloat16
-        and gate_up.is_contiguous()
-        and gate_up.data_ptr() % 16 == 0
-        and bias.dtype == torch.bfloat16
-        and bias.is_contiguous()
-        and bias.data_ptr() % 16 == 0
-        and N % _VEC == 0
-        and grouped_mm_offs.dtype == torch.int32
-        and grouped_mm_offs.is_contiguous()
-        and 0 < grouped_mm_offs.shape[0] <= _G_CAP
-    )
+    return (gate_up.dtype == torch.bfloat16 and gate_up.is_contiguous() and gate_up.data_ptr() % 16 == 0 and bias.dtype == torch.bfloat16 and bias.is_contiguous() and bias.data_ptr() % 16 == 0 and N % _VEC == 0 and grouped_mm_offs.dtype == torch.int32 and grouped_mm_offs.is_contiguous() and 0 < grouped_mm_offs.shape[0] <= _G_CAP)
 
 
 def clamped_swiglu_quant_fwd_sm90(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -549,15 +535,7 @@ def clamped_swiglu_quant_kmajor_sm90(gate_up: torch.Tensor, bias: torch.Tensor, 
     return km, km_scale
 
 
-def clamped_swiglu_bwd_quant_sm90(
-    dh: torch.Tensor,
-    gate_up: torch.Tensor,
-    bias: torch.Tensor,
-    grouped_mm_offs: torch.Tensor,
-    alpha: float,
-    limit: float,
-    kmajor_channels: int | None = None,
-) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+def clamped_swiglu_bwd_quant_sm90(dh: torch.Tensor, gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
     """(dgu_quant, bias_grad): fp8cast_rowwise_kmajor of the bf16 (M, 2N) input gradient and the (G, 2N) bias gradient; kmajor_channels as in clamped_swiglu_quant_fwd_sm90, for 2N channels."""
     M, N = gate_up.shape[0], gate_up.shape[1] // 2
     assert dh.shape == (M, N), (dh.shape, gate_up.shape)

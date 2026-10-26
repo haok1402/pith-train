@@ -1,12 +1,11 @@
 """
 Rowwise FP8 quantization of x plus 128x128 blockwise FP8 quantization of x.T from one read of x:
-SM90 runs the CuTe-DSL kernel, elsewhere the Triton kernel.
+SM90 runs the CuTe-DSL kernel, SM100 the Triton kernel.
 """
 
 import torch
 
-from pithtrain.kernels.arch import is_sm90
-from pithtrain.kernels.fp8_rowwise_blockwise_transpose_sm100 import fp8cast_rowwise_blockwise_transpose_sm100
+from pithtrain.kernels.arch import ARCH_MAJOR
 
 __all__ = ["fp8cast_rowwise_blockwise_transpose"]
 
@@ -18,15 +17,19 @@ def fp8cast_rowwise_blockwise_transpose(x: torch.Tensor) -> tuple[torch.Tensor, 
 
     x is 2-D (M, K) bf16 (fp16 / fp32 also accepted), any M and K, any strides; not modified.
     x_fp8 is e4m3 (M, K) contiguous with fp32 x_scale of logical shape (M, ceil(K / 128)), strides
-    unspecified (MN-major on SM90, row-major elsewhere).
+    unspecified (MN-major on SM90, row-major on SM100).
     xt_fp8 is e4m3 (K, M) contiguous with one scale per 128x128 tile: fp32 xt_scale (ceil(K / 128), ceil(M / 128)), row-major.
 
     Per block (a partial block uses its valid elements): scale = 2^ceil(log2(max(amax, 1e-4) / 448))
     (E8M0), fp8 = e4m3(x / scale) rounded to nearest even with saturation. Both architectures return
     the same bytes and scale values.
     """
-    if is_sm90():
-        from pithtrain.kernels.fp8_rowwise_blockwise_transpose_sm90 import fp8cast_rowwise_blockwise_transpose_sm90
-
-        return fp8cast_rowwise_blockwise_transpose_sm90(x)
-    return fp8cast_rowwise_blockwise_transpose_sm100(x)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.fp8_rowwise_blockwise_transpose_sm90 import fp8cast_rowwise_blockwise_transpose_sm90
+            return fp8cast_rowwise_blockwise_transpose_sm90(x)
+        case 10:
+            from pithtrain.kernels.fp8_rowwise_blockwise_transpose_sm100 import fp8cast_rowwise_blockwise_transpose_sm100
+            return fp8cast_rowwise_blockwise_transpose_sm100(x)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")

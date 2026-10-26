@@ -139,10 +139,7 @@ class _ScatterRowStore(TileStore):
     def store_setup(self, gemm, params, smem_tensor, tiled_copy_r2s, tiled_copy_t2r, tile_coord_mnkl, varlen_manager, tidx):
         tiled_copy = self._make_tiled_copy_r2s(gemm, params, tiled_copy_r2s, tiled_copy_t2r)
         batch = tile_coord_mnkl[3]
-        self._st = dict(
-            smem=smem_tensor, out=getattr(params, self.name), idx=getattr(params, self.idx_name), first=varlen_manager.params.cu_seqlens_m[batch], rows=varlen_manager.len_m(batch), m0=tile_coord_mnkl[0] * gemm.cta_tile_shape_mnk[0],
-            n0=tile_coord_mnkl[1] * gemm.cta_tile_shape_mnk[1], layout=cute.make_ordered_layout(cute.ceil_div(gemm.cta_tile_shape_mnk[:2], gemm.epi_tile), order=(0, 1) if gemm.epi_m_major else (1, 0)), count=0,
-        )
+        self._st = dict(smem=smem_tensor, out=getattr(params, self.name), idx=getattr(params, self.idx_name), first=varlen_manager.params.cu_seqlens_m[batch], rows=varlen_manager.len_m(batch), m0=tile_coord_mnkl[0] * gemm.cta_tile_shape_mnk[0], n0=tile_coord_mnkl[1] * gemm.cta_tile_shape_mnk[1], layout=cute.make_ordered_layout(cute.ceil_div(gemm.cta_tile_shape_mnk[:2], gemm.epi_tile), order=(0, 1) if gemm.epi_m_major else (1, 0)), count=0)
         tRS_s = tiled_copy.get_slice(tidx).partition_D(smem_tensor)
         return (tiled_copy, tRS_s, lambda src_idx, dst_idx: None, None)
 

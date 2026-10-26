@@ -154,7 +154,6 @@ def _record(entry: Callable[[], Tuple[torch.Tensor, ...]], inputs: Dict[str, tor
     """Run FA4's entry once, returning (its outputs, a plan or None)."""
     # Imported here, not at the top: FA4 loads cutlass, and importing pithtrain.kernels must not.
     from flash_attn.cute import interface as _fa4
-
     owners = [f for f in vars(_fa4).values() if callable(f) and hasattr(f, "compile_cache")]
     log: list = []
     caches = [_RecordingCache(f.compile_cache, log) for f in owners]

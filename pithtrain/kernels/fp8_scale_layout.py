@@ -38,9 +38,13 @@ def to_mn_major(sf: torch.Tensor) -> torch.Tensor:
 def act_scale_like(mn: int, sf_k: int, device: torch.device) -> torch.Tensor:
     """
     Uninitialized fp32 (mn, sf_k) tensor on device (meta included) with the strides this library's
-    quantization ops give a 1x128 activation scale: MN-major on SM90, row-major otherwise. For fake
+    quantization ops give a 1x128 activation scale: MN-major on SM90, row-major on SM100. For fake
     / meta implementations. The architecture is the one probed at import, not device's.
     """
-    if ARCH_MAJOR == 9:
-        return mn_major_scale(mn, sf_k, device)
-    return torch.empty((mn, sf_k), dtype=torch.float32, device=device)
+    match ARCH_MAJOR:
+        case 9:
+            return mn_major_scale(mn, sf_k, device)
+        case 10:
+            return torch.empty((mn, sf_k), dtype=torch.float32, device=device)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")

@@ -34,12 +34,7 @@ def clamped_swiglu_bwd_biased(dh: torch.Tensor, gate_up: torch.Tensor, bias: tor
 
 def _empty(M: int, N: int, device: torch.device) -> tuple[torch.Tensor, ...]:
     """The four outputs of fp8cast_rowwise_kmajor_sm100 for an empty (M, N) input."""
-    return (
-        torch.empty((M, N), dtype=torch.float8_e4m3fn, device=device),
-        torch.empty((M, (N + _BLOCK - 1) // _BLOCK), dtype=torch.float32, device=device),
-        torch.empty(M * N, dtype=torch.float8_e4m3fn, device=device),
-        torch.empty((N, M // _BLOCK), dtype=torch.float32, device=device),
-    )
+    return (torch.empty((M, N), dtype=torch.float8_e4m3fn, device=device), torch.empty((M, (N + _BLOCK - 1) // _BLOCK), dtype=torch.float32, device=device), torch.empty(M * N, dtype=torch.float8_e4m3fn, device=device), torch.empty((N, M // _BLOCK), dtype=torch.float32, device=device))
 
 
 def clamped_swiglu_quant_fwd_sm100(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -61,9 +56,7 @@ def clamped_swiglu_quant_kmajor_sm100(gate_up: torch.Tensor, bias: torch.Tensor,
     return clamped_swiglu_quant_fwd_sm100(gate_up, bias, grouped_mm_offs, alpha, limit)[2:]
 
 
-def clamped_swiglu_bwd_quant_sm100(
-    dh: torch.Tensor, gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None
-) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+def clamped_swiglu_bwd_quant_sm100(dh: torch.Tensor, gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
     """fp8cast_rowwise_kmajor_sm100 of the bf16 (M, 2N) input gradient, and the (G, 2N) bias gradient in bias.dtype."""
     M, N = gate_up.shape[0], gate_up.shape[1] // 2
     if M == 0 or N == 0:

@@ -11,10 +11,7 @@ __all__ = ["fp8cast_rowwise_colwise", "fp8cast_rowwise_colwise_kernel"]
 
 
 @triton.jit
-def fp8cast_rowwise_colwise_kernel(
-    x_ptr, out_tok_ptr, scale_tok_ptr, out_ch_ptr, scale_ch_ptr, M, N, stride_x_row, stride_x_col, stride_out_tok_row, scale_tok_cols, stride_out_ch_row, scale_ch_cols, block_to_group_ptr, cumsum_ptr,
-    BLOCK_N: tl.constexpr, NATIVE_E8M0: tl.constexpr, WRITE_KMAJOR: tl.constexpr = False
-):
+def fp8cast_rowwise_colwise_kernel(x_ptr, out_tok_ptr, scale_tok_ptr, out_ch_ptr, scale_ch_ptr, M, N, stride_x_row, stride_x_col, stride_out_tok_row, scale_tok_cols, stride_out_ch_row, scale_ch_cols, block_to_group_ptr, cumsum_ptr, BLOCK_N: tl.constexpr, NATIVE_E8M0: tl.constexpr, WRITE_KMAJOR: tl.constexpr = False):
     """
     One 128 x BLOCK_N tile per program: 1x128 rowwise and 128x1 colwise quantization. M % 128 == 0.
 
@@ -108,9 +105,6 @@ def fp8cast_rowwise_colwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     _BLOCK_N = 128
     grid = (num_row_groups, (N + _BLOCK_N - 1) // _BLOCK_N)
 
-    fp8cast_rowwise_colwise_kernel[grid](
-        x_ptr=x, out_tok_ptr=out_tok, scale_tok_ptr=scale_tok, out_ch_ptr=out_ch, scale_ch_ptr=scale_ch, M=M, N=N, stride_x_row=x.stride(0), stride_x_col=x.stride(1), stride_out_tok_row=N,
-        scale_tok_cols=scale_tok_cols, stride_out_ch_row=N, scale_ch_cols=N, block_to_group_ptr=out_tok, cumsum_ptr=out_tok, BLOCK_N=_BLOCK_N, NATIVE_E8M0=NATIVE_E8M0, WRITE_KMAJOR=False, num_warps=4, num_stages=2
-    )
+    fp8cast_rowwise_colwise_kernel[grid](x_ptr=x, out_tok_ptr=out_tok, scale_tok_ptr=scale_tok, out_ch_ptr=out_ch, scale_ch_ptr=scale_ch, M=M, N=N, stride_x_row=x.stride(0), stride_x_col=x.stride(1), stride_out_tok_row=N, scale_tok_cols=scale_tok_cols, stride_out_ch_row=N, scale_ch_cols=N, block_to_group_ptr=out_tok, cumsum_ptr=out_tok, BLOCK_N=_BLOCK_N, NATIVE_E8M0=NATIVE_E8M0, WRITE_KMAJOR=False, num_warps=4, num_stages=2)
 
     return out_tok, scale_tok, out_ch, scale_ch

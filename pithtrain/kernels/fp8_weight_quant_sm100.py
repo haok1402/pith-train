@@ -71,19 +71,13 @@ def fp8cast_blockwise_transpose_sm100(x: torch.Tensor) -> tuple[torch.Tensor, to
 
     grid = (scale_rows, scale_cols)
 
-    _fp8cast_blockwise_transpose_kernel[grid](
-        x_ptr=x, out_ptr=out, scale_ptr=scale, out_t_ptr=out_t, scale_t_ptr=scale_t, M=M, K=K, stride_x_row=x.stride(0), stride_x_col=x.stride(1),
-        stride_out_row=K, scale_cols=scale_cols, stride_out_t_row=M, scale_t_cols=scale_rows, NATIVE_E8M0=NATIVE_E8M0, num_warps=4, num_stages=2
-    )
+    _fp8cast_blockwise_transpose_kernel[grid](x_ptr=x, out_ptr=out, scale_ptr=scale, out_t_ptr=out_t, scale_t_ptr=scale_t, M=M, K=K, stride_x_row=x.stride(0), stride_x_col=x.stride(1), stride_out_row=K, scale_cols=scale_cols, stride_out_t_row=M, scale_t_cols=scale_rows, NATIVE_E8M0=NATIVE_E8M0, num_warps=4, num_stages=2)
 
     return out, scale, out_t, scale_t
 
 
 @triton.jit
-def _fp8cast_blockwise_transpose_batched_kernel(
-    x_ptr, out_ptr, scale_ptr, out_t_ptr, scale_t_ptr, G, N, K, stride_x_g, stride_x_row, stride_x_col, stride_out_g, stride_out_row, scale_cols, stride_scale_g, stride_out_t_g, stride_out_t_row, scale_t_cols, stride_scale_t_g,
-    NATIVE_E8M0: tl.constexpr
-):
+def _fp8cast_blockwise_transpose_batched_kernel(x_ptr, out_ptr, scale_ptr, out_t_ptr, scale_t_ptr, G, N, K, stride_x_g, stride_x_row, stride_x_col, stride_out_g, stride_out_row, scale_cols, stride_scale_g, stride_out_t_g, stride_out_t_row, scale_t_cols, stride_scale_t_g, NATIVE_E8M0: tl.constexpr):
     """One 128x128 tile of expert pid(2): grid (ceil(N / 128), ceil(K / 128), G)."""
     BLOCK: tl.constexpr = 128
 
@@ -142,10 +136,7 @@ def fp8cast_blockwise_transpose_batched_sm100(x: torch.Tensor) -> tuple[torch.Te
 
     grid = (scale_rows, scale_cols, G)
 
-    _fp8cast_blockwise_transpose_batched_kernel[grid](
-        x_ptr=x, out_ptr=out, scale_ptr=scale, out_t_ptr=out_t, scale_t_ptr=scale_t, G=G, N=N, K=K, stride_x_g=x.stride(0), stride_x_row=x.stride(1), stride_x_col=x.stride(2), stride_out_g=N * K, stride_out_row=K,
-        scale_cols=scale_cols, stride_scale_g=scale_rows * scale_cols, stride_out_t_g=K * N, stride_out_t_row=N, scale_t_cols=scale_rows, stride_scale_t_g=scale_cols * scale_rows, NATIVE_E8M0=NATIVE_E8M0, num_warps=4, num_stages=2
-    )
+    _fp8cast_blockwise_transpose_batched_kernel[grid](x_ptr=x, out_ptr=out, scale_ptr=scale, out_t_ptr=out_t, scale_t_ptr=scale_t, G=G, N=N, K=K, stride_x_g=x.stride(0), stride_x_row=x.stride(1), stride_x_col=x.stride(2), stride_out_g=N * K, stride_out_row=K, scale_cols=scale_cols, stride_scale_g=scale_rows * scale_cols, stride_out_t_g=K * N, stride_out_t_row=N, scale_t_cols=scale_rows, stride_scale_t_g=scale_cols * scale_rows, NATIVE_E8M0=NATIVE_E8M0, num_warps=4, num_stages=2)
 
     return out, scale, out_t, scale_t
 

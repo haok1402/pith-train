@@ -29,7 +29,6 @@ def bf16_expert_group_slots(expert_idxs: torch.Tensor, expand_idx: torch.Tensor 
     - Exact and deterministic; no host sync. S == 0 gives zero cu_seqlens (and mask).
     """
     from pithtrain.kernels.bf16_expert_slots_sm90 import bf16_expert_group_slots_sm90
-
     return bf16_expert_group_slots_sm90(expert_idxs, expand_idx, num_groups, num_tokens)
 
 
@@ -39,7 +38,6 @@ def bf16_expert_gather_rows(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     multiple of 8) and int32 row indices idx.
     """
     from pithtrain.kernels.bf16_expert_slots_sm90 import bf16_expert_gather_rows_sm90
-
     return bf16_expert_gather_rows_sm90(x, idx)
 
 
@@ -56,7 +54,6 @@ def bf16_expert_gather_sum(grad: torch.Tensor, maps: NamedTuple, num_groups: int
     Deterministic.
     """
     from pithtrain.kernels.bf16_expert_slots_sm90 import bf16_expert_gather_sum_sm90
-
     return bf16_expert_gather_sum_sm90(grad, maps, num_groups, max_slots)
 
 
@@ -72,5 +69,4 @@ def expert_slot_segment_sum(x: torch.Tensor, cu_host: list[int], cu: torch.Tenso
       fp32, then the chunk sums added in order; deterministic. An empty segment sums to zero.
     """
     from pithtrain.kernels.bf16_expert_slots_sm90 import expert_slot_segment_sum_sm90
-
     return expert_slot_segment_sum_sm90(x, cu_host, cu, idx)

@@ -18,10 +18,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from pithtrain.kernels.arch import sm_count
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import (
-    abs2, asm_args_last, bf16_hi, bf16_lo, bf16_sel, cp_async16, f32_as_u32, ld_b32_coherent, lds_b32_pred, lds_v4, max2, pack_bf16, prmt_args_last, selp_args_last, st_f32, st_v2_args_last, st_v4_args_last, sts_b32_nopred, sts_v4, to_ir, u32_as_f32,
-    unpack,
-)
+from pithtrain.kernels.cute_ptx_sm90 import abs2, asm_args_last, bf16_hi, bf16_lo, bf16_sel, cp_async16, f32_as_u32, ld_b32_coherent, lds_b32_pred, lds_v4, max2, pack_bf16, prmt_args_last, selp_args_last, st_f32, st_v2_args_last, st_v4_args_last, sts_b32_nopred, sts_v4, to_ir, u32_as_f32, unpack
 from pithtrain.kernels.fp8_e8m0_scale_sm90 import e8m0_scale_f32, quant4_e4m3
 from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import fp8cast_rowwise_kmajor_sm90
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale, mn_pad
@@ -108,22 +105,7 @@ class SiluMulQuant:
         self.stage_bytes = self.n_in * 4 * THREADS * 16
 
     @cute.jit
-    def __call__(
-        self,
-        mDh: cute.Tensor,
-        mG: cute.Tensor,
-        mU: cute.Tensor,
-        mOffs: cute.Tensor,
-        mTok0: cute.Tensor,
-        mTokS0: cute.Tensor,
-        mKm0: cute.Tensor,
-        mKmS0: cute.Tensor,
-        mTok1: cute.Tensor,
-        mTokS1: cute.Tensor,
-        mKm1: cute.Tensor,
-        mKmS1: cute.Tensor,
-        stream,
-    ):
+    def __call__(self, mDh: cute.Tensor, mG: cute.Tensor, mU: cute.Tensor, mOffs: cute.Tensor, mTok0: cute.Tensor, mTokS0: cute.Tensor, mKm0: cute.Tensor, mKmS0: cute.Tensor, mTok1: cute.Tensor, mTokS1: cute.Tensor, mKm1: cute.Tensor, mKmS1: cute.Tensor, stream):
         total = (mG.shape[0] // BLOCK) * self.NB
         self.kernel(mDh, mG, mU, mOffs, mTok0, mTokS0, mKm0, mKmS0, mTok1, mTokS1, mKm1, mKmS1).launch(grid=[cutlass.min(total, self.num_ctas), 1, 1], block=[THREADS, 1, 1], stream=stream)
 

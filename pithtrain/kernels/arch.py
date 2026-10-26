@@ -13,12 +13,6 @@ NATIVE_E8M0 = ARCH_MAJOR >= 10
 """Whether the E8M0 FP8 scale has a native PTX conversion (SM100+); SM90 emulates it."""
 
 
-@functools.cache
-def is_sm90() -> bool:
-    """Whether the current device is SM90, which selects the _sm90 kernels."""
-    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
-
-
 def is_sm90_device(device_index: int) -> bool:
     """Whether device device_index is SM90. Uncached, so a test can patch the probe."""
     return torch.cuda.get_device_capability(device_index)[0] == 9

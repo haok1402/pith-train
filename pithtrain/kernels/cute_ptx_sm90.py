@@ -57,10 +57,7 @@ def ld_b32(addr: Int64, pred: Int32, other: Int32, *, loc=None, ip=None) -> Int3
 
 @dsl_user_op
 def st_v2(addr: Int64, a: Uint32, b: Uint32, pred: Int32, *, loc=None, ip=None) -> None:
-    asm(
-        None, [Int64(addr).ir_value(loc=loc, ip=ip), Uint32(a).ir_value(loc=loc, ip=ip), Uint32(b).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip)],
-        "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $3, 0;\n\t@p st.global.v2.b32 [$0], {$1, $2};\n\t}", "l,r,r,r", side_effects=True,
-    )
+    asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Uint32(a).ir_value(loc=loc, ip=ip), Uint32(b).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip)], "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $3, 0;\n\t@p st.global.v2.b32 [$0], {$1, $2};\n\t}", "l,r,r,r", side_effects=True)
 
 
 @dsl_user_op
@@ -230,10 +227,7 @@ def f32x2_to_bf16x2(lo, hi, *, loc=None, ip=None) -> Uint32:
 
 @dsl_user_op
 def st_v4(addr: Int64, v: tuple, pred: Int32, *, loc=None, ip=None) -> None:
-    asm(
-        None, [Int64(addr).ir_value(loc=loc, ip=ip)] + [Uint32(x).ir_value(loc=loc, ip=ip) for x in v] + [Int32(pred).ir_value(loc=loc, ip=ip)],
-        "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $5, 0;\n\t@p st.global.v4.b32 [$0], {$1, $2, $3, $4};\n\t}", "l,r,r,r,r,r", side_effects=True,
-    )
+    asm(None, [Int64(addr).ir_value(loc=loc, ip=ip)] + [Uint32(x).ir_value(loc=loc, ip=ip) for x in v] + [Int32(pred).ir_value(loc=loc, ip=ip)], "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $5, 0;\n\t@p st.global.v4.b32 [$0], {$1, $2, $3, $4};\n\t}", "l,r,r,r,r,r", side_effects=True)
 
 
 @dsl_user_op

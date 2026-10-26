@@ -26,7 +26,6 @@ def bf16_expert_gated_forward(x, w_gate, w_up, cu, a_idx, bias=None, act=()):
     M == 0 launches nothing. Deterministic.
     """
     from pithtrain.kernels.bf16_expert_gemm_sm90 import bf16_expert_gated_forward_sm90
-
     return bf16_expert_gated_forward_sm90(x, w_gate, w_up, cu, a_idx, bias, act)
 
 
@@ -43,7 +42,6 @@ def bf16_expert_down_forward_scattered(h, w_down, cu, slot_of, bias=None):
     M == 0 launches nothing. Deterministic.
     """
     from pithtrain.kernels.bf16_expert_gemm_sm90 import bf16_expert_down_forward_scattered_sm90
-
     return bf16_expert_down_forward_scattered_sm90(h, w_down, cu, slot_of, bias)
 
 
@@ -64,7 +62,6 @@ def bf16_expert_dgated_backward(dy, w_down, preact, cu, slot_of, w_gate, w_up, a
     M == 0 launches nothing. Deterministic.
     """
     from pithtrain.kernels.bf16_expert_gemm_sm90 import bf16_expert_dgated_backward_sm90
-
     return bf16_expert_dgated_backward_sm90(dy, w_down, preact, cu, slot_of, w_gate, w_up, act)
 
 
@@ -80,7 +77,6 @@ def bf16_expert_dgrad(dpre, w_gate, w_up, cu, dpre_swapped):
     M == 0 launches nothing. Deterministic.
     """
     from pithtrain.kernels.bf16_expert_gemm_sm90 import bf16_expert_dgrad_sm90
-
     return bf16_expert_dgrad_sm90(dpre, w_gate, w_up, cu, dpre_swapped)
 
 
@@ -97,7 +93,6 @@ def bf16_expert_wgrad_gate_up(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a_idx):
     M == 0 is a no-op. Deterministic.
     """
     from pithtrain.kernels.bf16_expert_gemm_sm90 import bf16_expert_wgrad_gate_up_sm90
-
     return bf16_expert_wgrad_gate_up_sm90(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a_idx)
 
 
@@ -113,5 +108,4 @@ def bf16_expert_wgrad_down(dy, h, mg_down, cu, slot_of):
     M == 0 is a no-op. Deterministic.
     """
     from pithtrain.kernels.bf16_expert_gemm_sm90 import bf16_expert_wgrad_down_sm90
-
     return bf16_expert_wgrad_down_sm90(dy, h, mg_down, cu, slot_of)

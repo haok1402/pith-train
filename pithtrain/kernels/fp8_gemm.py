@@ -13,16 +13,13 @@ from typing import Tuple
 import deep_gemm
 import torch
 
-from pithtrain.kernels.arch import ARCH_MAJOR, is_sm90
+from pithtrain.kernels.arch import ARCH_MAJOR
 from pithtrain.kernels.fp8_rowwise_blockwise_transpose import fp8cast_rowwise_blockwise_transpose
 from pithtrain.kernels.fp8_rowwise_colwise import fp8cast_rowwise_colwise
 from pithtrain.kernels.fp8_rowwise_kmajor import fp8cast_rowwise_kmajor
 from pithtrain.kernels.fp8_rowwise_transpose import fp8cast_rowwise_transpose
 
-__all__ = [
-    "K_GROUPED_MAX_ROWS", "fp8_act_weight_gemm", "fp8_dgrad_wgrad", "fp8_fused_experts_supported", "fp8_gemm_nt", "fp8_grouped_wgrad_buffer", "fp8_m_grouped_gemm", "k_grouped_fp8_gemm",
-    "k_grouped_fp8_gemm_nt", "k_grouped_runs_transposed", "k_grouped_safe_size", "m_grouped_fp8_gemm_nt", "m_grouped_group_indices", "pad_k_major_channels", "quantize_grouped_input"
-]
+__all__ = ["K_GROUPED_MAX_ROWS", "fp8_act_weight_gemm", "fp8_dgrad_wgrad", "fp8_fused_experts_supported", "fp8_gemm_nt", "fp8_grouped_wgrad_buffer", "fp8_m_grouped_gemm", "k_grouped_fp8_gemm", "k_grouped_fp8_gemm_nt", "k_grouped_runs_transposed", "k_grouped_safe_size", "m_grouped_fp8_gemm_nt", "m_grouped_group_indices", "pad_k_major_channels", "quantize_grouped_input"]
 
 
 def fp8_gemm_nt(a_fp8: torch.Tensor, a_scale: torch.Tensor, b_fp8: torch.Tensor, b_scale: torch.Tensor, m: int, n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -77,12 +74,15 @@ def fp8_dgrad_wgrad(grad_2d: torch.Tensor, weight_t_fp8: torch.Tensor, scale_wei
 
 def m_grouped_fp8_gemm_nt(a, b, d, grouped_mm_offs, M, group_indices=None):
     """m-grouped FP8 GEMM NT into d; on SM90 group_indices is computed when None."""
-    if ARCH_MAJOR >= 10:
-        deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, grouped_mm_offs, use_psum_layout=True, expected_m_for_psum_layout=M)
-    else:
-        if group_indices is None:
-            group_indices = m_grouped_group_indices(grouped_mm_offs, M)
-        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a, b, d, group_indices)
+    match ARCH_MAJOR:
+        case 9:
+            if group_indices is None:
+                group_indices = m_grouped_group_indices(grouped_mm_offs, M)
+            deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a, b, d, group_indices)
+        case 10:
+            deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, grouped_mm_offs, use_psum_layout=True, expected_m_for_psum_layout=M)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 K_GROUPED_MAX_ROWS = 65536
@@ -208,22 +208,26 @@ def k_grouped_fp8_gemm(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tens
     - Either operand may have more channels than d (zero-padded, as the fused ops' padded=True
       writes it); the extra channels are dropped. Only the SM90 fused ops produce such operands.
     """
-    if ARCH_MAJOR >= 10:
-        deep_gemm.k_grouped_fp8_gemm_tn_contiguous(a, b, d, ks, ks_tensor, c=d)
-        return
-    G, N, K = d.shape
-    NA, KB = a[1].shape[0], b[1].shape[0]
-    if (NA, KB) == (N, K):
-        k_grouped_fp8_gemm_nt(a, b, d, ks, ks_tensor, c=d)
-        return
-    if NA % 256 != 0 and KB % 256 == 0:
-        c = torch.zeros((G, KB, NA), device=d.device, dtype=torch.float32)
-        k_grouped_fp8_gemm_nt(b, a, c, ks, ks_tensor, c=c)
-        d.add_(c[:, :K, :N].transpose(1, 2))
-    else:
-        c = torch.zeros((G, NA, KB), device=d.device, dtype=torch.float32)
-        k_grouped_fp8_gemm_nt(a, b, c, ks, ks_tensor, c=c)
-        d.add_(c[:, :N, :K])
+    match ARCH_MAJOR:
+        case 9:
+            G, N, K = d.shape
+            NA, KB = a[1].shape[0], b[1].shape[0]
+            if (NA, KB) == (N, K):
+                k_grouped_fp8_gemm_nt(a, b, d, ks, ks_tensor, c=d)
+                return
+            if NA % 256 != 0 and KB % 256 == 0:
+                c = torch.zeros((G, KB, NA), device=d.device, dtype=torch.float32)
+                k_grouped_fp8_gemm_nt(b, a, c, ks, ks_tensor, c=c)
+                d.add_(c[:, :K, :N].transpose(1, 2))
+            else:
+                c = torch.zeros((G, NA, KB), device=d.device, dtype=torch.float32)
+                k_grouped_fp8_gemm_nt(a, b, c, ks, ks_tensor, c=c)
+                d.add_(c[:, :N, :K])
+        case 10:
+            deep_gemm.k_grouped_fp8_gemm_tn_contiguous(a, b, d, ks, ks_tensor, c=d)
+            return
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def fp8_grouped_wgrad_buffer(size: torch.Size, device: torch.device) -> torch.Tensor:
@@ -232,7 +236,7 @@ def fp8_grouped_wgrad_buffer(size: torch.Size, device: torch.device) -> torch.Te
     k_grouped_fp8_gemm accumulates into it in place: a transposed view of (G, K, N) storage where
     SM90 computes the product transposed, otherwise contiguous.
     """
-    if len(size) == 3 and is_sm90():
+    if len(size) == 3 and ARCH_MAJOR == 9:
         g, n, k = size
         if k_grouped_runs_transposed(n, k):
             return torch.empty((g, k, n), dtype=torch.float32, device=device).transpose(1, 2)
@@ -244,7 +248,7 @@ def fp8_fused_experts_supported() -> bool:
     Whether the fused FP8 expert ops run on this device (the activation-fused quantizations,
     scatter_quant, the fused dense SwiGLU MLP): True on SM90 only.
     """
-    return is_sm90()
+    return ARCH_MAJOR == 9
 
 
 def quantize_grouped_input(input: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -263,9 +267,13 @@ def quantize_grouped_input(input: torch.Tensor, grouped_mm_offs: torch.Tensor) -
     Per 128-element block, scale = the power of two at or above max(amax, 1e-4) / 448 (at least
     2^-126) and fp8 = e4m3_satfinite(x / scale).
     """
-    if ARCH_MAJOR >= 10:
-        return fp8cast_rowwise_colwise(input)
-    return fp8cast_rowwise_kmajor(input, grouped_mm_offs)
+    match ARCH_MAJOR:
+        case 9:
+            return fp8cast_rowwise_kmajor(input, grouped_mm_offs)
+        case 10:
+            return fp8cast_rowwise_colwise(input)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def fp8_m_grouped_gemm(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tensor, torch.Tensor], n: int, grouped_mm_offs: torch.Tensor, group_indices: torch.Tensor | None = None) -> torch.Tensor:
@@ -302,10 +310,9 @@ def m_grouped_group_indices(grouped_mm_offs: torch.Tensor, M: int) -> torch.Tens
     On SM90: int32 (M,) per-row group ids, e.g. grouped_mm_offs = [128, 256, 384, 512] gives
     [0, ..., 1, ..., 2, ..., 3, ...]; rows at or past the last offset get the last group.
     """
-    if not is_sm90():
+    if ARCH_MAJOR != 9:
         return None
     from pithtrain.kernels import group_indices_sm90 as cgi
-
     if cgi.supports_group_indices(grouped_mm_offs, M):
         return cgi.group_indices(grouped_mm_offs, M)
     row_indices = torch.arange(M, device=grouped_mm_offs.device)

@@ -7,7 +7,8 @@ enforces the package layering (AGENTS.md, "Kernels"), the ``_sm90`` / ``_sm100``
 of ``pithtrain/kernels/`` and its black-box interface:
 
 - ``kernels/`` is flat; its ``__init__.py`` holds only ``from pithtrain.kernels.<module> import
-  <names>`` lines and ``__all__``, which lists exactly the imported names, each defined at the top
+  <names>`` lines and ``__all__`` (a list built by ``__all__.append`` calls), which lists exactly
+  the imported names, each defined at the top
   level of its module (no ``_sm100`` module, no private name); ``operators/__init__.py`` is empty;
 - outside ``kernels/`` the only import of the kernel library is ``from pithtrain.kernels import
   <name>`` with ``<name>`` in ``__all__`` (no submodule, no ``import pithtrain.kernels``);
@@ -115,7 +116,13 @@ def _exports() -> tuple[dict[str, list[str]], list[str], list[str]]:
             exports.setdefault(stem, []).extend(a.name for a in node.names if a.asname is None)
             other.extend(f"alias {a.name}" for a in node.names if a.asname is not None)
         elif isinstance(node, ast.Assign) and [getattr(t, "id", None) for t in node.targets] == ["__all__"]:  # fmt: skip
-            all_names = ast.literal_eval(node.value)
+            all_names = list(ast.literal_eval(node.value))
+        elif (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and ast.unparse(node.value.func) == "__all__.append"
+        ):
+            all_names.append(ast.literal_eval(node.value.args[0]))
         elif not (i == 0 and isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)):
             other.append(ast.dump(node)[:60])
     return exports, all_names, other

@@ -172,7 +172,6 @@ def _scale_bits(amax_bits: Uint32, *, loc=None, ip=None) -> Uint32:
 
 def _f32_hex(x: float) -> str:
     import struct
-
     return struct.pack(">f", x).hex().upper()
 
 
@@ -427,10 +426,7 @@ def _compile_blockwise(dtype: torch.dtype, mode: str, batched: bool):
     if fn is None:
         nd = 3 if batched else 2
         in_bytes = torch.tensor([], dtype=dtype).element_size()
-        fn = cute.compile(
-            _BlockwiseTranspose(in_bytes, mode, batched), _fake(TORCH2CUTE[dtype], nd, in_bytes),
-            _fake(cutlass.Float8E4M3FN, nd, 1), _fake(cutlass.Float32, nd, 4), _fake(cutlass.Float8E4M3FN, nd, 1), _fake(cutlass.Float32, nd, 4), fake_stream(), options="--enable-tvm-ffi",
-        )
+        fn = cute.compile(_BlockwiseTranspose(in_bytes, mode, batched), _fake(TORCH2CUTE[dtype], nd, in_bytes), _fake(cutlass.Float8E4M3FN, nd, 1), _fake(cutlass.Float32, nd, 4), _fake(cutlass.Float8E4M3FN, nd, 1), _fake(cutlass.Float32, nd, 4), fake_stream(), options="--enable-tvm-ffi")
         _COMPILED[key] = fn
     return fn
 
@@ -569,9 +565,7 @@ class _ShardTile:
         trs = row_offset // BLOCK
         tre = (row_offset + local_rows + BLOCK - 1) // BLOCK
         ct = (K + BLOCK - 1) // BLOCK
-        self.kernel(
-            mShard.iterator.toint(), mAmax.iterator.toint(), mOut.iterator.toint(), Int32(local_rows), Int32(K), Int32(trs), Int32(mAmax.shape[1]), Int32(mAmax.shape[2]), row_offset, group_offset
-        ).launch(grid=[tre - trs, ct, g_local], block=[NUM_THREADS, 1, 1], stream=stream)
+        self.kernel(mShard.iterator.toint(), mAmax.iterator.toint(), mOut.iterator.toint(), Int32(local_rows), Int32(K), Int32(trs), Int32(mAmax.shape[1]), Int32(mAmax.shape[2]), row_offset, group_offset).launch(grid=[tre - trs, ct, g_local], block=[NUM_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, shard: Int64, amax: Int64, out: Int64, local_rows: Int32, K: Int32, trs: Int32, R: Int32, C: Int32, row_offset: Int32, group_offset: Int32):

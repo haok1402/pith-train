@@ -196,11 +196,7 @@ def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num
 
     BLOCK_H = 256
     NUM_H_BLOCKS = triton.cdiv(hidden_size, BLOCK_H)
-    _scatter_for_grouped_gemm_kernel[(m,)](
-        input_tokens, expert_idxs, grouped_mm_offs, group_counts_2, group_counts_1,
-        output_tokens, reverse_shuffle_idxs, hidden_size, input_tokens.stride(0), output_tokens.stride(0), m, num_groups,
-        BLOCK_H=BLOCK_H, NUM_H_BLOCKS=NUM_H_BLOCKS, GEMM_ALLOC_ALIGNMENT=GEMM_ALLOC_ALIGNMENT
-    )
+    _scatter_for_grouped_gemm_kernel[(m,)](input_tokens, expert_idxs, grouped_mm_offs, group_counts_2, group_counts_1, output_tokens, reverse_shuffle_idxs, hidden_size, input_tokens.stride(0), output_tokens.stride(0), m, num_groups, BLOCK_H=BLOCK_H, NUM_H_BLOCKS=NUM_H_BLOCKS, GEMM_ALLOC_ALIGNMENT=GEMM_ALLOC_ALIGNMENT)
 
     if group_counts is not None:
         a = padding_alignment

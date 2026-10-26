@@ -7,8 +7,7 @@ MN-major (see fp8_scale_layout), SM100 row-major.
 
 import torch
 
-from pithtrain.kernels.arch import is_sm90
-from pithtrain.kernels.fp8_silu_mul_quant_sm100 import (silu_mul_bwd_quant_gu_sm100, silu_mul_bwd_quant_sm100, silu_mul_quant_fwd_sm100, silu_mul_quant_gu_fwd_sm100)
+from pithtrain.kernels.arch import ARCH_MAJOR
 
 __all__ = ["silu_mul_bwd_quant", "silu_mul_bwd_quant_gu", "silu_mul_quant_fwd", "silu_mul_quant_gu_fwd"]
 
@@ -42,11 +41,15 @@ def silu_mul_quant_fwd(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.
     Deterministic.
     """
     _check([g, u], grouped_mm_offs)
-    if is_sm90():
-        from pithtrain.kernels.fp8_silu_mul_quant_sm90 import silu_mul_quant_fwd_sm90
-
-        return silu_mul_quant_fwd_sm90(g, u, grouped_mm_offs)
-    return silu_mul_quant_fwd_sm100(g, u, grouped_mm_offs)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.fp8_silu_mul_quant_sm90 import silu_mul_quant_fwd_sm90
+            return silu_mul_quant_fwd_sm90(g, u, grouped_mm_offs)
+        case 10:
+            from pithtrain.kernels.fp8_silu_mul_quant_sm100 import silu_mul_quant_fwd_sm100
+            return silu_mul_quant_fwd_sm100(g, u, grouped_mm_offs)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def silu_mul_bwd_quant(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
@@ -60,11 +63,15 @@ def silu_mul_bwd_quant(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, group
     modified. Deterministic.
     """
     _check([dh, g, u], grouped_mm_offs)
-    if is_sm90():
-        from pithtrain.kernels.fp8_silu_mul_quant_sm90 import silu_mul_bwd_quant_sm90
-
-        return silu_mul_bwd_quant_sm90(dh, g, u, grouped_mm_offs)
-    return silu_mul_bwd_quant_sm100(dh, g, u, grouped_mm_offs)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.fp8_silu_mul_quant_sm90 import silu_mul_bwd_quant_sm90
+            return silu_mul_bwd_quant_sm90(dh, g, u, grouped_mm_offs)
+        case 10:
+            from pithtrain.kernels.fp8_silu_mul_quant_sm100 import silu_mul_bwd_quant_sm100
+            return silu_mul_bwd_quant_sm100(dh, g, u, grouped_mm_offs)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def silu_mul_quant_gu_fwd(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -75,11 +82,15 @@ def silu_mul_quant_gu_fwd(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tu
     grouped_mm_offs).
     """
     _check_gu(gu, grouped_mm_offs)
-    if is_sm90():
-        from pithtrain.kernels.fp8_silu_mul_quant_sm90 import silu_mul_quant_gu_fwd_sm90
-
-        return silu_mul_quant_gu_fwd_sm90(gu, grouped_mm_offs)
-    return silu_mul_quant_gu_fwd_sm100(gu, grouped_mm_offs)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.fp8_silu_mul_quant_sm90 import silu_mul_quant_gu_fwd_sm90
+            return silu_mul_quant_gu_fwd_sm90(gu, grouped_mm_offs)
+        case 10:
+            from pithtrain.kernels.fp8_silu_mul_quant_sm100 import silu_mul_quant_gu_fwd_sm100
+            return silu_mul_quant_gu_fwd_sm100(gu, grouped_mm_offs)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def silu_mul_bwd_quant_gu(dh: torch.Tensor, gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -93,8 +104,12 @@ def silu_mul_bwd_quant_gu(dh: torch.Tensor, gu: torch.Tensor, grouped_mm_offs: t
     _check_gu(gu, grouped_mm_offs)
     assert dh.dtype == torch.bfloat16 and dh.is_contiguous()
     assert dh.shape == (gu.shape[0], gu.shape[1] // 2)
-    if is_sm90():
-        from pithtrain.kernels.fp8_silu_mul_quant_sm90 import silu_mul_bwd_quant_gu_sm90
-
-        return silu_mul_bwd_quant_gu_sm90(dh, gu, grouped_mm_offs)
-    return silu_mul_bwd_quant_gu_sm100(dh, gu, grouped_mm_offs)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.fp8_silu_mul_quant_sm90 import silu_mul_bwd_quant_gu_sm90
+            return silu_mul_bwd_quant_gu_sm90(dh, gu, grouped_mm_offs)
+        case 10:
+            from pithtrain.kernels.fp8_silu_mul_quant_sm100 import silu_mul_bwd_quant_gu_sm100
+            return silu_mul_bwd_quant_gu_sm100(dh, gu, grouped_mm_offs)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")

@@ -14,7 +14,7 @@ from cutlass import Int32, Int64, Uint32
 
 from pithtrain.kernels.arch import sm_count
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import (atom_add_u64, atom_add_u64_pred, fence_gpu, lanemask_lt, ld_b32, ld_relaxed, lds_b32, red_add_shared, red_or_shared, spin_epoch, st_b32, st_b64, sts_b32)
+from pithtrain.kernels.cute_ptx_sm90 import atom_add_u64, atom_add_u64_pred, fence_gpu, lanemask_lt, ld_b32, ld_relaxed, lds_b32, red_add_shared, red_or_shared, spin_epoch, st_b32, st_b64, sts_b32
 from pithtrain.kernels.ep_dispatch_sm100 import expert_and_expand_idx_sm100, fused_dedup_prepare_dispatch_sm100
 
 __all__ = ["dispatch_index", "expand_index", "expert_and_expand_idx_sm90", "fused_dedup_prepare_dispatch_sm90", "supports_expand", "supports_index"]
@@ -353,10 +353,7 @@ def _scratch(device: torch.device, chunks: int, bins: int) -> _Scratch:
 
 def _compile_index(k: int, ep_size: int, experts_per_rank: int, max_ctas: int) -> Callable:
     i32, i64 = Int32, Int64
-    return cute.compile(
-        _DispatchIndex(k, ep_size, experts_per_rank, max_ctas), fake(i64, (cute.sym_int(), k), (cute.sym_int64(), 1), 8), fake(i64, (cute.sym_int(),), (1,), 8), fake(i64, (2 * ep_size,), (1,), 8), fake(i32, (cute.sym_int(),), (1,), 4),
-        fake(i64, (1,), (1,), 8), fake_stream(), options="--enable-tvm-ffi",
-    )
+    return cute.compile(_DispatchIndex(k, ep_size, experts_per_rank, max_ctas), fake(i64, (cute.sym_int(), k), (cute.sym_int64(), 1), 8), fake(i64, (cute.sym_int(),), (1,), 8), fake(i64, (2 * ep_size,), (1,), 8), fake(i32, (cute.sym_int(),), (1,), 4), fake(i64, (1,), (1,), 8), fake_stream(), options="--enable-tvm-ffi")
 
 
 def supports_index(topk_ids: torch.Tensor, ep_size: int, experts_per_rank: int) -> bool:

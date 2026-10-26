@@ -87,9 +87,6 @@ def fp8cast_rowwise_transpose_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torc
     _BLOCK_N = 128
     grid = ((M + BLOCK - 1) // BLOCK, (N + _BLOCK_N - 1) // _BLOCK_N)
 
-    _fp8cast_rowwise_transpose_kernel[grid](
-        x_ptr=x, out_tok_ptr=out_tok, scale_tok_ptr=scale_tok, out_t_ptr=out_t, scale_t_ptr=scale_t, M=M, N=N, stride_x_row=x.stride(0), stride_x_col=x.stride(1),
-        stride_out_tok_row=N, scale_tok_cols=scale_tok_cols, stride_out_t_row=M, stride_scale_t_row=scale_t_cols, BLOCK_N=_BLOCK_N, NATIVE_E8M0=NATIVE_E8M0, num_warps=4, num_stages=2
-    )
+    _fp8cast_rowwise_transpose_kernel[grid](x_ptr=x, out_tok_ptr=out_tok, scale_tok_ptr=scale_tok, out_t_ptr=out_t, scale_t_ptr=scale_t, M=M, N=N, stride_x_row=x.stride(0), stride_x_col=x.stride(1), stride_out_tok_row=N, scale_tok_cols=scale_tok_cols, stride_out_t_row=M, stride_scale_t_row=scale_t_cols, BLOCK_N=_BLOCK_N, NATIVE_E8M0=NATIVE_E8M0, num_warps=4, num_stages=2)
 
     return out_tok, scale_tok, out_t, scale_t

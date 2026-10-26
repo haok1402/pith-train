@@ -198,13 +198,7 @@ def _dispatch_scratch(device: torch.device, m: int, num_ctas: int, ne_padded: in
     return views
 
 
-def fused_dedup_prepare_dispatch_sm100(
-    topk_ids: torch.Tensor,
-    num_experts: int,
-    ep_size: int,
-    experts_per_rank: int,
-    meta_out: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fused_dedup_prepare_dispatch_sm100(topk_ids: torch.Tensor, num_experts: int, ep_size: int, experts_per_rank: int, meta_out: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The Triton path of fused_dedup_prepare_dispatch (atomic order within each bucket)."""
     m, k = topk_ids.shape
     device = topk_ids.device
@@ -226,22 +220,13 @@ def fused_dedup_prepare_dispatch_sm100(
 
     (per_cta_expert_hist, per_cta_gpu_hist, expert_starts, gpu_starts, dedup_counters, sort_counters, send_meta, dedup_local_pos) = _dispatch_scratch(device, m, num_ctas, ne_padded, ep_padded, num_experts, ep_size, experts_per_rank)
 
-    _dedup_bincount_kernel[(num_ctas,)](
-        topk_ids,
-        per_cta_expert_hist, per_cta_gpu_hist, m, topk_ids.stride(0),
-        K=k, EP_SIZE=ep_size, EXPERTS_PER_RANK=experts_per_rank, NUM_EXPERTS=num_experts, NE_PADDED=ne_padded, EP_PADDED=ep_padded, BLOCK=BLOCK
-    )
+    _dedup_bincount_kernel[(num_ctas,)](topk_ids, per_cta_expert_hist, per_cta_gpu_hist, m, topk_ids.stride(0), K=k, EP_SIZE=ep_size, EXPERTS_PER_RANK=experts_per_rank, NUM_EXPERTS=num_experts, NE_PADDED=ne_padded, EP_PADDED=ep_padded, BLOCK=BLOCK)
 
     if meta_out is None:
         meta_out = torch.empty(2 * ep_size, dtype=torch.int64, device=device)
     tokens_per_ep_rank, dedup_tokens_per_gpu = meta_out[:ep_size], meta_out[ep_size : 2 * ep_size]
 
-    _reduce_and_prefix_sum_kernel[(1,)](
-        per_cta_expert_hist, per_cta_gpu_hist,
-        dedup_tokens_per_gpu, tokens_per_ep_rank, expert_starts, gpu_starts,
-        dedup_counters, sort_counters, send_meta,
-        NUM_CTAS=num_ctas, NE_PADDED=ne_padded, EP_PADDED=ep_padded, NUM_EXPERTS=num_experts, EP_SIZE=ep_size, EXPERTS_PER_RANK=experts_per_rank
-    )
+    _reduce_and_prefix_sum_kernel[(1,)](per_cta_expert_hist, per_cta_gpu_hist, dedup_tokens_per_gpu, tokens_per_ep_rank, expert_starts, gpu_starts, dedup_counters, sort_counters, send_meta, NUM_CTAS=num_ctas, NE_PADDED=ne_padded, EP_PADDED=ep_padded, NUM_EXPERTS=num_experts, EP_SIZE=ep_size, EXPERTS_PER_RANK=experts_per_rank)
 
     dispatch_token_idxs = torch.empty(m * ep_size, dtype=torch.int64, device=device)
     idxs = torch.empty(m * k, dtype=torch.int64, device=device)
@@ -249,12 +234,7 @@ def fused_dedup_prepare_dispatch_sm100(
 
     BLOCK_M = 128
     grid = (triton.cdiv(m, BLOCK_M),)
-    _dedup_scatter_expand_kernel[grid](
-        topk_ids, expert_starts, gpu_starts,
-        dedup_counters, sort_counters,
-        dispatch_token_idxs, dedup_local_pos, idxs, expand_idx, m, topk_ids.stride(0),
-        K=k, EP_SIZE=ep_size, EXPERTS_PER_RANK=experts_per_rank, BLOCK_M=BLOCK_M
-    )
+    _dedup_scatter_expand_kernel[grid](topk_ids, expert_starts, gpu_starts, dedup_counters, sort_counters, dispatch_token_idxs, dedup_local_pos, idxs, expand_idx, m, topk_ids.stride(0), K=k, EP_SIZE=ep_size, EXPERTS_PER_RANK=experts_per_rank, BLOCK_M=BLOCK_M)
 
     return (tokens_per_ep_rank, dedup_tokens_per_gpu, dispatch_token_idxs, idxs, expand_idx, send_meta)
 

@@ -473,9 +473,7 @@ def _compile(vec_n: bool, m_align: int) -> Callable:
     def mn_major(rows, cols):
         return cute.runtime.make_fake_tensor(cutlass.Float32, (rows, cols), stride=(1, cute.sym_int64()), assumed_align=16)
 
-    return cute.compile(
-        _launch, fake(cutlass.BFloat16, (m, n), 16 if vec_n else 2), fake(cutlass.Float8E4M3FN, (m, n), 16), mn_major(m, sn), fake(cutlass.Float8E4M3FN, (n, m), 16), mn_major(n, sm), fake_stream(), vec_n, m_align, options="--enable-tvm-ffi"
-    )
+    return cute.compile(_launch, fake(cutlass.BFloat16, (m, n), 16 if vec_n else 2), fake(cutlass.Float8E4M3FN, (m, n), 16), mn_major(m, sn), fake(cutlass.Float8E4M3FN, (n, m), 16), mn_major(n, sm), fake_stream(), vec_n, m_align, options="--enable-tvm-ffi")
 
 
 def _get_compiled(key: tuple[bool, int]) -> Callable:

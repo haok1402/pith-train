@@ -7,8 +7,7 @@ kernels of ep_dispatch_sm100.
 
 import torch
 
-from pithtrain.kernels.arch import is_sm90
-from pithtrain.kernels.ep_dispatch_sm100 import expert_and_expand_idx_sm100, fused_dedup_prepare_dispatch_sm100
+from pithtrain.kernels.arch import ARCH_MAJOR
 
 __all__ = ["expert_and_expand_idx", "fused_dedup_prepare_dispatch"]
 
@@ -40,11 +39,15 @@ def fused_dedup_prepare_dispatch(topk_ids: torch.Tensor, num_experts: int, ep_si
     inputs the CuTe kernel does not cover (e.g. more than 1024 experts + ranks). Counts and
     per-bucket sets are identical on both. m == 0 gives zero counts and empty index outputs.
     """
-    if is_sm90():
-        from pithtrain.kernels.ep_dispatch_sm90 import fused_dedup_prepare_dispatch_sm90
-
-        return fused_dedup_prepare_dispatch_sm90(topk_ids, num_experts, ep_size, experts_per_rank, meta_out)
-    return fused_dedup_prepare_dispatch_sm100(topk_ids, num_experts, ep_size, experts_per_rank, meta_out)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.ep_dispatch_sm90 import fused_dedup_prepare_dispatch_sm90
+            return fused_dedup_prepare_dispatch_sm90(topk_ids, num_experts, ep_size, experts_per_rank, meta_out)
+        case 10:
+            from pithtrain.kernels.ep_dispatch_sm100 import fused_dedup_prepare_dispatch_sm100
+            return fused_dedup_prepare_dispatch_sm100(topk_ids, num_experts, ep_size, experts_per_rank, meta_out)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def expert_and_expand_idx(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -61,8 +64,12 @@ def expert_and_expand_idx(recv_meta: torch.Tensor, received_expand_idx: torch.Te
     - expand_idx[i]: received_expand_idx[i] plus the dedup counts of the preceding senders, i.e.
       slot i's row in the concatenated received deduplicated tokens.
     """
-    if is_sm90():
-        from pithtrain.kernels.ep_dispatch_sm90 import expert_and_expand_idx_sm90
-
-        return expert_and_expand_idx_sm90(recv_meta, received_expand_idx, ep_size, experts_per_rank)
-    return expert_and_expand_idx_sm100(recv_meta, received_expand_idx, ep_size, experts_per_rank)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.ep_dispatch_sm90 import expert_and_expand_idx_sm90
+            return expert_and_expand_idx_sm90(recv_meta, received_expand_idx, ep_size, experts_per_rank)
+        case 10:
+            from pithtrain.kernels.ep_dispatch_sm100 import expert_and_expand_idx_sm100
+            return expert_and_expand_idx_sm100(recv_meta, received_expand_idx, ep_size, experts_per_rank)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")

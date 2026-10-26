@@ -10,8 +10,7 @@ fp8_fused_experts_supported().
 
 import torch
 
-from pithtrain.kernels.arch import is_sm90
-from pithtrain.kernels.fp8_clamped_swiglu_quant_sm100 import (clamped_swiglu_bwd_quant_sm100, clamped_swiglu_quant_fwd_sm100, clamped_swiglu_quant_kmajor_sm100, clamped_swiglu_quant_rowwise_sm100)
+from pithtrain.kernels.arch import ARCH_MAJOR
 from pithtrain.kernels.fp8_gemm import k_grouped_safe_size
 
 __all__ = ["clamped_swiglu_bwd_quant", "clamped_swiglu_quant_fwd", "clamped_swiglu_quant_kmajor", "clamped_swiglu_quant_rowwise"]
@@ -26,11 +25,15 @@ def _check(gate_up: torch.Tensor) -> None:
 def clamped_swiglu_quant_fwd(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """All four outputs (rowwise pair, K-major pair) of fp8cast_rowwise_kmajor(clamped_swiglu(gate_up + bias[group], alpha, limit), grouped_mm_offs)."""
     _check(gate_up)
-    if is_sm90():
-        from pithtrain.kernels.fp8_clamped_swiglu_quant_sm90 import clamped_swiglu_quant_fwd_sm90
-
-        return clamped_swiglu_quant_fwd_sm90(gate_up, bias, grouped_mm_offs, alpha, limit, kmajor_channels)
-    return clamped_swiglu_quant_fwd_sm100(gate_up, bias, grouped_mm_offs, alpha, limit, kmajor_channels)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.fp8_clamped_swiglu_quant_sm90 import clamped_swiglu_quant_fwd_sm90
+            return clamped_swiglu_quant_fwd_sm90(gate_up, bias, grouped_mm_offs, alpha, limit, kmajor_channels)
+        case 10:
+            from pithtrain.kernels.fp8_clamped_swiglu_quant_sm100 import clamped_swiglu_quant_fwd_sm100
+            return clamped_swiglu_quant_fwd_sm100(gate_up, bias, grouped_mm_offs, alpha, limit, kmajor_channels)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def clamped_swiglu_quant_rowwise(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -42,11 +45,15 @@ def clamped_swiglu_quant_rowwise(gate_up: torch.Tensor, bias: torch.Tensor, grou
     group. bias is bf16 (G, 2N), added in fp32 and rounded to bf16 before the activation; h is
     rounded to bf16 before quantization. h_scale strides are unspecified. Deterministic.
     """
-    if is_sm90():
-        from pithtrain.kernels.fp8_clamped_swiglu_quant_sm90 import clamped_swiglu_quant_rowwise_sm90
-
-        return clamped_swiglu_quant_rowwise_sm90(gate_up, bias, grouped_mm_offs, alpha, limit)
-    return clamped_swiglu_quant_rowwise_sm100(gate_up, bias, grouped_mm_offs, alpha, limit)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.fp8_clamped_swiglu_quant_sm90 import clamped_swiglu_quant_rowwise_sm90
+            return clamped_swiglu_quant_rowwise_sm90(gate_up, bias, grouped_mm_offs, alpha, limit)
+        case 10:
+            from pithtrain.kernels.fp8_clamped_swiglu_quant_sm100 import clamped_swiglu_quant_rowwise_sm100
+            return clamped_swiglu_quant_rowwise_sm100(gate_up, bias, grouped_mm_offs, alpha, limit)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def clamped_swiglu_quant_kmajor(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, padded: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
@@ -61,16 +68,18 @@ def clamped_swiglu_quant_kmajor(gate_up: torch.Tensor, bias: torch.Tensor, group
     unspecified. Deterministic.
     """
     kmajor_channels = k_grouped_safe_size(gate_up.shape[1] // 2) if padded else None
-    if is_sm90():
-        from pithtrain.kernels.fp8_clamped_swiglu_quant_sm90 import clamped_swiglu_quant_kmajor_sm90
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.fp8_clamped_swiglu_quant_sm90 import clamped_swiglu_quant_kmajor_sm90
+            return clamped_swiglu_quant_kmajor_sm90(gate_up, bias, grouped_mm_offs, alpha, limit, kmajor_channels)
+        case 10:
+            from pithtrain.kernels.fp8_clamped_swiglu_quant_sm100 import clamped_swiglu_quant_kmajor_sm100
+            return clamped_swiglu_quant_kmajor_sm100(gate_up, bias, grouped_mm_offs, alpha, limit, kmajor_channels)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
-        return clamped_swiglu_quant_kmajor_sm90(gate_up, bias, grouped_mm_offs, alpha, limit, kmajor_channels)
-    return clamped_swiglu_quant_kmajor_sm100(gate_up, bias, grouped_mm_offs, alpha, limit, kmajor_channels)
 
-
-def clamped_swiglu_bwd_quant(
-    dh: torch.Tensor, gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, padded: bool = False
-) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+def clamped_swiglu_bwd_quant(dh: torch.Tensor, gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, padded: bool = False) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
     """
     Backward of gpt-oss's biased clamped SwiGLU with its consumers' quantization: (dgu_quant, d_bias).
 
@@ -84,8 +93,12 @@ def clamped_swiglu_bwd_quant(
     """
     kmajor_channels = k_grouped_safe_size(gate_up.shape[1]) if padded else None
     assert dh.shape == (gate_up.shape[0], gate_up.shape[1] // 2), (dh.shape, gate_up.shape)
-    if is_sm90():
-        from pithtrain.kernels.fp8_clamped_swiglu_quant_sm90 import clamped_swiglu_bwd_quant_sm90
-
-        return clamped_swiglu_bwd_quant_sm90(dh, gate_up, bias, grouped_mm_offs, alpha, limit, kmajor_channels)
-    return clamped_swiglu_bwd_quant_sm100(dh, gate_up, bias, grouped_mm_offs, alpha, limit, kmajor_channels)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.fp8_clamped_swiglu_quant_sm90 import clamped_swiglu_bwd_quant_sm90
+            return clamped_swiglu_bwd_quant_sm90(dh, gate_up, bias, grouped_mm_offs, alpha, limit, kmajor_channels)
+        case 10:
+            from pithtrain.kernels.fp8_clamped_swiglu_quant_sm100 import clamped_swiglu_bwd_quant_sm100
+            return clamped_swiglu_bwd_quant_sm100(dh, gate_up, bias, grouped_mm_offs, alpha, limit, kmajor_channels)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")

@@ -14,10 +14,7 @@ __all__ = ["fp8cast_rowwise_blockwise_transpose_sm100"]
 
 
 @triton.jit
-def _fp8cast_rowwise_blockwise_transpose_kernel(
-    x_ptr, out_tok_ptr, scale_tok_ptr, out_blk_t_ptr, scale_blk_t_ptr, M, K, stride_x_row, stride_x_col, stride_out_tok_row, stride_scale_tok_row, stride_out_blk_t_row, scale_blk_t_cols,
-    NATIVE_E8M0: tl.constexpr
-):
+def _fp8cast_rowwise_blockwise_transpose_kernel(x_ptr, out_tok_ptr, scale_tok_ptr, out_blk_t_ptr, scale_blk_t_ptr, M, K, stride_x_row, stride_x_col, stride_out_tok_row, stride_scale_tok_row, stride_out_blk_t_row, scale_blk_t_cols, NATIVE_E8M0: tl.constexpr):
     """One 128x128 tile of x per program."""
     BLOCK: tl.constexpr = 128
 
@@ -83,9 +80,6 @@ def fp8cast_rowwise_blockwise_transpose_sm100(x: torch.Tensor) -> tuple[torch.Te
 
     grid = ((M + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK)
 
-    _fp8cast_rowwise_blockwise_transpose_kernel[grid](
-        x_ptr=x, out_tok_ptr=out_tok, scale_tok_ptr=scale_tok, out_blk_t_ptr=out_blk_t, scale_blk_t_ptr=scale_blk_t, M=M, K=K, stride_x_row=x.stride(0), stride_x_col=x.stride(1),
-        stride_out_tok_row=K, stride_scale_tok_row=scale_tok_cols, stride_out_blk_t_row=M, scale_blk_t_cols=scale_blk_t_cols, NATIVE_E8M0=NATIVE_E8M0, num_warps=4, num_stages=2
-    )
+    _fp8cast_rowwise_blockwise_transpose_kernel[grid](x_ptr=x, out_tok_ptr=out_tok, scale_tok_ptr=scale_tok, out_blk_t_ptr=out_blk_t, scale_blk_t_ptr=scale_blk_t, M=M, K=K, stride_x_row=x.stride(0), stride_x_col=x.stride(1), stride_out_tok_row=K, stride_scale_tok_row=scale_tok_cols, stride_out_blk_t_row=M, scale_blk_t_cols=scale_blk_t_cols, NATIVE_E8M0=NATIVE_E8M0, num_warps=4, num_stages=2)
 
     return out_tok, scale_tok, out_blk_t, scale_blk_t

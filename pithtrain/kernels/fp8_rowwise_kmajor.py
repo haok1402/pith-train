@@ -1,9 +1,8 @@
-"""Picker of the fused rowwise + K-major colwise FP8 quantization (the SM90 grouped-GEMM input): the CuTe-DSL kernel on SM90, the Triton kernel elsewhere."""
+"""Picker of the fused rowwise + K-major colwise FP8 quantization (the SM90 grouped-GEMM input): the CuTe-DSL kernel on SM90, the Triton kernel on SM100."""
 
 import torch
 
-from pithtrain.kernels.arch import is_sm90
-from pithtrain.kernels.fp8_rowwise_kmajor_sm100 import fp8cast_rowwise_kmajor_sm100
+from pithtrain.kernels.arch import ARCH_MAJOR
 
 __all__ = ["fp8cast_rowwise_kmajor"]
 
@@ -20,8 +19,12 @@ def fp8cast_rowwise_kmajor(x: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tu
 
     FP8 bytes and scale values are the same on both architectures, the scale strides are not: SM90 returns both scales MN-major (see fp8_scale_layout), the layout DeepGEMM's SM90 GEMMs read without a transpose; SM100 returns them row-major.
     """
-    if is_sm90():
-        from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import fp8cast_rowwise_kmajor_sm90
-
-        return fp8cast_rowwise_kmajor_sm90(x, grouped_mm_offs)
-    return fp8cast_rowwise_kmajor_sm100(x, grouped_mm_offs)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import fp8cast_rowwise_kmajor_sm90
+            return fp8cast_rowwise_kmajor_sm90(x, grouped_mm_offs)
+        case 10:
+            from pithtrain.kernels.fp8_rowwise_kmajor_sm100 import fp8cast_rowwise_kmajor_sm100
+            return fp8cast_rowwise_kmajor_sm100(x, grouped_mm_offs)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
