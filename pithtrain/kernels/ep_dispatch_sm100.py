@@ -290,8 +290,7 @@ def expert_and_expand_idx_sm100(recv_meta: torch.Tensor, received_expand_idx: to
     # the kernel indexes both inputs with unit stride
     recv_meta, received_expand_idx = recv_meta.contiguous(), received_expand_idx.contiguous()
     total = received_expand_idx.shape[0]
-    expert_idxs = torch.empty_like(received_expand_idx)
-    expand_idx = torch.empty_like(received_expand_idx)
+    expert_idxs, expand_idx = torch.empty_like(received_expand_idx), torch.empty_like(received_expand_idx)
     if total == 0:
         return expert_idxs, expand_idx
     BLOCK = 1024

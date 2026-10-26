@@ -116,8 +116,7 @@ def segment_sum_along_rows(x: torch.Tensor, grouped_mm_offs: torch.Tensor, out_d
     offs_padded[0] = 0
     offs_padded[1:].copy_(grouped_mm_offs.to(torch.int32).clamp(max=M))
 
-    HEAD_BLOCK = 128
-    BLOCK_M = 128
+    HEAD_BLOCK, BLOCK_M = 128, 128
     out = torch.empty((E, H), dtype=torch.float32, device=x.device)
     h_blocks = triton.cdiv(H, HEAD_BLOCK)
     if E * h_blocks >= 2 * SM_COUNT:
@@ -143,8 +142,7 @@ def block_segment_sum_kernel(part_ptr, offs_ptr, out_ptr, H, BLOCK_H: tl.constex
     g = tl.program_id(0)
     h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     mask = h < H
-    end = tl.load(offs_ptr + g) // 128
-    start = tl.load(offs_ptr + g - 1, mask=g > 0, other=0) // 128
+    end, start = tl.load(offs_ptr + g) // 128, tl.load(offs_ptr + g - 1, mask=g > 0, other=0) // 128
     acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
     for b in tl.range(start, end):
         acc += tl.load(part_ptr + b.to(tl.int64) * H + h, mask=mask, other=0.0)

@@ -97,8 +97,7 @@ class RowwiseKmajor:
         self.tile(v, pid_row, pid_col, tidx, mX.shape[0], gp, s_red.iterator.toint())
 
     def coords(self, tidx):
-        lane = tidx % 32
-        warp = tidx // 32
+        lane, warp = tidx % 32, tidx // 32
         cv, rb = lane % 8 + 8 * (warp % 2), lane // 8 + 4 * (warp // 2)
         return lane, warp, cv, rb
 
@@ -189,8 +188,7 @@ class RowwiseKmajor:
 
         # FP8: rowwise (M, N) and K-major (group block (N, K_g) at g_start * N)
         km_row = km_base + g_start * N + (row0 - g_start)
-        tok = [[None, None] for _ in range(8)]
-        km = [[None, None] for _ in range(8)]
+        tok, km = [[None, None] for _ in range(8)], [[None, None] for _ in range(8)]
         for m in range(2):
             for h in range(2):
                 words = [v[4 * m + r][2 * h + q] for r in range(4) for q in range(2)]
@@ -211,9 +209,7 @@ COMPILED: dict = {}
 
 def compile_kernel(n: int, num_groups: int) -> Callable:
     fake = cute.runtime.make_fake_tensor
-    m = cute.sym_int()
-    mn = cute.sym_int()
-    mb = cute.sym_int()
+    m, mn, mb = cute.sym_int(), cute.sym_int(), cute.sym_int()
     nb = (n + TILE - 1) // TILE
     x = fake(cutlass.BFloat16, (m, n), stride=(n, 1), assumed_align=16)
     offs = fake(Int32, (num_groups,), stride=(1,), assumed_align=4)

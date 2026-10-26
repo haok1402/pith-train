@@ -60,15 +60,12 @@ class Prep:
     @cute.kernel
     def kernel(self, mE: cute.Tensor, mExp: cute.Tensor, mInv: cute.Tensor, mRank: cute.Tensor, mOffs: cute.Tensor, mKs: cute.Tensor, mCnt: cute.Tensor, mFlags: cute.Tensor, mHist: cute.Tensor, mCtr: cute.Tensor) -> None:
         G = self.G
-        NT = PREP_THREADS
-        NW = PREP_WARPS
+        NT, NW = PREP_THREADS, PREP_WARPS
         tid, _, _ = cute.arch.thread_idx()
         warp = tid // 32
         m = mE.shape[0]
         C = (m + PREP_CHUNK - 1) // PREP_CHUNK
-        e_base = mE.iterator.toint()
-        inv_base = mInv.iterator.toint()
-        flags_base = mFlags.iterator.toint()
+        e_base, inv_base, flags_base = mE.iterator.toint(), mInv.iterator.toint(), mFlags.iterator.toint()
         hist_base, ctr_base = mHist.iterator.toint(), mCtr.iterator.toint()
 
         smem = cutlass.memory.SmemAllocator()
@@ -198,8 +195,7 @@ class ScatterQuant(RowwiseKmajor):
         tidx, _, _ = cute.arch.thread_idx()
         pid_col, pid_row, _ = cute.arch.block_idx()
         m = mRsi.shape[0]
-        x_base = mX.iterator.toint()
-        offs_base = mOffs.iterator.toint()
+        x_base, offs_base = mX.iterator.toint(), mOffs.iterator.toint()
         gp = (x_base, offs_base, mTok.iterator.toint(), mTokScale.iterator.toint(), mKm.iterator.toint(), mKmScale.iterator.toint())
         smem = cutlass.memory.SmemAllocator()
         s_red = smem.allocate_tensor(Uint32, cute.make_layout(self.RED_WORDS), 16)
@@ -307,8 +303,7 @@ def scatter_quant_sm90(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_gr
     global copy_stream, copy_event
     assert padding_alignment == ALIGN, "the K-major FP8 layout needs 128-row groups"
     G = num_groups
-    m = expert_idxs.shape[0]
-    N = gathered.shape[1]
+    m, N = expert_idxs.shape[0], gathered.shape[1]
     dev = gathered.device
     if expand_idx is None and gathered.shape[0] != m:
         raise ValueError(f"{gathered.shape[0]=} must equal {m=} without expand_idx")

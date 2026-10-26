@@ -93,8 +93,7 @@ class Group:
     @cute.kernel
     def kernel(self, mE, mExp, mHist, mCu, mAIdx, mRowOf, mSlotOf, mMask, mTab) -> None:
         G = self.G
-        NT = THREADS
-        NW = WARPS
+        NT, NW = THREADS, WARPS
         tid, _, _ = cute.arch.thread_idx()
         c, _, _ = cute.arch.block_idx()
         warp = tid // 32
@@ -210,14 +209,12 @@ class GatherSum:
         tid, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
         T_ = mOut.shape[0]
-        g_base = mGrad.iterator.toint()
-        o_base = mOut.iterator.toint()
+        g_base, o_base = mGrad.iterator.toint(), mOut.iterator.toint()
         for s in cutlass.range_constexpr(SUM_TOKENS):
             t = bid * SUM_TOKENS + s
             t_ok = Int32(t < T_)
             mask = ld_b64(mMask.iterator.toint() + Int64(t) * 8, t_ok)
-            rows = []
-            valid = []
+            rows, valid = [], []
             for j in cutlass.range_constexpr(K):
                 ok = Int32(mask != Int64(0))
                 e = ctz64(mask)

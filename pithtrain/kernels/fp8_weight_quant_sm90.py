@@ -193,8 +193,7 @@ def thread_coords() -> tuple:
     256 threads per 128x128 tile, each owning an 8x8 block at (r0, c0).
     """
     tidx, _, _ = cute.arch.thread_idx()
-    warp = tidx // 32
-    lane = tidx % 32
+    warp, lane = tidx // 32, tidx % 32
     r0, c0 = (warp // 2) * 32 + (lane // 8) * 8, (warp % 2) * 64 + (lane % 8) * 8
     return tidx, warp, lane, r0, c0
 
@@ -360,8 +359,7 @@ def smem_store_tile(base: Int32, gtile: Int64, row_lo: Int32, row_hi: Int32, col
     tidx, _, _ = cute.arch.thread_idx()
     for it in cutlass.range_constexpr(TILE_BYTES // 16 // nthreads):
         idx = it * nthreads + tidx
-        row = idx >> 3
-        c = idx & 7
+        row, c = idx >> 3, idx & 7
         w = lds_v4(base + swz(row, c))
         pred = Int32(row >= row_lo) & Int32(row < row_hi) & Int32(c * 16 < cols)
         st_v4(gtile + Int64(row) * Int64(ld) + Int64(c * 16), w, pred)
@@ -397,8 +395,7 @@ class BlockwiseTranspose:
         aligned = const_expr(self.mode != "scalar")
 
         tile_r, tile_c = bx * BLOCK, by * BLOCK
-        row0 = tile_r + r0
-        col0 = tile_c + c0
+        row0, col0 = tile_r + r0, tile_c + c0
         mk = Int64(M) * Int64(K)
         x_g = x + Int64(bz) * mk * self.in_bytes
         rows = load_rows(x_g, row0, col0, Int32(0), M, K, self.in_bytes, False, aligned)
@@ -409,8 +406,7 @@ class BlockwiseTranspose:
         q = cast_rows(rows, Uint32(0x7F000000) - sbits, packed)
         # out_t is (K, M): the thread's column j is out_t row col0 + j, its rows are columns.
         qt = transpose8(q)
-        out_g = out + Int64(bz) * mk
-        out_t_g = out_t + Int64(bz) * mk
+        out_g, out_t_g = out + Int64(bz) * mk, out_t + Int64(bz) * mk
         if const_expr(self.mode == "smem"):
             buf = smem.allocate_tensor(Uint32, cute.make_layout(TILE_BYTES // 2), byte_alignment=128)
             base = buf.iterator.toint()
@@ -473,8 +469,7 @@ def fp8cast_blockwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Tensor, tor
     if x.stride(1) != 1:
         x = x.contiguous()
     M, K = x.shape
-    sr = (M + BLOCK - 1) // BLOCK
-    sc = (K + BLOCK - 1) // BLOCK
+    sr, sc = (M + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
     dev = x.device
     out = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=dev)
     scale = torch.empty((sr, sc), dtype=torch.float32, device=dev)
@@ -495,8 +490,7 @@ def fp8cast_blockwise_transpose_batched_sm90(x: torch.Tensor) -> tuple[torch.Ten
     if not x.is_contiguous():
         x = x.contiguous()
     G, N, K = x.shape
-    sr = (N + BLOCK - 1) // BLOCK
-    sc = (K + BLOCK - 1) // BLOCK
+    sr, sc = (N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
     dev = x.device
     out = torch.empty((G, N, K), dtype=torch.float8_e4m3fn, device=dev)
     scale = torch.empty((G, sr, sc), dtype=torch.float32, device=dev)
@@ -548,8 +542,7 @@ def shard_tile_row(shard: Int64, amax_tile: Int64, out: Int64, local_rows: Int32
     4 == 0 and a 16-byte aligned shard.
     """
     tidx, _, _ = cute.arch.thread_idx()
-    warp = tidx // 32
-    lane = tidx % 32
+    warp, lane = tidx // 32, tidx % 32
     nw = NUM_THREADS // 32
     col = by * BLOCK + lane * 4
     col_ok = Int32(col < K)
@@ -698,12 +691,9 @@ class PackTranspose:
         """
         bx, by, bz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
-        warp = tidx // 32
-        lane = tidx % 32
-        r0 = warp * 32 + (lane // 8) * 8
-        c0 = (lane % 8) * 16
-        tile_r = bx * BLOCK
-        tile_c = by * BLOCK
+        warp, lane = tidx // 32, tidx % 32
+        r0, c0 = warp * 32 + (lane // 8) * 8, (lane % 8) * 16
+        tile_r, tile_c = bx * BLOCK, by * BLOCK
         nk = Int64(N) * Int64(K)
         off = Int64(bz) * nk
         col_ok = Int32(tile_c + c0 < K)
@@ -716,8 +706,7 @@ class PackTranspose:
             row = tile_r + r0 + i
             addr = out + off + Int64(row) * Int64(K) + Int64(tile_c + c0)
             st_v4(addr, w[i], Int32(row < N) & col_ok)
-        left = transpose8([[w[i][0], w[i][1]] for i in range(8)])
-        right = transpose8([[w[i][2], w[i][3]] for i in range(8)])
+        left, right = transpose8([[w[i][0], w[i][1]] for i in range(8)]), transpose8([[w[i][2], w[i][3]] for i in range(8)])
         smem = cutlass.memory.SmemAllocator()
         buf = smem.allocate_tensor(Uint32, cute.make_layout(TILE_BYTES // 4), byte_alignment=128)
         base = buf.iterator.toint()
@@ -731,8 +720,7 @@ class PackTranspose:
     def kernel_8x8(self, x: Int64, out: Int64, N: Int32, K: Int32, G: Int32):
         bx, by, bz = cute.arch.block_idx()
         _, _, _, r0, c0 = thread_coords()
-        row0 = bx * BLOCK + r0
-        col0 = by * BLOCK + c0
+        row0, col0 = bx * BLOCK + r0, by * BLOCK + c0
         nk = Int64(N) * Int64(K)
         off = Int64(bz) * nk
         aligned = const_expr(self.mode != "scalar")
@@ -788,20 +776,15 @@ class ShardAmaxMulti:
             if first <= bx:
                 t = i
         row = table + Int64(t) * 2 * DESC * 8
-        shard = ld_u64(row)
-        amax = ld_u64(row + 8)
-        local_rows = Int32(ld_u64(row + 16))
-        K = Int32(ld_u64(row + 24))
-        row_offset = Int32(ld_u64(row + 32))
-        trs = Int32(ld_u64(row + 40))
+        shard, amax = ld_u64(row), ld_u64(row + 8)
+        local_rows, K = Int32(ld_u64(row + 16)), Int32(ld_u64(row + 24))
+        row_offset, trs = Int32(ld_u64(row + 32)), Int32(ld_u64(row + 40))
         a_base = ld_u64(row + 48)
         first = Int32(ld_u64(row + 56))
         R, C, ct, ntr = Int32(ld_u64(row + 64)), Int32(ld_u64(row + 72)), Int32(ld_u64(row + 80)), Int32(ld_u64(row + 88))
         local = bx - first
-        by = local % ct
-        rest = local // ct
-        bxr = rest % ntr
-        bz = rest // ntr
+        by, rest = local % ct, local // ct
+        bxr, bz = rest % ntr, rest // ntr
         tr = trs + bxr
         a_off = a_base + (Int64(bz) * Int64(R) + Int64(tr)) * Int64(C) + Int64(by)
         shard_tile(shard, amax + a_off * 4, amax, local_rows, K, tr, by, bz, row_offset, False, "row")
@@ -869,9 +852,7 @@ class ScalesMulti:
             if first <= bx:
                 t = i
         row = table + Int64(t) * DESC * 8
-        amax = ld_u64(row)
-        scale = ld_u64(row + 8)
-        scale_t = ld_u64(row + 16)
+        amax, scale, scale_t = ld_u64(row), ld_u64(row + 8), ld_u64(row + 16)
         R = Int32(ld_u64(row + 24))
         C, bpg, first = Int32(ld_u64(row + 32)), Int32(ld_u64(row + 40)), Int32(ld_u64(row + 56))
         local = bx - first

@@ -130,13 +130,10 @@ class RowwiseBlockwiseTranspose:
         esize, EPW, KIND = const_expr(self.dtype.width // 8), const_expr(32 // self.dtype.width), const_expr(self.kind)
         tidx, _, _ = cute.arch.thread_idx()
         bm, bk, _ = cute.arch.block_idx()
-        warp = tidx // 32
-        lane = tidx % 32
-        rg = lane // 8
-        cl = lane % 8
+        warp, lane = tidx // 32, tidx % 32
+        rg, cl = lane // 8, lane % 8
 
-        M = Int32(mX.shape[0])
-        K = Int32(mX.shape[1])
+        M, K = Int32(mX.shape[0]), Int32(mX.shape[1])
         sx = Int64(mX.stride[0])
         # mS is the MN-major tok_scale: scale[r, bk] at bk * s_ld + r.
         s_ld = Int64(mS.stride[1])
@@ -311,8 +308,7 @@ def fp8cast_rowwise_blockwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Ten
     dev = x.device
     out_tok = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=dev)
     scale_tok = mn_major_scale(M, nkb, dev)
-    out_blk_t = torch.empty((K, M), dtype=torch.float8_e4m3fn, device=dev)
-    scale_blk_t = torch.empty((nkb, nmb), dtype=torch.float32, device=dev)
+    out_blk_t, scale_blk_t = torch.empty((K, M), dtype=torch.float8_e4m3fn, device=dev), torch.empty((nkb, nmb), dtype=torch.float32, device=dev)
     if fn is not None:
         fn(x, out_tok, scale_tok, out_blk_t, scale_blk_t)
     return out_tok, scale_tok, out_blk_t, scale_blk_t

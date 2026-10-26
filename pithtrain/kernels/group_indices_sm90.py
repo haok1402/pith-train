@@ -35,8 +35,7 @@ class GroupIndices:
         tid, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
         M = mOut.shape[0]
-        offs = mOffs.iterator.toint()
-        out = mOut.iterator.toint()
+        offs, out = mOffs.iterator.toint(), mOut.iterator.toint()
         smem = cutlass.memory.SmemAllocator()
         s_offs = smem.allocate(G * 4, byte_alignment=16).toint()
         for j in cutlass.range_constexpr((G + THREADS - 1) // THREADS):

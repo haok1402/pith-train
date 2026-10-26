@@ -236,7 +236,6 @@ def fp8_pack_transpose_sm100(x: torch.Tensor, out: torch.Tensor) -> None:
     Triton fp8_pack_transpose.
     """
     G, N, K = x.shape
-    x = x.view(torch.uint8)
-    out = out.view(torch.uint8)
+    x, out = x.view(torch.uint8), out.view(torch.uint8)
     grid = (triton.cdiv(N, BLOCK), triton.cdiv(K, BLOCK), G)
     fp8_pack_transpose_kernel[grid](x, out, out[x.numel() :], N, K, num_warps=4)

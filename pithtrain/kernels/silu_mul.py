@@ -77,8 +77,7 @@ def silu_mul_bwd(grad_output: torch.Tensor, gate: torch.Tensor, up: torch.Tensor
     assert grad_output.shape == gate.shape, (f"grad_output shape {grad_output.shape} != gate shape {gate.shape}")
     assert grad_output.dtype == gate.dtype, (f"grad_output dtype {grad_output.dtype} != gate dtype {gate.dtype}")
     assert grad_output.is_contiguous(), "grad_output must be contiguous"
-    grad_gate = torch.empty_like(gate)
-    grad_up = torch.empty_like(up)
+    grad_gate, grad_up = torch.empty_like(gate), torch.empty_like(up)
     n = gate.numel()
     grid = (triton.cdiv(n, BLOCK_SIZE),)
     silu_mul_bwd_kernel[grid](grad_output, gate, up, grad_gate, grad_up, n, BLOCK_SIZE=BLOCK_SIZE)

@@ -259,10 +259,7 @@ class ClampedSwiGLUQuant:
         tid, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
         grid, _, _ = cute.arch.grid_dim()
-        lane = tid % 32
-        warp = tid // 32
-        cv = tid % 16
-        rg = tid // 16
+        lane, warp, cv, rg = tid % 32, tid // 32, tid % 16, tid // 16
         M = mGU.shape[0]
         nrb = M // BLOCK
         total = nrb * NB
@@ -443,8 +440,7 @@ class ClampedSwiGLUQuant:
                 km_base = mKm.iterator.toint() + Int64(gs) * self.KP + Int64(row0 - gs)
                 for p in cutlass.range_constexpr(BLOCK * BLOCK // 16 // THREADS):
                     idx = p * THREADS + tid
-                    cl = idx // 8
-                    qq = idx % 8
+                    cl, qq = idx // 8, idx % 8
                     v = lds_v4(s_tr + cl * BLOCK + ((qq ^ ((cl // 8) & 7)) << 4))
                     c = col0 + cl
                     c_ok = Int32(1)

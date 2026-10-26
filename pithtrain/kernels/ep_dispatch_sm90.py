@@ -131,8 +131,7 @@ class DispatchIndex:
         out = mOut.iterator.toint()
         idxs_p, expand_p, inv_p = out, out + mk * 8, out + 2 * mk * 8
         dti_p = out + 3 * mk * 8
-        hist = mHist.iterator.toint()
-        ctr = mCtr.iterator.toint()
+        hist, ctr = mHist.iterator.toint(), mCtr.iterator.toint()
 
         smem = cutlass.memory.SmemAllocator()
         s_a = smem.allocate(NB * 4, byte_alignment=16).toint()  # chunk histogram, then totals
@@ -230,18 +229,15 @@ class DispatchIndex:
                 t = toks[r]
                 for j in cutlass.range_constexpr(K):
                     e = ids[r][j]
-                    b_e = e * WARPS
-                    b_g = (NE + e // EPR) * WARPS
-                    re = Int32(0)
-                    rg = Int32(0)
+                    b_e, b_g = e * WARPS, (NE + e // EPR) * WARPS
+                    re, rg = Int32(0), Int32(0)
                     for w in cutlass.range_constexpr(WARPS):
                         below = Int32(w < warp)
                         re = re + Int32(cute.arch.popc(lds_b32(s_bits + (b_e + w) * 4))) * below
                         rg = rg + Int32(cute.arch.popc(lds_b32(s_bits + (b_g + w) * 4))) * below
                     re = re + Int32(cute.arch.popc(lds_b32(s_bits + (b_e + warp) * 4) & lt))
                     rg = rg + Int32(cute.arch.popc(lds_b32(s_bits + (b_g + warp) * 4) & lt))
-                    p = Int32(lds_b32(s_run + e * 4)) + re
-                    dr = Int32(lds_b32(s_run + (NE + e // EPR) * 4)) + rg
+                    p, dr = Int32(lds_b32(s_run + e * 4)) + re, Int32(lds_b32(s_run + (NE + e // EPR) * 4)) + rg
                     gs = Int32(lds_b32(s_b + (NE + e // EPR) * 4)) - d0
                     flat = Int64(t) * K + j
                     ok = oks[r]
@@ -286,9 +282,7 @@ class ExpertAndExpandIdx:
         tid, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
         total = mRecv.shape[0]
-        meta = mMeta.iterator.toint()
-        recv = mRecv.iterator.toint()
-        out = mOut.iterator.toint()
+        meta, recv, out = mMeta.iterator.toint(), mRecv.iterator.toint(), mOut.iterator.toint()
 
         smem = cutlass.memory.SmemAllocator()
         s_end = smem.allocate(NSEG * 4, byte_alignment=16).toint()  # segment starts, then ends
@@ -374,8 +368,7 @@ def dispatch_index(topk_ids: torch.Tensor, num_experts: int, ep_size: int, exper
     if meta_out is None:
         meta_out = torch.empty(2 * ep_size, dtype=torch.int64, device=dev)
     counts = meta_out[: 2 * ep_size]
-    nmeta = ep_size * (experts_per_rank + 1)
-    mk = m * k
+    nmeta, mk = ep_size * (experts_per_rank + 1), m * k
     out = torch.empty(3 * mk + m * ep_size + nmeta, dtype=torch.int64, device=dev)
     send_meta = out[3 * mk + m * ep_size :]
     if m == 0:

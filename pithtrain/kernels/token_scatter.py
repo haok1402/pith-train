@@ -156,8 +156,7 @@ def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num
 
     Rows are copied exactly. Placement within a group is atomic_add order, not deterministic.
     """
-    m = input_tokens.shape[0]
-    hidden_size = input_tokens.shape[1]
+    m, hidden_size = input_tokens.shape[0], input_tokens.shape[1]
     device = input_tokens.device
 
     if m == 0:

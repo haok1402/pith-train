@@ -45,8 +45,7 @@ def conv_bwd_kernel(g_ptr, x_ptr, w_ptr, dx_ptr, dw_ptr, L, S, C, offset, n_t, s
     r = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)  # input row (dx) / output row (dw)
     c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
     c_ok = c < C
-    g_base = g_ptr + b.to(tl.int64) * sg_b
-    x_base = x_ptr + b.to(tl.int64) * L * C
+    g_base, x_base = g_ptr + b.to(tl.int64) * sg_b, x_ptr + b.to(tl.int64) * L * C
     # dx[s] = sum_k w[k] * g[s - offset + (K - 1) - k], in the order of ATen's backward kernel
     # (taps k = 0 .. K - 1), over the outputs that exist.
     acc = tl.zeros((BLOCK_T, BLOCK_C), dtype=tl.float32)

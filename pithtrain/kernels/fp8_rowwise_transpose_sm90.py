@@ -319,8 +319,7 @@ def load_global(x_base: Int64, N64: Int64, tl: Tile, vec_n: bool) -> list:
         # Rows of x are not 16-byte aligned: full 8-column groups take the widest access the
         # runtime alignment allows; the partial group at the N edge loads element by element.
         for i in range(8):
-            full = tl.rowv[i] & tl.full_cols
-            part = tl.rowv[i] & (tl.full_cols ^ 1)
+            full, part = tl.rowv[i] & tl.full_cols, tl.rowv[i] & (tl.full_cols ^ 1)
             row_off = Int64(tl.row0 + i) * N64 + Int64(tl.col0)
             words = ld8_any(x_base + cutlass.select_(full != 0, row_off * 2, Int64(0)), full)
             for k in range(4):
@@ -417,8 +416,7 @@ def quantize_tile(v: list, th: Thread, tl: Tile, sred: Int32, stile: Int32, base
         s = (r // 8) % 16
         w = ld_shared_v4(stile + r * TILE + (((2 * ch) ^ s) & 14) * 8)
         odd = (s % 2) != 0
-        lo = [cutlass.select_(odd, w[2], w[0]), cutlass.select_(odd, w[3], w[1])]
-        hi = [cutlass.select_(odd, w[0], w[2]), cutlass.select_(odd, w[1], w[3])]
+        lo, hi = [cutlass.select_(odd, w[2], w[0]), cutlass.select_(odd, w[3], w[1])], [cutlass.select_(odd, w[0], w[2]), cutlass.select_(odd, w[1], w[3])]
         col = tl.tn * TILE + r
         col_ok = pred_i32(col < N64)
         addr = t_base + Int64(col) * M64 + start

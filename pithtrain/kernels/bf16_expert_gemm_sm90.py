@@ -167,8 +167,7 @@ class ScatterRowStore(TileStore):
         t = tidx % nthr
         for it in cutlass.range_constexpr((epi_m * vecs + nthr - 1) // nthr):
             q = it * nthr + t
-            r = q // vecs
-            c = (q % vecs) * 8
+            r, c = q // vecs, (q % vecs) * 8
             row, col = st["m0"] + epi_coord[0] * epi_m + r, st["n0"] + epi_coord[1] * epi_n + c
             # rows past the expert's end and columns past N (a partial last tile) stay unwritten
             if (row < st["rows"]) & (col < cols) & (q < epi_m * vecs):
@@ -470,8 +469,7 @@ def bf16_expert_down_forward_scattered_sm90(h, w_down, cu, slot_of, bias=None):
 def bf16_expert_dgated_backward_sm90(dy, w_down, preact, cu, slot_of, w_gate, w_up, act=()):
     M, inter = preact.shape[0], preact.shape[1] // 2
     swapped = w_up.data_ptr() < w_gate.data_ptr()
-    dpre = preact.new_empty(M, 2 * inter)
-    h = preact.new_empty(M, inter)
+    dpre, h = preact.new_empty(M, 2 * inter), preact.new_empty(M, inter)
     if M:
         if act:
             assert not swapped
