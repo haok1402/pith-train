@@ -110,9 +110,9 @@ def fp8cast_rowwise_colwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     out_ch = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=x.device)
     scale_ch = torch.empty((num_row_groups, N), dtype=torch.float32, device=x.device)
 
-    _BLOCK_N = 128
-    grid = (num_row_groups, (N + _BLOCK_N - 1) // _BLOCK_N)
+    block_n = 128
+    grid = (num_row_groups, (N + block_n - 1) // block_n)
 
-    fp8cast_rowwise_colwise_kernel[grid](x_ptr=x, out_tok_ptr=out_tok, scale_tok_ptr=scale_tok, out_ch_ptr=out_ch, scale_ch_ptr=scale_ch, M=M, N=N, stride_x_row=x.stride(0), stride_x_col=x.stride(1), stride_out_tok_row=N, scale_tok_cols=scale_tok_cols, stride_out_ch_row=N, scale_ch_cols=N, block_to_group_ptr=out_tok, cumsum_ptr=out_tok, BLOCK_N=_BLOCK_N, NATIVE_E8M0=NATIVE_E8M0, WRITE_KMAJOR=False, num_warps=4, num_stages=2)
+    fp8cast_rowwise_colwise_kernel[grid](x_ptr=x, out_tok_ptr=out_tok, scale_tok_ptr=scale_tok, out_ch_ptr=out_ch, scale_ch_ptr=scale_ch, M=M, N=N, stride_x_row=x.stride(0), stride_x_col=x.stride(1), stride_out_tok_row=N, scale_tok_cols=scale_tok_cols, stride_out_ch_row=N, scale_ch_cols=N, block_to_group_ptr=out_tok, cumsum_ptr=out_tok, BLOCK_N=block_n, NATIVE_E8M0=NATIVE_E8M0, WRITE_KMAJOR=False, num_warps=4, num_stages=2)
 
     return out_tok, scale_tok, out_ch, scale_ch

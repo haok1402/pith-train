@@ -68,7 +68,7 @@ class RowwiseKmajor:
     """
 
     RED_WORDS = 64 * 6
-    """Shared-memory words _tile reduces through; subclasses (ScatterQuant) size theirs by it."""
+    """Shared-memory words tile reduces through; subclasses (ScatterQuant) size theirs by it."""
 
     def __init__(self, n: int, num_groups: int) -> None:
         self.n = n
@@ -91,28 +91,28 @@ class RowwiseKmajor:
 
         v = []
         for i in cutlass.range_constexpr(8):
-            addr, ok = self._src(gp[0], pid_row, pid_col, tidx, i)
+            addr, ok = self.src(gp[0], pid_row, pid_col, tidx, i)
             v.append(ld_v4(addr, ok))
-        self._tile(v, pid_row, pid_col, tidx, mX.shape[0], gp, s_red.iterator.toint())
+        self.tile(v, pid_row, pid_col, tidx, mX.shape[0], gp, s_red.iterator.toint())
 
-    def _coords(self, tidx):
+    def coords(self, tidx):
         lane = tidx % 32
         warp = tidx // 32
         cv = lane % 8 + 8 * (warp % 2)
         rb = lane // 8 + 4 * (warp // 2)
         return lane, warp, cv, rb
 
-    def _src(self, x_base, pid_row, pid_col, tidx, i):
+    def src(self, x_base, pid_row, pid_col, tidx, i):
         """Global address of row i of this thread's sub-block, and whether it is in bounds."""
-        _, _, cv, rb = self._coords(tidx)
+        _, _, cv, rb = self.coords(tidx)
         col0 = pid_col * TILE + cv * 8
         row = Int64(pid_row) * TILE + rb * 8 + i
         return x_base + (row * self.n + col0) * 2, Int32(col0 < self.n)
 
-    def _tile(self, v, pid_row, pid_col, tidx, M, gp, red_base) -> None:
+    def tile(self, v, pid_row, pid_col, tidx, M, gp, red_base) -> None:
         x_base, offs_base, tok_base, tok_scale_base, km_base, km_scale_base = gp
         N, G = self.n, self.num_groups
-        lane, warp, cv, rb = self._coords(tidx)
+        lane, warp, cv, rb = self.coords(tidx)
         cl = lane % 8  # column vector within the warp
         rl = lane // 8  # row block within the warp
 

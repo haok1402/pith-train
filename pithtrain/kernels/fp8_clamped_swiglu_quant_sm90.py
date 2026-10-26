@@ -209,15 +209,15 @@ class ClampedSwiGLUQuant:
         total = (mGU.shape[0] // BLOCK) * self.NB
         self.kernel(mDh, mGU, mBias, mOffs, mTok, mTokS, mKm, mKmS, mPart).launch(grid=[cutlass.min(total, self.num_ctas), 1, 1], block=[THREADS, 1, 1], stream=stream)
 
-    def _tile(self, t: Int32) -> tuple:
+    def tile(self, t: Int32) -> tuple:
         """Tile t -> (row block, column block); column blocks of a row block adjacent."""
         return t // self.NB, t % self.NB
 
-    def _issue(self, t: Int32, stage_addr: Int32, total: Int32, tid: Int32, dh_base, gu_base):
+    def issue(self, t: Int32, stage_addr: Int32, total: Int32, tid: Int32, dh_base, gu_base):
         """cp.async tile t (zero-filled when out of range) into a stage; traced inline."""
         N, NO = self.N, self.NO
         ok = Int32(t < total)
-        rb, cb = self._tile(t)
+        rb, cb = self.tile(t)
         r = rb * BLOCK + (tid // 16) * 4
         c = cb * BLOCK + (tid % 16) * VEC  # first output column
         if cutlass.const_expr(NO % BLOCK != 0):
@@ -272,7 +272,7 @@ class ClampedSwiGLUQuant:
         bias_base = mBias.iterator.toint()
 
         for s in cutlass.range_constexpr(S):
-            self._issue(bid + s * grid, s_in + s * self.stage_bytes, total, tid, dh_base, gu_base)
+            self.issue(bid + s * grid, s_in + s * self.stage_bytes, total, tid, dh_base, gu_base)
 
         # Expert-group offsets into shared memory (searched once per tile below).
         for gc in cutlass.range((G + THREADS - 1) // THREADS, unroll=1):
@@ -285,7 +285,7 @@ class ClampedSwiGLUQuant:
         n_it = (total - bid + grid - 1) // grid
         for it in cutlass.range(n_it, unroll=1):
             t = bid + it * grid
-            rb, cb = self._tile(t)
+            rb, cb = self.tile(t)
             row0 = rb * BLOCK
             col0 = cb * BLOCK
             col = col0 + cv * VEC
@@ -337,7 +337,7 @@ class ClampedSwiGLUQuant:
                         h[k][m] = pack_bf16(o[2 * m], o[2 * m + 1])
 
             # The stage is consumed: refill it with the tile S iterations ahead.
-            self._issue(t + S * grid, stage_addr, total, tid, dh_base, gu_base)
+            self.issue(t + S * grid, stage_addr, total, tid, dh_base, gu_base)
 
             a = [[abs2(h[k][m]) for m in range(4)] for k in range(4)]
 

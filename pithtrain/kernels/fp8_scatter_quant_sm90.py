@@ -212,7 +212,7 @@ class ScatterQuant(RowwiseKmajor):
         total = Int64(ld_b32(offs_base + (G - 1) * 4, Int32(1), Int32(0)))
         row_start = Int64(pid_row) * TILE
         if row_start < total:
-            lane, _, cv, rb = self._coords(tidx)
+            lane, _, cv, rb = self.coords(tidx)
             cnt = Int32(0)
             for c in range((G + 31) // 32):
                 idx = lane + c * 32
@@ -238,7 +238,7 @@ class ScatterQuant(RowwiseKmajor):
             es = ld_b32(offs_base + Int64(e - 1) * 4, t_ok & Int32(e > 0), Int32(0))
             st_b64(mRsi.iterator.toint() + t * 8, Int64(es) + Int64(rk), t_ok)
             # M = total rows: the column stride of the MN-major rowwise scale (M % 128 == 0)
-            self._tile(v, pid_row, pid_col, tidx, total, gp, s_red.iterator.toint())
+            self.tile(v, pid_row, pid_col, tidx, total, gp, s_red.iterator.toint())
 
 
 PREP: dict = {}
@@ -302,10 +302,10 @@ def supports_scatter_quant(gathered: torch.Tensor, expert_idxs: torch.Tensor, nu
     return not (m == 0 or N == 0 or not 0 < num_groups <= MAX_GROUPS or gathered.dtype != torch.bfloat16 or N % 8 != 0 or not gathered.is_contiguous() or gathered.data_ptr() % 16 != 0 or expert_idxs.dtype != torch.int64 or not expert_idxs.is_contiguous() or (expand_idx is not None and (expand_idx.dtype != torch.int64 or not expand_idx.is_contiguous())))
 
 
-def scatter_quant_sm90(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor] = None, padding_alignment: int = 128, group_counts: Optional[list[int]] = None, _pdl: bool = True) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
+def scatter_quant_sm90(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor] = None, padding_alignment: int = 128, group_counts: Optional[list[int]] = None, pdl: bool = True) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
     """
     scatter_quant on SM90 (see the picker for the contract): fused where supports_scatter_quant,
-    else the unfused path. Scales are MN-major. _pdl=False launches the main kernel without PDL.
+    else the unfused path. Scales are MN-major. pdl=False launches the main kernel without PDL.
     """
     global copy_stream, copy_event
     assert padding_alignment == ALIGN, "the K-major FP8 layout needs 128-row groups"
@@ -354,10 +354,10 @@ def scatter_quant_sm90(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_gr
             copy_event = torch.cuda.Event()
         copy_event.record()
 
-    key = (N, G, _pdl)
+    key = (N, G, pdl)
     fn = MAIN.get(key)
     if fn is None:
-        fn = MAIN[key] = compile_main(N, G, _pdl)
+        fn = MAIN[key] = compile_main(N, G, pdl)
     fn(gathered, expert_idxs, rank, inv, cnt, offs, rsi, x_fp8, x_scale, x_ch, x_ch_scale)
 
     if ks is None:

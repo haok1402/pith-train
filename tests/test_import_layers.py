@@ -20,7 +20,8 @@ of ``pithtrain/kernels/`` and its black-box interface:
   ``<feature>`` its module's stem without ``_sm90`` / ``_sm100``, and ``tests/kernels/`` imports
   nothing from pithtrain but ``pithtrain.kernels``;
 - inside ``kernels/`` every module lists what it exports in a literal ``__all__``, defines no
-  module-level ``_name`` (``__all__`` marks what is internal, not an underscore), and imports from a
+  ``_name`` at any level (functions, classes, methods, attributes, locals, parameters, import
+  aliases; ``__all__`` marks what is internal, not an underscore), and imports from a
   sibling only names in that sibling's ``__all__`` (``from pithtrain.kernels.x import n`` or ``x.n``
   through a module alias);
 - importing ``pithtrain.kernels`` loads neither cutlass, QuACK nor FA4: no module it imports at
@@ -182,6 +183,25 @@ def _top_level_names(path: Path) -> set[str]:
             names.update(t.id for t in node.targets if isinstance(t, ast.Name))
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             names.add(node.target.id)
+    return names
+
+
+def _defined_names(tree: ast.Module) -> set[str]:
+    """Every name a module defines at any level: functions, classes, methods, assignment targets
+    (attributes such as self.x included), parameters and import aliases. Reads of other code's
+    attributes (a library's _hooks) are not definitions."""
+    names: set[str] = set()
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(n.name)
+        elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+            names.add(n.id)
+        elif isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Store):
+            names.add(n.attr)
+        elif isinstance(n, ast.arg):
+            names.add(n.arg)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            names |= {a.asname for a in n.names if a.asname}
     return names
 
 
@@ -449,8 +469,12 @@ def _violations() -> set[tuple[str, str, str]]:
             module_all[path.stem] = set()
         if not decl:
             found.add(("kernels-module-all", f"pithtrain.kernels.{path.stem}", "missing __all__"))
-        for name in sorted(_top_level_names(path)):
-            if name.startswith("_") and not name.startswith("__") and name != "_":
+        for name in sorted(_defined_names(tree)):
+            if (
+                name.startswith("_")
+                and name != "_"
+                and not (name.startswith("__") and name.endswith("__"))
+            ):
                 found.add(("kernels-underscore-name", f"pithtrain.kernels.{path.stem}", name))
     for path in sorted(KERNELS.glob("*.py")):
         tree = ast.parse(path.read_text())

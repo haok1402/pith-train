@@ -153,8 +153,8 @@ def build(t: Any, inputs: Dict[str, torch.Tensor], allocs: List[torch.Tensor]) -
 def record(entry: Callable[[], Tuple[torch.Tensor, ...]], inputs: Dict[str, torch.Tensor]):
     """Run FA4's entry once, returning (its outputs, a plan or None)."""
     # Imported here, not at the top: FA4 loads cutlass, and importing pithtrain.kernels must not.
-    from flash_attn.cute import interface as _fa4
-    owners = [f for f in vars(_fa4).values() if callable(f) and hasattr(f, "compile_cache")]
+    from flash_attn.cute import interface as fa4_interface
+    owners = [f for f in vars(fa4_interface).values() if callable(f) and hasattr(f, "compile_cache")]
     log: list = []
     caches = [RecordingCache(f.compile_cache, log) for f in owners]
     for f, cache in zip(owners, caches):
@@ -203,7 +203,7 @@ def replay(plan: Plan, inputs: Dict[str, torch.Tensor], device: torch.device) ->
     return tuple(allocs[o[1]] if o[2] is None else build(o, inputs, allocs) for o in plan.outputs)
 
 
-MISSING, _SEEN = object(), object()
+MISSING, SEEN = object(), object()
 plans: Dict[Tuple, Optional[Plan]] = {}
 
 
@@ -235,9 +235,9 @@ def memoized_launch(kind: str, inputs: Dict[str, Optional[torch.Tensor]], scalar
     plan = plans.get(key, MISSING)
     if plan is MISSING:
         # First call of the signature: plain entry, which compiles whatever it needs.
-        plans[key] = _SEEN
+        plans[key] = SEEN
         return entry()
-    if plan is _SEEN:
+    if plan is SEEN:
         outs, plan = record(entry, inputs)
         if plan is not MISSING:
             plans[key] = plan

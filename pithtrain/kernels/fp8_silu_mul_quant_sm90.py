@@ -111,18 +111,18 @@ class SiluMulQuant:
         total = (mG.shape[0] // BLOCK) * self.NB
         self.kernel(mDh, mG, mU, mOffs, mTok0, mTokS0, mKm0, mKmS0, mTok1, mTokS1, mKm1, mKmS1).launch(grid=[cutlass.min(total, self.num_ctas), 1, 1], block=[THREADS, 1, 1], stream=stream)
 
-    def _tile(self, t: Int32) -> tuple:
+    def tile(self, t: Int32) -> tuple:
         """
         Tile t -> (row block, column block); column blocks of a row block are adjacent
         for read locality.
         """
         return t // self.NB, t % self.NB
 
-    def _issue(self, t: Int32, stage_addr: Int32, total: Int32, tid: Int32, in_base: list):
+    def issue(self, t: Int32, stage_addr: Int32, total: Int32, tid: Int32, in_base: list):
         """cp.async tile t (zero-filled when out of range) into a stage."""
         N = self.N
         ok = Int32(t < total)
-        rb, cb = self._tile(t)
+        rb, cb = self.tile(t)
         r = rb * BLOCK + (tid // 16) * 4
         c = cb * BLOCK + (tid % 16) * VEC
         if cutlass.const_expr(N % BLOCK != 0):
@@ -164,7 +164,7 @@ class SiluMulQuant:
         in_base = [t.iterator.toint() for t in ins]
 
         for s in cutlass.range_constexpr(S):
-            self._issue(bid + s * grid, s_in + s * self.stage_bytes, total, tid, in_base)
+            self.issue(bid + s * grid, s_in + s * self.stage_bytes, total, tid, in_base)
 
         # Expert-group offsets into shared memory, searched once per tile below.
         for gc in cutlass.range((G + THREADS - 1) // THREADS, unroll=1):
@@ -178,7 +178,7 @@ class SiluMulQuant:
         n_it = (total - bid + grid - 1) // grid
         for it in cutlass.range(n_it, unroll=1):
             t = bid + it * grid
-            rb, cb = self._tile(t)
+            rb, cb = self.tile(t)
             row0 = rb * BLOCK
             col0 = cb * BLOCK
             col = col0 + cv * VEC
@@ -210,7 +210,7 @@ class SiluMulQuant:
                         h[0][k][m] = pack_bf16(lo, hi)
 
             # The stage is consumed: refill it with the tile S iterations ahead.
-            self._issue(t + S * grid, stage_addr, total, tid, in_base)
+            self.issue(t + S * grid, stage_addr, total, tid, in_base)
 
             # Expert group of this row block: searchsorted(offs, row0, right=True), clamped.
             cnt = Int32(0)
@@ -328,11 +328,11 @@ class SiluMulQuantGU(SiluMulQuant):
         total = (mG.shape[0] // BLOCK) * self.NB
         self.kernel(mDh, mG, mU, mOffs, mTok, mTokS, mKm, mKmS).launch(grid=[cutlass.min(total, self.num_ctas), 1, 1], block=[THREADS, 1, 1], stream=stream)
 
-    def _issue(self, t: Int32, stage_addr: Int32, total: Int32, tid: Int32, in_base: list):
+    def issue(self, t: Int32, stage_addr: Int32, total: Int32, tid: Int32, in_base: list):
         """cp.async tile t (zero-filled when out of range); dh has row stride N, g / u 2N."""
         N = self.N
         ok = Int32(t < total)
-        rb, cb = self._tile(t)
+        rb, cb = self.tile(t)
         r = rb * BLOCK + (tid // 16) * 4
         c = cb * BLOCK + (tid % 16) * VEC
         for x in range(self.n_in):
@@ -377,7 +377,7 @@ class SiluMulQuantGU(SiluMulQuant):
         kms_base = mKmS.iterator.toint()
 
         for s in cutlass.range_constexpr(S):
-            self._issue(bid + s * grid, s_in + s * self.stage_bytes, total, tid, in_base)
+            self.issue(bid + s * grid, s_in + s * self.stage_bytes, total, tid, in_base)
 
         for gc in cutlass.range((G + THREADS - 1) // THREADS, unroll=1):
             j = gc * THREADS + tid
@@ -389,7 +389,7 @@ class SiluMulQuantGU(SiluMulQuant):
         n_it = (total - bid + grid - 1) // grid
         for it in cutlass.range(n_it, unroll=1):
             t = bid + it * grid
-            rb, cb = self._tile(t)
+            rb, cb = self.tile(t)
             row0 = rb * BLOCK
             col0 = cb * BLOCK
             col = col0 + cv * VEC
@@ -416,7 +416,7 @@ class SiluMulQuantGU(SiluMulQuant):
                         hi = swiglu_fwd(bf16_hi(g), bf16_hi(u))
                         h[0][k][m] = pack_bf16(lo, hi)
 
-            self._issue(t + S * grid, stage_addr, total, tid, in_base)
+            self.issue(t + S * grid, stage_addr, total, tid, in_base)
 
             cnt = Int32(0)
             for gc in cutlass.range((G + 31) // 32, unroll=1):

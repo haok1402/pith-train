@@ -655,12 +655,12 @@ class PackTranspose:
     @cute.kernel
     def kernel(self, x: Int64, out: Int64, N: Int32, K: Int32, G: Int32):
         if const_expr(self.mode == "w16"):
-            self._kernel_w16(x, out, N, K, G)
+            self.kernel_w16(x, out, N, K, G)
         else:
-            self._kernel_8x8(x, out, N, K, G)
+            self.kernel_8x8(x, out, N, K, G)
 
     @cute.jit
-    def _kernel_w16(self, x: Int64, out: Int64, N: Int32, K: Int32, G: Int32):
+    def kernel_w16(self, x: Int64, out: Int64, N: Int32, K: Int32, G: Int32):
         """
         128 threads, each owning 8 rows x 16 bytes; the transposed tile is staged in shared memory
         for 16-byte stores.
@@ -697,7 +697,7 @@ class PackTranspose:
         smem_store_tile(base, gtt, Int32(0), K - tile_c, N - tile_r, N, PACK_THREADS)
 
     @cute.jit
-    def _kernel_8x8(self, x: Int64, out: Int64, N: Int32, K: Int32, G: Int32):
+    def kernel_8x8(self, x: Int64, out: Int64, N: Int32, K: Int32, G: Int32):
         bx, by, bz = cute.arch.block_idx()
         _, _, _, r0, c0 = thread_coords()
         row0 = bx * BLOCK + r0

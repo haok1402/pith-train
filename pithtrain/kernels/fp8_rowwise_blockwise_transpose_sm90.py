@@ -190,7 +190,7 @@ class RowwiseBlockwiseTranspose:
                 for h in cutlass.range_constexpr(2):
                     for g in cutlass.range_constexpr(2):
                         elems = [i * 16 + h * 8 + 4 * g + k for k in range(4)]
-                        qw[g] = self._quant4(xw, elems, rcp)
+                        qw[g] = self.quant4(xw, elems, rcp)
                     for p in cutlass.range_constexpr(8 // VK):
                         c = col_base + h * 64 + p * VK
                         if c < K:
@@ -224,7 +224,7 @@ class RowwiseBlockwiseTranspose:
                     c = col_base + h * 64 + e
                     if c < K:
                         for g in cutlass.range_constexpr(R // 4):
-                            qw[g] = self._quant4(xw, [(4 * g + k) * 16 + h * 8 + e for k in range(4)], brcp)
+                            qw[g] = self.quant4(xw, [(4 * g + k) * 16 + h * 8 + e for k in range(4)], brcp)
                         for p in cutlass.range_constexpr(R // VM):
                             r = row0 + p * VM
                             if r < M:
@@ -233,7 +233,7 @@ class RowwiseBlockwiseTranspose:
                                 src = cute.make_tensor(qb.iterator + p * VM, cute.make_layout(VM))
                                 cute.autovec_copy(src, dst)
 
-    def _quant4(self, xw: cute.Tensor, elems: list, rcp: Float32) -> Uint32:
+    def quant4(self, xw: cute.Tensor, elems: list, rcp: Float32) -> Uint32:
         """Quantize the 4 register-block elements at flat indices elems."""
         epw = 32 // self.dtype.width
         words: list = []

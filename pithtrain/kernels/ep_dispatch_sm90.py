@@ -91,7 +91,7 @@ class DispatchIndex:
         G = cutlass.min(C, self.max_ctas)
         self.kernel(mE, mOut, mCounts, mHist, mCtr).launch(grid=[G, 1, 1], block=[THREADS, 1, 1], stream=stream, cooperative=True)
 
-    def _load_ids(self, mE: cute.Tensor, c: Int32, tid: Int32) -> tuple:
+    def load_ids(self, mE: cute.Tensor, c: Int32, tid: Int32) -> tuple:
         """
         Expert ids of this thread's tokens (ROUNDS x K), first-visit flags, validity, token index.
         """
@@ -148,7 +148,7 @@ class DispatchIndex:
                 b = j * THREADS + tid
                 sts_b32(s_a + b * 4, Uint32(0), Int32(b < NB))
             cute.arch.sync_threads()
-            ids, firsts, oks, _ = self._load_ids(mE, c, tid)
+            ids, firsts, oks, _ = self.load_ids(mE, c, tid)
             for r in cutlass.range_constexpr(ROUNDS):
                 for j in cutlass.range_constexpr(K):
                     e = ids[r][j]
@@ -224,7 +224,7 @@ class DispatchIndex:
                 w = j * THREADS + tid
                 sts_b32(s_bits + w * 4, Uint32(0), Int32(w < NB * WARPS))
             cute.arch.sync_threads()
-            ids, firsts, oks, toks = self._load_ids(mE, c, tid)
+            ids, firsts, oks, toks = self.load_ids(mE, c, tid)
             for r in cutlass.range_constexpr(ROUNDS):
                 for j in cutlass.range_constexpr(K):
                     e = ids[r][j]
