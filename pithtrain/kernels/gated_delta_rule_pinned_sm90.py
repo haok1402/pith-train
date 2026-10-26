@@ -55,7 +55,9 @@ SIGNATURES = {
 
 
 def jit_kernel(name: str) -> triton.JITFunction:
-    """The raw JITFunction under FLA's Heuristics(CachedAutotuner(...)) wrappers."""
+    """
+    The raw JITFunction under FLA's Heuristics(CachedAutotuner(...)) wrappers.
+    """
     return KERNELS[name].fn.fn
 
 
@@ -119,7 +121,9 @@ def check_supported() -> bool:
 
 
 def cumsum(s: torch.Tensor, reverse: bool) -> torch.Tensor:
-    """chunk_local_cumsum (scalar, fp32 out): scaled by 1/ln 2 forward, unscaled in reverse."""
+    """
+    chunk_local_cumsum (scalar, fp32 out): scaled by 1/ln 2 forward, unscaled in reverse.
+    """
     B, T, H = s.shape
     o = torch.empty_like(s, dtype=torch.float)
     config = CONFIGS["cumsum_rev" if reverse else "cumsum_fwd"]
@@ -128,7 +132,9 @@ def cumsum(s: torch.Tensor, reverse: bool) -> torch.Tensor:
 
 
 def w_u(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """recompute_w_u_fwd."""
+    """
+    recompute_w_u_fwd.
+    """
     B, T, H, K, HV, V = *k.shape, *v.shape[2:]
     w, u = k.new_empty(B, T, HV, K), torch.empty_like(v)
     launch("w_u", (triton.cdiv(T, BT), B * HV), k=k, v=v, beta=beta, w=w, u=u, A=A, g=g, cu_seqlens=None, chunk_indices=None, T=T, H=H, HV=HV, K=K, V=V, BT=BT, BK=64, BV=64, USE_G=True, IS_VARLEN=False, **CONFIGS["w_u"])
@@ -136,7 +142,9 @@ def w_u(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, g
 
 
 def fwd_h(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """chunk_gated_delta_rule_fwd_h: per-chunk states h and the transformed values."""
+    """
+    chunk_gated_delta_rule_fwd_h: per-chunk states h and the transformed values.
+    """
     B, T, H, K, HV, V = *k.shape, *u.shape[2:]
     h, v_new = k.new_empty(B, triton.cdiv(T, BT), HV, K, V), torch.empty_like(u)
     config = CONFIGS["fwd_h"]
@@ -222,7 +230,7 @@ def gated_delta_rule_pinned_supported(q: torch.Tensor, k: torch.Tensor, v: torch
     """
     Whether chunk_gdr_fwd_pinned / chunk_gdr_bwd_pinned apply to this call: the recorded geometry
     (pinned_shapes) on SM90 with the recorded FLA and Triton versions (pinned_launch_supported).
-    Otherwise the caller uses FLA's autotuned entry points. Constant per geometry, so
-    torch.compile evaluates it rather than tracing into it.
+    Otherwise the caller uses FLA's autotuned entry points. Constant per geometry, so torch.compile
+    evaluates it rather than tracing into it.
     """
     return pinned_shapes(q, k, v, g, beta) and pinned_launch_supported()

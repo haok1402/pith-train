@@ -67,7 +67,9 @@ class RowwiseKmajor:
     """
 
     RED_WORDS = 64 * 6
-    """Shared-memory words tile reduces through; subclasses (ScatterQuant) size theirs by it."""
+    """
+    Shared-memory words tile reduces through; subclasses (ScatterQuant) size theirs by it.
+    """
 
     def __init__(self, n: int, num_groups: int) -> None:
         self.n = n
@@ -101,7 +103,9 @@ class RowwiseKmajor:
         return lane, warp, cv, rb
 
     def src(self, x_base, pid_row, pid_col, tidx, i):
-        """Global address of row i of this thread's sub-block, and whether it is in bounds."""
+        """
+        Global address of row i of this thread's sub-block, and whether it is in bounds.
+        """
         _, _, cv, rb = self.coords(tidx)
         col0, row = pid_col * TILE + cv * 8, Int64(pid_row) * TILE + rb * 8 + i
         return x_base + (row * self.n + col0) * 2, Int32(col0 < self.n)

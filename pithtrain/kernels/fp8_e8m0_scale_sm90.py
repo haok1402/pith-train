@@ -17,7 +17,9 @@ __all__ = ["AMAX_MIN", "FP8_MAX_RCP", "e8m0_scale", "e8m0_scale_bf16x2", "e8m0_s
 
 
 def ptx_f32(x: float) -> str:
-    """PTX hex literal of the float32 nearest to x."""
+    """
+    PTX hex literal of the float32 nearest to x.
+    """
     return "0f%08X" % struct.unpack("<I", struct.pack("<f", x))[0]
 
 
@@ -26,7 +28,9 @@ FP8_MAX_RCP, AMAX_MIN = ptx_f32(1.0 / 448.0), ptx_f32(1e-4)
 
 @dsl_user_op
 def e8m0_scale_f32(amax: Float32, *, loc=None, ip=None) -> tuple:
-    """SM90 branch of compute_fp8_scale: (scale, reciprocal), both exact powers of 2."""
+    """
+    SM90 branch of compute_fp8_scale: (scale, reciprocal), both exact powers of 2.
+    """
     ty = ir.Type.parse("!llvm.struct<(f32, f32)>")
     res = asm_args_last(
         ty,
@@ -51,7 +55,9 @@ def e8m0_scale_f32(amax: Float32, *, loc=None, ip=None) -> tuple:
 
 @dsl_user_op
 def quant4_e4m3(x0: Float32, x1: Float32, x2: Float32, x3: Float32, r: tuple, *, loc=None, ip=None) -> Uint32:
-    """Four cvt.rn.satfinite.e4m3 of x_i * r_i, packed little-endian into one word."""
+    """
+    Four cvt.rn.satfinite.e4m3 of x_i * r_i, packed little-endian into one word.
+    """
     args = [to_ir(v, Float32, loc, ip) for v in (x0, x1, x2, x3)]
     args += [to_ir(v, Float32, loc, ip) for v in r]
     return Uint32(
@@ -135,7 +141,9 @@ def e8m0_scale(amax: Float32, *, loc=None, ip=None) -> Float32:
 
 @dsl_user_op
 def exact_rcp(scale: Float32, *, loc=None, ip=None) -> Float32:
-    """Exact reciprocal of a power of 2 by exponent flip: bits -> (254 << 23) - bits."""
+    """
+    Exact reciprocal of a power of 2 by exponent flip: bits -> (254 << 23) - bits.
+    """
     res = llvm.inline_asm(
         T.f32(), [Float32(scale).ir_value(loc=loc, ip=ip)],
         "{\n\t"

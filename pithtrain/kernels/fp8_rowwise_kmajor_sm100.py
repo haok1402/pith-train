@@ -12,7 +12,9 @@ __all__ = ["fp8cast_rowwise_kmajor_sm100"]
 
 
 def fp8cast_rowwise_kmajor_sm100(x: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """fp8cast_rowwise_kmajor in Triton; both scales come back row-major."""
+    """
+    fp8cast_rowwise_kmajor in Triton; both scales come back row-major.
+    """
     assert x.ndim == 2 and x.shape[0] % 128 == 0, (f"Expected 2D tensor with M%128==0, got shape {x.shape}")
     M, N = x.shape
     BLOCK = 128

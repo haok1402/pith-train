@@ -44,12 +44,16 @@ STAGES = {False: 3, True: 2}  # cp.async tiles in flight per CTA, by direction (
 
 
 def ptx_f32(x: float) -> str:
-    """PTX hex literal of the float32 nearest to x."""
+    """
+    PTX hex literal of the float32 nearest to x.
+    """
     return "0f%08X" % struct.unpack("<I", struct.pack("<f", x))[0]
 
 
 def f32(x: float) -> float:
-    """x rounded to float32, as Triton receives a Python float scalar argument."""
+    """
+    x rounded to float32, as Triton receives a Python float scalar argument.
+    """
     return struct.unpack("<f", struct.pack("<f", x))[0]
 
 
@@ -73,7 +77,9 @@ def ld_v4(addr: Int64, pred: Int32, *, loc=None, ip=None) -> tuple:
 
 @dsl_user_op
 def add_bias2(w: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
-    """Two packed BF16 plus two packed BF16, each an fp32 add rounded to BF16 (RN)."""
+    """
+    Two packed BF16 plus two packed BF16, each an fp32 add rounded to BF16 (RN).
+    """
     return Uint32(
         asm_args_last(
             T.i32(),
@@ -101,7 +107,9 @@ def add_bias2(w: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
 #             grad_gc = ((uc + 1) * do * s) * fma(a * gc, 1 - s, 1)      (LLVM contraction)
 #             grad_g  = g <= L ? grad_gc : 0;   grad_u = -L <= u <= L ? grad_uc : 0
 def sigmoid_ptx(x: str) -> str:
-    """PTX computing s = sigmoid(-(-x)) of the fp32 register x (uses t, s)."""
+    """
+    PTX computing s = sigmoid(-(-x)) of the fp32 register x (uses t, s).
+    """
     return (
         f"mul.rn.f32 t, {x}, 0fBFB8AA3B;\n"
         "ex2.approx.ftz.f32 t, t;\n"
@@ -112,7 +120,9 @@ def sigmoid_ptx(x: str) -> str:
 
 
 def clamp_ptx(alpha: float, limit: float) -> str:
-    """gc, uc, ag = alpha * gc and s = sigmoid(ag) from g = $G, u = $U."""
+    """
+    gc, uc, ag = alpha * gc and s = sigmoid(ag) from g = $G, u = $U.
+    """
     L, nL, A = ptx_f32(limit), ptx_f32(-limit), ptx_f32(alpha)
     return (
         f"min.f32 gc, $G, {L};\n"
@@ -210,11 +220,15 @@ class ClampedSwiGLUQuant:
         self.kernel(mDh, mGU, mBias, mOffs, mTok, mTokS, mKm, mKmS, mPart).launch(grid=[cutlass.min(total, self.num_ctas), 1, 1], block=[THREADS, 1, 1], stream=stream)
 
     def tile(self, t: Int32) -> tuple:
-        """Tile t -> (row block, column block); column blocks of a row block adjacent."""
+        """
+        Tile t -> (row block, column block); column blocks of a row block adjacent.
+        """
         return t // self.NB, t % self.NB
 
     def issue(self, t: Int32, stage_addr: Int32, total: Int32, tid: Int32, dh_base, gu_base):
-        """cp.async tile t (zero-filled when out of range) into a stage; traced inline."""
+        """
+        cp.async tile t (zero-filled when out of range) into a stage; traced inline.
+        """
         N, NO = self.N, self.NO
         ok = Int32(t < total)
         rb, cb = self.tile(t)
@@ -483,7 +497,9 @@ def alloc(M: int, N: int, device: torch.device, KP: int | None = None) -> tuple[
 
 
 def clamped_swiglu_quant_fusable(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor) -> bool:
-    """Inputs the fused kernel handles; others take the (bit-identical) unfused path."""
+    """
+    Inputs the fused kernel handles; others take the (bit-identical) unfused path.
+    """
     N = gate_up.shape[1] // 2
     return (gate_up.dtype == torch.bfloat16 and gate_up.is_contiguous() and gate_up.data_ptr() % 16 == 0 and bias.dtype == torch.bfloat16 and bias.is_contiguous() and bias.data_ptr() % 16 == 0 and N % VEC == 0 and grouped_mm_offs.dtype == torch.int32 and grouped_mm_offs.is_contiguous() and 0 < grouped_mm_offs.shape[0] <= G_CAP)
 
@@ -514,7 +530,9 @@ def clamped_swiglu_quant_fwd_sm90(gate_up: torch.Tensor, bias: torch.Tensor, gro
 
 
 def clamped_swiglu_quant_rowwise_sm90(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """Only the rowwise pair of clamped_swiglu_quant_fwd_sm90."""
+    """
+    Only the rowwise pair of clamped_swiglu_quant_fwd_sm90.
+    """
     M, N = gate_up.shape[0], gate_up.shape[1] // 2
     if M == 0 or N == 0 or not clamped_swiglu_quant_fusable(gate_up, bias, grouped_mm_offs):
         return clamped_swiglu_quant_fwd_sm90(gate_up, bias, grouped_mm_offs, alpha, limit)[:2]
@@ -526,7 +544,9 @@ def clamped_swiglu_quant_rowwise_sm90(gate_up: torch.Tensor, bias: torch.Tensor,
 
 
 def clamped_swiglu_quant_kmajor_sm90(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-    """Only the K-major pair of clamped_swiglu_quant_fwd_sm90."""
+    """
+    Only the K-major pair of clamped_swiglu_quant_fwd_sm90.
+    """
     M, N = gate_up.shape[0], gate_up.shape[1] // 2
     if M == 0 or N == 0 or not clamped_swiglu_quant_fusable(gate_up, bias, grouped_mm_offs):
         return clamped_swiglu_quant_fwd_sm90(gate_up, bias, grouped_mm_offs, alpha, limit, kmajor_channels)[2:]

@@ -278,7 +278,9 @@ def st_v4(addr: Int64, w: list, pred: Int32) -> None:
 
 
 class Thread:
-    """Trace-time per-thread constants."""
+    """
+    Trace-time per-thread constants.
+    """
 
     def __init__(self, tidx: Int32) -> None:
         self.warp = tidx // 32
@@ -288,7 +290,9 @@ class Thread:
 
 
 class Tile:
-    """Trace-time coordinates and bounds predicates of one 128x128 tile."""
+    """
+    Trace-time coordinates and bounds predicates of one 128x128 tile.
+    """
 
     def __init__(self, th: Thread, tm: Int32, tn: Int32, M: Int32, N: Int32) -> None:
         self.tm = tm
@@ -302,7 +306,9 @@ class Tile:
 
 
 def load_global(x_base: Int64, N64: Int64, tl: Tile, vec_n: bool) -> list:
-    """The thread's 8x8 block as bf16x2 words: v[i][k] = columns (2k, 2k+1) of row i."""
+    """
+    The thread's 8x8 block as bf16x2 words: v[i][k] = columns (2k, 2k+1) of row i.
+    """
     v = []
     if vec_n:
         for i in range(8):
@@ -435,7 +441,9 @@ def quantize_tile(v: list, th: Thread, tl: Tile, sred: Int32, stile: Int32, base
 
 @cute.kernel
 def rowwise_transpose_kernel(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, vec_n: cutlass.Constexpr[bool], m_align: cutlass.Constexpr[int]) -> None:
-    """One 128x128 tile per CTA."""
+    """
+    One 128x128 tile per CTA.
+    """
     M, N = mX.shape[0], mX.shape[1]
     tidx, _, _ = cute.arch.thread_idx()
     tn, tm, _ = cute.arch.block_idx()
@@ -478,7 +486,9 @@ def get_compiled(key: tuple[bool, int]) -> Callable:
 
 
 def supports_rowwise_transpose(x: torch.Tensor) -> bool:
-    """Whether the CuTe kernel covers x: non-empty, contiguous, bf16."""
+    """
+    Whether the CuTe kernel covers x: non-empty, contiguous, bf16.
+    """
     M, N = x.shape
     return x.dtype is torch.bfloat16 and x.is_contiguous() and bool(M) and bool(N)
 

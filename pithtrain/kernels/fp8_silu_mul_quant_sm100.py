@@ -14,12 +14,16 @@ BLOCK = 128
 
 
 def empty(M: int, N: int, device: torch.device) -> tuple[torch.Tensor, ...]:
-    """The four outputs of fp8cast_rowwise_kmajor_sm100 for an empty (M, N) input."""
+    """
+    The four outputs of fp8cast_rowwise_kmajor_sm100 for an empty (M, N) input.
+    """
     return (torch.empty((M, N), dtype=torch.float8_e4m3fn, device=device), torch.empty((M, (N + BLOCK - 1) // BLOCK), dtype=torch.float32, device=device), torch.empty(M * N, dtype=torch.float8_e4m3fn, device=device), torch.empty((N, M // BLOCK), dtype=torch.float32, device=device))
 
 
 def silu_mul_quant_fwd_sm100(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """fp8cast_rowwise_kmajor_sm100(silu_mul_fwd(g, u), grouped_mm_offs)."""
+    """
+    fp8cast_rowwise_kmajor_sm100(silu_mul_fwd(g, u), grouped_mm_offs).
+    """
     M, N = g.shape
     if M == 0 or N == 0:
         return empty(M, N, g.device)
@@ -27,7 +31,9 @@ def silu_mul_quant_fwd_sm100(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: 
 
 
 def silu_mul_bwd_quant_sm100(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-    """fp8cast_rowwise_kmajor_sm100 of each gradient of silu_mul_bwd(dh, g, u)."""
+    """
+    fp8cast_rowwise_kmajor_sm100 of each gradient of silu_mul_bwd(dh, g, u).
+    """
     M, N = g.shape
     if M == 0 or N == 0:
         return empty(M, N, g.device), empty(M, N, g.device)
@@ -36,7 +42,9 @@ def silu_mul_bwd_quant_sm100(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor,
 
 
 def silu_mul_quant_gu_fwd_sm100(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """silu_mul_quant_fwd_sm100 of the halves of a fused gate_up output gu (M, 2N)."""
+    """
+    silu_mul_quant_fwd_sm100 of the halves of a fused gate_up output gu (M, 2N).
+    """
     M, N = gu.shape[0], gu.shape[1] // 2
     if M == 0:
         return empty(0, N, gu.device)
@@ -45,7 +53,9 @@ def silu_mul_quant_gu_fwd_sm100(gu: torch.Tensor, grouped_mm_offs: torch.Tensor)
 
 
 def silu_mul_bwd_quant_gu_sm100(dh: torch.Tensor, gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """fp8cast_rowwise_kmajor_sm100(cat([dg, du], 1)) of the SwiGLU gradients of gu."""
+    """
+    fp8cast_rowwise_kmajor_sm100(cat([dg, du], 1)) of the SwiGLU gradients of gu.
+    """
     M, N = gu.shape[0], gu.shape[1] // 2
     if M == 0:
         return empty(0, 2 * N, gu.device)

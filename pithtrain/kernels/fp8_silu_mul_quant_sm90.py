@@ -51,7 +51,9 @@ SIGMOID_PTX = (
 
 @dsl_user_op
 def swiglu_fwd(g: Float32, u: Float32, *, loc=None, ip=None) -> Float32:
-    """silu(g) * u in fp32 as (sigmoid(g) * g) * u, the Triton forward's exact op order."""
+    """
+    silu(g) * u in fp32 as (sigmoid(g) * g) * u, the Triton forward's exact op order.
+    """
     return Float32(asm_args_last(T.f32(), "{\n.reg .f32 t, s;\n" + SIGMOID_PTX.replace("$G", "$1") + "mul.rn.f32 s, s, $1;\nmul.rn.f32 $0, s, $2;\n}", "=f,f,f", [to_ir(g, Float32, loc, ip), to_ir(u, Float32, loc, ip)]))
 
 
@@ -119,7 +121,9 @@ class SiluMulQuant:
         return t // self.NB, t % self.NB
 
     def issue(self, t: Int32, stage_addr: Int32, total: Int32, tid: Int32, in_base: list):
-        """cp.async tile t (zero-filled when out of range) into a stage."""
+        """
+        cp.async tile t (zero-filled when out of range) into a stage.
+        """
         N = self.N
         ok = Int32(t < total)
         rb, cb = self.tile(t)
@@ -325,7 +329,9 @@ class SiluMulQuantGU(SiluMulQuant):
         self.kernel(mDh, mG, mU, mOffs, mTok, mTokS, mKm, mKmS).launch(grid=[cutlass.min(total, self.num_ctas), 1, 1], block=[THREADS, 1, 1], stream=stream)
 
     def issue(self, t: Int32, stage_addr: Int32, total: Int32, tid: Int32, in_base: list):
-        """cp.async tile t (zero-filled when out of range); dh has row stride N, g / u 2N."""
+        """
+        cp.async tile t (zero-filled when out of range); dh has row stride N, g / u 2N.
+        """
         N = self.N
         ok = Int32(t < total)
         rb, cb = self.tile(t)
@@ -497,7 +503,9 @@ compiled_gu: dict = {}
 
 
 def get_kernel(N: int, backward: bool, device: torch.device) -> object:
-    """Compiled kernel for (N, direction, device); M and the group count stay dynamic."""
+    """
+    Compiled kernel for (N, direction, device); M and the group count stay dynamic.
+    """
     key = (N, backward, device.index)
     fn = compiled.get(key)
     if fn is None:
@@ -514,7 +522,9 @@ def get_kernel(N: int, backward: bool, device: torch.device) -> object:
 
 
 def get_kernel_gu(N: int, backward: bool, device: torch.device) -> object:
-    """Compiled gate_up kernel for (N, direction, device); M and the group count stay dynamic."""
+    """
+    Compiled gate_up kernel for (N, direction, device); M and the group count stay dynamic.
+    """
     key = (N, backward, device.index)
     fn = compiled_gu.get(key)
     if fn is None:
@@ -541,17 +551,23 @@ def alloc_rowwise_kmajor_outputs(M: int, N: int, device: torch.device) -> tuple[
 
 
 def silu_mul_quant_fusable(N: int, grouped_mm_offs: torch.Tensor) -> bool:
-    """Shapes the fused kernel handles; others take the bit-identical unfused path."""
+    """
+    Shapes the fused kernel handles; others take the bit-identical unfused path.
+    """
     return N % VEC == 0 and 0 < grouped_mm_offs.shape[0] <= G_CAP
 
 
 def silu_mul_quant_gu_fusable(N: int, M: int, grouped_mm_offs: torch.Tensor) -> bool:
-    """Shapes the fused gate_up kernel handles; others take the bit-identical unfused path."""
+    """
+    Shapes the fused gate_up kernel handles; others take the bit-identical unfused path.
+    """
     return N % BLOCK == 0 and M % BLOCK == 0 and 0 < grouped_mm_offs.shape[0] <= G_CAP
 
 
 def silu_mul_quant_fwd_sm90(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """fp8cast_rowwise_kmajor(silu_mul_fwd(g, u), grouped_mm_offs) without writing h."""
+    """
+    fp8cast_rowwise_kmajor(silu_mul_fwd(g, u), grouped_mm_offs) without writing h.
+    """
     M, N = g.shape
     if M != 0 and N != 0 and not silu_mul_quant_fusable(N, grouped_mm_offs):
         return fp8cast_rowwise_kmajor_sm90(silu_mul_fwd(g, u), grouped_mm_offs)
@@ -563,7 +579,9 @@ def silu_mul_quant_fwd_sm90(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: t
 
 
 def silu_mul_bwd_quant_sm90(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """fp8cast_rowwise_kmajor of each gradient of silu_mul_bwd(dh, g, u) without writing them."""
+    """
+    fp8cast_rowwise_kmajor of each gradient of silu_mul_bwd(dh, g, u) without writing them.
+    """
     M, N = g.shape
     if M == 0 or N == 0:
         return (alloc_rowwise_kmajor_outputs(M, N, g.device), alloc_rowwise_kmajor_outputs(M, N, g.device))
@@ -576,7 +594,9 @@ def silu_mul_bwd_quant_sm90(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, 
 
 
 def silu_mul_quant_gu_fwd_sm90(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """fp8cast_rowwise_kmajor(silu_mul_fwd(gu[:, :N], gu[:, N:]), offs) for gu (M, 2N)."""
+    """
+    fp8cast_rowwise_kmajor(silu_mul_fwd(gu[:, :N], gu[:, N:]), offs) for gu (M, 2N).
+    """
     M, N = gu.shape[0], gu.shape[1] // 2
     if M == 0:
         return alloc_rowwise_kmajor_outputs(0, N, gu.device)
@@ -589,7 +609,9 @@ def silu_mul_quant_gu_fwd_sm90(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) 
 
 
 def silu_mul_bwd_quant_gu_sm90(dh: torch.Tensor, gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """fp8cast_rowwise_kmajor(cat([dg, du], 1), offs) of the SwiGLU gradients of gu (M, 2N)."""
+    """
+    fp8cast_rowwise_kmajor(cat([dg, du], 1), offs) of the SwiGLU gradients of gu (M, 2N).
+    """
     M, N = gu.shape[0], gu.shape[1] // 2
     if M == 0:
         return alloc_rowwise_kmajor_outputs(0, 2 * N, gu.device)

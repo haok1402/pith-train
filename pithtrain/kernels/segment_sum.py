@@ -15,7 +15,9 @@ __all__ = ["block_segment_sum", "segment_sum_along_rows"]
 
 @triton.jit
 def segment_sum_kernel(x_ptr, offs_padded_ptr, out_ptr, H: tl.constexpr, HEAD_BLOCK: tl.constexpr, BLOCK_M: tl.constexpr):
-    """One block reduces rows [start, end) of group g over HEAD_BLOCK columns, in fp32."""
+    """
+    One block reduces rows [start, end) of group g over HEAD_BLOCK columns, in fp32.
+    """
     g, h_blk = tl.program_id(0), tl.program_id(1)
     start, end = tl.load(offs_padded_ptr + g), tl.load(offs_padded_ptr + g + 1)
 
@@ -74,7 +76,9 @@ def segment_tile_sum_kernel(x_ptr, offs_padded_ptr, part_ptr, E, H: tl.constexpr
 
 @triton.jit
 def segment_tile_reduce_kernel(part_ptr, offs_padded_ptr, out_ptr, E, H: tl.constexpr, HEAD_BLOCK: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_E: tl.constexpr):
-    """out[g] = the tile sums of group g added in row order, starting from zero (fp32)."""
+    """
+    out[g] = the tile sums of group g added in row order, starting from zero (fp32).
+    """
     g, h_blk = tl.program_id(0), tl.program_id(1)
     first, ntiles, _, _ = segment_tile(offs_padded_ptr, E, BLOCK_M, BLOCK_E)
     sel = tl.arange(0, BLOCK_E) == g
@@ -133,7 +137,9 @@ def segment_sum_along_rows(x: torch.Tensor, grouped_mm_offs: torch.Tensor, out_d
 
 @triton.jit
 def block_segment_sum_kernel(part_ptr, offs_ptr, out_ptr, H, BLOCK_H: tl.constexpr):
-    """out[g] = sum of the 128-row-block partials of expert g, in row order (fp32)."""
+    """
+    out[g] = sum of the 128-row-block partials of expert g, in row order (fp32).
+    """
     g = tl.program_id(0)
     h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     mask = h < H

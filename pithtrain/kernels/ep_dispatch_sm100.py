@@ -27,7 +27,9 @@ def dedup_bincount_kernel(
     EP_PADDED: tl.constexpr,  # next_power_of_2(EP_SIZE + 1)
     BLOCK: tl.constexpr,
 ):
-    """Per-CTA histograms of slots per expert and of distinct tokens per EP rank."""
+    """
+    Per-CTA histograms of slots per expert and of distinct tokens per EP rank.
+    """
     pid = tl.program_id(0)
     num_ctas = tl.num_programs(0)
 
@@ -201,7 +203,9 @@ def dispatch_scratch(device: torch.device, m: int, num_ctas: int, ne_padded: int
 
 
 def fused_dedup_prepare_dispatch_sm100(topk_ids: torch.Tensor, num_experts: int, ep_size: int, experts_per_rank: int, meta_out: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The Triton path of fused_dedup_prepare_dispatch (atomic order within each bucket)."""
+    """
+    The Triton path of fused_dedup_prepare_dispatch (atomic order within each bucket).
+    """
     m, k = topk_ids.shape
     device = topk_ids.device
     assert ep_size <= 32, f"ep_size={ep_size} exceeds int32 bitmask limit of 32"
@@ -280,7 +284,9 @@ def expert_and_expand_idx_kernel(
 
 
 def expert_and_expand_idx_sm100(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """The Triton path of expert_and_expand_idx."""
+    """
+    The Triton path of expert_and_expand_idx.
+    """
     # the kernel indexes both inputs with unit stride
     recv_meta, received_expand_idx = recv_meta.contiguous(), received_expand_idx.contiguous()
     total = received_expand_idx.shape[0]

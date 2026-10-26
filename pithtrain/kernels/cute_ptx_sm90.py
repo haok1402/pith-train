@@ -49,7 +49,9 @@ def ld_v4(addr: Int64, pred: Int32, *, loc=None, ip=None) -> tuple:
 
 @dsl_user_op
 def ld_b32(addr: Int64, pred: Int32, other: Int32, *, loc=None, ip=None) -> Int32:
-    """Predicated 4-byte global load returning other where pred == 0."""
+    """
+    Predicated 4-byte global load returning other where pred == 0.
+    """
     return Int32(
         asm(
             T.i32(), [Int64(addr).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip), Int32(other).ir_value(loc=loc, ip=ip)],
@@ -82,7 +84,9 @@ def sts_b32(addr: Int32, a: Uint32, pred: Int32, *, loc=None, ip=None) -> None:
 
 @dsl_user_op
 def max_u16x2(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
-    """Packed max of two halves; equals the bf16 max for non-negative (abs) values."""
+    """
+    Packed max of two halves; equals the bf16 max for non-negative (abs) values.
+    """
     return Uint32(asm(T.i32(), [Uint32(a).ir_value(loc=loc, ip=ip), Uint32(b).ir_value(loc=loc, ip=ip)], "max.u16x2 $0, $1, $2;", "=r,r,r"))
 
 
@@ -93,7 +97,9 @@ def prmt(a: Uint32, b: Uint32, sel: int, *, loc=None, ip=None) -> Uint32:
 
 @dsl_user_op
 def selp(pred: Int32, a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
-    """pred ? a : b."""
+    """
+    pred ? a : b.
+    """
     return Uint32(asm(T.i32(), [Int32(pred).ir_value(loc=loc, ip=ip), Uint32(a).ir_value(loc=loc, ip=ip), Uint32(b).ir_value(loc=loc, ip=ip)], "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $1, 0;\n\tselp.b32 $0, $2, $3, p;\n\t}", "=r,r,r,r"))
 
 
@@ -124,7 +130,9 @@ def st_release(addr: Int64, v: Int32, *, loc=None, ip=None) -> None:
 
 @dsl_user_op
 def spin_until(addr: Int64, v: Int32, pred: Int32, *, loc=None, ip=None) -> None:
-    """Where pred: spin with acquire loads until *addr == v."""
+    """
+    Where pred: spin with acquire loads until *addr == v.
+    """
     asm(
         None, [Int64(addr).ir_value(loc=loc, ip=ip), Int32(v).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip)],
         "{\n\t.reg .pred p, q;\n\t.reg .b32 t;\n\t"
@@ -141,7 +149,9 @@ def spin_until(addr: Int64, v: Int32, pred: Int32, *, loc=None, ip=None) -> None
 
 @dsl_user_op
 def ld_relaxed(addr: Int64, pred: Int32, *, loc=None, ip=None) -> Int32:
-    """Predicated gpu-scope relaxed 4-byte load (L2, never a stale L1 line); 0 where not pred."""
+    """
+    Predicated gpu-scope relaxed 4-byte load (L2, never a stale L1 line); 0 where not pred.
+    """
     return Int32(
         asm(
             T.i32(), [Int64(addr).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip)],
@@ -179,7 +189,9 @@ def atom_add_u64_pred(addr: Int64, v: Int64, pred: Int32, *, loc=None, ip=None) 
 
 @dsl_user_op
 def spin_epoch(addr: Int64, epoch: Int32, pred: Int32, *, loc=None, ip=None) -> None:
-    """Where pred: spin with acquire loads until the epoch (high word of *addr) moves on."""
+    """
+    Where pred: spin with acquire loads until the epoch (high word of *addr) moves on.
+    """
     asm(
         None, [Int64(addr).ir_value(loc=loc, ip=ip), Int32(epoch).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip)],
         "{\n\t.reg .pred p, q;\n\t.reg .b32 lo, hi;\n\t"
@@ -201,7 +213,9 @@ def red_or_u64(addr: Int64, v: Int64, pred: Int32, *, loc=None, ip=None) -> None
 
 @dsl_user_op
 def ld_b64(addr: Int64, pred: Int32, *, loc=None, ip=None) -> Int64:
-    """Predicated 8-byte global load; 0 where pred == 0."""
+    """
+    Predicated 8-byte global load; 0 where pred == 0.
+    """
     return Int64(
         asm(
             T.i64(), [Int64(addr).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip)],
@@ -214,7 +228,9 @@ def ld_b64(addr: Int64, pred: Int32, *, loc=None, ip=None) -> Int64:
 
 @dsl_user_op
 def ctz64(v: Int64, *, loc=None, ip=None) -> Int32:
-    """Index of the lowest set bit (64 for 0)."""
+    """
+    Index of the lowest set bit (64 for 0).
+    """
     return Int32(asm(T.i32(), [Int64(v).ir_value(loc=loc, ip=ip)], "{\n\t.reg .b64 r;\n\tbrev.b64 r, $1;\n\tclz.b64 $0, r;\n\t}", "=r,l"))
 
 
@@ -260,7 +276,9 @@ def unpack(res, n: int, ty, loc=None, ip=None) -> tuple:
 
 @dsl_user_op
 def ld_b32_coherent(addr: Int64, pred: Int32, other: Int32, *, loc=None, ip=None) -> Int32:
-    """Predicated coherent 4-byte global load; other when pred is 0."""
+    """
+    Predicated coherent 4-byte global load; other when pred is 0.
+    """
     return Int32(asm_args_last(T.i32(), "{\n.reg .pred p;\nsetp.ne.b32 p, $2, 0;\nmov.b32 $0, $3;\n@p ld.global.b32 $0, [$1];\n}", "=r,l,r,r", [to_ir(addr, Int64, loc, ip), to_ir(pred, Int32, loc, ip), to_ir(other, Int32, loc, ip)]))
 
 
@@ -308,7 +326,9 @@ def lds_v4(addr: Int32, *, loc=None, ip=None) -> tuple:
 
 @dsl_user_op
 def cp_async16(dst: Int32, src: Int64, src_size: Int32, *, loc=None, ip=None) -> None:
-    """16-byte global->shared cp.async.cg; zero-fills when src_size is 0."""
+    """
+    16-byte global->shared cp.async.cg; zero-fills when src_size is 0.
+    """
     asm_args_last(T.i32(), "cp.async.cg.shared.global [$1], [$2], 16, $3;\nmov.b32 $0, 0;", "=r,r,l,r", [to_ir(dst, Int32, loc, ip), to_ir(src, Int64, loc, ip), to_ir(src_size, Int32, loc, ip)], side_effects=True)
 
 
@@ -319,13 +339,17 @@ def lds_b32_pred(addr: Int32, pred: Int32, other: Int32, *, loc=None, ip=None) -
 
 @dsl_user_op
 def selp_args_last(pred: Int32, a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
-    """pred ? a : b."""
+    """
+    pred ? a : b.
+    """
     return Uint32(asm_args_last(T.i32(), "{\n.reg .pred p;\nsetp.ne.b32 p, $1, 0;\nselp.b32 $0, $2, $3, p;\n}", "=r,r,r,r", [to_ir(pred, Int32, loc, ip), to_ir(a, Uint32, loc, ip), to_ir(b, Uint32, loc, ip)]))
 
 
 @dsl_user_op
 def bf16_sel(pred_hi: Int32, x: Uint32, *, loc=None, ip=None) -> Float32:
-    """fp32 value of the high (pred_hi) or low BF16 half of x."""
+    """
+    fp32 value of the high (pred_hi) or low BF16 half of x.
+    """
     return Float32(
         asm_args_last(
             T.f32(),
@@ -358,19 +382,25 @@ def bf16_hi(x: Uint32, *, loc=None, ip=None) -> Float32:
 
 @dsl_user_op
 def pack_bf16(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Uint32:
-    """Round two fp32 to BF16 (RN, as Triton's .to(tl.bfloat16)) and pack {lo, hi}."""
+    """
+    Round two fp32 to BF16 (RN, as Triton's .to(tl.bfloat16)) and pack {lo, hi}.
+    """
     return Uint32(asm_args_last(T.i32(), "cvt.rn.bf16x2.f32 $0, $1, $2;", "=r,f,f", [to_ir(hi, Float32, loc, ip), to_ir(lo, Float32, loc, ip)]))
 
 
 @dsl_user_op
 def abs2(x: Uint32, *, loc=None, ip=None) -> Uint32:
-    """Magnitude bits of two packed BF16."""
+    """
+    Magnitude bits of two packed BF16.
+    """
     return Uint32(asm_args_last(T.i32(), "and.b32 $0, $1, 0x7FFF7FFF;", "=r,r", [to_ir(x, Uint32, loc, ip)]))
 
 
 @dsl_user_op
 def max2(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
-    """Lane-wise max of two packed BF16 magnitudes (NaN-ignoring, like Triton's max.f32)."""
+    """
+    Lane-wise max of two packed BF16 magnitudes (NaN-ignoring, like Triton's max.f32).
+    """
     return Uint32(asm_args_last(T.i32(), "max.bf16x2 $0, $1, $2;", "=r,r,r", [to_ir(a, Uint32, loc, ip), to_ir(b, Uint32, loc, ip)]))
 
 
@@ -381,7 +411,9 @@ def prmt_args_last(a: Uint32, b: Uint32, sel: int, *, loc=None, ip=None) -> Uint
 
 @dsl_user_op
 def cp_async8(dst: Int32, src: Int64, src_size: Int32, *, loc=None, ip=None) -> None:
-    """8-byte global->shared cp.async.ca; zero-fills when src_size is 0."""
+    """
+    8-byte global->shared cp.async.ca; zero-fills when src_size is 0.
+    """
     asm_args_last(T.i32(), "cp.async.ca.shared.global [$1], [$2], 8, $3;\nmov.b32 $0, 0;", "=r,r,l,r", [to_ir(dst, Int32, loc, ip), to_ir(src, Int64, loc, ip), to_ir(src_size, Int32, loc, ip)], side_effects=True)
 
 

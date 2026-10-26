@@ -22,7 +22,9 @@ def group_ids(grouped_mm_offs: torch.Tensor, M: int) -> torch.Tensor:
 
 
 def biased_gate_up(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor) -> torch.Tensor:
-    """gate_up + bias[group of each row]."""
+    """
+    gate_up + bias[group of each row].
+    """
     return gate_up + bias[group_ids(grouped_mm_offs, gate_up.shape[0])]
 
 
@@ -36,7 +38,9 @@ def clamped_swiglu_bwd_biased(dh: torch.Tensor, gate_up: torch.Tensor, bias: tor
 
 
 def empty(M: int, N: int, device: torch.device) -> tuple[torch.Tensor, ...]:
-    """The four outputs of fp8cast_rowwise_kmajor_sm100 for an empty (M, N) input."""
+    """
+    The four outputs of fp8cast_rowwise_kmajor_sm100 for an empty (M, N) input.
+    """
     return (torch.empty((M, N), dtype=torch.float8_e4m3fn, device=device), torch.empty((M, (N + BLOCK - 1) // BLOCK), dtype=torch.float32, device=device), torch.empty(M * N, dtype=torch.float8_e4m3fn, device=device), torch.empty((N, M // BLOCK), dtype=torch.float32, device=device))
 
 
@@ -53,12 +57,16 @@ def clamped_swiglu_quant_fwd_sm100(gate_up: torch.Tensor, bias: torch.Tensor, gr
 
 
 def clamped_swiglu_quant_rowwise_sm100(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """The rowwise pair of clamped_swiglu_quant_fwd_sm100."""
+    """
+    The rowwise pair of clamped_swiglu_quant_fwd_sm100.
+    """
     return clamped_swiglu_quant_fwd_sm100(gate_up, bias, grouped_mm_offs, alpha, limit)[:2]
 
 
 def clamped_swiglu_quant_kmajor_sm100(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-    """The K-major pair of clamped_swiglu_quant_fwd_sm100."""
+    """
+    The K-major pair of clamped_swiglu_quant_fwd_sm100.
+    """
     return clamped_swiglu_quant_fwd_sm100(gate_up, bias, grouped_mm_offs, alpha, limit)[2:]
 
 

@@ -41,7 +41,9 @@ def asm_u32(args: list, asm: str, constraints: str, loc=None, ip=None) -> Uint32
 
 @dsl_user_op
 def absmax_acc(acc: Uint32, w: Uint32, kind: str, *, loc=None, ip=None) -> Uint32:
-    """acc = max(acc, |w|) lane-wise in the input dtype (maxNum semantics, as tl.max)."""
+    """
+    acc = max(acc, |w|) lane-wise in the input dtype (maxNum semantics, as tl.max).
+    """
     op = {"bf16": "max.bf16x2", "f16": "max.f16x2", "f32": "max.f32"}[kind]
     mask = "0x7FFFFFFF" if kind == "f32" else "0x7FFF7FFF"
     asm = f"{{\n\t.reg .b32 t;\n\tand.b32 t, $2, {mask};\n\t{op} $0, $1, t;\n\t}}"
@@ -50,7 +52,9 @@ def absmax_acc(acc: Uint32, w: Uint32, kind: str, *, loc=None, ip=None) -> Uint3
 
 @dsl_user_op
 def amax_f32(acc: Uint32, kind: str, *, loc=None, ip=None) -> Float32:
-    """Reduce a packed |max| word to one fp32 value (exact widening)."""
+    """
+    Reduce a packed |max| word to one fp32 value (exact widening).
+    """
     if kind == "f32":
         body = "mov.b32 $0, $1;"
     else:
@@ -223,7 +227,9 @@ class RowwiseBlockwiseTranspose:
                                 cute.autovec_copy(src, dst)
 
     def quant4(self, xw: cute.Tensor, elems: list, rcp: Float32) -> Uint32:
-        """Quantize the 4 register-block elements at flat indices elems."""
+        """
+        Quantize the 4 register-block elements at flat indices elems.
+        """
         epw = 32 // self.dtype.width
         words: list = []
         sel: list = []
@@ -261,7 +267,9 @@ DISPATCH: dict[tuple, tuple] = {}
 
 
 def resolve(dtype: torch.dtype, M: int, K: int, sx: int, ptr: int) -> tuple:
-    """(compiled kernel or None for an empty input, ceil(K/128), ceil(M/128))."""
+    """
+    (compiled kernel or None for an empty input, ceil(K/128), ceil(M/128)).
+    """
     nkb, nmb = (K + BLOCK - 1) // BLOCK, (M + BLOCK - 1) // BLOCK
     if M == 0 or K == 0:
         return None, nkb, nmb
@@ -283,7 +291,9 @@ def resolve(dtype: torch.dtype, M: int, K: int, sx: int, ptr: int) -> tuple:
 
 
 def fp8cast_rowwise_blockwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """fp8cast_rowwise_blockwise_transpose with the rowwise scale MN-major."""
+    """
+    fp8cast_rowwise_blockwise_transpose with the rowwise scale MN-major.
+    """
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     M, K = x.shape
     sx, sk = x.stride()

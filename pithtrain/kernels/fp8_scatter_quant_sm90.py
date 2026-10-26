@@ -42,7 +42,9 @@ ALIGN = 128
 
 
 class Prep:
-    """Stable per-expert ranking, group offsets and inverse map; one CTA per PREP_CHUNK tokens."""
+    """
+    Stable per-expert ranking, group offsets and inverse map; one CTA per PREP_CHUNK tokens.
+    """
 
     def __init__(self, num_groups: int, has_expand: bool) -> None:
         assert 0 < num_groups <= MAX_GROUPS
@@ -281,7 +283,9 @@ def compile_main(n: int, G: int, pdl: bool) -> Callable:
 
 
 def reference(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor], group_counts: Optional[list[int]]) -> tuple:
-    """The unfused path for inputs the fused kernels do not cover (rows in atomic_add order)."""
+    """
+    The unfused path for inputs the fused kernels do not cover (rows in atomic_add order).
+    """
     x = gathered if expand_idx is None else gathered[expand_idx]
     out, rsi, offs, ks_t, ks = scatter_by_expert(x, expert_idxs, num_groups, group_counts=group_counts)
     return fp8cast_rowwise_kmajor_sm90(out, offs), rsi, offs, ks, ks_t

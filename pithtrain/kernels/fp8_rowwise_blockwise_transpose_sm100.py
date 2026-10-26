@@ -15,7 +15,9 @@ __all__ = ["fp8cast_rowwise_blockwise_transpose_sm100"]
 
 @triton.jit
 def fp8cast_rowwise_blockwise_transpose_kernel(x_ptr, out_tok_ptr, scale_tok_ptr, out_blk_t_ptr, scale_blk_t_ptr, M, K, stride_x_row, stride_x_col, stride_out_tok_row, stride_scale_tok_row, stride_out_blk_t_row, scale_blk_t_cols, NATIVE_E8M0: tl.constexpr):
-    """One 128x128 tile of x per program."""
+    """
+    One 128x128 tile of x per program.
+    """
     BLOCK: tl.constexpr = 128
 
     pid_row, pid_col = tl.program_id(0), tl.program_id(1)
@@ -58,7 +60,9 @@ def fp8cast_rowwise_blockwise_transpose_kernel(x_ptr, out_tok_ptr, scale_tok_ptr
 
 
 def fp8cast_rowwise_blockwise_transpose_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """fp8cast_rowwise_blockwise_transpose with the rowwise scale row-major."""
+    """
+    fp8cast_rowwise_blockwise_transpose with the rowwise scale row-major.
+    """
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     M, K = x.shape
     BLOCK = 128

@@ -37,7 +37,9 @@ VIEW_OPS = {"detach.default", "alias.default", "view.default", "_unsafe_view.def
 
 
 class Recording(TorchDispatchMode):
-    """Logs the aten ops run under it: allocations (and whether zero-filled) and anything else."""
+    """
+    Logs the aten ops run under it: allocations (and whether zero-filled) and anything else.
+    """
 
     def __init__(self) -> None:
         super().__init__()
@@ -69,7 +71,9 @@ class Recorder:
 
 
 class RecordingCache:
-    """Stands in for one FA4 compile cache during a recorded call."""
+    """
+    Stands in for one FA4 compile cache during a recorded call.
+    """
 
     def __init__(self, inner: Any, log: list) -> None:
         self.inner, self.log, self.inserted = inner, log, False
@@ -103,7 +107,9 @@ class Unsupported(Exception):
 
 
 def template(x: Any, inputs: Dict[str, torch.Tensor], allocs: List[torch.Tensor]) -> Any:
-    """How to rebuild x from the live inputs and fresh allocations of a later call."""
+    """
+    How to rebuild x from the live inputs and fresh allocations of a later call.
+    """
     if isinstance(x, torch.Tensor):
         same = lambda t: t.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()
         meta = (x.shape, x.stride(), x.storage_offset())
@@ -151,7 +157,9 @@ def build(t: Any, inputs: Dict[str, torch.Tensor], allocs: List[torch.Tensor]) -
 
 
 def record(entry: Callable[[], Tuple[torch.Tensor, ...]], inputs: Dict[str, torch.Tensor]):
-    """Run FA4's entry once, returning (its outputs, a plan or None)."""
+    """
+    Run FA4's entry once, returning (its outputs, a plan or None).
+    """
     # Imported here, not at the top: FA4 loads cutlass, and importing pithtrain.kernels must not.
     from flash_attn.cute import interface as fa4_interface
     owners = [f for f in vars(fa4_interface).values() if callable(f) and hasattr(f, "compile_cache")]

@@ -102,7 +102,9 @@ def make_dgated_oai(alpha: float, limit: float):
 
 
 class IndexArg(EpiOp):
-    """A tensor handed through to the epilogue params (read by ScatterRowStore)."""
+    """
+    A tensor handed through to the epilogue params (read by ScatterRowStore).
+    """
 
     def param_fields(self):
         return [(self.name, object, None)]
@@ -187,13 +189,17 @@ def scatter_bias(acc, bias):
 
 
 def mint(mod, *, c=False, paired=False, packed=False, add=False, bias=False) -> type:
-    """The QuACK SM90 GEMM class with this epilogue (its operand kinds fixed here)."""
+    """
+    The QuACK SM90 GEMM class with this epilogue (its operand kinds fixed here).
+    """
     kind_sig = (("c", "c"),) if c else (("bias", "row"),) if bias else ()
     return mod._mint(kind_sig, 9, paired, packed, (), RoundingMode.RN, (), add)
 
 
 def paired_tensor(t0: cute.Tensor, t1: cute.Tensor, shape: Callable, stride: Callable) -> cute.Tensor:
-    """A tensor over t0 whose size-2 pair mode strides to t1 (same element type)."""
+    """
+    A tensor over t0 whose size-2 pair mode strides to t1 (same element type).
+    """
     d = (t1.iterator.toint() - t0.iterator.toint()) // (t0.element_type.width // 8)
     return cute.make_tensor(t0.iterator, cute.make_layout(shape(d), stride=stride(d)))
 
@@ -212,7 +218,9 @@ class Entry:
 
 
 class GatedFwd(Entry):
-    """preact (M, 2I), h (M, I) = gated(gathered[a_idx] @ [W0|W1]^T), per expert."""
+    """
+    preact (M, 2I), h (M, I) = gated(gathered[a_idx] @ [W0|W1]^T), per expert.
+    """
 
     @cute.jit
     def __call__(self, mX, mW0, mW1, mPre, mH, mCu, mIdx, stream):
@@ -225,7 +233,9 @@ class GatedFwd(Entry):
 
 
 class GatedFwdBias(Entry):
-    """As GatedFwd plus a (G, 2I) bias row (interleaved like the weight rows) before the gate."""
+    """
+    As GatedFwd plus a (G, 2I) bias row (interleaved like the weight rows) before the gate.
+    """
 
     @cute.jit
     def __call__(self, mX, mW0, mW1, mBias, mPre, mH, mCu, mIdx, stream):
@@ -238,7 +248,9 @@ class GatedFwdBias(Entry):
 
 
 class DownScatter(Entry):
-    """out[slot_of[r]] = (h @ W_down^T)[r], per expert: rows land in received-slot order."""
+    """
+    out[slot_of[r]] = (h @ W_down^T)[r], per expert: rows land in received-slot order.
+    """
 
     @cute.jit
     def __call__(self, mH, mW, mOut, mSlot, mCu, stream):
@@ -248,7 +260,9 @@ class DownScatter(Entry):
 
 
 class DownBiasScatter(Entry):
-    """out[slot_of[r]] = (h @ W_down^T + bias)[r], per expert."""
+    """
+    out[slot_of[r]] = (h @ W_down^T + bias)[r], per expert.
+    """
 
     @cute.jit
     def __call__(self, mH, mW, mBias, mOut, mSlot, mCu, stream):
@@ -258,7 +272,9 @@ class DownBiasScatter(Entry):
 
 
 class Dgated(Entry):
-    """dpre (M, 2I), h (M, I) = dgated(dy[slot_of] @ W_down, preact), per expert."""
+    """
+    dpre (M, 2I), h (M, I) = dgated(dy[slot_of] @ W_down, preact), per expert.
+    """
 
     @cute.jit
     def __call__(self, mDy, mW, mPre, mDpre, mH, mCu, mIdx, stream):
@@ -268,7 +284,9 @@ class Dgated(Entry):
 
 
 class Dgrad(Entry):
-    """dx (M, H) = dpre @ [W0; W1], one GEMM over K = 2I, per expert."""
+    """
+    dx (M, H) = dpre @ [W0; W1], one GEMM over K = 2I, per expert.
+    """
 
     @cute.jit
     def __call__(self, mDpre, mW0, mW1, mDx, mCu, stream):
@@ -280,7 +298,9 @@ class Dgrad(Entry):
 
 
 class WgradPair(Entry):
-    """[G0 | G1] (G, I, H) fp32 += dpre^T @ gathered[a_idx], per expert, as D = (H, (2, I))."""
+    """
+    [G0 | G1] (G, I, H) fp32 += dpre^T @ gathered[a_idx], per expert, as D = (H, (2, I)).
+    """
 
     @cute.jit
     def __call__(self, mX, mDpre, mG0, mG1, mCu, mIdx, stream):
@@ -293,7 +313,9 @@ class WgradPair(Entry):
 
 
 class WgradDown(Entry):
-    """G (G, H, I) fp32 += dy[slot_of]^T @ h, per expert."""
+    """
+    G (G, H, I) fp32 += dy[slot_of]^T @ h, per expert.
+    """
 
     @cute.jit
     def __call__(self, mDy, mH, mG, mCu, mIdx, stream):
@@ -340,7 +362,9 @@ CONFIGS: dict[tuple, Config] = {
     ("wgrad_pair", 5760, 2880): Config(128, 192, 2, True),
     ("wgrad_down", 2880, 2880): Config(128, 192, 1, True),
 }
-"""(kind, GEMM n, GEMM k) -> Config, fixed offline; shapes not listed take DEFAULT_CONFIG."""
+"""
+(kind, GEMM n, GEMM k) -> Config, fixed offline; shapes not listed take DEFAULT_CONFIG.
+"""
 
 
 def config(kind: str, n: int, k: int) -> Config:

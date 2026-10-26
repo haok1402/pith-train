@@ -333,7 +333,9 @@ EXPAND: dict = {}
 
 
 class Scratch:
-    """Per-device scratch of the index kernel: chunk histograms and the grid barrier counter."""
+    """
+    Per-device scratch of the index kernel: chunk histograms and the grid barrier counter.
+    """
 
     def __init__(self, device: torch.device, chunks: int, bins: int) -> None:
         self.chunks, self.bins = chunks, bins
@@ -399,7 +401,9 @@ def supports_expand(received_expand_idx: torch.Tensor, ep_size: int, experts_per
 
 
 def expand_index(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """The outputs of expert_and_expand_idx, sharing one int64 allocation."""
+    """
+    The outputs of expert_and_expand_idx, sharing one int64 allocation.
+    """
     total = received_expand_idx.shape[0]
     out = received_expand_idx.new_empty(2 * total)
     if total == 0:
@@ -413,14 +417,18 @@ def expand_index(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_
 
 
 def fused_dedup_prepare_dispatch_sm90(topk_ids: torch.Tensor, num_experts: int, ep_size: int, experts_per_rank: int, meta_out: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
-    """dispatch_index's first six outputs, or the Triton path for inputs it does not cover."""
+    """
+    dispatch_index's first six outputs, or the Triton path for inputs it does not cover.
+    """
     if supports_index(topk_ids, ep_size, experts_per_rank):
         return dispatch_index(topk_ids, num_experts, ep_size, experts_per_rank, meta_out)[:6]
     return fused_dedup_prepare_dispatch_sm100(topk_ids, num_experts, ep_size, experts_per_rank, meta_out)
 
 
 def expert_and_expand_idx_sm90(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """expand_index, or the Triton path for inputs it does not cover."""
+    """
+    expand_index, or the Triton path for inputs it does not cover.
+    """
     if supports_expand(received_expand_idx, ep_size, experts_per_rank):
         return expand_index(recv_meta, received_expand_idx, ep_size, experts_per_rank)
     return expert_and_expand_idx_sm100(recv_meta, received_expand_idx, ep_size, experts_per_rank)

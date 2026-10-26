@@ -14,7 +14,9 @@ from pithtrain.kernels.host_transfer import get_pinned_buffer
 __all__ = ["GEMM_ALLOC_ALIGNMENT", "scatter_by_expert"]
 
 GEMM_ALLOC_ALIGNMENT = 1024
-"""Row alignment of the scattered output's allocation (the tail rows are zeroed)."""
+"""
+Row alignment of the scattered output's allocation (the tail rows are zeroed).
+"""
 
 # The padded sizes are copied to the host on a side stream so the copy overlaps the scatter kernel.
 shared_copy_stream: Optional[torch.cuda.Stream] = None

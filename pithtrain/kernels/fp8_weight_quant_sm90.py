@@ -40,7 +40,9 @@ def struct_fields(res, n: int) -> list:
 
 @dsl_user_op
 def ld_v4(addr: Int64, pred: Int32, *, loc=None, ip=None) -> list:
-    """Predicated 16-byte global load (zero when pred is 0)."""
+    """
+    Predicated 16-byte global load (zero when pred is 0).
+    """
     res = asm(
         llvm.StructType.get_literal([T.i32()] * 4),
         "{\n.reg .pred p;\nsetp.ne.b32 p, $5, 0;\n"
@@ -53,7 +55,9 @@ def ld_v4(addr: Int64, pred: Int32, *, loc=None, ip=None) -> list:
 
 @dsl_user_op
 def ld_v2(addr: Int64, pred: Int32, *, loc=None, ip=None) -> list:
-    """Predicated 8-byte global load (zero when pred is 0)."""
+    """
+    Predicated 8-byte global load (zero when pred is 0).
+    """
     res = asm(
         llvm.StructType.get_literal([T.i32()] * 2),
         "{\n.reg .pred p;\nsetp.ne.b32 p, $3, 0;\nmov.b32 $0, 0;\nmov.b32 $1, 0;\n"
@@ -65,7 +69,9 @@ def ld_v2(addr: Int64, pred: Int32, *, loc=None, ip=None) -> list:
 
 @dsl_user_op
 def ld_scalar(addr: Int64, pred: Int32, nbytes: int, *, loc=None, ip=None) -> Uint32:
-    """Predicated zero-extended 1/2/4-byte global load."""
+    """
+    Predicated zero-extended 1/2/4-byte global load.
+    """
     ty = {1: "u8", 2: "u16", 4: "b32"}[nbytes]
     res = asm(
         T.i32(),
@@ -125,13 +131,17 @@ def redux_max(a: Uint32, *, loc=None, ip=None) -> Uint32:
 
 @dsl_user_op
 def f32x2_to_bf16x2(lo: Uint32, hi: Uint32, *, loc=None, ip=None) -> Uint32:
-    """Two fp32 bit patterns -> packed bf16x2 (round to nearest even), lo in bits [15:0]."""
+    """
+    Two fp32 bit patterns -> packed bf16x2 (round to nearest even), lo in bits [15:0].
+    """
     return Uint32(asm(T.i32(), "{\n.reg .f32 a, b;\nmov.b32 a, $1;\nmov.b32 b, $2;\ncvt.rn.bf16x2.f32 $0, b, a;\n}", "=r,r,r", [lo, hi]))
 
 
 @dsl_user_op
 def cast4(v0: Uint32, v1: Uint32, v2: Uint32, v3: Uint32, rcp: Uint32, *, loc=None, ip=None) -> Uint32:
-    """Four fp32 bit patterns times rcp -> four e4m3 bytes, v0 in bits [7:0]."""
+    """
+    Four fp32 bit patterns times rcp -> four e4m3 bytes, v0 in bits [7:0].
+    """
     return Uint32(
         asm(
             T.i32(),
@@ -149,7 +159,9 @@ def cast4(v0: Uint32, v1: Uint32, v2: Uint32, v3: Uint32, rcp: Uint32, *, loc=No
 
 @dsl_user_op
 def scale_bits(amax_bits: Uint32, *, loc=None, ip=None) -> Uint32:
-    """E8M0 scale bits from amax bits, exactly as compute_fp8_scale (SM90 branch)."""
+    """
+    E8M0 scale bits from amax bits, exactly as compute_fp8_scale (SM90 branch).
+    """
     return Uint32(
         asm(
             T.i32(),
@@ -177,7 +189,9 @@ def ptx_f32(x: float) -> str:
 
 @cute.jit
 def thread_coords() -> tuple:
-    """256 threads per 128x128 tile, each owning an 8x8 block at (r0, c0)."""
+    """
+    256 threads per 128x128 tile, each owning an 8x8 block at (r0, c0).
+    """
     tidx, _, _ = cute.arch.thread_idx()
     warp = tidx // 32
     lane = tidx % 32
@@ -226,7 +240,9 @@ def load_rows(base: Int64, row0: Int32, col0: Int32, row_lo: Int32, row_hi: Int3
 
 @cute.jit
 def thread_amax_bits(rows: list, packed_bf16: cutlass.Constexpr[bool]) -> Uint32:
-    """Max magnitude bit pattern (as fp32 bits) over the thread's block."""
+    """
+    Max magnitude bit pattern (as fp32 bits) over the thread's block.
+    """
     m = Uint32(0)
     if const_expr(packed_bf16):
         for i in cutlass.range_constexpr(8):
@@ -242,7 +258,9 @@ def thread_amax_bits(rows: list, packed_bf16: cutlass.Constexpr[bool]) -> Uint32
 
 @cute.jit
 def block_amax_bits(m: Uint32, warp: Int32, lane: Int32, smem: cute.Tensor) -> Uint32:
-    """CTA-wide max of m (every thread gets the result)."""
+    """
+    CTA-wide max of m (every thread gets the result).
+    """
     m = redux_max(m)
     if lane == 0:
         smem[warp] = m
@@ -255,7 +273,9 @@ def block_amax_bits(m: Uint32, warp: Int32, lane: Int32, smem: cute.Tensor) -> U
 
 @cute.jit
 def cast_rows(rows: list, rcp: Uint32, packed_bf16: cutlass.Constexpr[bool]) -> list:
-    """Cast 8 rows to e4m3: two words (cols 0-3, cols 4-7) per row."""
+    """
+    Cast 8 rows to e4m3: two words (cols 0-3, cols 4-7) per row.
+    """
     out = []
     for i in cutlass.range_constexpr(8):
         f = []
@@ -272,14 +292,18 @@ def cast_rows(rows: list, rcp: Uint32, packed_bf16: cutlass.Constexpr[bool]) -> 
 
 @cute.jit
 def transpose4(a0: Uint32, a1: Uint32, a2: Uint32, a3: Uint32) -> list:
-    """4x4 byte transpose: word r holds row r; result word c holds column c."""
+    """
+    4x4 byte transpose: word r holds row r; result word c holds column c.
+    """
     t0, t1, t2, t3 = prmt(a0, a1, 0x5140), prmt(a0, a1, 0x7362), prmt(a2, a3, 0x5140), prmt(a2, a3, 0x7362)
     return [prmt(t0, t2, 0x5410), prmt(t0, t2, 0x7632), prmt(t1, t3, 0x5410), prmt(t1, t3, 0x7632)]
 
 
 @cute.jit
 def transpose8(q: list) -> list:
-    """8x8 byte transpose of [row][lo, hi] words into [col][rows 0-3, rows 4-7] words."""
+    """
+    8x8 byte transpose of [row][lo, hi] words into [col][rows 0-3, rows 4-7] words.
+    """
     a = transpose4(q[0][0], q[1][0], q[2][0], q[3][0])  # rows 0-3, cols 0-3
     b = transpose4(q[4][0], q[5][0], q[6][0], q[7][0])  # rows 4-7, cols 0-3
     c = transpose4(q[0][1], q[1][1], q[2][1], q[3][1])  # rows 0-3, cols 4-7
@@ -289,7 +313,9 @@ def transpose8(q: list) -> list:
 
 @cute.jit
 def store_rows(base: Int64, q: list, row0: Int32, col0: Int32, row_lo: Int32, row_hi: Int32, K: Int32, aligned: cutlass.Constexpr[bool]) -> None:
-    """Store [row][lo, hi] fp8 words to a row-major (rows, K) byte matrix at base."""
+    """
+    Store [row][lo, hi] fp8 words to a row-major (rows, K) byte matrix at base.
+    """
     for i in cutlass.range_constexpr(8):
         row = row0 + i
         row_ok = Int32(row >= row_lo) & Int32(row < row_hi)
@@ -317,7 +343,9 @@ def swz(row: Int32, chunk: Int32) -> Int32:
 
 @cute.jit
 def smem_write_block(base: Int32, q: list, rr0: Int32, cc0: Int32) -> None:
-    """Write [row][lo, hi] words of the 8x8 block at tile (rr0, cc0) into the staged tile."""
+    """
+    Write [row][lo, hi] words of the 8x8 block at tile (rr0, cc0) into the staged tile.
+    """
     for i in cutlass.range_constexpr(8):
         sts_v2(base + swz(rr0 + i, cc0 >> 4) + (cc0 & 8), q[i][0], q[i][1])
 
@@ -425,7 +453,9 @@ def compile_blockwise(dtype: torch.dtype, mode: str, batched: bool):
 
 
 def store_mode(tiles: int, M: int, K: int, *tensors: torch.Tensor) -> str:
-    """Store path for the blockwise kernels: the widest the shape and pointers allow."""
+    """
+    Store path for the blockwise kernels: the widest the shape and pointers allow.
+    """
     if any(t.data_ptr() % 16 for t in tensors):
         mode = "scalar"
     elif M % 16 == 0 and K % 16 == 0 and tiles >= SMEM_MIN_TILES:
@@ -436,7 +466,9 @@ def store_mode(tiles: int, M: int, K: int, *tensors: torch.Tensor) -> str:
 
 
 def fp8cast_blockwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """CuTe-DSL fp8cast_blockwise_transpose: x 2-D (M, K) bf16 / fp32."""
+    """
+    CuTe-DSL fp8cast_blockwise_transpose: x 2-D (M, K) bf16 / fp32.
+    """
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     if x.stride(1) != 1:
         x = x.contiguous()
@@ -456,7 +488,9 @@ def fp8cast_blockwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Tensor, tor
 
 
 def fp8cast_blockwise_transpose_batched_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """CuTe-DSL fp8cast_blockwise_transpose_batched: x 3-D (G, N, K) bf16 / fp32."""
+    """
+    CuTe-DSL fp8cast_blockwise_transpose_batched: x 3-D (G, N, K) bf16 / fp32.
+    """
     assert x.ndim == 3, f"Expected 3D tensor, got {x.ndim}D"
     if not x.is_contiguous():
         x = x.contiguous()
@@ -586,12 +620,16 @@ def shard_tiles(shard: torch.Tensor, amax: torch.Tensor, out: Optional[torch.Ten
 
 
 def fp8_shard_amax_sm90(shard: torch.Tensor, amax: torch.Tensor, row_offset: int, group_offset: int) -> None:
-    """CuTe-DSL fp8_shard_amax."""
+    """
+    CuTe-DSL fp8_shard_amax.
+    """
     shard_tiles(shard, amax, None, row_offset, group_offset)
 
 
 def fp8_shard_cast_sm90(shard: torch.Tensor, amax: torch.Tensor, out: torch.Tensor, row_offset: int, group_offset: int) -> None:
-    """CuTe-DSL fp8_shard_cast."""
+    """
+    CuTe-DSL fp8_shard_cast.
+    """
     shard_tiles(shard, amax, out, row_offset, group_offset)
 
 
@@ -621,7 +659,9 @@ def scale_elem(amax: Int64, scale: Int64, scale_t: Int64, g: Int64, idx: Int32, 
 
 
 def fp8_scales_sm90(amax: torch.Tensor, scale: torch.Tensor, scale_t: torch.Tensor) -> None:
-    """CuTe-DSL fp8_scales."""
+    """
+    CuTe-DSL fp8_scales.
+    """
     fn = COMPILED.get("scales")
     if fn is None:
         f = [fake(cutlass.Float32, 3, 4) for _ in range(3)]
@@ -704,7 +744,9 @@ class PackTranspose:
 
 
 def fp8_pack_transpose_sm90(x: torch.Tensor, out: torch.Tensor) -> None:
-    """CuTe-DSL fp8_pack_transpose."""
+    """
+    CuTe-DSL fp8_pack_transpose.
+    """
     G, N, K = x.shape
     if x.numel() == 0:
         return
@@ -867,10 +909,14 @@ class FP8ScalesGroup:
 
 
 def fp8_shard_amax_multi_sm90(shards: Sequence[torch.Tensor], amaxes: Sequence[torch.Tensor], row_offsets: Sequence[int], group_offsets: Sequence[int]) -> FP8ShardAmaxGroup:
-    """CuTe-DSL fp8_shard_amax_multi."""
+    """
+    CuTe-DSL fp8_shard_amax_multi.
+    """
     return FP8ShardAmaxGroup(shards, amaxes, row_offsets, group_offsets)
 
 
 def fp8_scales_multi_sm90(amaxes: Sequence[torch.Tensor], scales: Sequence[torch.Tensor], scales_t: Sequence[torch.Tensor]) -> FP8ScalesGroup:
-    """CuTe-DSL fp8_scales_multi."""
+    """
+    CuTe-DSL fp8_scales_multi.
+    """
     return FP8ScalesGroup(amaxes, scales, scales_t)

@@ -12,22 +12,30 @@ __all__ = ["act_scale_like", "is_mn_major", "mn_major_scale", "mn_pad", "to_mn_m
 
 
 def mn_pad(mn: int) -> int:
-    """Row count of one MN-major column: mn rounded up to 16 bytes of fp32."""
+    """
+    Row count of one MN-major column: mn rounded up to 16 bytes of fp32.
+    """
     return (mn + 3) & ~3
 
 
 def mn_major_scale(mn: int, sf_k: int, device: torch.device) -> torch.Tensor:
-    """Uninitialized fp32 (mn, sf_k) scale with strides (1, mn_pad(mn))."""
+    """
+    Uninitialized fp32 (mn, sf_k) scale with strides (1, mn_pad(mn)).
+    """
     return torch.empty_strided((mn, sf_k), (1, mn_pad(mn)), dtype=torch.float32, device=device)
 
 
 def is_mn_major(sf: torch.Tensor) -> bool:
-    """Whether DeepGEMM takes the 2D scale sf as it is."""
+    """
+    Whether DeepGEMM takes the 2D scale sf as it is.
+    """
     return sf.dim() == 2 and sf.stride(0) == 1 and sf.stride(1) == mn_pad(sf.shape[0])
 
 
 def to_mn_major(sf: torch.Tensor) -> torch.Tensor:
-    """sf in the MN-major layout (a copy unless it already is)."""
+    """
+    sf in the MN-major layout (a copy unless it already is).
+    """
     if is_mn_major(sf):
         return sf
     out = mn_major_scale(sf.shape[0], sf.shape[1], sf.device)

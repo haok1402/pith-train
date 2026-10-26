@@ -190,7 +190,9 @@ class Group:
 
 
 class GatherSum:
-    """out[t] = sum over the token's local experts e (ascending) of grad[tab[t, e]], in fp32."""
+    """
+    out[t] = sum over the token's local experts e (ascending) of grad[tab[t, e]], in fp32.
+    """
 
     def __init__(self, hidden: int, num_groups: int, max_slots: int) -> None:
         assert hidden % 8 == 0
@@ -239,7 +241,9 @@ class GatherSum:
 
 
 class SlotMaps(NamedTuple):
-    """Index maps of one call; see bf16_expert_group_slots."""
+    """
+    Index maps of one call; see bf16_expert_group_slots.
+    """
 
     cu_seqlens: torch.Tensor  # (G + 1,) int32
     a_idx: torch.Tensor  # (S,) int32
@@ -379,7 +383,9 @@ ROW_THREADS, ROWS_PER_CTA = 128, 4
 
 
 class GatherRows:
-    """out[i] = x[idx[i]] for bf16 rows, 16-byte vectors."""
+    """
+    out[i] = x[idx[i]] for bf16 rows, 16-byte vectors.
+    """
 
     def __init__(self, n: int) -> None:
         assert n % 8 == 0

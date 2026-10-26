@@ -73,7 +73,9 @@ def fp8_dgrad_wgrad(grad_2d: torch.Tensor, weight_t_fp8: torch.Tensor, scale_wei
 
 
 def m_grouped_fp8_gemm_nt(a, b, d, grouped_mm_offs, M, group_indices=None):
-    """m-grouped FP8 GEMM NT into d; on SM90 group_indices is computed when None."""
+    """
+    m-grouped FP8 GEMM NT into d; on SM90 group_indices is computed when None.
+    """
     match ARCH_MAJOR:
         case 9:
             if group_indices is None:

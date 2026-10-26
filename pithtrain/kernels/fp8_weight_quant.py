@@ -100,8 +100,8 @@ def fp8_scales(amax: torch.Tensor, scale: torch.Tensor, scale_t: torch.Tensor) -
 
 def fp8_pack_transpose(x: torch.Tensor, out: torch.Tensor) -> None:
     """
-    In place: x, a one-byte-element (G, N, K) contiguous tensor, and its per-expert transpose
-    (G, K, N), written back to back into out, a contiguous one-byte-element buffer of at least 2
+    In place: x, a one-byte-element (G, N, K) contiguous tensor, and its per-expert transpose (G, K,
+    N), written back to back into out, a contiguous one-byte-element buffer of at least 2
     * x.numel() elements.
     """
     match ARCH_MAJOR:
