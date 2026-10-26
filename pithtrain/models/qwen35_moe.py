@@ -11,8 +11,7 @@ from torch.utils.checkpoint import (
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
 
 from pithtrain.contexts import distributed, training
-from pithtrain.kernels import bf16_expert_support
-from pithtrain.kernels.arch import ARCH_MAJOR
+from pithtrain.kernels import bf16_experts_supported, fp8_fused_experts_supported
 from pithtrain.modules.load_balance import (
     MoELoadBalanceLossInjector,
     MoELoadBalanceLossTracker,
@@ -333,7 +332,7 @@ class Qwen35MoeExperts(nn.Module):
         quantized_input: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
         gi = precompute_group_indices(grouped_mm_offs, x.shape[0])
-        if training.fp8 and gi is not None and x.shape[0]:
+        if training.fp8 and fp8_fused_experts_supported() and x.shape[0]:
             # Hopper FP8: SwiGLU fused into the quantization of its neighbouring GEMMs, reading g
             # and u straight out of the fused gate_up output.
             args = (x, grouped_mm_offs, ks, ks_tensor, gi, quantized_input)
@@ -346,7 +345,7 @@ class Qwen35MoeExperts(nn.Module):
 
     def uses_bf16_cute(self) -> bool:
         """Whether BF16 stage 3 runs as the fused CuTe experts (operators/bf16_experts.py) in this process."""
-        return not training.fp8 and bf16_expert_support.supported(self.gate_up_proj.num_groups)
+        return not training.fp8 and bf16_experts_supported(self.gate_up_proj.num_groups)
 
     def forward_from_tokens(
         self,
@@ -509,7 +508,7 @@ class Qwen35MoeDecoderLayer(nn.Module):
         expand_idx: torch.Tensor | None = None,
         expert_counts: list[int] | None = None,
     ) -> torch.Tensor:
-        if training.fp8 and ARCH_MAJOR == 9:
+        if training.fp8 and fp8_fused_experts_supported():
             # Expand, scatter by expert and quantize in one pass; the bf16 expert input is never
             # written, and x inside only carries its gradient.
             expand = expand_idx if distributed.ep_size > 1 else None

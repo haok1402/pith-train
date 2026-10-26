@@ -13,17 +13,14 @@ import torch.nn.functional as F
 
 from pithtrain.contexts import training
 from pithtrain.contexts.weight_grad_store import WeightGradStore
-from pithtrain.kernels.bf16_expert_support import QUACK_VERSION
-from pithtrain.kernels.bf16_expert_support import quack_version as _quack_version
+from pithtrain.kernels import bf16_experts_supported
 from pithtrain.operators.grouped_linear import GroupedLinear
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import padded_index_gather, scatter_for_grouped_gemm
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0] != 9
-    or _quack_version() != QUACK_VERSION,
-    reason="needs SM90 and the validated quack-kernels",
+    not torch.cuda.is_available() or not bf16_experts_supported(),
+    reason="needs the BF16 CuTe experts (SM90 and the validated quack-kernels)",
 )
 
 
@@ -260,3 +257,12 @@ def test_gptoss_vs_r5base_and_fp32(limit):
     new = [out.detach(), src.grad] + [getattr(m, n).grad.float() for n in names]
     for name, a, b, r in zip(("out", "dgathered") + names, new, r5, ref):
         assert rel(a, r) <= 1.5 * rel(b, r), f"{name}: {rel(a, r):.3e} vs unfused {rel(b, r):.3e}"
+
+
+def test_fp8_disables(monkeypatch):
+    """FP8 training never takes the BF16 CuTe experts: the models check training.fp8 first."""
+    from pithtrain.models.qwen3_moe import Qwen3MoeExperts
+
+    monkeypatch.setattr(training, "fp8", True, raising=False)
+    experts = Qwen3MoeExperts.__new__(Qwen3MoeExperts)
+    assert not experts.uses_bf16_cute()

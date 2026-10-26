@@ -83,8 +83,22 @@ def cross_entropy_fwd_inplace(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Mean cross-entropy of the ``(N, V)`` logits ``inp`` against ``target``, overwriting the logits
-    with the gradient of that mean. Returns ``(loss, grad)``: ``grad`` is ``inp`` itself, or a
-    contiguous copy of it when ``inp`` is not row-contiguous (the in-place saving is then lost).
+    with the gradient of that mean. Returns ``(loss, grad)``.
+
+    - ``inp``: 2-D ``(N, V)`` floating logits (bf16 or fp32). Overwritten in place when it is
+      row-contiguous; otherwise a contiguous copy is made and overwritten instead (``inp`` is then
+      left alone and the in-place saving is lost).
+    - ``target``: integer ``(N,)`` class indices in ``[0, V)``, or ``ignore_index`` (any other value
+      reads out of bounds). Not modified.
+    - ``loss``: fp32 scalar, the sum over non-ignored rows of ``logsumexp(x) - x[target]`` (fp32
+      online softmax per row) divided by ``n = max(#non-ignored rows, 1)``; 0 when every row is
+      ignored.
+    - ``grad``: ``(N, V)`` in ``inp``'s dtype, ``inp`` itself or the copy: ``(softmax(x) -
+      onehot(target)) / n`` per non-ignored row, computed in fp32 and rounded once; zero rows where
+      ``target == ignore_index``.
+
+    Matches ``F.cross_entropy(inp.float(), target, ignore_index=ignore_index)`` and its gradient to
+    fp32 rounding (not bit for bit); deterministic. Same Triton kernel on both architectures.
     """
     n_rows, n_cols = inp.shape
 

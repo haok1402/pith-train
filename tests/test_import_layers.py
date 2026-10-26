@@ -1,10 +1,26 @@
 """
-Import layering and kernel naming rules, checked statically (CPU only, nothing is imported).
+Import layering, kernel naming and the kernel library's interface, checked statically (CPU only,
+nothing is imported).
 
-An AST walk over ``pithtrain/`` and ``tests/`` that enforces the package layering (AGENTS.md,
-"Kernels") and the ``_sm90`` / ``_sm100`` naming convention of ``pithtrain/kernels/``:
+An AST walk over ``pithtrain/``, ``tests/``, ``benchmarks/``, ``tools/`` and ``examples/`` that
+enforces the package layering (AGENTS.md, "Kernels"), the ``_sm90`` / ``_sm100`` naming convention
+of ``pithtrain/kernels/`` and its black-box interface:
 
-- ``kernels/`` is flat and its ``__init__.py`` is empty, as is ``operators/__init__.py``;
+- ``kernels/`` is flat; its ``__init__.py`` holds only ``from pithtrain.kernels.<module> import
+  <names>`` lines and ``__all__``, which lists exactly the imported names, each defined at the top
+  level of its module (no ``_sm100`` module, no private name); ``operators/__init__.py`` is empty;
+- outside ``kernels/`` the only import of the kernel library is ``from pithtrain.kernels import
+  <name>`` with ``<name>`` in ``__all__`` (no submodule, no ``import pithtrain.kernels``);
+- outside ``kernels/`` nothing in ``pithtrain/`` branches on the architecture: no
+  ``get_device_capability``, ``ARCH_MAJOR``, ``NATIVE_E8M0``, ``is_sm90`` or ``is_sm90_device``
+  (capability queries named for a feature are exported instead), and neither does
+  ``tests/kernels/``;
+- every name in ``__all__`` is exercised (imported and used) by ``tests/kernels/test_<feature>.py``,
+  ``<feature>`` its module's stem without ``_sm90`` / ``_sm100``, and ``tests/kernels/`` imports
+  nothing from pithtrain but ``pithtrain.kernels``;
+- importing ``pithtrain.kernels`` loads neither cutlass, QuACK nor FA4: no module it imports at
+  module level, transitively, imports them at module level (the ``_sm90`` CuTe kernels and FA4
+  are imported inside the functions that run them);
 - ``kernels/`` imports only third-party code and other ``kernels/`` modules; ``contexts/`` imports
   nothing from pithtrain at runtime; ``operators/`` imports only ``kernels/``, ``contexts/`` and
   sibling operators; ``pipeline/``, ``models/`` and ``tasks/`` import only what the layering allows
@@ -15,9 +31,8 @@ An AST walk over ``pithtrain/`` and ``tests/`` that enforces the package layerin
 - no ``_sm100`` file imports an ``_sm90`` file or a picker, an ``_sm90`` file imports another
   feature's ``_smXX`` file only along the named cross-feature edges, and no picker imports another
   picker;
-- outside ``kernels/`` and ``tests/``, only the two SM90-only operators import an ``_smXX`` file;
 - ``get_device_capability`` appears in ``pithtrain/`` only in ``kernels/arch.py``;
-- every ``tests/**/test_*_sm90.py`` skips unless SM90;
+- no test file is named for an architecture (``test_*_sm90.py`` / ``test_*_sm100.py``);
 - the ``modules/`` files the models import do not import the models back;
 - the module import graph of ``pithtrain/`` has no cycle.
 
@@ -49,11 +64,7 @@ SM90_CROSS_EDGES = {
     ("fp8_clamped_swiglu_quant_sm90", "fp8_rowwise_kmajor_sm90"),
     ("fp8_scatter_quant_sm90", "fp8_rowwise_kmajor_sm90"),
 }
-# The only modules outside kernels/ that may import an _smXX file (both SM90-only, imported lazily
-# by their callers after the gate).
-SMXX_IMPORTERS = {"pithtrain.operators.bf16_experts", "pithtrain.operators.gated_delta_rule"}
-# What models/ may import from kernels/ and modules/.
-MODELS_KERNELS = {"arch", "fp8_gemm", "fp8_weight_quant", "bf16_expert_support"}
+# What models/ may import from modules/ (from kernels/: only the package, like everyone else).
 MODELS_MODULES = {"load_balance", "recompute", "fp8_param_gather"}
 PIPELINE_OPERATORS = {"all_to_all", "routing"}
 
@@ -76,6 +87,110 @@ def _modules(base: Path) -> dict[str, Path]:
 
 MODULES = _modules(PKG)
 TEST_MODULES = _modules(ROOT / "tests")
+# Every Python file outside pithtrain/kernels/ that may import the kernel library.
+OUTSIDE_FILES = [
+    p
+    for base in ("pithtrain", "tests", "benchmarks", "tools", "examples")
+    for p in sorted((ROOT / base).rglob("*.py"))
+    if "__pycache__" not in p.parts and KERNELS not in p.parents
+]
+# Names that read the device architecture; only kernels/ may use them.
+ARCH_NAMES = {"get_device_capability", "ARCH_MAJOR", "NATIVE_E8M0", "is_sm90", "is_sm90_device"}
+
+
+def _exports() -> tuple[dict[str, list[str]], list[str], list[str]]:
+    """
+    From kernels/__init__.py: the imported names by defining module stem, ``__all__``, and every
+    statement that is neither such an import nor ``__all__`` (the docstring aside).
+    """
+    tree = ast.parse((KERNELS / "__init__.py").read_text())
+    exports: dict[str, list[str]] = {}
+    all_names: list[str] = []
+    other: list[str] = []
+    for i, node in enumerate(tree.body):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
+            "pithtrain.kernels."
+        ):
+            stem = node.module.rpartition(".")[2]
+            exports.setdefault(stem, []).extend(a.name for a in node.names if a.asname is None)
+            other.extend(f"alias {a.name}" for a in node.names if a.asname is not None)
+        elif isinstance(node, ast.Assign) and [getattr(t, "id", None) for t in node.targets] == ["__all__"]:  # fmt: skip
+            all_names = ast.literal_eval(node.value)
+        elif not (i == 0 and isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)):
+            other.append(ast.dump(node)[:60])
+    return exports, all_names, other
+
+
+EXPORTS, ALL_LIST, INIT_OTHER = _exports()
+ALL = {name for names in EXPORTS.values() for name in names}
+
+
+# Third-party packages importing pithtrain.kernels must not load: cutlass and QuACK (CuTe-DSL; QuACK
+# patches it globally), and flash_attn (FA4 imports both).
+HEAVY = {"cutlass", "quack", "flash_attn"}
+
+
+def _top_level_imports(path: Path) -> list[str]:
+    """Modules ``path`` imports at module level (not inside a function), resolved to pithtrain
+    modules where they are one."""
+    out: list[str] = []
+    for node in ast.parse(path.read_text()).body:
+        if isinstance(node, ast.Import):
+            out.extend(_resolve(a.name) for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            for a in node.names:
+                full = f"{node.module}.{a.name}"
+                out.append(full if full in MODULES else _resolve(node.module))
+    return out
+
+
+def _eager_closure(root: str) -> set[str]:
+    """The pithtrain modules importing ``root`` loads: module-level imports, transitively."""
+    seen, stack = {root}, [root]
+    while stack:
+        for t in _top_level_imports(MODULES[stack.pop()]):
+            if t in MODULES and t not in seen:
+                seen.add(t)
+                stack.append(t)
+    return seen
+
+
+def _feature(stem: str) -> str:
+    for suffix in ("_sm90", "_sm100"):
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)]
+    return stem
+
+
+def _top_level_names(path: Path) -> set[str]:
+    names: set[str] = set()
+    for node in ast.parse(path.read_text()).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return names
+
+
+def _kernel_imports(path: Path) -> list[tuple[int, str, str]]:
+    """(line, form, detail) of every import of pithtrain.kernels in ``path``, TYPE_CHECKING too."""
+    out: list[tuple[int, str, str]] = []
+    for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "pithtrain.kernels" or a.name.startswith("pithtrain.kernels."):
+                    out.append((node.lineno, "import", a.name))
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            if node.module.startswith("pithtrain.kernels."):
+                out.append((node.lineno, "submodule", node.module))
+            elif node.module == "pithtrain.kernels":
+                for a in node.names:
+                    out.append((node.lineno, "name", a.name))
+            elif node.module == "pithtrain" and any(a.name == "kernels" for a in node.names):
+                out.append((node.lineno, "import", "pithtrain.kernels"))
+    return out
 
 
 def _is_type_checking(test: ast.expr) -> bool:
@@ -157,9 +272,76 @@ def _violations() -> set[tuple[str, str, str]]:
         for p in KERNELS.iterdir():
             if p.is_dir() and p.name != "__pycache__":
                 found.add(("kernels-flat", "pithtrain.kernels", p.name))
-    for init in (KERNELS / "__init__.py", PKG / "operators" / "__init__.py"):
-        if init.exists() and init.read_text().strip():
-            found.add(("empty-init", _module_name(init), ""))
+    init = PKG / "operators" / "__init__.py"
+    if init.exists() and init.read_text().strip():
+        found.add(("empty-init", _module_name(init), ""))
+
+    # The kernel library's interface: __all__ is exactly the imported names, each defined in the
+    # module it is imported from, nothing private, nothing else in __init__.py.
+    if not EXPORTS:
+        found.add(("exports-missing", "pithtrain.kernels", "imports"))
+    if sorted(ALL_LIST) != sorted(ALL) or len(ALL_LIST) != len(set(ALL_LIST)):
+        diff = sorted(set(ALL_LIST) ^ ALL)
+        found.add(("exports-all-mismatch", "pithtrain.kernels", ", ".join(diff)))
+    for detail in INIT_OTHER:
+        found.add(("init-extra", "pithtrain.kernels", detail))
+    for module, names in EXPORTS.items():
+        path = KERNELS / f"{module}.py"
+        if not path.exists():
+            found.add(("exports-module", "pithtrain.kernels", module))
+            continue
+        if module.endswith("_sm100"):
+            found.add(("exports-sm100", "pithtrain.kernels", module))
+        defined = _top_level_names(path)
+        for name in names:
+            if name not in defined:
+                found.add(("exports-undefined", f"pithtrain.kernels.{module}", name))
+            if name.startswith("_"):
+                found.add(("exports-private", f"pithtrain.kernels.{module}", name))
+    if len(ALL) != sum(len(v) for v in EXPORTS.values()):
+        found.add(("exports-duplicate", "pithtrain.kernels", ""))
+
+    # Outside kernels/: only `from pithtrain.kernels import <name in __all__>`, no arch branches.
+    for path in OUTSIDE_FILES:
+        rel = str(path.relative_to(ROOT))
+        for line, form, detail in _kernel_imports(path):
+            if form != "name" or detail not in ALL:
+                found.add(("kernels-interface", rel, f"{line}: {form} {detail}"))
+        in_pkg = PKG in path.parents
+        in_kernel_tests = (ROOT / "tests" / "kernels") in path.parents
+        if in_pkg or in_kernel_tests:
+            for node in ast.walk(ast.parse(path.read_text())):
+                name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else None  # fmt: skip
+                if name in ARCH_NAMES:
+                    found.add(("arch-outside-kernels", rel, name))
+
+    # Every exported name is exercised by its feature's verifier, which imports only the library.
+    kernel_tests = ROOT / "tests" / "kernels"
+    for module, names in EXPORTS.items():
+        test = kernel_tests / f"test_{_feature(module)}.py"
+        if not test.exists():
+            found.add(("verifier-missing", str(test.relative_to(ROOT)), module))
+            continue
+        tree = ast.parse(test.read_text())
+        imported = {d for _, form, d in _kernel_imports(test) if form == "name"}
+        used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        for name in names:
+            if name not in imported or name not in used:
+                found.add(("verifier-coverage", str(test.relative_to(ROOT)), name))
+    if kernel_tests.exists():
+        for path in sorted(kernel_tests.rglob("*.py")):
+            for node in ast.walk(ast.parse(path.read_text())):
+                mods = []
+                if isinstance(node, ast.Import):
+                    mods = [a.name for a in node.names]
+                elif isinstance(node, ast.ImportFrom):
+                    mods = [node.module or ""] if node.level == 0 else ["." * node.level]
+                for m in mods:
+                    if m.startswith(".") or (
+                        (m == "pithtrain" or m.startswith(("pithtrain.", "tests")))
+                        and m != "pithtrain.kernels"
+                    ):
+                        found.add(("verifier-imports", str(path.relative_to(ROOT)), m))
 
     for mod, path in MODULES.items():
         layer, stem = _layer(mod), _stem(mod)
@@ -197,7 +379,7 @@ def _violations() -> set[tuple[str, str, str]]:
                 found.add(("pipeline-imports", mod, t))
             elif layer == "models" and (
                 tl == "tasks"
-                or (tl == "kernels" and _stem(t) not in MODELS_KERNELS)
+                or (tl == "kernels" and t != "pithtrain.kernels")
                 or (tl == "modules" and _stem(t) not in MODELS_MODULES)
             ):
                 found.add(("models-imports", mod, t))
@@ -212,7 +394,7 @@ def _violations() -> set[tuple[str, str, str]]:
 
             # _smXX edges.
             if _smxx(t):
-                if layer != "kernels" and mod not in SMXX_IMPORTERS:
+                if layer != "kernels":
                     found.add(("smxx-importer", mod, t))
                 if stem.endswith("_sm100") and _stem(t).endswith("_sm90"):
                     found.add(("sm100-imports-sm90", mod, t))
@@ -230,12 +412,17 @@ def _violations() -> set[tuple[str, str, str]]:
                 if mod in PICKERS and t != mod:
                     found.add(("picker-imports-picker", mod, t))
 
-    # SM90 tests skip unless SM90.
-    for mod, path in TEST_MODULES.items():
-        if _stem(mod).startswith("test_") and _stem(mod).endswith("_sm90"):
-            src = path.read_text()
-            if "pytestmark" not in src or "is_sm90" not in src:
-                found.add(("sm90-test-skip", mod, ""))
+    # Importing pithtrain.kernels never loads cutlass, QuACK or FA4 (which loads both): no module
+    # the package imports at module level, transitively, imports them at module level.
+    for mod in sorted(_eager_closure("pithtrain.kernels")):
+        heavy = [t for t in _top_level_imports(MODULES[mod]) if t.split(".")[0] in HEAVY]
+        if heavy:
+            found.add(("kernels-eager-heavy", mod, heavy[0]))
+
+    # Tests are named for the feature, never for an architecture.
+    for mod in TEST_MODULES:
+        if _stem(mod).startswith("test_") and _smxx(mod):
+            found.add(("arch-named-test", mod, ""))
 
     # The module import graph has no cycle.
     for cycle in _cycles():

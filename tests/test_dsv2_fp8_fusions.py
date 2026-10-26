@@ -13,7 +13,7 @@ from transformers.models.deepseek_v2.configuration_deepseek_v2 import DeepseekV2
 
 from pithtrain.contexts import distributed, training
 from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
-from pithtrain.kernels.arch import ARCH_MAJOR
+from pithtrain.kernels import fp8_fused_experts_supported
 from pithtrain.operators.grouped_linear import FP8GroupedLinear
 from pithtrain.operators.linear import FP8Linear
 from pithtrain.operators.silu_mul import silu_mul
@@ -23,7 +23,9 @@ from pithtrain.operators.token_scatter import (
     scatter_for_grouped_gemm,
 )
 
-pytestmark = pytest.mark.skipif(ARCH_MAJOR != 9, reason="Hopper-only fused path")
+pytestmark = pytest.mark.skipif(
+    not fp8_fused_experts_supported(), reason="needs the fused FP8 expert ops"
+)
 
 
 @pytest.fixture

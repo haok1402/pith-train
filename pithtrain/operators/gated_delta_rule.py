@@ -22,12 +22,10 @@ from fla.ops.utils import prepare_chunk_indices
 from torch.distributed import ProcessGroup, get_world_size
 from torch.distributed.distributed_c10d import _resolve_process_group
 
-from pithtrain.kernels.gated_delta_rule_pinned_sm90 import (
-    BT,
+from pithtrain.kernels import (
     chunk_gdr_bwd_pinned,
     chunk_gdr_fwd_pinned,
-    pinned_launch_supported,
-    pinned_shapes,
+    gated_delta_rule_pinned_supported,
 )
 
 __all__ = ["dense_gated_delta_rule", "gated_delta_rule"]
@@ -37,6 +35,8 @@ __all__ = ["dense_gated_delta_rule", "gated_delta_rule"]
 
 # Disable FLA's issue#640 guard: the BK=64 backward miscompile doesn't apply at head_k_dim=128.
 fla.ops.common.chunk_o.TRITON_ABOVE_3_4_0 = False
+
+BT = 64  # FLA's chunk size: the chunk indices of the CP path and the last dim of the WY matrix A
 
 
 @lru_cache(maxsize=None)
@@ -100,7 +100,7 @@ def _gdr_backward(ctx: torch.autograd.function.FunctionCtx, do: torch.Tensor, *_
 _gdr_fwd.register_autograd(_gdr_backward, setup_context=_gdr_setup_context)
 
 # ------------------------------------------------------------
-# DENSE PATH THROUGH THE PINNED FLA LAUNCHES (kernels/gated_delta_rule_pinned_sm90.py)
+# DENSE PATH THROUGH THE PINNED FLA LAUNCHES (pithtrain.kernels.chunk_gdr_*_pinned)
 # ------------------------------------------------------------
 
 def _key_heads(t: torch.Tensor) -> torch.Tensor:
@@ -159,7 +159,7 @@ def dense_gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g:
     """
     Chunked gated delta rule: q / k [b, s, heads, dim], v [b, s, value_heads, value_dim], g and
     beta [b, s, value_heads], value_heads a multiple of heads, through the pinned FLA launches
-    (kernels/gated_delta_rule_pinned_sm90.py).
+    (``pithtrain.kernels.chunk_gdr_fwd_pinned`` / ``chunk_gdr_bwd_pinned``).
     """
     q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
     B, S, H, K = k.shape
@@ -189,7 +189,7 @@ def gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch
     host, where the installed versions, GPU and call geometry match the recorded configs. The other paths
     repeat_interleave grouped q / k first.
     """
-    if cp_group is None and pinned and pinned_shapes(q, k, v, g, beta) and pinned_launch_supported(q.device.index):
+    if cp_group is None and pinned and gated_delta_rule_pinned_supported(q, k, v, g, beta):
         return dense_gated_delta_rule(q, k, v, g, beta)
     repeats = v.shape[2] // q.shape[2]
     if repeats > 1:

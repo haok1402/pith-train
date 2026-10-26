@@ -161,15 +161,29 @@ def scatter_by_expert(
     group_counts: Optional[list[int]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
     """
-    Reorder ``input_tokens`` ``(m, hidden)`` by ``expert_idxs`` into per-expert groups, each padded
-    with zero rows to ``padding_alignment``.
+    Reorder ``input_tokens`` by ``expert_idxs`` into expert-major groups, each padded with zero rows
+    to a multiple of ``padding_alignment``: ``(output_tokens, reverse_shuffle_idxs,
+    grouped_mm_offs, ks_tensor, ks)``.
 
-    Returns ``(output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks_tensor, ks)``:
-    ``output_tokens`` ``(sum(ks), hidden)``, ``reverse_shuffle_idxs`` ``(m,)`` int64 (the output row
-    of each input token), ``grouped_mm_offs`` ``(G,)`` int32 cumulative padded sizes,
-    ``ks_tensor`` ``(G,)`` int32 padded sizes and ``ks`` the same on the host. With
-    ``group_counts`` (rows per group, known on the host) ``ks`` follows without a device-to-host
-    copy; otherwise the copy runs on a side stream overlapping the scatter kernel.
+    - ``input_tokens``: 2-D ``(m, hidden)`` with unit inner stride (any row stride, any dtype);
+      ``expert_idxs``: int64 ``(m,)`` contiguous, values in ``[0, num_groups)`` (a length other than
+      m raises ValueError). Neither is modified.
+    - ``group_counts``: the true rows per group on the host, if known; ``ks`` then follows without
+      the device-to-host copy (and host sync) of the padded sizes, and must match ``expert_idxs``.
+    - ``output_tokens``: ``(sum(ks), hidden)`` row-major in ``input_tokens``' dtype, a prefix view
+      of a larger allocation: group ``g`` occupies rows ``[offs[g - 1], offs[g])``, its tokens
+      first, then zero rows. The rows of the allocation past ``sum(ks)`` (up to a multiple of 1024)
+      are zero too.
+    - ``reverse_shuffle_idxs``: int64 ``(m,)``, the output row of each input token
+      (``output_tokens[reverse_shuffle_idxs] == input_tokens``).
+    - ``grouped_mm_offs``: int32 ``(G,)`` cumulative padded group ends; ``ks_tensor``: int32
+      ``(G,)`` padded group sizes (zero for an empty group); ``ks``: the same as a host list.
+    - ``m == 0`` returns empty tensors, ``grouped_mm_offs`` and ``ks_tensor`` of shape ``(0,)``
+      and ``ks == []``.
+
+    Rows are copied exactly. Placement within a group is ``atomic_add`` order, not deterministic;
+    the multiset of rows per group, the offsets and the sizes are. Same kernels on both
+    architectures.
     """
     m = input_tokens.shape[0]
     hidden_size = input_tokens.shape[1]

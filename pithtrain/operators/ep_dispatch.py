@@ -2,19 +2,20 @@
 Expert-parallel dispatch: from the router's top-k to the received, deduplicated tokens and the
 routing metadata of stages 3-5 (``RoutingInfo``).
 
-The index math runs in the kernels of ``pithtrain/kernels/ep_dispatch.py``; this module does the
-metadata and expand_idx all-to-alls, the host-side split arithmetic and the token gather.
-``prepare_dispatch_issue`` / ``PendingDispatch.finish`` split it so that independent GPU work can
-be enqueued while the metadata travels to the host.
+The index math runs in the kernel library (``fused_dedup_prepare_dispatch``,
+``expert_and_expand_idx``); this module does the metadata and expand_idx all-to-alls, the
+host-side split arithmetic and the token gather. ``prepare_dispatch_issue`` /
+``PendingDispatch.finish`` split it so that independent GPU work can be enqueued while the
+metadata travels to the host.
 """
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 import torch.distributed as dist
 
-from pithtrain.kernels.ep_dispatch import expert_and_expand_idx, fused_dedup_prepare_dispatch
-from pithtrain.kernels.host_transfer import get_pinned_buffer
+from pithtrain.kernels import expert_and_expand_idx, fused_dedup_prepare_dispatch
 from pithtrain.operators.all_to_all import all_to_all_sync
 from pithtrain.operators.routing import AllToAllSplits, RoutingInfo
 from pithtrain.operators.token_scatter import padded_index_gather
@@ -22,6 +23,16 @@ from pithtrain.operators.token_scatter import padded_index_gather
 # At most one deferred dispatch is outstanding per process: its metadata lands in the single
 # pinned buffer below, which the next issue would overwrite.
 _outstanding: list["PendingDispatch"] = []
+
+
+@lru_cache(maxsize=None)
+def _pinned_meta(numel: int, dtype: torch.dtype) -> torch.Tensor:
+    """
+    The pinned host buffer the dispatch metadata is copied into, one per size, cached because
+    freeing a pinned tensor costs a cudaEventRecordWithFlags (~10 us) in PyTorch's host allocator.
+    Shared by every dispatch: the MoE ops run on one thread at a time.
+    """
+    return torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True)
 
 
 @dataclass(slots=True, eq=False)
@@ -136,7 +147,7 @@ def prepare_dispatch_issue(
     all_to_all_sync(recv_meta, send_meta, group=ep_group)
 
     # -- One device-to-host copy, completion marked by an event --
-    meta_cpu = get_pinned_buffer("dispatch_meta", meta.shape[0], meta.dtype)
+    meta_cpu = _pinned_meta(meta.shape[0], meta.dtype)
     done = torch.cuda.Event()
     meta_cpu.copy_(meta, non_blocking=True)
     done.record()

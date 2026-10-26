@@ -15,7 +15,7 @@ parallel and atomic-free.
 
 import torch
 
-from pithtrain.kernels.segment_sum import segment_sum_along_rows
+from pithtrain.kernels import segment_sum_along_rows
 
 
 class _IndexedBiasAdd(torch.autograd.Function):

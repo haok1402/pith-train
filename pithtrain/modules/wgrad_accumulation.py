@@ -32,9 +32,11 @@ from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
 from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
 
 from pithtrain.contexts import training
-from pithtrain.kernels import bf16_expert_support
-from pithtrain.kernels.arch import ARCH_MAJOR, is_sm90
-from pithtrain.kernels.fp8_gemm import k_grouped_runs_transposed
+from pithtrain.kernels import (
+    bf16_experts_supported,
+    fp8_fused_experts_supported,
+    fp8_grouped_wgrad_buffer,
+)
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
 from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.main_grad import MAIN_GRADS
@@ -61,28 +63,16 @@ def install_wgrad_accumulation(model: nn.Module) -> None:
                 if not isinstance(owner, (BF16Linear, GroupedLinear, FP8GroupedLinear)):
                     continue
                 size, device = fsdp_param._orig_size, fsdp_param.device
-                owner.main_grad = torch.empty(size, dtype=torch.float32, device=device)
-                if isinstance(owner, FP8GroupedLinear) and _wgrad_runs_transposed(size):
-                    # The SM90 k-grouped wgrad computes this weight's gradient transposed (see
-                    # kernels.fp8_gemm.k_grouped_fp8_gemm_nt); keep main_grad in that layout so it
-                    # accumulates in place instead of transposing twice per micro-batch.
-                    g, n, k = size
-                    owner.main_grad = torch.empty((g, k, n), dtype=torch.float32, device=device).transpose(1, 2)  # fmt: skip
+                if isinstance(owner, FP8GroupedLinear):
+                    # Laid out as the k-grouped FP8 wgrad accumulates in place (transposed where
+                    # it computes the product transposed), not transposed twice per micro-batch.
+                    owner.main_grad = fp8_grouped_wgrad_buffer(size, device)
+                else:
+                    owner.main_grad = torch.empty(size, dtype=torch.float32, device=device)
                 owner.main_grad.untyped_storage().resize_(0)
                 pairs.append((fsdp_param, owner.main_grad))
             if pairs:
                 _attach_main_grads(group, pairs)
-
-
-def _wgrad_runs_transposed(size: torch.Size) -> bool:
-    """
-    Whether the Hopper k-grouped FP8 wgrad of a (G, N, K) weight takes the transposed branch of
-    the deadlock guard in kernels/fp8_gemm.py (``k_grouped_runs_transposed``).
-    """
-    if not is_sm90() or len(size) != 3:
-        return False
-    _, n, k = size
-    return k_grouped_runs_transposed(n, k)
 
 
 def _attach_main_grads(group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch.Tensor]]) -> None:
@@ -125,10 +115,10 @@ def _attach_main_grads(group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch
 
 def install_raw_main_grad(model: nn.Module) -> None:
     """Give every raw parameter named in a module's ``fp8_raw_params`` an fp32 main_grad, after
-    fully_shard (alongside install_wgrad_accumulation). Only the Hopper FP8 expert path
-    (operators/fp8_experts.py) and the BF16 CuTe experts (operators/bf16_experts.py) write it, so nothing is installed
-    otherwise."""
-    if not ((training.fp8 and ARCH_MAJOR == 9) or (not training.fp8 and bf16_expert_support.supported())):  # fmt: skip
+    fully_shard (alongside install_wgrad_accumulation). Only the fused FP8 expert path
+    (operators/fp8_experts.py) and the BF16 CuTe experts (operators/bf16_experts.py) write it, so
+    nothing is installed otherwise."""
+    if not ((training.fp8 and fp8_fused_experts_supported()) or (not training.fp8 and bf16_experts_supported())):  # fmt: skip
         return
     for module in model.modules():
         if not isinstance(module, FSDPModule):

@@ -8,15 +8,12 @@ import torch.nn.functional as F
 
 from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
 from pithtrain.contexts.weight_grad_store import WeightGradStore
-from pithtrain.kernels.arch import ARCH_MAJOR
-from pithtrain.kernels.fp8_gemm import (
-    k_grouped_fp8_gemm_nt,
-    m_grouped_fp8_gemm_nt,
+from pithtrain.kernels import (
+    fp8_m_grouped_gemm,
+    fp8cast_blockwise_transpose_batched,
+    k_grouped_fp8_gemm,
     quantize_grouped_input,
 )
-from pithtrain.kernels.fp8_rowwise_colwise import fp8cast_rowwise_colwise
-from pithtrain.kernels.fp8_rowwise_kmajor import fp8cast_rowwise_kmajor
-from pithtrain.kernels.fp8_weight_quant import fp8cast_blockwise_transpose_batched
 
 
 class GroupedLinearFunc(torch.autograd.Function):
@@ -118,21 +115,17 @@ def fp8_grouped_wgrad(
     deferred to DualPipeV's W phase when WeightGradStore is on. With an fp32 main_grad on the
     weight (FP8GroupedLinear sets weight.main_grad when wgrad_accumulation installed one), the
     GEMM accumulates straight into it, so no bf16 .grad and no fp32 temporary exist; otherwise the
-    result is added into weight.grad in bf16. Blackwell (TN, MN-Major) takes the per-channel data
-    directly; on Hopper (NT, K-Major) the quantization kernel already wrote it K-major.
+    result is added into weight.grad in bf16. The operands are the per-channel FP8 of
+    ``quantize_grouped_input``, in whatever layout the kernel library's k-grouped GEMM reads.
     """
-    if ARCH_MAJOR >= 10:
-        k_grouped_gemm = deep_gemm.k_grouped_fp8_gemm_tn_contiguous
-    else:
-        k_grouped_gemm = k_grouped_fp8_gemm_nt
     main_grad = getattr(weight, "main_grad", None)
 
     def grad_weight_fn(a, b, ks, ks_tensor):
         if main_grad is not None:
-            k_grouped_gemm(a, b, main_grad, ks, ks_tensor, c=main_grad)
+            k_grouped_fp8_gemm(a, b, main_grad, ks, ks_tensor)
             return
         c = torch.zeros(shape, device=a[0].device, dtype=torch.float32)
-        k_grouped_gemm(a, b, c, ks, ks_tensor, c=c)
+        k_grouped_fp8_gemm(a, b, c, ks, ks_tensor)
         weight_grad_bf16 = c.to(torch.bfloat16)
         if weight.grad is None:
             weight.grad = weight_grad_bf16
@@ -154,7 +147,6 @@ class FP8GroupedLinearFunc(torch.autograd.Function):
     Forward:  output = grouped_mm(input, weight.T)  via m_grouped FP8 GEMM NT
     Dgrad:    grad_input = grouped_mm(grad_output, weight_t.T)  via m_grouped FP8 GEMM NT
     Wgrad:    weight_grad = grouped_mm(grad_output.T, input)  via k_grouped FP8 GEMM
-              (Blackwell: TN/MN-Major, Hopper: NT/K-Major)
     """
 
     @staticmethod
@@ -170,7 +162,7 @@ class FP8GroupedLinearFunc(torch.autograd.Function):
         quantized_input: tuple[torch.Tensor, ...] | None = None,
     ):
         weight_fp8, scale_weight, weight_t_fp8, scale_weight_t = quantized_weight
-        M, K = input.shape
+        K = input.shape[1]
         num_groups, N, _ = weight.shape
 
         # Quantize input to FP8 (fused: single read for both forward and wgrad), unless the caller
@@ -179,20 +171,10 @@ class FP8GroupedLinearFunc(torch.autograd.Function):
             quantized_input = quantize_grouped_input(input, grouped_mm_offs)
         input_fp8, scale_input, input_ch_fp8, scale_input_ch = quantized_input
 
-        assert ARCH_MAJOR >= 10 or group_indices is not None, (
-            "group_indices is required on Hopper (SM90); call precompute_group_indices() once "
-            "at the caller level and pass it to all grouped projections"
-        )
-
-        # Forward: m_grouped GEMM NT contiguous
-        output = torch.empty((M, N), device=input.device, dtype=input.dtype)
-        m_grouped_fp8_gemm_nt(
-            (input_fp8, scale_input),
-            (weight_fp8, scale_weight),
-            output,
-            grouped_mm_offs,
-            M,
-            group_indices=group_indices,
+        # Forward: m_grouped GEMM NT contiguous. group_indices is an optional hint the caller
+        # computes once (precompute_group_indices) and passes to all grouped projections.
+        output = fp8_m_grouped_gemm(
+            (input_fp8, scale_input), (weight_fp8, scale_weight), N, grouped_mm_offs, group_indices
         )
 
         ctx.save_for_backward(
@@ -201,7 +183,6 @@ class FP8GroupedLinearFunc(torch.autograd.Function):
         ctx.weight_ref = weight
         ctx.ks = ks
         ctx.group_indices = group_indices
-        ctx.M = M
         ctx.K = K
         ctx.N = N
         ctx.num_groups = num_groups
@@ -216,29 +197,22 @@ class FP8GroupedLinearFunc(torch.autograd.Function):
         weight = ctx.weight_ref
         ks = ctx.ks
         group_indices = ctx.group_indices
-        M = ctx.M
         K, N, num_groups = ctx.K, ctx.N, ctx.num_groups
 
         # Quantize grad_output (fused: single read).
         # Produces both per-token (for dgrad) and per-channel (for wgrad)
         # FP8 tensors in one pass, eliminating a redundant BF16 read.
-        # On Hopper the colwise output is K-major (fused transpose).
-        if ARCH_MAJOR >= 10:
-            grad_fp8, scale_grad, grad_ch_fp8, scale_grad_ch = fp8cast_rowwise_colwise(grad_output)
-        else:
-            grad_fp8, scale_grad, grad_ch_fp8, scale_grad_ch = fp8cast_rowwise_kmajor(
-                grad_output, grouped_mm_offs
-            )
+        grad_fp8, scale_grad, grad_ch_fp8, scale_grad_ch = quantize_grouped_input(
+            grad_output, grouped_mm_offs
+        )
 
         # Dgrad: m_grouped GEMM NT contiguous with pre-transposed weight
-        grad_input = torch.empty((M, K), device=grad_output.device, dtype=grad_output.dtype)
-        m_grouped_fp8_gemm_nt(
+        grad_input = fp8_m_grouped_gemm(
             (grad_fp8, scale_grad),
             (weight_t_fp8, scale_weight_t),
-            grad_input,
+            K,
             grouped_mm_offs,
-            M,
-            group_indices=group_indices,
+            group_indices,
         )
 
         # Wgrad: k_grouped GEMM on the per-channel FP8 of grad_output and input.

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import torch
 
-from pithtrain.kernels.silu_mul import silu_mul_bwd, silu_mul_fwd
+from pithtrain.kernels import silu_mul_bwd, silu_mul_fwd
 
 
 class _SiLUMul(torch.autograd.Function):

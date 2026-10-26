@@ -11,12 +11,14 @@ import torch
 from pithtrain.contexts import training
 from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
 from pithtrain.contexts.weight_grad_store import WeightGradStore
-from pithtrain.kernels.arch import ARCH_MAJOR
+from pithtrain.kernels import fp8_fused_experts_supported
 from pithtrain.operators.fp8_experts import fp8_swiglu_experts
 from pithtrain.operators.grouped_linear import FP8GroupedLinear
 from pithtrain.operators.token_scatter import precompute_group_indices
 
-pytestmark = pytest.mark.skipif(ARCH_MAJOR != 9, reason="Hopper-only fused path")
+pytestmark = pytest.mark.skipif(
+    not fp8_fused_experts_supported(), reason="needs the fused FP8 expert ops"
+)
 
 
 def make(G: int, H: int, inter: int, main_grad: bool) -> tuple[FP8GroupedLinear, ...]:

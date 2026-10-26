@@ -3,15 +3,18 @@ FP8 routed experts on Hopper as single autograd nodes, with the activation fused
 quantization of its neighbours, and the fused stage-3 input path that feeds them.
 
 - :class:`FP8SwiGLUExpertsFunc` (``fp8_swiglu_experts``): separate gate / up / down
-  FP8GroupedLinear weights (DeepSeek-V2-Lite, Qwen3), SwiGLU fused through
-  ``kernels/fp8_silu_mul_quant.py``.
+  FP8GroupedLinear weights (DeepSeek-V2-Lite, Qwen3), SwiGLU fused through the kernel library's
+  ``silu_mul_quant_*``.
 - :class:`FP8SwiGLUGateUpExpertsFunc` (``fp8_swiglu_gate_up_experts``): one fused (G, 2I, H) gate_up
   weight (Qwen3.5).
 - :class:`FP8ClampedSwiGLUExpertsFunc` (``fp8_clamped_swiglu_experts``): gpt-oss's raw biased
   interleaved gate_up and down parameters and its clamped SwiGLU, fused through
-  ``kernels/fp8_clamped_swiglu_quant.py``.
+  ``clamped_swiglu_quant_*``.
 - :class:`FP8ScatterQuantFunc` (``fp8_scatter_quant``): received tokens -> quantized grouped input
-  in one pass (``kernels/fp8_scatter_quant.py``), with ``scatter_quant_backward``.
+  in one pass (``scatter_quant``), with ``scatter_quant_backward``.
+
+Only where ``fp8_fused_experts_supported()`` (the models check it); elsewhere FP8 training takes
+the unfused FP8GroupedLinear path.
 
 Every FP8 operand is bit-identical to the unfused path (FP8GroupedLinear -> activation ->
 FP8GroupedLinear), so the outputs and gradients are too, except where noted (gpt-oss's gate_up
@@ -19,8 +22,8 @@ bias gradient sums the same bf16 values in a different fp32 order).
 
 The gpt-oss experts: the down bias is added in place into the down GEMM's output (one fp32 add
 rounded to bf16, as ``indexed_bias_add`` does, without materializing ``bias[group_ids]``); its
-gradient is ``indexed_bias_add``'s segment sum. Their wgrads go through
-:func:`fp8_padded_wgrad`, which lays the k-grouped operands out with DeepGEMM-safe channel counts.
+gradient is ``indexed_bias_add``'s segment sum. Their wgrads go through :func:`fp8_padded_wgrad`,
+whose operands are laid out padded to the channel counts the k-grouped GEMM takes without a copy.
 """
 
 from typing import Optional
@@ -28,27 +31,21 @@ from typing import Optional
 import torch
 
 from pithtrain.contexts.weight_grad_store import WeightGradStore
-from pithtrain.kernels.fp8_clamped_swiglu_quant import (
+from pithtrain.kernels import (
     clamped_swiglu_bwd_quant,
     clamped_swiglu_quant_kmajor,
     clamped_swiglu_quant_rowwise,
-)
-from pithtrain.kernels.fp8_gemm import (
     fp8_m_grouped_gemm,
-    k_grouped_fp8_gemm_nt,
-    k_grouped_safe_size,
+    group_bias_add_,
+    k_grouped_fp8_gemm,
     quantize_grouped_input,
-)
-from pithtrain.kernels.fp8_rowwise_kmajor import fp8cast_rowwise_kmajor
-from pithtrain.kernels.fp8_scatter_quant import scatter_quant
-from pithtrain.kernels.fp8_silu_mul_quant import (
+    scatter_quant,
+    segment_sum_along_rows,
     silu_mul_bwd_quant,
     silu_mul_bwd_quant_gu,
     silu_mul_quant_fwd,
     silu_mul_quant_gu_fwd,
 )
-from pithtrain.kernels.group_bias_add import group_bias_add_
-from pithtrain.kernels.segment_sum import segment_sum_along_rows
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, fp8_grouped_wgrad
 
 __all__ = [
@@ -75,7 +72,7 @@ class FP8SwiGLUExpertsFunc(torch.autograd.Function):
     """
     gate_proj, up_proj -> SwiGLU -> down_proj for FP8 routed experts on Hopper, as one autograd node.
 
-    SwiGLU is fused into the quantization of its neighbours (kernels/fp8_silu_mul_quant_sm90.py): forward
+    SwiGLU is fused into the quantization of its neighbours (``silu_mul_quant_fwd`` and co.): forward
     quantizes h for down_proj straight from g and u, and backward quantizes dg and du for the
     gate/up GEMMs straight from dh, so h, dg and du never reach HBM in bf16. The x quantization is
     shared by gate_proj and up_proj. Every kernel is bit-identical to the unfused path, so the
@@ -138,7 +135,7 @@ class FP8SwiGLUExpertsFunc(torch.autograd.Function):
         # the backward low; the deferred wgrads keep only the K-major operands they need.
         if h_ch is None:
             _, _, h_ch, h_ch_scale = silu_mul_quant_fwd(g, u, offs)
-        dy_fp8, dy_scale, dy_ch, dy_ch_scale = fp8cast_rowwise_kmajor(dy, offs)
+        dy_fp8, dy_scale, dy_ch, dy_ch_scale = quantize_grouped_input(dy, offs)
         del dy
         dh = fp8_m_grouped_gemm((dy_fp8, dy_scale), (wd_t, sd_t), inter, offs, gi)
         del dy_fp8, dy_scale
@@ -204,7 +201,7 @@ def scatter_quant_backward(
 
 class FP8ScatterQuantFunc(torch.autograd.Function):
     """
-    Received tokens -> quantized grouped expert input in one pass (kernels/fp8_scatter_quant_sm90.py): the
+    Received tokens -> quantized grouped expert input in one pass (``scatter_quant``): the
     dedup expansion (padded_index_gather), the scatter by expert (scatter_for_grouped_gemm) and the
     FP8 quantization (quantize_grouped_input) fused, so the bf16 expert input is never written.
 
@@ -313,7 +310,7 @@ class FP8SwiGLUGateUpExpertsFunc(torch.autograd.Function):
         ks, gi = ctx.ks, ctx.group_indices
         inter, hidden = w_down.shape[2], w_down.shape[1]
 
-        dy_fp8, dy_scale, dy_ch, dy_ch_scale = fp8cast_rowwise_kmajor(dy, offs)
+        dy_fp8, dy_scale, dy_ch, dy_ch_scale = quantize_grouped_input(dy, offs)
         dh = fp8_m_grouped_gemm((dy_fp8, dy_scale), (wd_t, sd_t), inter, offs, gi)
         _, _, h_ch, h_ch_scale = silu_mul_quant_gu_fwd(gu, offs)
         fp8_grouped_wgrad((dy_ch, dy_ch_scale), (h_ch, h_ch_scale), ks, ks_tensor, w_down, tuple(w_down.shape))  # fmt: skip
@@ -360,28 +357,19 @@ def fp8_padded_wgrad(
 ) -> None:
     """
     weight.grad += a^T b per expert (into main_grad in fp32 instead when it holds storage, see
-    modules/wgrad_accumulation.install_raw_main_grad) (k-grouped FP8 GEMM, deferred to DualPipeV's W phase like
-    grouped_linear.fp8_grouped_wgrad), for weight (G, N, K), a's K-major channels NA >= N and
-    b's KB >= K (either may be laid out padded, see k_grouped_safe_size). The operand with a multiple
-    of 256 channels goes first, so DeepGEMM's tile count is even; if that is b, the product is
-    computed transposed (b^T a).
+    modules/wgrad_accumulation.install_raw_main_grad) (k-grouped FP8 GEMM, deferred to DualPipeV's
+    W phase like grouped_linear.fp8_grouped_wgrad), for weight (G, N, K), a's per-channel FP8 with
+    NA >= N channels and b's with KB >= K (either may be laid out padded: the fused ops'
+    ``padded=True``); ``k_grouped_fp8_gemm`` drops the padding.
     """
     G, N, K = weight.shape
-    NA, KB = a[1].shape[0], b[1].shape[0]
-    swap = NA % 256 != 0 and KB % 256 == 0
 
     def fn(a, b, ks, ks_tensor):
-        if swap:
-            c = torch.zeros((G, KB, NA), device=a[0].device, dtype=torch.float32)
-            k_grouped_fp8_gemm_nt(b, a, c, ks, ks_tensor, c=c)
-            grad = c[:, :K, :N].transpose(1, 2)
-        else:
-            c = torch.zeros((G, NA, KB), device=a[0].device, dtype=torch.float32)
-            k_grouped_fp8_gemm_nt(a, b, c, ks, ks_tensor, c=c)
-            grad = c[:, :N, :K]
         if main_grad is not None and main_grad.untyped_storage().size() > 0:
-            main_grad.add_(grad)
+            k_grouped_fp8_gemm(a, b, main_grad, ks, ks_tensor)
             return
+        grad = torch.zeros((G, N, K), device=a[0].device, dtype=torch.float32)
+        k_grouped_fp8_gemm(a, b, grad, ks, ks_tensor)
         grad = grad.to(torch.bfloat16)
         if weight.grad is None:
             weight.grad = grad.contiguous()
@@ -473,17 +461,17 @@ class FP8ClampedSwiGLUExpertsFunc(torch.autograd.Function):
 
         dy = dy.contiguous()
         d_b_down = segment_sum_along_rows(dy, offs, ctx.b_down_dtype)
-        dy_fp8, dy_scale, dy_ch, dy_ch_scale = fp8cast_rowwise_kmajor(dy, offs)
+        dy_fp8, dy_scale, dy_ch, dy_ch_scale = quantize_grouped_input(dy, offs)
         dh = fp8_m_grouped_gemm((dy_fp8, dy_scale), (wd_t, sd_t), inter, offs, gi)
-        # h's K-major copy, laid out with DeepGEMM-safe channels (see k_grouped_safe_size).
-        kp = k_grouped_safe_size(inter)
-        h_ch, h_ch_scale = clamped_swiglu_quant_kmajor(gu, b_gate_up, offs, ctx.alpha, ctx.limit, kp)  # fmt: skip
+        # h's K-major copy, laid out padded for the k-grouped wgrad.
+        h_ch, h_ch_scale = clamped_swiglu_quant_kmajor(gu, b_gate_up, offs, ctx.alpha, ctx.limit, padded=True)  # fmt: skip
         mg_gate_up, mg_down = ctx.main_grads
         fp8_padded_wgrad((dy_ch, dy_ch_scale), (h_ch, h_ch_scale), ks, ks_tensor, w_down, mg_down)
         del h_ch, h_ch_scale
         del dy_fp8, dy_scale, dy_ch, dy_ch_scale
-        kp = k_grouped_safe_size(w_gate_up.shape[1])
-        dguq, d_bias = clamped_swiglu_bwd_quant(dh, gu, b_gate_up, offs, ctx.alpha, ctx.limit, kp)
+        dguq, d_bias = clamped_swiglu_bwd_quant(
+            dh, gu, b_gate_up, offs, ctx.alpha, ctx.limit, padded=True
+        )
         del dh
         dx = fp8_m_grouped_gemm(dguq[:2], (wgu_t, sgu_t), hidden, offs, gi)
         fp8_padded_wgrad(dguq[2:], (x_ch, x_ch_scale), ks, ks_tensor, w_gate_up, mg_gate_up)

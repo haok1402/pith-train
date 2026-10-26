@@ -96,7 +96,18 @@ BLOCK_SIZE = 1024
 
 
 def clamped_swiglu_fwd(gate_up: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
-    """Clamped SwiGLU ``(M, N)`` of the contiguous interleaved ``gate_up`` ``(M, 2N)``."""
+    """
+    gpt-oss's clamped SwiGLU of an interleaved gate_up: a fresh contiguous ``(M, N)`` tensor in
+    ``gate_up``'s dtype, ``out = (uc + 1) * gc * sigmoid(alpha * gc)`` with ``gate =
+    gate_up[:, 0::2]``, ``up = gate_up[:, 1::2]``, ``gc = min(gate, limit)``, ``uc = clamp(up,
+    -limit, limit)``.
+
+    - ``gate_up``: 2-D ``(M, 2N)`` contiguous, bf16 (any float dtype); not modified. ``alpha``,
+      ``limit``: Python floats (gpt-oss: 1.702, 7.0).
+    - Computed in fp32 (Triton's ``sigmoid``) and rounded once to the input dtype; agrees with
+      the PyTorch fp32 formula to fp32 rounding before that final rounding. Deterministic; same
+      kernel on both architectures. M == 0 or N == 0 launches nothing.
+    """
     assert gate_up.dim() == 2, f"gate_up must be 2-D, got shape {gate_up.shape}"
     M, two_n = gate_up.shape
     assert two_n % 2 == 0, f"gate_up last dim must be even, got {two_n}"
@@ -119,7 +130,19 @@ def clamped_swiglu_fwd(gate_up: torch.Tensor, alpha: float, limit: float) -> tor
 def clamped_swiglu_bwd(
     grad_output: torch.Tensor, gate_up: torch.Tensor, alpha: float, limit: float
 ) -> torch.Tensor:
-    """Gradient ``(M, 2N)`` with respect to the interleaved ``gate_up``."""
+    """
+    Gradient of :func:`clamped_swiglu_fwd` with respect to the interleaved ``gate_up``: a fresh
+    ``(M, 2N)`` tensor like ``gate_up``, gate gradients at the even and up gradients at the odd
+    columns.
+
+    - ``grad_output``: ``(M, N)`` contiguous, ``gate_up``'s dtype; ``gate_up``: the saved
+      ``(M, 2N)`` contiguous forward input. Neither is modified.
+    - ``d_up = grad_output * gc * sigmoid(alpha * gc)``, zero where ``|up| > limit``; ``d_gate =
+      grad_output * (uc + 1) * s * (1 + alpha * gc * (1 - s))`` with ``s = sigmoid(alpha * gc)``,
+      zero where ``gate > limit`` (the clamp boundary itself passes the gradient, as
+      ``torch.clamp`` does). fp32 arithmetic, each rounded once to the dtype. Deterministic;
+      same kernel on both architectures.
+    """
     assert grad_output.shape[0] == gate_up.shape[0]
     assert grad_output.shape[1] * 2 == gate_up.shape[1]
     assert grad_output.dtype == gate_up.dtype

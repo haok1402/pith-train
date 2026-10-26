@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import torch
 
-from pithtrain.kernels.clamped_swiglu import clamped_swiglu_bwd, clamped_swiglu_fwd
+from pithtrain.kernels import clamped_swiglu_bwd, clamped_swiglu_fwd
 
 
 class _ClampedSwiGLU(torch.autograd.Function):

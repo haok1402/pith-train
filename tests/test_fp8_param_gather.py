@@ -20,10 +20,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
 from pithtrain.contexts import training
 from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
-from pithtrain.kernels.fp8_weight_quant import (
-    fp8cast_blockwise_transpose,
-    fp8cast_blockwise_transpose_batched,
-)
+from pithtrain.kernels import fp8cast_blockwise_transpose, fp8cast_blockwise_transpose_batched
 from pithtrain.modules.fp8_param_gather import install_fp8_param_gather, precompute_fp8_param_scales
 from pithtrain.operators.grouped_linear import FP8GroupedLinear
 from pithtrain.operators.linear import FP8Linear

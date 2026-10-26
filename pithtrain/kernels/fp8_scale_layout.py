@@ -45,9 +45,14 @@ def to_mn_major(sf: torch.Tensor) -> torch.Tensor:
 
 
 def act_scale_like(mn: int, sf_k: int, device: torch.device) -> torch.Tensor:
-    """Fake of a 1x128 activation scale with the strides the quantization kernels return: on SM90
-    the ``_sm90`` kernels write it MN-major (above) so DeepGEMM skips its transpose_fp32; elsewhere
-    the ``_sm100`` (Triton) kernels write it row-major."""
+    """
+    Uninitialized fp32 tensor of logical shape ``(mn, sf_k)`` on ``device`` (any device, ``meta``
+    included) with the strides this library's quantization ops give a 1x128 activation scale of
+    that shape: MN-major (``(1, align(mn, 4))``, above) when the process's device is SM90,
+    row-major contiguous otherwise. For fake / meta implementations of ops that return such a
+    scale; callers never read the strides. The architecture is the one probed at import (the
+    current CUDA device then), not ``device``'s.
+    """
     if ARCH_MAJOR == 9:
         return mn_major_scale(mn, sf_k, device)
     return torch.empty((mn, sf_k), dtype=torch.float32, device=device)

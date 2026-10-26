@@ -505,12 +505,8 @@ def _lower_first(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.
     return (a, b, False) if da > 0 else (b, a, True)
 
 
-def gated_forward(x, w_gate, w_up, cu, a_idx, bias=None, act=()):
-    """
-    (preact (M, 2I) interleaved (gate, up), h (M, I)) for gathered rows x[a_idx]. With ``act`` =
-    (alpha, limit) the gpt-oss form: ``bias`` (G, 2I) interleaved like the pairs is added before
-    the clamped SwiGLU (gate must be the lower address).
-    """
+def bf16_expert_gated_forward_sm90(x, w_gate, w_up, cu, a_idx, bias=None, act=()):
+    """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_gemm.bf16_expert_gated_forward` (its contract)."""
     M, inter = a_idx.shape[0], w_gate.shape[1]
     w0, w1, swapped = _lower_first(w_gate, w_up)
     pre = x.new_empty(M, 2 * inter)
@@ -528,11 +524,8 @@ def gated_forward(x, w_gate, w_up, cu, a_idx, bias=None, act=()):
     return pre, h
 
 
-def down_forward_scattered(h, w_down, cu, slot_of, bias=None):
-    """
-    (h @ W_down^T) per expert, plus ``bias`` (G, H) if given, with row r written to row
-    slot_of[r] (received-slot order).
-    """
+def bf16_expert_down_forward_scattered_sm90(h, w_down, cu, slot_of, bias=None):
+    """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_gemm.bf16_expert_down_forward_scattered` (its contract)."""
     M, H = h.shape[0], w_down.shape[1]
     out = h.new_empty(M, H)
     if M == 0:
@@ -545,12 +538,8 @@ def down_forward_scattered(h, w_down, cu, slot_of, bias=None):
     return out
 
 
-def dgated_backward(dy, w_down, preact, cu, slot_of, w_gate, w_up, act=()):
-    """
-    (dpre (M, 2I), h (M, I), dpre lanes swapped) from received-order dy gathered by slot_of; dpre
-    pairs are in the address order of (w_gate, w_up), as the dgrad reads them. ``act`` as in
-    gated_forward.
-    """
+def bf16_expert_dgated_backward_sm90(dy, w_down, preact, cu, slot_of, w_gate, w_up, act=()):
+    """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_gemm.bf16_expert_dgated_backward` (its contract)."""
     M, inter = preact.shape[0], preact.shape[1] // 2
     swapped = w_up.data_ptr() < w_gate.data_ptr()
     dpre = preact.new_empty(M, 2 * inter)
@@ -565,8 +554,8 @@ def dgated_backward(dy, w_down, preact, cu, slot_of, w_gate, w_up, act=()):
     return dpre, h, swapped
 
 
-def dgrad(dpre, w_gate, w_up, cu, dpre_swapped):
-    """dx (M, H) = dpre @ [W_gate; W_up]; dpre pairs as dgated_backward wrote them."""
+def bf16_expert_dgrad_sm90(dpre, w_gate, w_up, cu, dpre_swapped):
+    """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_gemm.bf16_expert_dgrad` (its contract)."""
     M, H = dpre.shape[0], w_gate.shape[2]
     w0, w1, swapped = _lower_first(w_gate, w_up)
     assert swapped == dpre_swapped, "the weights moved between the dgated backward and the dgrad"
@@ -576,8 +565,8 @@ def dgrad(dpre, w_gate, w_up, cu, dpre_swapped):
     return dx
 
 
-def wgrad_gate_up(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a_idx):
-    """mg_gate, mg_up (G, I, H) fp32 += their grads; dpre pairs as dgated_backward wrote them."""
+def bf16_expert_wgrad_gate_up_sm90(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a_idx):
+    """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_gemm.bf16_expert_wgrad_gate_up` (its contract)."""
     if a_idx.shape[0] == 0:
         return
     m0, m1, mg_swapped = _lower_first(mg_gate, mg_up)
@@ -585,18 +574,18 @@ def wgrad_gate_up(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a_idx):
     fn(x, dpre, m0, m1, cu, a_idx)
 
 
-def wgrad_down(dy, h, mg_down, cu, slot_of):
-    """mg_down (G, H, I) fp32 += dy[slot_of]^T @ h per expert."""
+def bf16_expert_wgrad_down_sm90(dy, h, mg_down, cu, slot_of):
+    """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_gemm.bf16_expert_wgrad_down` (its contract)."""
     if slot_of.shape[0] == 0:
         return
     compiled_gemm("wgrad_down", False, config("wgrad_down", h.shape[1], dy.shape[1]), dy.device)(dy, h, mg_down, cu, slot_of)  # fmt: skip
 
 
 __all__ = [
-    "gated_forward",
-    "down_forward_scattered",
-    "dgated_backward",
-    "dgrad",
-    "wgrad_gate_up",
-    "wgrad_down",
+    "bf16_expert_gated_forward_sm90",
+    "bf16_expert_down_forward_scattered_sm90",
+    "bf16_expert_dgated_backward_sm90",
+    "bf16_expert_dgrad_sm90",
+    "bf16_expert_wgrad_gate_up_sm90",
+    "bf16_expert_wgrad_down_sm90",
 ]

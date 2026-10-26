@@ -49,6 +49,7 @@ __all__ = [
     "BT",
     "chunk_gdr_bwd_pinned",
     "chunk_gdr_fwd_pinned",
+    "gated_delta_rule_pinned_supported",
     "pinned_launch_supported",
     "pinned_shapes",
 ]
@@ -212,9 +213,22 @@ def _fwd_h(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g: torch.Tensor) -
 
 def chunk_gdr_fwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:  # fmt: skip
     """
-    chunk_gated_delta_rule_fwd, dense: returns the output, the chunk-cumulated gate and the solved
-    WY matrix A, the two forward intermediates the backward reads. q and k are [b, s, H, dim]
-    (contiguous), v, g and beta have HV heads, HV a multiple of H.
+    FLA's dense chunked gated delta rule forward (``chunk_gated_delta_rule_fwd``, chunk size 64,
+    scale ``K ** -0.5``, no initial or final state, no ``cu_seqlens``): fresh ``(o, g_cum, A)``.
+
+    - ``q``, ``k``: bf16 ``(B, T, H, K)`` contiguous (unrepeated key heads); ``v``: bf16
+      ``(B, T, HV, V)``; ``g``: fp32 ``(B, T, HV)``, the raw per-step log gate; ``beta``: bf16
+      ``(B, T, HV)``; HV a multiple of H, value head ``j`` reading key head ``j // (HV / H)``.
+      None is modified.
+    - ``o``: bf16 ``(B, T, HV, V)``; ``g_cum``: fp32 ``(B, T, HV)``, FLA's chunk-local cumulative
+      gate; ``A``: bf16 ``(B, T, HV, 64)``, the solved WY matrix. ``g_cum`` and ``A`` are what
+      :func:`chunk_gdr_bwd_pinned` takes.
+    - Bit-identical to FLA 0.5.2's ``chunk_gated_delta_rule_fwd`` with q / k repeat-interleaved
+      to HV heads (the same kernels in the same order with the configs its autotuner picks);
+      deterministic.
+
+    Only where :func:`gated_delta_rule_pinned_supported` (q, k, v, g, beta) is True (SM90, the
+    recorded FLA / Triton versions, B == 1, HV == 32, K == V == 128); importing the name loads FLA.
     """
     B, T, H, K, HV, V = *k.shape, *v.shape[2:]
     NT = triton.cdiv(T, BT)
@@ -239,8 +253,20 @@ def chunk_gdr_fwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: t
 
 def chunk_gdr_bwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cum: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:  # fmt: skip
     """
-    chunk_gated_delta_rule_bwd, dense: (dq, dk, dv, dg, dbeta), dg w.r.t. the raw gate; q and k as
-    in :func:`chunk_gdr_fwd_pinned`. dq and dk are per value head, [b, s, HV, dim].
+    FLA's dense chunked gated delta rule backward (``chunk_gated_delta_rule_bwd``): fresh
+    ``(dq, dk, dv, dg, dbeta)``.
+
+    - ``q``, ``k``, ``v``, ``beta``: the forward inputs of :func:`chunk_gdr_fwd_pinned`;
+      ``g_cum``, ``A``: its outputs; ``do``: bf16 ``(B, T, HV, V)``, the gradient of ``o``. None is
+      modified.
+    - ``dq``, ``dk``: ``(B, T, HV, K)`` in q's / k's dtype, per value head (the caller sums each
+      group of ``HV / H`` heads, in ``repeat_interleave`` order, to get the key-head gradients);
+      ``dv`` like ``v``; ``dg``: fp32 ``(B, T, HV)``, with respect to the raw gate ``g``;
+      ``dbeta`` like ``beta``.
+    - Bit-identical to FLA 0.5.2's ``chunk_gated_delta_rule_bwd`` on repeat-interleaved q / k;
+      deterministic.
+
+    Only where :func:`gated_delta_rule_pinned_supported` is True, as for the forward.
     """
     B, T, H, K, HV, V = *k.shape, *v.shape[2:]
     NT, scale = triton.cdiv(T, BT), K**-0.5
@@ -295,3 +321,14 @@ def pinned_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Te
         B == 1 and HV == 32 and HV % H == 0 and K == 128 and V == 128 and q.shape == k.shape
         and q.dtype == k.dtype == v.dtype == beta.dtype == bf and g.dtype == torch.float32
     )  # fmt: skip
+
+
+def gated_delta_rule_pinned_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:  # fmt: skip
+    """
+    Whether :func:`chunk_gdr_fwd_pinned` / :func:`chunk_gdr_bwd_pinned` apply to this call: the
+    recorded geometry (:func:`pinned_shapes`) on a device and installation where the pinned
+    configs are FLA's autotuned picks (:func:`pinned_launch_supported`: SM90, the recorded FLA and
+    Triton versions). Otherwise the caller keeps FLA's autotuned entry points. A constant per
+    device and geometry, so torch.compile evaluates it rather than tracing into it.
+    """
+    return pinned_shapes(q, k, v, g, beta) and pinned_launch_supported(q.device.index)

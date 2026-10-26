@@ -18,8 +18,7 @@ import torch
 import torch.distributed as dist
 
 import pithtrain.operators.ep_dispatch as ep_dispatch
-from pithtrain.kernels.ep_dispatch import expert_and_expand_idx
-from pithtrain.kernels.host_transfer import get_pinned_buffer
+from pithtrain.kernels import expert_and_expand_idx
 from pithtrain.operators.ep_dispatch import prepare_dispatch, prepare_dispatch_issue
 from pithtrain.operators.routing import AllToAllSplits, RoutingInfo
 from pithtrain.operators.token_scatter import padded_index_gather
@@ -35,7 +34,7 @@ def reference_prepare_dispatch(hidden_states, topk_ids, topk_weight, num_experts
     )  # fmt: skip
     recv_meta = meta[2 * ep_size :]
     torch.compiler.disable(dist.all_to_all_single)(recv_meta, send_meta, group=ep_group)
-    meta_cpu = get_pinned_buffer("dispatch_meta_reference", meta.shape[0], meta.dtype)
+    meta_cpu = torch.empty(meta.shape[0], dtype=meta.dtype, pin_memory=True)
     meta_cpu.copy_(meta, non_blocking=True)
     torch.cuda.current_stream(hidden_states.device).synchronize()
     host = meta_cpu.tolist()

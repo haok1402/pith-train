@@ -25,8 +25,20 @@ def _group_bias_add_kernel(y_ptr, bias_ptr, gi_ptr, H, BLOCK_M: tl.constexpr, BL
 
 
 def group_bias_add_(y: torch.Tensor, bias: torch.Tensor, group_indices: torch.Tensor) -> None:
-    """In-place ``y += bias[group_indices]``, bit-identical to ``y + bias[group_indices]`` for
-    bf16 y and bias (M a multiple of 128, as grouped rows are)."""
+    """
+    In place: ``y[r] += bias[group_indices[r]]`` for every row, without materializing
+    ``bias[group_indices]``. Returns None.
+
+    - ``y``: 2-D ``(M, H)``, bf16 (any float dtype), overwritten. ``bias``: ``(G, H)``;
+      ``group_indices``: integer ``(M,)`` with values in ``[0, G)`` (e.g. per-row expert ids of
+      grouped rows). Neither is modified.
+    - Each sum is computed in fp32 and rounded once to ``y``'s dtype: bit-identical to
+      ``y.copy_(y + bias[group_indices])``. The Triton kernel runs when ``y`` and ``bias`` share
+      a dtype, are contiguous and M is a multiple of 128 (grouped rows); other inputs take exactly
+      that PyTorch expression.
+
+    Deterministic; same kernel on both architectures.
+    """
     M, H = y.shape
     if y.dtype != bias.dtype or M % 128 != 0 or not y.is_contiguous() or not bias.is_contiguous():  # fmt: skip
         y.copy_(y + bias[group_indices])

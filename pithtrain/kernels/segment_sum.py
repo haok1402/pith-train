@@ -140,23 +140,21 @@ def segment_sum_along_rows(
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
     """
-    Per-group sum over rows.  Tokens are assumed already sorted by group.
+    Per-group column sums of rows already sorted by group (the bias gradient of
+    ``x + bias[group_ids]``): a fresh ``(G, H)`` tensor of ``out_dtype``, row ``g`` the sum of
+    rows ``[offs[g - 1], offs[g])`` of ``x`` (``offs[-1] := 0``).
 
-    Each group is summed tile by tile (128 rows from the group's start), adding the tiles' fp32
-    column sums in row order: one block per (group, 128 columns) does exactly that. With too few
-    groups to fill the GPU (a few experts per rank), the tile sums run instead as one block per
-    tile and 128 columns, and a second pass adds them up per group in the same order, so both
-    give the same bits.
+    - ``x``: ``(M, H)`` contiguous, any float dtype; not modified.
+    - ``grouped_mm_offs``: integer ``(G,)`` non-decreasing cumulative group ends; ends past M are
+      clamped to M and rows past the last end are ignored. Groups need not be multiples of 128;
+      an empty group sums to zero.
+    - ``out_dtype``: the result dtype (the bias parameter's); the sums are fp32, rounded once.
 
-    Parameters:
-        x: (M, H) contiguous tensor.
-        grouped_mm_offs: (E,) cumulative end-offsets per group (group g
-            spans rows [offs[g-1], offs[g]) with offs[-1] := 0).
-        out_dtype: dtype of the returned bias gradient (matches the bias
-            parameter's dtype).
-
-    Returns:
-        (E, H) tensor where row g holds the sum of x rows in group g.
+    Summation order (fixed, so the result is deterministic and atomic-free): each group is cut
+    into 128-row tiles from its own start, each tile's fp32 column sums are taken, and the tile
+    sums are added in row order starting from zero. Both internal schedules (one block per
+    (group, 128 columns) when there are enough groups to fill the GPU, else one block per tile
+    plus an ordered per-group pass) give the same bits. Same kernels on both architectures.
     """
     assert x.is_contiguous(), "x must be contiguous"
     M, H = x.shape

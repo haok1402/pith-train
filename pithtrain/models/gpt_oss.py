@@ -9,9 +9,11 @@ from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
 from pithtrain.contexts import distributed, training
 from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
-from pithtrain.kernels import bf16_expert_support
-from pithtrain.kernels.arch import ARCH_MAJOR
-from pithtrain.kernels.fp8_weight_quant import fp8cast_blockwise_transpose_batched
+from pithtrain.kernels import (
+    bf16_experts_supported,
+    fp8_fused_experts_supported,
+    fp8cast_blockwise_transpose_batched,
+)
 from pithtrain.modules.fp8_param_gather import fp8_param_operands
 from pithtrain.modules.load_balance import (
     MoELoadBalanceLossInjector,
@@ -197,7 +199,7 @@ class GptOssExperts(nn.Module):
         ks_tensor: torch.Tensor | None = None,
         quantized_input: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
-        if training.fp8 and ARCH_MAJOR == 9 and x.shape[0]:
+        if training.fp8 and fp8_fused_experts_supported() and x.shape[0]:
             # Hopper FP8: bias + clamped SwiGLU fused into the quantization of the neighbouring
             # GEMMs (operators/fp8_experts.py); bit-identical to the unfused path below.
             gi = precompute_group_indices(grouped_mm_offs, x.shape[0])
@@ -227,7 +229,7 @@ class GptOssExperts(nn.Module):
 
     def uses_bf16_cute(self) -> bool:
         """Whether BF16 stage 3 runs as the fused CuTe experts (operators/bf16_experts.py) in this process."""
-        return not training.fp8 and bf16_expert_support.supported(self.num_experts)
+        return not training.fp8 and bf16_experts_supported(self.num_experts)
 
     def forward_from_tokens(
         self,
@@ -425,7 +427,7 @@ class GptOssDecoderLayer(nn.Module):
         expand_idx: torch.Tensor | None = None,
         expert_counts: list[int] | None = None,
     ) -> torch.Tensor:
-        if training.fp8 and ARCH_MAJOR == 9:
+        if training.fp8 and fp8_fused_experts_supported():
             # Expand, scatter by expert and quantize in one pass; the bf16 expert input is never
             # written, and x inside only carries its gradient.
             expand = expand_idx if distributed.ep_size > 1 else None

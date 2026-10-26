@@ -9,7 +9,7 @@
 
 import torch
 
-from pithtrain.kernels.cross_entropy import cross_entropy_fwd_inplace
+from pithtrain.kernels import cross_entropy_fwd_inplace
 
 
 class CrossEntropy(torch.autograd.Function):

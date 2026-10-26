@@ -1,8 +1,8 @@
 """
 BF16 SwiGLU routed experts on SM90 from the received tokens, as one autograd node.
 
-Forward, for slots grouped by expert (``kernels/bf16_expert_slots_sm90.py``: group_slots; no expanded or scattered copy of the
-tokens is written):
+Forward, for slots grouped by expert (``bf16_expert_group_slots``; no expanded or scattered copy
+of the tokens is written):
 
     preact, h = gated(gathered[a_idx] @ [W_gate | W_up]^T)   one GEMM, SwiGLU in its epilogue
     out[slot_of[r]] = (h @ W_down^T)[r]                        per expert, rows stored to their
@@ -32,22 +32,27 @@ epilogues, the clamped SwiGLU of the model's limit, and the bias gradients as pe
 (expert_slot_segment_sum) returned with the input gradient.
 
 SM90 only: this module imports the SM90 kernels (and QuACK) at the top, so the models import it
-lazily, after ``kernels.bf16_expert_support.supported`` said yes.
+lazily, after ``pithtrain.kernels.bf16_experts_supported`` said yes.
 """
 
 from functools import partial
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
 
 from pithtrain.contexts.weight_grad_store import WeightGradStore
-from pithtrain.kernels import bf16_expert_gemm_sm90 as gemm
-from pithtrain.kernels.bf16_expert_slots_sm90 import (
-    SlotMaps,
+from pithtrain.kernels import (
+    bf16_expert_dgated_backward,
+    bf16_expert_dgrad,
+    bf16_expert_down_forward_scattered,
+    bf16_expert_gated_forward,
+    bf16_expert_gather_rows,
+    bf16_expert_gather_sum,
+    bf16_expert_group_slots,
+    bf16_expert_wgrad_down,
+    bf16_expert_wgrad_gate_up,
     expert_slot_segment_sum,
-    gather_rows,
-    gather_sum,
-    group_slots,
 )
 from pithtrain.operators.main_grad import raw_main_grad
 
@@ -81,10 +86,12 @@ class _Grads:
             p.grad = g if p.grad is None else p.grad.add_(g)
 
 
-def _wgrads(grads: _Grads, x, dy, h, dpre, dpre_swapped, maps: SlotMaps) -> None:
+def _wgrads(grads: _Grads, x, dy, h, dpre, dpre_swapped, maps: NamedTuple) -> None:
     def accumulate(mg_gate, mg_up, mg_down):
-        gemm.wgrad_down(dy, h, mg_down, maps.cu_seqlens, maps.slot_of)
-        gemm.wgrad_gate_up(x, dpre, dpre_swapped, mg_gate, mg_up, maps.cu_seqlens, maps.a_idx)
+        bf16_expert_wgrad_down(dy, h, mg_down, maps.cu_seqlens, maps.slot_of)
+        bf16_expert_wgrad_gate_up(
+            x, dpre, dpre_swapped, mg_gate, mg_up, maps.cu_seqlens, maps.a_idx
+        )
 
     grads.run(accumulate)
 
@@ -101,16 +108,18 @@ class BF16SwiGLUExpertsFunc(torch.autograd.Function):
         w_down: torch.Tensor,
         b_gate_up: torch.Tensor | None,
         b_down: torch.Tensor | None,
-        maps: SlotMaps,
+        maps: NamedTuple,
         grads: _Grads,
         max_slots: int,
         act: tuple,
         cu_host: list[int] | None,
     ) -> torch.Tensor:
         cu = maps.cu_seqlens
-        preact, h = gemm.gated_forward(gathered, w_gate, w_up, cu, maps.a_idx, b_gate_up, act)
+        preact, h = bf16_expert_gated_forward(
+            gathered, w_gate, w_up, cu, maps.a_idx, b_gate_up, act
+        )
         # rows written straight to their slots by the down GEMM's epilogue
-        out = gemm.down_forward_scattered(h, w_down, cu, maps.slot_of, b_down)
+        out = bf16_expert_down_forward_scattered(h, w_down, cu, maps.slot_of, b_down)
         del h
         # The received tokens (and, in backward, dout) come from an all-to-all on the comm stream
         # and are read again by the deferred weight gradient on this stream: tie their reuse to
@@ -132,7 +141,7 @@ class BF16SwiGLUExpertsFunc(torch.autograd.Function):
         cu = maps.cu_seqlens
         dout = dout.contiguous()
         dout.record_stream(torch.cuda.current_stream())
-        dpre, h, swapped = gemm.dgated_backward(dout, w_down, preact, cu, maps.slot_of, w_gate, w_up, ctx.act)  # fmt: skip
+        dpre, h, swapped = bf16_expert_dgated_backward(dout, w_down, preact, cu, maps.slot_of, w_gate, w_up, ctx.act)  # fmt: skip
         del preact
         db_gate_up = db_down = None
         if ctx.bias_dtypes[0] is not None:
@@ -142,11 +151,11 @@ class BF16SwiGLUExpertsFunc(torch.autograd.Function):
             db_down = expert_slot_segment_sum(dout, cu_host, cu, maps.slot_of).to(
                 ctx.bias_dtypes[1]
             )
-        dx = gemm.dgrad(dpre, w_gate, w_up, cu, swapped)
+        dx = bf16_expert_dgrad(dpre, w_gate, w_up, cu, swapped)
         if maps.mask is not None:
-            dgathered = gather_sum(dx, maps, w_gate.shape[0], ctx.max_slots)
+            dgathered = bf16_expert_gather_sum(dx, maps, w_gate.shape[0], ctx.max_slots)
         else:
-            dgathered = gather_rows(dx, maps.row_of)
+            dgathered = bf16_expert_gather_rows(dx, maps.row_of)
         del dx
         x = gathered.detach()
         wgrad = partial(_wgrads, ctx.grads, x, dout.detach(), h, dpre, swapped, maps)
@@ -173,7 +182,7 @@ def bf16_swiglu_experts(
     fused ``gate_proj`` whose rows are [gate; up].
     """
     G = gate_proj.num_groups
-    maps = group_slots(expert_idxs, expand_idx, G, gathered.shape[0])
+    maps = bf16_expert_group_slots(expert_idxs, expand_idx, G, gathered.shape[0])
     if up_proj is not None:
         w_gate, w_up = gate_proj.weight, up_proj.weight
         targets = [(gate_proj, "weight", None), (up_proj, "weight", None)]
@@ -204,7 +213,7 @@ def bf16_clamped_swiglu_experts(
     expert for the slots of the received tokens, returned in slot order.
     """
     G = experts.num_experts
-    maps = group_slots(expert_idxs, expand_idx, G, gathered.shape[0])
+    maps = bf16_expert_group_slots(expert_idxs, expand_idx, G, gathered.shape[0])
     w = experts.gate_up_proj
     even, odd = (slice(None), slice(0, None, 2)), (slice(None), slice(1, None, 2))
     grads = _Grads(

@@ -13,11 +13,13 @@ import pytest
 import torch
 
 from pithtrain.contexts import distributed, training
-from pithtrain.kernels.arch import ARCH_MAJOR
+from pithtrain.kernels import fp8_fused_experts_supported
 from pithtrain.operators.grouped_linear import FP8GroupedLinear
 from pithtrain.operators.linear import FP8Linear
 
-pytestmark = pytest.mark.skipif(ARCH_MAJOR != 9, reason="Hopper FP8 paths")
+pytestmark = pytest.mark.skipif(
+    not fp8_fused_experts_supported(), reason="needs the fused FP8 expert ops"
+)
 
 S = 1024
 

@@ -13,16 +13,16 @@ import pytest
 import torch
 
 from pithtrain.contexts.weight_grad_store import WeightGradStore
-from pithtrain.kernels.arch import ARCH_MAJOR
-from pithtrain.kernels.fp8_gemm import (
-    k_grouped_fp8_gemm_nt,
-    k_grouped_safe_size,
-    pad_k_major_channels,
+from pithtrain.kernels import (
+    fp8_fused_experts_supported,
+    k_grouped_fp8_gemm,
+    quantize_grouped_input,
 )
-from pithtrain.kernels.fp8_rowwise_kmajor import fp8cast_rowwise_kmajor
 from pithtrain.operators.fp8_experts import fp8_padded_wgrad
 
-pytestmark = pytest.mark.skipif(ARCH_MAJOR != 9, reason="Hopper k-grouped FP8 wgrad")
+pytestmark = pytest.mark.skipif(
+    not fp8_fused_experts_supported(), reason="needs the fused FP8 expert ops"
+)
 
 H, INTER = 2880, 2880
 # name -> (N, K, which operand carries padded channels), as in FP8ClampedSwiGLUExpertsFunc.backward
@@ -30,16 +30,17 @@ LAYOUTS = {"gate_up_proj": (2 * INTER, H, "a"), "down_proj": (H, INTER, "b")}
 
 
 def operands(name, counts, seed):
+    """Per-channel FP8 of random grad_output (N) and input (K), one zero-padded to a multiple of 256
+    channels as the fused ops' padded layout is (zero channels only add discarded outputs)."""
     N, K, padded = LAYOUTS[name]
     g = torch.Generator(device="cuda").manual_seed(seed)
     offs = torch.tensor(counts, device="cuda").cumsum(0).to(torch.int32)
     M = sum(counts)
-    a = fp8cast_rowwise_kmajor(torch.randn(M, N, generator=g, device="cuda").to(torch.bfloat16), offs)[2:]  # fmt: skip
-    b = fp8cast_rowwise_kmajor(torch.randn(M, K, generator=g, device="cuda").to(torch.bfloat16), offs)[2:]  # fmt: skip
-    if padded == "a":
-        a = pad_k_major_channels(a, counts, k_grouped_safe_size(N))
-    else:
-        b = pad_k_major_channels(b, counts, k_grouped_safe_size(K))
+    dy = torch.randn(M, N, generator=g, device="cuda").to(torch.bfloat16)
+    x = torch.randn(M, K, generator=g, device="cuda").to(torch.bfloat16)
+    pad = lambda t: torch.nn.functional.pad(t, (0, -(-t.shape[1] // 256) * 256 - t.shape[1]))  # noqa: E731
+    a = quantize_grouped_input(pad(dy) if padded == "a" else dy, offs)[2:]
+    b = quantize_grouped_input(pad(x) if padded == "b" else x, offs)[2:]
     return a, b
 
 
@@ -55,16 +56,9 @@ def adversarial_main_grad(G, N, K, seed):
 
 def reference(a, b, counts, kt, main_grad):
     """The exact semantics: zeroed fp32 temporary, k-grouped GEMM into it, one add into main_grad."""
-    G, N, K = main_grad.shape
-    NA, KB = a[1].shape[0], b[1].shape[0]
-    if NA % 256 != 0 and KB % 256 == 0:
-        c = torch.zeros((G, KB, NA), device="cuda", dtype=torch.float32)
-        k_grouped_fp8_gemm_nt(b, a, c, counts, kt, c=c)
-        main_grad.add_(c[:, :K, :N].transpose(1, 2))
-    else:
-        c = torch.zeros((G, NA, KB), device="cuda", dtype=torch.float32)
-        k_grouped_fp8_gemm_nt(a, b, c, counts, kt, c=c)
-        main_grad.add_(c[:, :N, :K])
+    c = torch.zeros(main_grad.shape, device="cuda", dtype=torch.float32)
+    k_grouped_fp8_gemm(a, b, c, counts, kt)
+    main_grad.add_(c)
 
 
 @pytest.mark.parametrize("name", list(LAYOUTS))

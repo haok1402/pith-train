@@ -108,15 +108,31 @@ BWD = dict(BLOCK_T=128, BLOCK_C=64, num_warps=4)  # tuned on H200, (1, 4096, 819
 
 
 def causal_conv1d_out_like(x: torch.Tensor, offset: int) -> torch.Tensor:
-    """(B, S, C) output stored channels-first, (B, C, S) dense: the layout nn.Conv1d's output
-    has after the slice, so the compiled consumers (SiLU, split, L2 norm) see the strides they
-    always saw and Inductor generates the same, bit-identical, reductions."""
+    """
+    Uninitialized output of :func:`causal_conv1d_fwd` for ``x`` ``(B, offset + S, C)`` (any
+    device, ``meta`` included): logical shape ``(B, S, C)`` in ``x``'s dtype, stored channels-first
+    (a transposed view of a dense ``(B, C, S)`` tensor, strides ``(C * S, 1, S)``), the layout
+    ``nn.Conv1d``'s output has after the slice, so compiled consumers (SiLU, split, L2 norm) see the
+    strides they always saw. For fake / meta implementations.
+    """
     B, L, C = x.shape
     return x.new_empty((B, C, L - offset)).transpose(1, 2)
 
 
 def causal_conv1d_fwd(x: torch.Tensor, w: torch.Tensor, offset: int) -> torch.Tensor:
-    """Conv output (B, S, C) of the contiguous ``x`` (B, offset + S, C); see the module docstring."""
+    """
+    Causal depthwise conv ``y[b, t, c] = sum_k w[c, k] * x[b, t + offset - (K - 1) + k, c]`` over
+    ``k = 0 .. K - 1``, taps at negative positions skipped.
+
+    - ``x``: bf16 ``(B, offset + S, C)`` contiguous; its first ``offset`` rows are history (conv
+      state), not outputs. ``w``: ``(C, 1, K)`` or ``(C, K)`` contiguous (any float dtype, read as
+      fp32). Neither is modified.
+    - Returns a fresh bf16 ``(B, S, C)`` in the layout of :func:`causal_conv1d_out_like`.
+
+    Bit-identical to ATen's CUDA ``conv1d(x.transpose(1, 2), w, padding=K - 1, groups=C)[...,
+    offset:offset + S].transpose(1, 2)``: taps accumulated in order as fp32 fma, rounded once to
+    bf16. Deterministic; same Triton kernel on both architectures.
+    """
     B, L, C = x.shape
     K = w.shape[-1]
     S = L - offset
@@ -129,7 +145,20 @@ def causal_conv1d_fwd(x: torch.Tensor, w: torch.Tensor, offset: int) -> torch.Te
 def causal_conv1d_bwd(
     g: torch.Tensor, x: torch.Tensor, w: torch.Tensor, offset: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """(dx, dw) of the conv for the output gradient ``g``."""
+    """
+    Gradients of :func:`causal_conv1d_fwd` for the output gradient ``g``: ``(dx, dw)``.
+
+    - ``g``: bf16 ``(B, S, C)``, any strides; ``x``, ``w``, ``offset``: as in the forward. None is
+      modified.
+    - ``dx``: fresh bf16 ``(B, offset + S, C)`` contiguous, the gradient of every row of ``x``
+      (the ``offset`` history rows included); bit-identical to ATen's depthwise conv backward
+      (taps in order as fp32 fma, rounded once).
+    - ``dw``: fresh, ``w``'s shape and dtype: fp32 partial sums per (batch, 128-row block) added by
+      a fixed-order reduction, rounded once. Deterministic, but agrees with ATen only to fp32
+      rounding (a different summation order).
+
+    Same Triton kernel on both architectures.
+    """
     B, L, C = x.shape
     K = w.shape[-1]
     S = L - offset

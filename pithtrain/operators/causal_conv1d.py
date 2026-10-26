@@ -14,11 +14,7 @@ from __future__ import annotations
 
 import torch
 
-from pithtrain.kernels.causal_conv1d import (
-    causal_conv1d_bwd,
-    causal_conv1d_fwd,
-    causal_conv1d_out_like,
-)
+from pithtrain.kernels import causal_conv1d_bwd, causal_conv1d_fwd, causal_conv1d_out_like
 
 __all__ = ["causal_conv1d"]
 

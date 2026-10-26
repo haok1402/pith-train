@@ -27,8 +27,8 @@ The hooks are plain functions set as attributes of the sharded local tensor, whi
 at lazy init; no tensor subclass is involved, so optimizers, checkpointing and ``torch.compile``
 only ever see plain tensors.
 
-The kernels (amax, cast, scales, pack + transpose) are the ``fp8_weight_quant`` picker's
-(``pithtrain/kernels/fp8_weight_quant.py``).
+The kernels (amax, cast, scales, pack + transpose) come from the kernel library:
+``fp8_shard_amax[_multi]``, ``fp8_shard_cast``, ``fp8_scales[_multi]``, ``fp8_pack_transpose``.
 """
 
 from dataclasses import dataclass
@@ -40,7 +40,7 @@ import torch.nn as nn
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam, free_storage
 
-from pithtrain.kernels.fp8_weight_quant import (
+from pithtrain.kernels import (
     fp8_pack_transpose,
     fp8_scales,
     fp8_scales_multi,

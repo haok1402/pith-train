@@ -7,7 +7,7 @@ back and quantize, and in backward a SwiGLU-backward pass that writes dg and du 
 and up_proj to read back and quantize. Here:
 
 - x is quantized once for gate_proj and up_proj (as ``FP8Linear.quantize_input`` does);
-- backward quantizes dg and du straight from dh (``kernels.fp8_silu_mul_quant.silu_mul_bwd_quant``
+- backward quantizes dg and du straight from dh (``pithtrain.kernels.silu_mul_bwd_quant``
   with one group of all M rows, whose per-channel K-major output is exactly the transposed half of
   ``fp8cast_rowwise_transpose``), so dg and du never reach HBM in BF16;
 - the whole MLP is one autograd node: one op dispatch in place of five, and the saved state is the
@@ -23,9 +23,11 @@ from typing import Tuple
 
 import torch
 
-from pithtrain.kernels.fp8_gemm import fp8_gemm_nt
-from pithtrain.kernels.fp8_rowwise_blockwise_transpose import fp8cast_rowwise_blockwise_transpose
-from pithtrain.kernels.fp8_rowwise_transpose import fp8cast_rowwise_transpose
+from pithtrain.kernels import (
+    fp8_gemm_nt,
+    fp8cast_rowwise_blockwise_transpose,
+    fp8cast_rowwise_transpose,
+)
 
 __all__ = ["fp8_swiglu_mlp", "fusable"]
 
@@ -109,7 +111,7 @@ def _bwd(
     wd_t_scale: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """(dx, dw_gate, dw_up, dw_down), each as FP8Linear's backward computes it."""
-    from pithtrain.kernels.fp8_silu_mul_quant import silu_mul_bwd_quant
+    from pithtrain.kernels import silu_mul_bwd_quant
 
     (M, hidden), inter = dy.shape, g.shape[1]
     dev, dt = dy.device, dy.dtype

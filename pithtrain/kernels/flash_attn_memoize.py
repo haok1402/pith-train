@@ -14,7 +14,6 @@ import importlib.metadata
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
-from flash_attn.cute import interface as _fa4
 from torch.utils._python_dispatch import TorchDispatchMode
 
 __all__ = ["FAST_PATH", "MISSING", "memoized_launch", "plans", "signature"]
@@ -171,6 +170,9 @@ def _build(t: Any, inputs: Dict[str, torch.Tensor], allocs: List[torch.Tensor]) 
 
 def _record(entry: Callable[[], Tuple[torch.Tensor, ...]], inputs: Dict[str, torch.Tensor]):
     """Run FA4's entry once, returning (its outputs, a plan or None)."""
+    # Imported here, not at the top: FA4 loads cutlass, and importing pithtrain.kernels must not.
+    from flash_attn.cute import interface as _fa4
+
     owners = [f for f in vars(_fa4).values() if callable(f) and hasattr(f, "compile_cache")]
     log: list = []
     caches = [_RecordingCache(f.compile_cache, log) for f in owners]
@@ -237,7 +239,27 @@ def signature(kind: str, inputs: Dict[str, Optional[torch.Tensor]], *scalars) ->
 
 
 def memoized_launch(kind: str, inputs: Dict[str, Optional[torch.Tensor]], scalars: Tuple, entry: Callable[[], Tuple[torch.Tensor, ...]]) -> Tuple[torch.Tensor, ...]:
-    """entry() through the plan recorded for this signature, once one exists."""
+    """
+    ``entry()``, the call into FA4's Python entry, replayed through a recorded host-side plan once
+    one exists for this call's signature. Returns ``entry()``'s output tuple.
+
+    - ``kind``: the FA4 entry point's name; ``scalars``: a hashable tuple of every non-tensor
+      argument of the call; ``inputs``: name -> tensor (or None) of every tensor argument, with
+      ``"q"`` present. ``entry`` must be a function of exactly these (its tensors taken from
+      ``inputs``), and must return freshly allocated tensors.
+    - The signature is ``kind``, ``scalars``, the device and each input's shape, strides, dtype and
+      address modulo 16. The first call of a signature runs ``entry()``; the second runs it while
+      recording; once a clean recording exists (FA4 only allocated, took views and called compiled
+      kernels), later calls allocate the same buffers afresh (zero-filled where FA4 zero-fills
+      them) and call the same compiled kernels with the same argument layout and the live input
+      tensors, skipping FA4's Python. A signature that recorded anything else keeps calling
+      ``entry()``.
+    - The outputs are therefore those of ``entry()`` (the same kernels on the same arguments; bit
+      for bit wherever FA4 itself is deterministic). Inputs are never modified by the replay
+      machinery itself.
+    - Only with the validated FA4 version (``_VALIDATED_FA4``); otherwise every call is ``entry()``.
+      The plan cache is process-global and not thread-safe. Runs on SM90 and SM100.
+    """
     if not FAST_PATH:
         return entry()
     key = signature(kind, inputs, *scalars)

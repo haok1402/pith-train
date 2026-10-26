@@ -84,7 +84,16 @@ BLOCK_SIZE = 1024
 
 
 def silu_mul_fwd(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-    """``silu(gate) * up`` of two contiguous same-shape, same-dtype tensors."""
+    """
+    ``silu(gate) * up``: a fresh contiguous tensor like ``gate``.
+
+    - ``gate``, ``up``: contiguous, same shape and dtype (bf16 in every caller; any float dtype);
+      not modified.
+    - Computed in fp32 (``gate * sigmoid(gate) * up`` with Triton's ``sigmoid``) and rounded once
+      to the dtype; agrees with the PyTorch fp32 formula to fp32 rounding before that final
+      rounding, not bit for bit. Deterministic; same kernel on both architectures. The fused FP8
+      ops (:func:`silu_mul_quant_fwd`) reproduce this result bit for bit.
+    """
     assert gate.shape == up.shape, f"shape mismatch: {gate.shape} vs {up.shape}"
     assert gate.dtype == up.dtype, f"dtype mismatch: {gate.dtype} vs {up.dtype}"
     assert gate.is_contiguous(), "gate must be contiguous"
@@ -99,7 +108,15 @@ def silu_mul_fwd(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 def silu_mul_bwd(
     grad_output: torch.Tensor, gate: torch.Tensor, up: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``(grad_gate, grad_up)`` of ``silu(gate) * up`` for the contiguous ``grad_output``."""
+    """
+    Gradients of :func:`silu_mul_fwd`: fresh ``(grad_gate, grad_up)`` like ``gate`` / ``up``.
+
+    - ``grad_output``, ``gate``, ``up``: contiguous, same shape and dtype; not modified.
+    - With ``s = sigmoid(gate)`` in fp32: ``grad_up = grad_output * gate * s`` and ``grad_gate =
+      grad_output * up * s * (1 + gate - gate * s)``, each rounded once to the dtype.
+      Deterministic; same kernel on both architectures; :func:`silu_mul_bwd_quant` reproduces
+      both bit for bit.
+    """
     assert grad_output.shape == gate.shape, (
         f"grad_output shape {grad_output.shape} != gate shape {gate.shape}"
     )

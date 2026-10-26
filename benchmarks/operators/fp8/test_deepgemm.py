@@ -24,7 +24,7 @@ import torch.nn as nn
 from triton.testing import do_bench
 
 from benchmarks.operators.utilities import Metrics
-from pithtrain.kernels.arch import ARCH_MAJOR
+from pithtrain.kernels import m_grouped_group_indices
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
 from pithtrain.operators.linear import FP8Linear
 from pithtrain.operators.token_scatter import scatter_for_grouped_gemm
@@ -191,11 +191,8 @@ def bench_normal_bwd(M: int, N: int, K: int) -> Metrics:
 # Grouped benchmarks
 # ---------------------------------------------------------------------------
 def _make_group_indices(grouped_mm_offs: torch.Tensor, M: int):
-    """Build per-row group indices for Hopper; returns None on Blackwell."""
-    if ARCH_MAJOR >= 10:
-        return None
-    row_indices = torch.arange(M, device=grouped_mm_offs.device)
-    return torch.searchsorted(grouped_mm_offs, row_indices, right=True).to(torch.int32)
+    """Per-row group indices where the m-grouped GEMM takes them (Hopper); None elsewhere."""
+    return m_grouped_group_indices(grouped_mm_offs, M)
 
 
 def _make_grouped_inputs(

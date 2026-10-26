@@ -21,7 +21,7 @@ from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
 from pithtrain.contexts import training
 from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
-from pithtrain.kernels.fp8_weight_quant import fp8cast_blockwise_transpose_batched
+from pithtrain.kernels import fp8cast_blockwise_transpose_batched
 from pithtrain.models.gpt_oss import GptOssExperts
 from pithtrain.modules.fp8_param_gather import (
     fp8_param_operands,

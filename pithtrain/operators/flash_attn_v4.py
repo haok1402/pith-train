@@ -14,7 +14,7 @@ from typing import Optional, Tuple
 import torch
 from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
 
-from pithtrain.kernels.flash_attn_memoize import memoized_launch
+from pithtrain.kernels import memoized_launch
 
 # fmt: off
 

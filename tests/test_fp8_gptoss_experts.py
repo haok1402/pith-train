@@ -15,11 +15,13 @@ import pithtrain.models.gpt_oss as gpt_oss
 from pithtrain.contexts import training
 from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
 from pithtrain.contexts.weight_grad_store import WeightGradStore
-from pithtrain.kernels.arch import ARCH_MAJOR
+from pithtrain.kernels import fp8_fused_experts_supported
 from pithtrain.models.gpt_oss import GptOssExperts
 from pithtrain.operators.token_scatter import padded_index_gather, scatter_for_grouped_gemm
 
-pytestmark = pytest.mark.skipif(ARCH_MAJOR != 9, reason="Hopper-only fused path")
+pytestmark = pytest.mark.skipif(
+    not fp8_fused_experts_supported(), reason="needs the fused FP8 expert ops"
+)
 
 
 def make(G: int, H: int, inter: int, seed: int) -> GptOssExperts:
@@ -32,7 +34,7 @@ def make(G: int, H: int, inter: int, seed: int) -> GptOssExperts:
 
 
 def run(m: GptOssExperts, x, dy, offs, ks, ks_t, fused: bool, defer: bool, monkeypatch):
-    monkeypatch.setattr(gpt_oss, "ARCH_MAJOR", 9 if fused else 0)
+    monkeypatch.setattr(gpt_oss, "fp8_fused_experts_supported", lambda: fused)
     monkeypatch.setattr(WeightGradStore, "enabled", defer)
     WeightGradStore.clear()
     FP8WeightCacheControl.step()
@@ -116,7 +118,7 @@ def test_forward_from_tokens(ntok: int, G: int, monkeypatch: pytest.MonkeyPatch)
 def test_wgrad_layouts(N: int, K: int) -> None:
     """fp8_padded_wgrad (operand order / padding chosen to dodge DeepGEMM's odd-tile deadlock) against
     an fp32 product: the error is FP8 quantization only (~3.8% relative for Gaussian data)."""
-    from pithtrain.kernels.fp8_rowwise_kmajor import fp8cast_rowwise_kmajor
+    from pithtrain.kernels import quantize_grouped_input
     from pithtrain.operators.fp8_experts import fp8_padded_wgrad
 
     torch.manual_seed(0)
@@ -126,8 +128,8 @@ def test_wgrad_layouts(N: int, K: int) -> None:
     kt = torch.tensor(ks, device="cuda", dtype=torch.int32)
     dy = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
     x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
-    a = fp8cast_rowwise_kmajor(dy, offs)[2:]
-    b = fp8cast_rowwise_kmajor(x, offs)[2:]
+    a = quantize_grouped_input(dy, offs)[2:]
+    b = quantize_grouped_input(x, offs)[2:]
     w = torch.nn.Parameter(torch.empty(G, N, K, device="cuda", dtype=torch.bfloat16))
     fp8_padded_wgrad(a, b, ks, kt, w)
     ref = torch.stack([dy[o - k : o].float().T @ x[o - k : o].float() for o, k in zip(offs.tolist(), ks)])  # fmt: skip

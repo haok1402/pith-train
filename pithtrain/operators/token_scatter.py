@@ -9,9 +9,7 @@ from typing import Optional
 import torch
 
 from pithtrain.contexts import training
-from pithtrain.kernels.arch import ARCH_MAJOR
-from pithtrain.kernels.fp8_gemm import m_grouped_group_indices
-from pithtrain.kernels.token_scatter import scatter_by_expert
+from pithtrain.kernels import m_grouped_group_indices, scatter_by_expert
 
 
 class ScatterForGroupedGemm(torch.autograd.Function):
@@ -144,8 +142,9 @@ def precompute_group_indices(grouped_mm_offs: torch.Tensor, M: int) -> Optional[
     Converts cumulative offsets to per-row group IDs, e.g.
     ``grouped_mm_offs = [128, 256, 384, 512]`` -> ``[0,0,...,1,1,...,2,2,...,3,3,...]``.
 
-    Only needed on Hopper with the DeepGEMM backend; returns None otherwise.
+    Only FP8 training's m-grouped GEMMs read it, and only where the kernel library's GEMM takes it
+    (``m_grouped_group_indices`` returns None otherwise); None in BF16 training.
     """
-    if training.fp8 and ARCH_MAJOR < 10:
+    if training.fp8:
         return m_grouped_group_indices(grouped_mm_offs, M)
     return None

@@ -16,9 +16,9 @@ expanded and scattered copies of the tokens this module only produces maps:
 Grouped rows are expert-major with no padding (``cu_seqlens``) and slots placed stably within
 their expert (slot order), so every map is deterministic, and so is the gather-sum.
 
-:func:`group_slots` is one launch: one CTA per chunk of slots ranks them stably within their
-expert (the warp-level ranking of kernels/fp8_scatter_quant_sm90.py's prep kernel) and counts the experts
-of all slots itself, so it needs neither the host's counts nor the other CTAs.
+:func:`bf16_expert_group_slots_sm90` is one launch: one CTA per chunk of slots ranks them stably within
+their expert (the warp-level ranking of kernels/fp8_scatter_quant_sm90.py's prep kernel) and counts
+the experts of all slots itself, so it needs neither the host's counts nor the other CTAs.
 """
 
 from typing import NamedTuple
@@ -49,7 +49,13 @@ from pithtrain.kernels.cute_ptx_sm90 import (
     sts_b32,
 )
 
-__all__ = ["SlotMaps", "group_slots", "gather_rows", "gather_sum", "expert_slot_segment_sum"]
+__all__ = [
+    "SlotMaps",
+    "bf16_expert_group_slots_sm90",
+    "bf16_expert_gather_rows_sm90",
+    "bf16_expert_gather_sum_sm90",
+    "expert_slot_segment_sum_sm90",
+]
 
 _THREADS = 512
 _WARPS = _THREADS // 32
@@ -299,17 +305,13 @@ def _vec(dtype: type, align: int) -> object:
     return fake(dtype, (cute.sym_int(),), (1,), align)
 
 
-def group_slots(
+def bf16_expert_group_slots_sm90(
     expert_idxs: torch.Tensor,
     expand_idx: torch.Tensor | None,
     num_groups: int,
     num_tokens: int,
 ) -> SlotMaps:
-    """
-    Maps of the grouped expert input for slots with local experts ``expert_idxs`` ((S,) int64,
-    values below ``num_groups``) reading rows ``expand_idx`` ((S,) int64, None for the identity)
-    of ``num_tokens`` received tokens.
-    """
+    """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_slots.bf16_expert_group_slots` (its contract)."""
     G = num_groups
     S = expert_idxs.shape[0]
     dev = expert_idxs.device
@@ -353,12 +355,10 @@ def group_slots(
     return SlotMaps(cu, a_idx, row_of, slot_of, mask, table)
 
 
-def gather_sum(grad: torch.Tensor, maps: SlotMaps, num_groups: int, max_slots: int) -> torch.Tensor:
-    """
-    Gradient of the received tokens from the grouped input gradient ``grad`` ((S, H) bf16): each
-    token's rows summed in fp32 in expert order, rounded once. ``max_slots`` bounds the local
-    experts of one token (min(top-k, G)).
-    """
+def bf16_expert_gather_sum_sm90(
+    grad: torch.Tensor, maps: SlotMaps, num_groups: int, max_slots: int
+) -> torch.Tensor:
+    """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_slots.bf16_expert_gather_sum` (its contract)."""
     T_ = maps.mask.shape[0]
     H = grad.shape[1]
     out = grad.new_empty(T_, H)
@@ -430,14 +430,10 @@ class _SegmentSum:
 _SEG: dict = {}
 
 
-def expert_slot_segment_sum(
+def expert_slot_segment_sum_sm90(
     x: torch.Tensor, cu_host: list[int], cu: torch.Tensor, idx: torch.Tensor | None = None
 ) -> torch.Tensor:
-    """
-    (G, N) fp32 sums of the rows of each segment ``[cu[g], cu[g + 1])`` of ``x`` ((rows, N) bf16),
-    read as ``x[idx[r]]`` when ``idx`` is given; deterministic (fixed chunks, summed in order).
-    ``cu_host`` is ``cu`` on the host (it sizes the chunk list).
-    """
+    """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_slots.expert_slot_segment_sum` (its contract)."""
     G, N = len(cu_host) - 1, x.shape[1]
     lengths = [-(-(cu_host[g + 1] - cu_host[g]) // _SEG_ROWS) for g in range(G)]
     chunks = [(g, k) for g in range(G) for k in range(lengths[g])]
@@ -499,8 +495,8 @@ class _GatherRows:
 _ROWS: dict = {}
 
 
-def gather_rows(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-    """``x[idx]`` for a contiguous (rows, N) bf16 ``x`` and an int32 ``idx``."""
+def bf16_expert_gather_rows_sm90(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_slots.bf16_expert_gather_rows` (its contract)."""
     N = x.shape[1]
     out = x.new_empty(idx.shape[0], N)
     if idx.shape[0] == 0:
