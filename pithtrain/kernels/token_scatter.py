@@ -50,8 +50,7 @@ def compute_group_offsets_kernel(
         for g in tl.static_range(NUM_GROUPS):
             count = tl.load(group_counts_ptr + g)
             padded = ((count + PADDING_ALIGNMENT - 1) // PADDING_ALIGNMENT) * PADDING_ALIGNMENT
-            running_sum = running_sum + padded
-            off_mm = g + tl.arange(0, 1)
+            running_sum, off_mm = running_sum + padded, g + tl.arange(0, 1)
             tl.store(grouped_mm_offs_ptr + off_mm, running_sum.to(tl.int32))
             tl.store(ks_ptr + off_mm, padded.to(tl.int32))
 
@@ -83,8 +82,7 @@ def scatter_for_grouped_gemm_kernel(
     global_pos = pos_in_group + base_offset.to(tl.int64)
     tl.store(reverse_shuffle_idxs_ptr + pid, global_pos)
 
-    src_base = pid * stride_src_m
-    dst_base = global_pos * stride_dst_m
+    src_base, dst_base = pid * stride_src_m, global_pos * stride_dst_m
     for i in tl.static_range(NUM_H_BLOCKS):
         h_offs = i * BLOCK_H + tl.arange(0, BLOCK_H)
         mask = h_offs < hidden_size
@@ -177,9 +175,7 @@ def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num
     grouped_mm_offs = torch.empty((num_groups,), device=device, dtype=torch.int32)
     ks_tensor = torch.empty((num_groups,), device=device, dtype=torch.int32)
     all_zeros = torch.zeros((num_groups * 2 + 1,), device=device, dtype=torch.int64)
-    group_counts_1 = all_zeros[:num_groups]
-    group_counts_2 = all_zeros[num_groups : num_groups * 2]
-    completion_counter = all_zeros[num_groups * 2 :]
+    group_counts_1, group_counts_2, completion_counter = all_zeros[:num_groups], all_zeros[num_groups : num_groups * 2], all_zeros[num_groups * 2 :]
 
     # The prep kernel masks its expert_idxs loads with m: a shorter expert_idxs would be read out
     # of bounds and the garbage would index group_counts.

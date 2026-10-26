@@ -47,8 +47,7 @@ def exclusive_scan(s_in: Int32, s_out: Int32, n: int, s_tmp: Int32, tid: Int32) 
     src = 0
     for step in range(THREADS.bit_length() - 1):
         off = 1 << step
-        has = Int32(tid >= off)
-        v = Int32(lds_b32(s_tmp + (src * THREADS + tid) * 4))
+        has, v = Int32(tid >= off), Int32(lds_b32(s_tmp + (src * THREADS + tid) * 4))
         w = Int32(lds_b32(s_tmp + (src * THREADS + tid - off * has) * 4))
         sts_b32(s_tmp + ((1 - src) * THREADS + tid) * 4, Uint32(v + w * has), Int32(1))
         cute.arch.sync_threads()
@@ -166,8 +165,7 @@ class DispatchIndex:
         cute.arch.sync_threads()
         if tid == 0:
             old = atom_add_u64(ctr, Int64(1))
-            arrived = Int32(old & 0xFFFFFFFF)
-            epoch = Int32(old >> 32)
+            arrived, epoch = Int32(old & 0xFFFFFFFF), Int32(old >> 32)
             last = Int32(arrived == G - 1)
             # the last arrival starts the next epoch and zeroes the arrivals; the others wait for it
             atom_add_u64_pred(ctr, (Int64(1) << 32) - Int64(G), last)
@@ -178,8 +176,7 @@ class DispatchIndex:
         # totals and their exclusive starts (each CTA)
         for j in cutlass.range_constexpr(NBJ):
             b = j * THREADS + tid
-            ok = Int32(b < NB)
-            tot = Int32(0)
+            ok, tot = Int32(b < NB), Int32(0)
             for cc in cutlass.range(C, unroll=4):
                 tot = tot + ld_relaxed(hist + (Int64(cc) * NB + b) * 4, ok)
             sts_b32(s_a + cutlass.min(b, NB - 1) * 4, Uint32(tot), ok)
@@ -190,8 +187,7 @@ class DispatchIndex:
         if bid == 0:
             cnt = mCounts.iterator.toint()
             if tid < EP:
-                lo = Int32(lds_b32(s_b + tid * EPR * 4))
-                hi = Int32(lds_b32(s_b + (tid + 1) * EPR * 4))
+                lo, hi = Int32(lds_b32(s_b + tid * EPR * 4)), Int32(lds_b32(s_b + (tid + 1) * EPR * 4))
                 st_b64(cnt + Int64(tid) * 8, Int64(hi - lo), Int32(1))
                 d = Int32(lds_b32(s_a + (NE + tid) * 4))
                 st_b64(cnt + Int64(EP + tid) * 8, Int64(d), Int32(1))
@@ -321,8 +317,7 @@ class ExpertAndExpandIdx:
             b = top
             while b > 0:
                 nxt = pos + b
-                inb = Int32(nxt < NSEG)
-                st = Int32(lds_b32(s_end + cutlass.min(nxt, NSEG - 1) * 4))
+                inb, st = Int32(nxt < NSEG), Int32(lds_b32(s_end + cutlass.min(nxt, NSEG - 1) * 4))
                 pos = pos + b * (inb & Int32(st <= s))
                 b //= 2
             sender = pos // EPR
@@ -352,8 +347,7 @@ SCRATCH: dict = {}
 def scratch(device: torch.device, chunks: int, bins: int) -> Scratch:
     s = SCRATCH.get(device.index)
     if s is None or s.chunks < chunks or s.bins < bins:
-        chunks = max(chunks, s.chunks if s is not None else 0, 64)
-        bins = max(bins, s.bins if s is not None else 0)
+        chunks, bins = max(chunks, s.chunks if s is not None else 0, 64), max(bins, s.bins if s is not None else 0)
         s = SCRATCH[device.index] = Scratch(device, chunks, bins)
     return s
 

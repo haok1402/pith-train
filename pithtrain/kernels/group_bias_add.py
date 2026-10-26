@@ -12,13 +12,11 @@ __all__ = ["group_bias_add_"]
 
 @triton.jit
 def group_bias_add_kernel(y_ptr, bias_ptr, gi_ptr, H, BLOCK_M: tl.constexpr, BLOCK_H: tl.constexpr):
-    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    cols = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    rows, cols = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M), tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     mask = cols[None, :] < H
     g = tl.load(gi_ptr + rows).to(tl.int64)
     offs = rows.to(tl.int64)[:, None] * H + cols[None, :]
-    y = tl.load(y_ptr + offs, mask=mask).to(tl.float32)
-    b = tl.load(bias_ptr + g[:, None] * H + cols[None, :], mask=mask).to(tl.float32)
+    y, b = tl.load(y_ptr + offs, mask=mask).to(tl.float32), tl.load(bias_ptr + g[:, None] * H + cols[None, :], mask=mask).to(tl.float32)
     tl.store(y_ptr + offs, (y + b).to(y_ptr.dtype.element_ty), mask=mask)
 
 

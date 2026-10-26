@@ -120,23 +120,17 @@ class Group:
         C = (m + CHUNK - 1) // CHUNK
         lo = c * CHUNK
         if tid < G:
-            tot = Int32(0)
-            pre = Int32(0)
+            tot, pre = Int32(0), Int32(0)
             for j in cutlass.range(C, unroll=1):
                 v = ld_b32(mHist.iterator.toint() + (Int64(j) * G + Int64(tid)) * 4, Int32(1), Int32(0))
-                tot = tot + v
-                pre = pre + v * Int32(j < c)
+                tot, pre = tot + v, pre + v * Int32(j < c)
             sts_b32(s_tot + tid * 4, Uint32(tot), Int32(1))
             sts_b32(s_pre + tid * 4, Uint32(pre), Int32(1))
         lt_mask = lanemask_lt()
 
         # stable rank of each slot within its expert, inside this chunk
-        srcs = []
-        ids = []
-        eids = []
-        oks = []
-        rls = []
-        es_in = []
+        srcs, ids, eids, oks = [], [], [], []
+        rls, es_in = [], []
         for r in cutlass.range_constexpr(CHUNK // NT):  # all loads in flight at once
             i = lo + r * NT + tid
             ok = Int32(i < m)
@@ -299,8 +293,7 @@ def bf16_expert_group_slots_sm90(expert_idxs: torch.Tensor, expand_idx: torch.Te
 
 
 def bf16_expert_gather_sum_sm90(grad: torch.Tensor, maps: SlotMaps, num_groups: int, max_slots: int) -> torch.Tensor:
-    T_ = maps.mask.shape[0]
-    H = grad.shape[1]
+    T_, H = maps.mask.shape[0], grad.shape[1]
     out = grad.new_empty(T_, H)
     if T_ == 0:
         return out
@@ -341,8 +334,7 @@ class SegmentSum:
         v = b * SEG_THREADS + tid
         v_ok = Int32(v < N // 8)
         # chunk q covers rows [start, end) of its segment
-        g = ld_b32(mChunk.iterator.toint() + Int64(q) * 8, Int32(1), Int32(0))
-        k = ld_b32(mChunk.iterator.toint() + Int64(q) * 8 + 4, Int32(1), Int32(0))
+        g, k = ld_b32(mChunk.iterator.toint() + Int64(q) * 8, Int32(1), Int32(0)), ld_b32(mChunk.iterator.toint() + Int64(q) * 8 + 4, Int32(1), Int32(0))
         seg_end = ld_b32(mCu.iterator.toint() + Int64(g + 1) * 4, Int32(1), Int32(0))
         start = ld_b32(mCu.iterator.toint() + Int64(g) * 4, Int32(1), Int32(0)) + k * SEG_ROWS
         n = cutlass.min(seg_end - start, Int32(SEG_ROWS))
@@ -383,8 +375,7 @@ def expert_slot_segment_sum_sm90(x: torch.Tensor, cu_host: list[int], cu: torch.
     return torch.segment_reduce(part, "sum", lengths=lengths_t, initial=0.0)
 
 
-ROW_THREADS = 128
-ROWS_PER_CTA = 4
+ROW_THREADS, ROWS_PER_CTA = 128, 4
 
 
 class GatherRows:

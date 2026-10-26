@@ -25,14 +25,9 @@ def fp8cast_rowwise_colwise_kernel(x_ptr, out_tok_ptr, scale_tok_ptr, out_ch_ptr
     BLOCK_ROWS: tl.constexpr = 128
     CHUNKS: tl.constexpr = BLOCK_N // BLOCK_ROWS
 
-    pid_row = tl.program_id(0)
-    pid_col = tl.program_id(1)
-
-    row_start = pid_row * BLOCK_ROWS
-    col_start = pid_col * BLOCK_N
-
-    row_offs = row_start + tl.arange(0, BLOCK_ROWS)
-    col_offs = col_start + tl.arange(0, BLOCK_N)
+    pid_row, pid_col = tl.program_id(0), tl.program_id(1)
+    row_start, col_start = pid_row * BLOCK_ROWS, pid_col * BLOCK_N
+    row_offs, col_offs = row_start + tl.arange(0, BLOCK_ROWS), col_start + tl.arange(0, BLOCK_N)
 
     # amax runs on the input dtype; only the multiply is widened to fp32
     ptrs = x_ptr + row_offs[:, None] * stride_x_row + col_offs[None, :] * stride_x_col
@@ -69,10 +64,8 @@ def fp8cast_rowwise_colwise_kernel(x_ptr, out_tok_ptr, scale_tok_ptr, out_ch_ptr
     if WRITE_KMAJOR:
         # Groups are 128-aligned, so each pid_row belongs to exactly one group.
         group_id = tl.load(block_to_group_ptr + pid_row).to(tl.int64)
-        group_end = tl.load(cumsum_ptr + group_id).to(tl.int64)
-        group_start = tl.load(cumsum_ptr + group_id - 1, mask=group_id > 0, other=0).to(tl.int64)
-        k_g = group_end - group_start
-        k_offset = row_start - group_start
+        group_end, group_start = tl.load(cumsum_ptr + group_id).to(tl.int64), tl.load(cumsum_ptr + group_id - 1, mask=group_id > 0, other=0).to(tl.int64)
+        k_g, k_offset = group_end - group_start, row_start - group_start
 
         flat_base = group_start * N
         row_local = tl.arange(0, BLOCK_ROWS).to(tl.int64)
@@ -102,8 +95,7 @@ def fp8cast_rowwise_colwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     M, N = x.shape
     BLOCK = 128
 
-    num_row_groups = M // BLOCK
-    scale_tok_cols = (N + BLOCK - 1) // BLOCK
+    num_row_groups, scale_tok_cols = M // BLOCK, (N + BLOCK - 1) // BLOCK
 
     out_tok = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=x.device)
     scale_tok = torch.empty((M, scale_tok_cols), dtype=torch.float32, device=x.device)

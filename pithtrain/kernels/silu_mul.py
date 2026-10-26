@@ -17,11 +17,8 @@ def silu_mul_fwd_kernel(gate_ptr, up_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.co
     offs = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offs < n_elements
 
-    gate = tl.load(gate_ptr + offs, mask=mask)
-    up = tl.load(up_ptr + offs, mask=mask)
-
-    gate_f = gate.to(tl.float32)
-    up_f = up.to(tl.float32)
+    gate, up = tl.load(gate_ptr + offs, mask=mask), tl.load(up_ptr + offs, mask=mask)
+    gate_f, up_f = gate.to(tl.float32), up.to(tl.float32)
     silu = gate_f * tl.sigmoid(gate_f)
     out = silu * up_f
 
@@ -34,19 +31,13 @@ def silu_mul_bwd_kernel(grad_out_ptr, gate_ptr, up_ptr, grad_gate_ptr, grad_up_p
     offs = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offs < n_elements
 
-    grad_out = tl.load(grad_out_ptr + offs, mask=mask)
-    gate = tl.load(gate_ptr + offs, mask=mask)
-    up = tl.load(up_ptr + offs, mask=mask)
-
-    grad_out_f = grad_out.to(tl.float32)
-    gate_f = gate.to(tl.float32)
-    up_f = up.to(tl.float32)
+    grad_out, gate, up = tl.load(grad_out_ptr + offs, mask=mask), tl.load(gate_ptr + offs, mask=mask), tl.load(up_ptr + offs, mask=mask)
+    grad_out_f, gate_f, up_f = grad_out.to(tl.float32), gate.to(tl.float32), up.to(tl.float32)
 
     sig = tl.sigmoid(gate_f)
     silu = gate_f * sig
 
-    grad_up = grad_out_f * silu
-    grad_gate = grad_out_f * up_f * sig * (1.0 + gate_f - silu)
+    grad_up, grad_gate = grad_out_f * silu, grad_out_f * up_f * sig * (1.0 + gate_f - silu)
 
     tl.store(grad_gate_ptr + offs, grad_gate.to(gate.dtype), mask=mask)
     tl.store(grad_up_ptr + offs, grad_up.to(up.dtype), mask=mask)

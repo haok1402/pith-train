@@ -167,8 +167,7 @@ def k_grouped_fp8_gemm_nt(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.T
         ops = []
         for (data, scale), n in zip((a, b), channels):
             if chunk is None:
-                data = data[row0 * n : row1 * n]
-                scale = scale[:, row0 // 128 : row1 // 128]
+                data, scale = data[row0 * n : row1 * n], scale[:, row0 // 128 : row1 // 128]
             else:
                 k, (r0, r1) = row1 - row0, chunk
                 data = data[row0 * n : row1 * n].view(n, k)[:, r0:r1].contiguous().view(-1)

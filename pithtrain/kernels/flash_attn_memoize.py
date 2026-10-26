@@ -180,8 +180,7 @@ def record(entry: Callable[[], Tuple[torch.Tensor, ...]], inputs: Dict[str, torc
         return outs, None
     fast_calls = []
     for fn, args, _ in calls:
-        consts = tuple(a[1] if a[0] == "const" else None for a in args[2])
-        slots = tuple((i, a) for i, a in enumerate(args[2]) if a[0] != "const")
+        consts, slots = tuple(a[1] if a[0] == "const" else None for a in args[2]), tuple((i, a) for i, a in enumerate(args[2]) if a[0] != "const")
         fast_calls.append((fn, consts, slots))
     return outs, Plan(alloc_meta, calls, outputs, tuple(fast_calls))
 

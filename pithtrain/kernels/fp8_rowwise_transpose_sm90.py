@@ -22,8 +22,7 @@ from pithtrain.kernels.fp8_scale_layout import mn_major_scale, to_mn_major
 
 __all__ = ["fp8cast_rowwise_transpose_sm90", "supports_rowwise_transpose"]
 
-TILE = 128
-THREADS = 256
+TILE, THREADS = 128, 256
 
 # fp32 bit patterns of the constants compute_fp8_scale uses (Triton materializes the Python
 # floats as fp32): 1e-4 -> 0x38D1B717, 1/448 -> 0x3B124925.
@@ -353,8 +352,7 @@ def quantize_tile(v: list, th: Thread, tl: Tile, sred: Int32, stile: Int32, base
     rm = [bmax(bmax(a[i][0], a[i][1]), bmax(a[i][2], a[i][3])) for i in range(8)]
     rpk = []
     for j in range(4):
-        lo = prmt(rm[2 * j], rm[2 * j + 1], 0x5410)
-        hi = prmt(rm[2 * j], rm[2 * j + 1], 0x7632)
+        lo, hi = prmt(rm[2 * j], rm[2 * j + 1], 0x5410), prmt(rm[2 * j], rm[2 * j + 1], 0x7632)
         rpk.append(bmax(lo, hi))
     for s in range(4):
         for j in range(4):
@@ -366,8 +364,7 @@ def quantize_tile(v: list, th: Thread, tl: Tile, sred: Int32, stile: Int32, base
         tok_scale.append(scale_bits(rpk[j] << 16))
         tok_scale.append(scale_bits(rpk[j] & Uint32(0xFFFF0000)))
     # MN-major scales: scale[r, j] at j * align(rows, 4) + r.
-    m_pad = (M64 + 3) // 4 * 4
-    n_pad = (N64 + 3) // 4 * 4
+    m_pad, n_pad = (M64 + 3) // 4 * 4, (N64 + 3) // 4 * 4
     for i in range(8):
         pred = tl.rowv[i] & pred_i32(th.cg == i)
         off = (Int64(tl.tn) * m_pad + Int64(tl.row0 + i)) * 4
@@ -403,8 +400,7 @@ def quantize_tile(v: list, th: Thread, tl: Tile, sred: Int32, stile: Int32, base
     for c in range(8):
         k = c // 2
         rcp = Uint32(0x7F000000) - t_scale[c]
-        w0 = qcol([v[i][k] for i in range(4)], rcp, c % 2)
-        w1 = qcol([v[i][k] for i in range(4, 8)], rcp, c % 2)
+        w0, w1 = qcol([v[i][k] for i in range(4)], rcp, c % 2), qcol([v[i][k] for i in range(4, 8)], rcp, c % 2)
         st_shared_v2(stile + (th.cg * 8 + c) * TILE + (th.rg ^ th.cg) * 8, w0, w1)
     cute.arch.barrier()
     # Each warp writes 4 contiguous 128-byte rows of out_t per pass (16 B per lane).
@@ -440,8 +436,7 @@ def quantize_tile(v: list, th: Thread, tl: Tile, sred: Int32, stile: Int32, base
 @cute.kernel
 def rowwise_transpose_kernel(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, vec_n: cutlass.Constexpr[bool], m_align: cutlass.Constexpr[int]) -> None:
     """One 128x128 tile per CTA."""
-    M = mX.shape[0]
-    N = mX.shape[1]
+    M, N = mX.shape[0], mX.shape[1]
     tidx, _, _ = cute.arch.thread_idx()
     tn, tm, _ = cute.arch.block_idx()
     th = Thread(tidx)
@@ -456,8 +451,7 @@ def rowwise_transpose_kernel(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: c
 
 @cute.jit
 def launch(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, stream, vec_n: cutlass.Constexpr[bool], m_align: cutlass.Constexpr[int]) -> None:
-    M = mX.shape[0]
-    N = mX.shape[1]
+    M, N = mX.shape[0], mX.shape[1]
     rowwise_transpose_kernel(mX, mOutTok, mScaleTok, mOutT, mScaleT, vec_n, m_align).launch(grid=[(N + (TILE - 1)) // TILE, (M + (TILE - 1)) // TILE, 1], block=[THREADS, 1, 1], stream=stream)
 
 
@@ -465,10 +459,7 @@ COMPILED: dict[tuple[bool, int], Callable] = {}
 
 
 def compile_kernel(vec_n: bool, m_align: int) -> Callable:
-    m = cute.sym_int()
-    n = cute.sym_int()
-    sn = cute.sym_int()
-    sm = cute.sym_int()
+    m, n, sn, sm = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
 
     def fake(dtype, shape, align):
         return cute.runtime.make_fake_tensor(dtype, shape, stride=(cute.sym_int64(), 1), assumed_align=align)

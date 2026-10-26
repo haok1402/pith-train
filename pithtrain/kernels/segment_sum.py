@@ -16,11 +16,8 @@ __all__ = ["block_segment_sum", "segment_sum_along_rows"]
 @triton.jit
 def segment_sum_kernel(x_ptr, offs_padded_ptr, out_ptr, H: tl.constexpr, HEAD_BLOCK: tl.constexpr, BLOCK_M: tl.constexpr):
     """One block reduces rows [start, end) of group g over HEAD_BLOCK columns, in fp32."""
-    g = tl.program_id(0)
-    h_blk = tl.program_id(1)
-
-    start = tl.load(offs_padded_ptr + g)
-    end = tl.load(offs_padded_ptr + g + 1)
+    g, h_blk = tl.program_id(0), tl.program_id(1)
+    start, end = tl.load(offs_padded_ptr + g), tl.load(offs_padded_ptr + g + 1)
 
     h_offs = h_blk * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
     h_mask = h_offs < H
@@ -44,8 +41,7 @@ def segment_tile(offs_padded_ptr, E, BLOCK_M: tl.constexpr, BLOCK_E: tl.constexp
     vectors (zero past E).
     """
     e = tl.arange(0, BLOCK_E)
-    starts = tl.load(offs_padded_ptr + e, mask=e < E, other=0)
-    ends = tl.load(offs_padded_ptr + e + 1, mask=e < E, other=0)
+    starts, ends = tl.load(offs_padded_ptr + e, mask=e < E, other=0), tl.load(offs_padded_ptr + e + 1, mask=e < E, other=0)
     ntiles = (ends - starts + BLOCK_M - 1) // BLOCK_M
     first = tl.cumsum(ntiles, 0) - ntiles
     return first, ntiles, starts, ends
@@ -57,8 +53,7 @@ def segment_tile_sum_kernel(x_ptr, offs_padded_ptr, part_ptr, E, H: tl.constexpr
     fp32 column sums of row tile t of x, written to row t of part. The tile is the one the per-group
     loop of segment_sum_kernel would take, so its sum has the same bits.
     """
-    t = tl.program_id(0)
-    h_blk = tl.program_id(1)
+    t, h_blk = tl.program_id(0), tl.program_id(1)
     first, ntiles, starts, ends = segment_tile(offs_padded_ptr, E, BLOCK_M, BLOCK_E)
     e = tl.arange(0, BLOCK_E)
     g = tl.sum(((first + ntiles) <= t).to(tl.int32), axis=0)
@@ -80,12 +75,10 @@ def segment_tile_sum_kernel(x_ptr, offs_padded_ptr, part_ptr, E, H: tl.constexpr
 @triton.jit
 def segment_tile_reduce_kernel(part_ptr, offs_padded_ptr, out_ptr, E, H: tl.constexpr, HEAD_BLOCK: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_E: tl.constexpr):
     """out[g] = the tile sums of group g added in row order, starting from zero (fp32)."""
-    g = tl.program_id(0)
-    h_blk = tl.program_id(1)
+    g, h_blk = tl.program_id(0), tl.program_id(1)
     first, ntiles, _, _ = segment_tile(offs_padded_ptr, E, BLOCK_M, BLOCK_E)
     sel = tl.arange(0, BLOCK_E) == g
-    t0 = tl.sum(tl.where(sel, first, 0), axis=0)
-    n = tl.sum(tl.where(sel, ntiles, 0), axis=0)
+    t0, n = tl.sum(tl.where(sel, first, 0), axis=0), tl.sum(tl.where(sel, ntiles, 0), axis=0)
 
     h_offs = h_blk * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
     h_mask = h_offs < H

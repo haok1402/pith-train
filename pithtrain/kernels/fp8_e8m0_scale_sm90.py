@@ -21,8 +21,7 @@ def ptx_f32(x: float) -> str:
     return "0f%08X" % struct.unpack("<I", struct.pack("<f", x))[0]
 
 
-FP8_MAX_RCP = ptx_f32(1.0 / 448.0)
-AMAX_MIN = ptx_f32(1e-4)
+FP8_MAX_RCP, AMAX_MIN = ptx_f32(1.0 / 448.0), ptx_f32(1e-4)
 
 
 @dsl_user_op

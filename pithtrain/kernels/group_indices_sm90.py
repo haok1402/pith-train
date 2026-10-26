@@ -15,9 +15,7 @@ from pithtrain.kernels.cute_ptx_sm90 import ld_b32, lds_b32, st_b32, sts_b32
 
 __all__ = ["group_indices", "supports_group_indices"]
 
-THREADS = 256
-ROWS_PER_THREAD = 8
-MAX_GROUPS = 1024
+THREADS, ROWS_PER_THREAD, MAX_GROUPS = 256, 8, 1024
 
 
 class GroupIndices:
@@ -54,8 +52,7 @@ class GroupIndices:
             b = top
             while b > 0:
                 nxt = cnt + b
-                inb = Int32(nxt <= G)
-                end = Int32(lds_b32(s_offs + cutlass.min(nxt - 1, G - 1) * 4))
+                inb, end = Int32(nxt <= G), Int32(lds_b32(s_offs + cutlass.min(nxt - 1, G - 1) * 4))
                 cnt = cnt + b * (inb & Int32(end <= r))
                 b //= 2
             st_b32(out + Int64(r) * 4, Uint32(cutlass.min(cnt, G - 1)), Int32(r < M))

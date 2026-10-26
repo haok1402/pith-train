@@ -19,8 +19,7 @@ __all__ = ["BLOCK_C", "BLOCK_T", "BWD", "causal_conv1d_bwd", "causal_conv1d_fwd"
 @triton.jit
 def conv_fwd_kernel(x_ptr, w_ptr, y_ptr, L, S, C, offset, sy_b, sy_t, sy_c, K: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr):
     pid_t, pid_c, b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
-    c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    t, c = pid_t * BLOCK_T + tl.arange(0, BLOCK_T), pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
     c_ok = c < C
     x_base = x_ptr + b.to(tl.int64) * L * C
     acc = tl.zeros((BLOCK_T, BLOCK_C), dtype=tl.float32)

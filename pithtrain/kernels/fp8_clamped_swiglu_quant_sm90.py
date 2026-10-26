@@ -224,8 +224,7 @@ class ClampedSwiGLUQuant:
             ok = ok & Int32(c < NO)
         if cutlass.const_expr(self.backward):
             # dh columns c/2 .. c/2+3 (8 B); gate_up columns c .. c+7 (16 B).
-            dh_off = (Int64(r) * N + c // 2) * 2 * Int64(ok)
-            gu_off = (Int64(r) * (2 * N) + c) * 2 * Int64(ok)
+            dh_off, gu_off = (Int64(r) * N + c // 2) * 2 * Int64(ok), (Int64(r) * (2 * N) + c) * 2 * Int64(ok)
             for k in range(4):
                 cp_async8(stage_addr + (k * THREADS + tid) * 8, dh_base + dh_off + k * N * 2, ok * 8)
             for k in range(4):
@@ -286,8 +285,7 @@ class ClampedSwiGLUQuant:
         for it in cutlass.range(n_it, unroll=1):
             t = bid + it * grid
             rb, cb = self.tile(t)
-            row0 = rb * BLOCK
-            col0 = cb * BLOCK
+            row0, col0 = rb * BLOCK, cb * BLOCK
             col = col0 + cv * VEC
             col_ok = Int32(1)
             if cutlass.const_expr(not even_n):
@@ -301,8 +299,7 @@ class ClampedSwiGLUQuant:
                 v = lds_b32_pred(s_offs + j * 4, Int32(j < G), Int32(0x7FFFFFFF))
                 cnt += cute.arch.popc(cute.arch.vote_ballot_sync(v <= row0))
             gid = cutlass.min(cnt, G - 1)
-            ge = lds_b32_pred(s_offs + gid * 4, Int32(1), Int32(0))
-            gs = lds_b32_pred(s_offs + (gid - 1) * 4, Int32(gid > 0), Int32(0))
+            ge, gs = lds_b32_pred(s_offs + gid * 4, Int32(1), Int32(0)), lds_b32_pred(s_offs + (gid - 1) * 4, Int32(gid > 0), Int32(0))
             k_g = Int64(ge - gs)
 
             # Bias of this expert for the thread's interleaved gate_up columns.
@@ -326,8 +323,7 @@ class ClampedSwiGLUQuant:
                         h[k][m] = pack_bf16(dg, du)
             else:
                 for k in cutlass.range_constexpr(4):
-                    a = lds_v4(stage_addr + (k * THREADS + tid) * 16)
-                    b = lds_v4(stage_addr + ((4 + k) * THREADS + tid) * 16)
+                    a, b = lds_v4(stage_addr + (k * THREADS + tid) * 16), lds_v4(stage_addr + ((4 + k) * THREADS + tid) * 16)
                     ws = a + b
                     o = [None] * 8
                     for j in cutlass.range_constexpr(8):
@@ -358,8 +354,7 @@ class ClampedSwiGLUQuant:
                 for m in cutlass.range_constexpr(4):
                     lo = ((bf16_lo(h[0][m]) + bf16_lo(h[1][m])) + bf16_lo(h[2][m])) + bf16_lo(h[3][m])
                     hi = ((bf16_hi(h[0][m]) + bf16_hi(h[1][m])) + bf16_hi(h[2][m])) + bf16_hi(h[3][m])
-                    lo = lo + cute.arch.shuffle_sync_bfly(lo, offset=16)
-                    hi = hi + cute.arch.shuffle_sync_bfly(hi, offset=16)
+                    lo, hi = lo + cute.arch.shuffle_sync_bfly(lo, offset=16), hi + cute.arch.shuffle_sync_bfly(hi, offset=16)
                     ps[2 * m] = f32_as_u32(lo)
                     ps[2 * m + 1] = f32_as_u32(hi)
                 if lane < 16:

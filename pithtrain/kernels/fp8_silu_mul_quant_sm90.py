@@ -123,8 +123,7 @@ class SiluMulQuant:
         N = self.N
         ok = Int32(t < total)
         rb, cb = self.tile(t)
-        r = rb * BLOCK + (tid // 16) * 4
-        c = cb * BLOCK + (tid % 16) * VEC
+        r, c = rb * BLOCK + (tid // 16) * 4, cb * BLOCK + (tid % 16) * VEC
         if cutlass.const_expr(N % BLOCK != 0):
             ok = ok & Int32(c < N)
         off = (Int64(r) * N + c) * 2 * Int64(ok)
@@ -179,8 +178,7 @@ class SiluMulQuant:
         for it in cutlass.range(n_it, unroll=1):
             t = bid + it * grid
             rb, cb = self.tile(t)
-            row0 = rb * BLOCK
-            col0 = cb * BLOCK
+            row0, col0 = rb * BLOCK, cb * BLOCK
             col = col0 + cv * VEC
             col_ok = Int32(1)
             if cutlass.const_expr(not even_n):
@@ -205,8 +203,7 @@ class SiluMulQuant:
                         h[1][k][m] = pack_bf16(du_lo, du_hi)
                     else:
                         g, u = raw[0][k][m], raw[1][k][m]
-                        lo = swiglu_fwd(bf16_lo(g), bf16_lo(u))
-                        hi = swiglu_fwd(bf16_hi(g), bf16_hi(u))
+                        lo, hi = swiglu_fwd(bf16_lo(g), bf16_lo(u)), swiglu_fwd(bf16_hi(g), bf16_hi(u))
                         h[0][k][m] = pack_bf16(lo, hi)
 
             # The stage is consumed: refill it with the tile S iterations ahead.
@@ -219,8 +216,7 @@ class SiluMulQuant:
                 v = lds_b32_pred(s_offs + j * 4, Int32(j < G), Int32(0x7FFFFFFF))
                 cnt += cute.arch.popc(cute.arch.vote_ballot_sync(v <= row0))
             gid = cutlass.min(cnt, G - 1)
-            ge = lds_b32_pred(s_offs + gid * 4, Int32(1), Int32(0))
-            gs = lds_b32_pred(s_offs + (gid - 1) * 4, Int32(gid > 0), Int32(0))
+            ge, gs = lds_b32_pred(s_offs + gid * 4, Int32(1), Int32(0)), lds_b32_pred(s_offs + (gid - 1) * 4, Int32(gid > 0), Int32(0))
             k_g = Int64(ge - gs)
 
             for o in cutlass.range_constexpr(self.n_out):
@@ -333,8 +329,7 @@ class SiluMulQuantGU(SiluMulQuant):
         N = self.N
         ok = Int32(t < total)
         rb, cb = self.tile(t)
-        r = rb * BLOCK + (tid // 16) * 4
-        c = cb * BLOCK + (tid % 16) * VEC
+        r, c = rb * BLOCK + (tid // 16) * 4, cb * BLOCK + (tid % 16) * VEC
         for x in range(self.n_in):
             ld = N if (self.backward and x == 0) else self.in_ld
             off = (Int64(r) * ld + c) * 2 * Int64(ok)
@@ -390,10 +385,8 @@ class SiluMulQuantGU(SiluMulQuant):
         for it in cutlass.range(n_it, unroll=1):
             t = bid + it * grid
             rb, cb = self.tile(t)
-            row0 = rb * BLOCK
-            col0 = cb * BLOCK
-            col = col0 + cv * VEC
-            stage_addr = s_in + (it % S) * self.stage_bytes
+            row0, col0 = rb * BLOCK, cb * BLOCK
+            col, stage_addr = col0 + cv * VEC, s_in + (it % S) * self.stage_bytes
 
             cute.arch.cp_async_wait_group(S - 1)
             raw = [[None] * 4 for _ in range(self.n_in)]
@@ -412,8 +405,7 @@ class SiluMulQuantGU(SiluMulQuant):
                         h[1][k][m] = pack_bf16(du_lo, du_hi)
                     else:
                         g, u = raw[0][k][m], raw[1][k][m]
-                        lo = swiglu_fwd(bf16_lo(g), bf16_lo(u))
-                        hi = swiglu_fwd(bf16_hi(g), bf16_hi(u))
+                        lo, hi = swiglu_fwd(bf16_lo(g), bf16_lo(u)), swiglu_fwd(bf16_hi(g), bf16_hi(u))
                         h[0][k][m] = pack_bf16(lo, hi)
 
             self.issue(t + S * grid, stage_addr, total, tid, in_base)
@@ -424,8 +416,7 @@ class SiluMulQuantGU(SiluMulQuant):
                 v = lds_b32_pred(s_offs + j * 4, Int32(j < G), Int32(0x7FFFFFFF))
                 cnt += cute.arch.popc(cute.arch.vote_ballot_sync(v <= row0))
             gid = cutlass.min(cnt, G - 1)
-            ge = lds_b32_pred(s_offs + gid * 4, Int32(1), Int32(0))
-            gs = lds_b32_pred(s_offs + (gid - 1) * 4, Int32(gid > 0), Int32(0))
+            ge, gs = lds_b32_pred(s_offs + gid * 4, Int32(1), Int32(0)), lds_b32_pred(s_offs + (gid - 1) * 4, Int32(gid > 0), Int32(0))
             k_g = Int64(ge - gs)
             km_base = km_root + Int64(gs) * NC + Int64(row0 - gs)
 
@@ -579,8 +570,7 @@ def silu_mul_bwd_quant_sm90(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, 
     if not silu_mul_quant_fusable(N, grouped_mm_offs):
         dg, du = silu_mul_bwd(dh, g, u)
         return fp8cast_rowwise_kmajor_sm90(dg, grouped_mm_offs), fp8cast_rowwise_kmajor_sm90(du, grouped_mm_offs)
-    dg_q = alloc_rowwise_kmajor_outputs(M, N, g.device)
-    du_q = alloc_rowwise_kmajor_outputs(M, N, g.device)
+    dg_q, du_q = alloc_rowwise_kmajor_outputs(M, N, g.device), alloc_rowwise_kmajor_outputs(M, N, g.device)
     get_kernel(N, True, g.device)(dh, g, u, grouped_mm_offs, *dg_q, *du_q)
     return dg_q, du_q
 

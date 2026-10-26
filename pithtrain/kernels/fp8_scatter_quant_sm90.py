@@ -67,8 +67,7 @@ class Prep:
         e_base = mE.iterator.toint()
         inv_base = mInv.iterator.toint()
         flags_base = mFlags.iterator.toint()
-        hist_base = mHist.iterator.toint()
-        ctr_base = mCtr.iterator.toint()
+        hist_base, ctr_base = mHist.iterator.toint(), mCtr.iterator.toint()
 
         smem = cutlass.memory.SmemAllocator()
         s_run = smem.allocate(G * 4, byte_alignment=16).toint()  # running per-expert count
@@ -89,14 +88,10 @@ class Prep:
             sts_b32(s_misc, Uint32(Int32(t & 0xFFFFFFFF)), Int32(1))
             sts_b32(s_misc + 4, Uint32(Int32(t >> 32)), Int32(1))
         cute.arch.sync_threads()
-        c = Int32(lds_b32(s_misc))
-        epoch = Int32(lds_b32(s_misc + 4))
+        c, epoch = Int32(lds_b32(s_misc)), Int32(lds_b32(s_misc + 4))
 
         # stable rank of each token within its expert, inside this chunk
-        srcs = []
-        ids = []
-        eids = []
-        oks = []
+        srcs, ids, eids, oks = [], [], [], []
         rls = []
         lt_mask = lanemask_lt()
         es_in = []
@@ -233,8 +228,7 @@ class ScatterQuant(RowwiseKmajor):
             # reverse_shuffle_idxs, token side: rsi[i] = start of expert(i) + rank(i)
             t = Int64(pid_row) * TILE + tidx
             t_ok = Int32(pid_col == 0) & Int32(tidx < TILE) & Int32(t < m)
-            e = ld_b32(mE.iterator.toint() + t * 8, t_ok, Int32(0))
-            rk = ld_b32(mRank.iterator.toint() + t * 4, t_ok, Int32(0))
+            e, rk = ld_b32(mE.iterator.toint() + t * 8, t_ok, Int32(0)), ld_b32(mRank.iterator.toint() + t * 4, t_ok, Int32(0))
             es = ld_b32(offs_base + Int64(e - 1) * 4, t_ok & Int32(e > 0), Int32(0))
             st_b64(mRsi.iterator.toint() + t * 8, Int64(es) + Int64(rk), t_ok)
             # M = total rows: the column stride of the MN-major rowwise scale (M % 128 == 0)
@@ -268,8 +262,7 @@ copy_event: Optional[torch.cuda.Event] = None
 def scratch(device: torch.device, chunks: int, groups: int) -> Scratch:
     s = SCRATCH.get(device.index)
     if s is None or s.chunks < chunks or s.groups < groups:
-        chunks = max(chunks, s.chunks if s is not None else 0, 64)
-        groups = max(groups, s.groups if s is not None else 0)
+        chunks, groups = max(chunks, s.chunks if s is not None else 0, 64), max(groups, s.groups if s is not None else 0)
         s = SCRATCH[device.index] = Scratch(device, chunks, groups)
     return s
 
@@ -332,8 +325,7 @@ def scatter_quant_sm90(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_gr
     meta = torch.empty(3 * G + m + G * m, dtype=torch.int32, device=dev)
     offs, ks_t, cnt = meta[:G], meta[G : 2 * G], meta[2 * G : 3 * G]
     rank, inv = meta[3 * G : 3 * G + m], meta[3 * G + m :]
-    rsi = torch.empty(m, dtype=torch.int64, device=dev)
-    x_fp8 = torch.empty((M_alloc, N), dtype=torch.float8_e4m3fn, device=dev)
+    rsi, x_fp8 = torch.empty(m, dtype=torch.int64, device=dev), torch.empty((M_alloc, N), dtype=torch.float8_e4m3fn, device=dev)
     # the kernel addresses the MN-major rowwise scale with the device-side M, so it fits the upper bound too
     x_scale = mn_major_scale(M_alloc, nb, dev)
     x_ch = torch.empty(M_alloc * N, dtype=torch.float8_e4m3fn, device=dev)

@@ -17,8 +17,7 @@ def fp8cast_rowwise_kmajor_sm100(x: torch.Tensor, grouped_mm_offs: torch.Tensor)
     M, N = x.shape
     BLOCK = 128
 
-    num_row_groups = M // BLOCK
-    scale_tok_cols = (N + BLOCK - 1) // BLOCK
+    num_row_groups, scale_tok_cols = M // BLOCK, (N + BLOCK - 1) // BLOCK
 
     out_tok = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=x.device)
     scale_tok = torch.empty((M, scale_tok_cols), dtype=torch.float32, device=x.device)

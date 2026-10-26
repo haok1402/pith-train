@@ -167,8 +167,7 @@ class ScatterRowStore(TileStore):
             q = it * nthr + t
             r = q // vecs
             c = (q % vecs) * 8
-            row = st["m0"] + epi_coord[0] * epi_m + r
-            col = st["n0"] + epi_coord[1] * epi_n + c
+            row, col = st["m0"] + epi_coord[0] * epi_m + r, st["n0"] + epi_coord[1] * epi_n + c
             # rows past the expert's end and columns past N (a partial last tile) stay unwritten
             if (row < st["rows"]) & (col < cols) & (q < epi_m * vecs):
                 frag = cute.make_rmem_tensor(cute.make_layout(8), sub.element_type)
@@ -419,8 +418,7 @@ def lower_first(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.T
 def bf16_expert_gated_forward_sm90(x, w_gate, w_up, cu, a_idx, bias=None, act=()):
     M, inter = a_idx.shape[0], w_gate.shape[1]
     w0, w1, swapped = lower_first(w_gate, w_up)
-    pre = x.new_empty(M, 2 * inter)
-    h = x.new_empty(M, inter)
+    pre, h = x.new_empty(M, 2 * inter), x.new_empty(M, inter)
     if M == 0:
         return pre, h
     if act:

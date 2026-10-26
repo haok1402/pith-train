@@ -181,8 +181,7 @@ def thread_coords() -> tuple:
     tidx, _, _ = cute.arch.thread_idx()
     warp = tidx // 32
     lane = tidx % 32
-    r0 = (warp // 2) * 32 + (lane // 8) * 8
-    c0 = (warp % 2) * 64 + (lane % 8) * 8
+    r0, c0 = (warp // 2) * 32 + (lane // 8) * 8, (warp % 2) * 64 + (lane % 8) * 8
     return tidx, warp, lane, r0, c0
 
 
@@ -274,10 +273,7 @@ def cast_rows(rows: list, rcp: Uint32, packed_bf16: cutlass.Constexpr[bool]) -> 
 @cute.jit
 def transpose4(a0: Uint32, a1: Uint32, a2: Uint32, a3: Uint32) -> list:
     """4x4 byte transpose: word r holds row r; result word c holds column c."""
-    t0 = prmt(a0, a1, 0x5140)
-    t1 = prmt(a0, a1, 0x7362)
-    t2 = prmt(a2, a3, 0x5140)
-    t3 = prmt(a2, a3, 0x7362)
+    t0, t1, t2, t3 = prmt(a0, a1, 0x5140), prmt(a0, a1, 0x7362), prmt(a2, a3, 0x5140), prmt(a2, a3, 0x7362)
     return [prmt(t0, t2, 0x5410), prmt(t0, t2, 0x7632), prmt(t1, t3, 0x5410), prmt(t1, t3, 0x7632)]
 
 
@@ -361,8 +357,7 @@ class BlockwiseTranspose:
             G, M, K = mX.shape[0], mX.shape[1], mX.shape[2]
         else:
             G, M, K = 1, mX.shape[0], mX.shape[1]
-        rt = (M + BLOCK - 1) // BLOCK
-        ct = (K + BLOCK - 1) // BLOCK
+        rt, ct = (M + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
         self.kernel(mX.iterator.toint(), mOut.iterator.toint(), mScale.iterator.toint(), mOutT.iterator.toint(), mScaleT.iterator.toint(), Int32(M), Int32(K), Int32(rt), Int32(ct)).launch(grid=[rt, ct, G], block=[NUM_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
@@ -373,8 +368,7 @@ class BlockwiseTranspose:
         red = smem.allocate_tensor(Uint32, cute.make_layout(NUM_THREADS // 32), byte_alignment=16)
         aligned = const_expr(self.mode != "scalar")
 
-        tile_r = bx * BLOCK
-        tile_c = by * BLOCK
+        tile_r, tile_c = bx * BLOCK, by * BLOCK
         row0 = tile_r + r0
         col0 = tile_c + c0
         mk = Int64(M) * Int64(K)
@@ -405,8 +399,7 @@ class BlockwiseTranspose:
 
         if tidx == 0:
             nt = Int64(rt) * Int64(ct)
-            s_off = Int64(bz) * nt + Int64(bx) * Int64(ct) + Int64(by)
-            st_off = Int64(bz) * nt + Int64(by) * Int64(rt) + Int64(bx)
+            s_off, st_off = Int64(bz) * nt + Int64(bx) * Int64(ct) + Int64(by), Int64(bz) * nt + Int64(by) * Int64(rt) + Int64(bx)
             st_scalar(scale + s_off * 4, sbits, Int32(1), 4)
             st_scalar(scale_t + st_off * 4, sbits, Int32(1), 4)
 
@@ -564,9 +557,7 @@ class ShardTile:
     @cute.jit
     def __call__(self, mShard: cute.Tensor, mAmax: cute.Tensor, mOut: cute.Tensor, row_offset: Int32, group_offset: Int32, stream: cuda.CUstream):
         g_local, local_rows, K = mShard.shape[0], mShard.shape[1], mShard.shape[2]
-        trs = row_offset // BLOCK
-        tre = (row_offset + local_rows + BLOCK - 1) // BLOCK
-        ct = (K + BLOCK - 1) // BLOCK
+        trs, tre, ct = row_offset // BLOCK, (row_offset + local_rows + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
         self.kernel(mShard.iterator.toint(), mAmax.iterator.toint(), mOut.iterator.toint(), Int32(local_rows), Int32(K), Int32(trs), Int32(mAmax.shape[1]), Int32(mAmax.shape[2]), row_offset, group_offset).launch(grid=[tre - trs, ct, g_local], block=[NUM_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
@@ -763,10 +754,7 @@ class ShardAmaxMulti:
         trs = Int32(ld_u64(row + 40))
         a_base = ld_u64(row + 48)
         first = Int32(ld_u64(row + 56))
-        R = Int32(ld_u64(row + 64))
-        C = Int32(ld_u64(row + 72))
-        ct = Int32(ld_u64(row + 80))
-        ntr = Int32(ld_u64(row + 88))
+        R, C, ct, ntr = Int32(ld_u64(row + 64)), Int32(ld_u64(row + 72)), Int32(ld_u64(row + 80)), Int32(ld_u64(row + 88))
         local = bx - first
         by = local % ct
         rest = local // ct
@@ -843,9 +831,7 @@ class ScalesMulti:
         scale = ld_u64(row + 8)
         scale_t = ld_u64(row + 16)
         R = Int32(ld_u64(row + 24))
-        C = Int32(ld_u64(row + 32))
-        bpg = Int32(ld_u64(row + 40))
-        first = Int32(ld_u64(row + 56))
+        C, bpg, first = Int32(ld_u64(row + 32)), Int32(ld_u64(row + 40)), Int32(ld_u64(row + 56))
         local = bx - first
         g = local // bpg
         blk = local - g * bpg

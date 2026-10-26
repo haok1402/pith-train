@@ -20,14 +20,9 @@ def clamped_swiglu_fwd_kernel(gate_up_ptr, out_ptr, n_elements, alpha, limit, BL
     offs = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offs < n_elements
 
-    gate = tl.load(gate_up_ptr + 2 * offs, mask=mask)
-    up = tl.load(gate_up_ptr + 2 * offs + 1, mask=mask)
-
-    g = gate.to(tl.float32)
-    u = up.to(tl.float32)
-
-    gc = tl.minimum(g, limit)
-    uc = tl.minimum(tl.maximum(u, -limit), limit)
+    gate, up = tl.load(gate_up_ptr + 2 * offs, mask=mask), tl.load(gate_up_ptr + 2 * offs + 1, mask=mask)
+    g, u = gate.to(tl.float32), up.to(tl.float32)
+    gc, uc = tl.minimum(g, limit), tl.minimum(tl.maximum(u, -limit), limit)
 
     sig = tl.sigmoid(alpha * gc)
     glu = gc * sig
@@ -43,27 +38,18 @@ def clamped_swiglu_bwd_kernel(grad_out_ptr, gate_up_ptr, grad_gate_up_ptr, n_ele
     offs = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offs < n_elements
 
-    do = tl.load(grad_out_ptr + offs, mask=mask)
-    gate = tl.load(gate_up_ptr + 2 * offs, mask=mask)
-    up = tl.load(gate_up_ptr + 2 * offs + 1, mask=mask)
-
-    do_f = do.to(tl.float32)
-    g = gate.to(tl.float32)
-    u = up.to(tl.float32)
-
-    gc = tl.minimum(g, limit)
-    uc = tl.minimum(tl.maximum(u, -limit), limit)
+    do, gate, up = tl.load(grad_out_ptr + offs, mask=mask), tl.load(gate_up_ptr + 2 * offs, mask=mask), tl.load(gate_up_ptr + 2 * offs + 1, mask=mask)
+    do_f, g, u = do.to(tl.float32), gate.to(tl.float32), up.to(tl.float32)
+    gc, uc = tl.minimum(g, limit), tl.minimum(tl.maximum(u, -limit), limit)
 
     sig = tl.sigmoid(alpha * gc)
     glu = gc * sig
 
-    grad_uc = do_f * glu
-    grad_gc = do_f * (uc + 1.0) * sig * (1.0 + alpha * gc * (1.0 - sig))
+    grad_uc, grad_gc = do_f * glu, do_f * (uc + 1.0) * sig * (1.0 + alpha * gc * (1.0 - sig))
 
     g_active = g <= limit
     u_active = (u >= -limit) & (u <= limit)
-    grad_g = tl.where(g_active, grad_gc, 0.0)
-    grad_u = tl.where(u_active, grad_uc, 0.0)
+    grad_g, grad_u = tl.where(g_active, grad_gc, 0.0), tl.where(u_active, grad_uc, 0.0)
 
     tl.store(grad_gate_up_ptr + 2 * offs, grad_g.to(gate.dtype), mask=mask)
     tl.store(grad_gate_up_ptr + 2 * offs + 1, grad_u.to(up.dtype), mask=mask)

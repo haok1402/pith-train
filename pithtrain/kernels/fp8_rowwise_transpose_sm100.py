@@ -19,14 +19,9 @@ def fp8cast_rowwise_transpose_kernel(x_ptr, out_tok_ptr, scale_tok_ptr, out_t_pt
     BLOCK_ROWS: tl.constexpr = 128
     CHUNKS: tl.constexpr = BLOCK_N // BLOCK_ROWS
 
-    pid_row = tl.program_id(0)
-    pid_col = tl.program_id(1)
-
-    row_start = pid_row * BLOCK_ROWS
-    col_start = pid_col * BLOCK_N
-
-    row_offs = row_start + tl.arange(0, BLOCK_ROWS)
-    col_offs = col_start + tl.arange(0, BLOCK_N)
+    pid_row, pid_col = tl.program_id(0), tl.program_id(1)
+    row_start, col_start = pid_row * BLOCK_ROWS, pid_col * BLOCK_N
+    row_offs, col_offs = row_start + tl.arange(0, BLOCK_ROWS), col_start + tl.arange(0, BLOCK_N)
 
     ptrs = x_ptr + row_offs[:, None] * stride_x_row + col_offs[None, :] * stride_x_col
     mask = (row_offs[:, None] < M) & (col_offs[None, :] < N)
@@ -59,8 +54,7 @@ def fp8cast_rowwise_transpose_kernel(x_ptr, out_tok_ptr, scale_tok_ptr, out_t_pt
 
     t_fp8_t = tl.trans(t_fp8)
 
-    t_row_offs = col_start + tl.arange(0, BLOCK_N)
-    t_col_offs = row_start + tl.arange(0, BLOCK_ROWS)
+    t_row_offs, t_col_offs = col_start + tl.arange(0, BLOCK_N), row_start + tl.arange(0, BLOCK_ROWS)
     out_t_ptrs = out_t_ptr + t_row_offs[:, None] * stride_out_t_row + t_col_offs[None, :]
     t_mask = (t_row_offs[:, None] < N) & (t_col_offs[None, :] < M)
     tl.store(out_t_ptrs, t_fp8_t, mask=t_mask)
@@ -76,8 +70,7 @@ def fp8cast_rowwise_transpose_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torc
     M, N = x.shape
     BLOCK = 128
 
-    scale_tok_cols = (N + BLOCK - 1) // BLOCK
-    scale_t_cols = (M + BLOCK - 1) // BLOCK
+    scale_tok_cols, scale_t_cols = (N + BLOCK - 1) // BLOCK, (M + BLOCK - 1) // BLOCK
 
     out_tok = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=x.device)
     scale_tok = torch.empty((M, scale_tok_cols), dtype=torch.float32, device=x.device)

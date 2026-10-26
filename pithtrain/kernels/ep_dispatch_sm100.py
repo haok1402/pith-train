@@ -31,8 +31,7 @@ def dedup_bincount_kernel(
     pid = tl.program_id(0)
     num_ctas = tl.num_programs(0)
 
-    local_expert_hist = tl.zeros([NE_PADDED], dtype=tl.int64)
-    local_gpu_hist = tl.zeros([EP_PADDED], dtype=tl.int64)
+    local_expert_hist, local_gpu_hist = tl.zeros([NE_PADDED], dtype=tl.int64), tl.zeros([EP_PADDED], dtype=tl.int64)
 
     for start in range(pid * BLOCK, m, num_ctas * BLOCK):
         tok_offs = start + tl.arange(0, BLOCK)
@@ -85,8 +84,7 @@ def reduce_and_prefix_sum_kernel(
     Single CTA: reduce the per-CTA histograms into the counts, their exclusive starts and send_meta,
     and zero kernel 3's atomic counters.
     """
-    expert_prefix = tl.zeros([], dtype=tl.int64)
-    gpu_prefix = tl.zeros([], dtype=tl.int64)
+    expert_prefix, gpu_prefix = tl.zeros([], dtype=tl.int64), tl.zeros([], dtype=tl.int64)
     for g in tl.static_range(EP_SIZE):
         rank_total = tl.zeros([], dtype=tl.int64)
         for e in tl.static_range(EXPERTS_PER_RANK):
@@ -219,8 +217,7 @@ def fused_dedup_prepare_dispatch_sm100(topk_ids: torch.Tensor, num_experts: int,
     BLOCK = 1024
     num_ctas = min(triton.cdiv(m, BLOCK), 32)
     # tl.histogram needs a power-of-2 bin count; +1 for the sentinel bin of masked-out lanes
-    ne_padded = triton.next_power_of_2(num_experts + 1)
-    ep_padded = triton.next_power_of_2(ep_size + 1)
+    ne_padded, ep_padded = triton.next_power_of_2(num_experts + 1), triton.next_power_of_2(ep_size + 1)
 
     (per_cta_expert_hist, per_cta_gpu_hist, expert_starts, gpu_starts, dedup_counters, sort_counters, send_meta, dedup_local_pos) = dispatch_scratch(device, m, num_ctas, ne_padded, ep_padded, num_experts, ep_size, experts_per_rank)
 
@@ -273,8 +270,7 @@ def expert_and_expand_idx_kernel(
         for e in tl.static_range(EXPERTS_PER_RANK):
             count = tl.load(recv_meta_ptr + g * (EXPERTS_PER_RANK + 1) + e)
             in_seg = (offs >= start) & (offs < start + count)
-            expert_idx = tl.where(in_seg, e, expert_idx)
-            offset = tl.where(in_seg, dedup_start, offset)
+            expert_idx, offset = tl.where(in_seg, e, expert_idx), tl.where(in_seg, dedup_start, offset)
             start += count
         dedup_start += tl.load(recv_meta_ptr + g * (EXPERTS_PER_RANK + 1) + EXPERTS_PER_RANK)
 

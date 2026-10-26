@@ -22,7 +22,7 @@ ruff format pithtrain/               # format
 pre-commit run --all-files       # run all pre-commit hooks
 ```
 
-Style: 100-char line length, double quotes, `py312` target. Rules: E, F, I, W (ignoring E501, E731). First-party import: `pithtrain`. `pithtrain/kernels/` is not reformatted (`ruff format` and its pre-commit hook skip it) and its import blocks are not re-sorted (`I001` ignored there), so every statement without a comment (calls, signatures, imports, tables) stays on one line, with no line-length limit; multi-line PTX strings stay as written. The rest of the lint rules still apply there.
+Style: 100-char line length, double quotes, `py312` target. Rules: E, F, I, W (ignoring E501, E731). First-party import: `pithtrain`. `pithtrain/kernels/` is not reformatted (`ruff format` and its pre-commit hook skip it) and its import blocks are not re-sorted (`I001` ignored there), so every statement without a comment (calls, signatures, imports, tables) stays on one line, with no line-length limit; multi-line PTX strings stay as written. Consecutive independent assignments of the same kind (same called function or operator, no right-hand side reading an earlier target) are written as one parallel assignment, `pid_row, pid_col = tl.program_id(0), tl.program_id(1)`, with no blank line between such groups. The rest of the lint rules still apply there.
 
 ### Testing (pytest)
 

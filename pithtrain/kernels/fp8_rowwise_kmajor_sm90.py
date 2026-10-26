@@ -20,8 +20,7 @@ from pithtrain.kernels.fp8_scale_layout import mn_major_scale, mn_pad, to_mn_maj
 
 __all__ = ["RowwiseKmajor", "THREADS", "TILE", "fp8cast_rowwise_kmajor_sm90", "supports_rowwise_kmajor"]
 
-THREADS = 256
-TILE = 128
+THREADS, TILE = 256, 128
 
 
 @dsl_user_op
@@ -98,15 +97,13 @@ class RowwiseKmajor:
     def coords(self, tidx):
         lane = tidx % 32
         warp = tidx // 32
-        cv = lane % 8 + 8 * (warp % 2)
-        rb = lane // 8 + 4 * (warp // 2)
+        cv, rb = lane % 8 + 8 * (warp % 2), lane // 8 + 4 * (warp // 2)
         return lane, warp, cv, rb
 
     def src(self, x_base, pid_row, pid_col, tidx, i):
         """Global address of row i of this thread's sub-block, and whether it is in bounds."""
         _, _, cv, rb = self.coords(tidx)
-        col0 = pid_col * TILE + cv * 8
-        row = Int64(pid_row) * TILE + rb * 8 + i
+        col0, row = pid_col * TILE + cv * 8, Int64(pid_row) * TILE + rb * 8 + i
         return x_base + (row * self.n + col0) * 2, Int32(col0 < self.n)
 
     def tile(self, v, pid_row, pid_col, tidx, M, gp, red_base) -> None:
@@ -128,8 +125,7 @@ class RowwiseKmajor:
             o = ld_b32(offs_base + Int64(idx) * 4, Int32(idx < G), Int32(0x7FFFFFFF))
             cnt = cnt + cute.arch.popc(cute.arch.vote_ballot_sync(Int64(o) <= row_start))
         gid = cutlass.min(cnt, G - 1)
-        g_end = Int64(ld_b32(offs_base + Int64(gid) * 4, Int32(1), Int32(0)))
-        g_start = Int64(ld_b32(offs_base + Int64(gid - 1) * 4, Int32(gid > 0), Int32(0)))
+        g_end, g_start = Int64(ld_b32(offs_base + Int64(gid) * 4, Int32(1), Int32(0))), Int64(ld_b32(offs_base + Int64(gid - 1) * 4, Int32(gid > 0), Int32(0)))
         k_g = g_end - g_start
 
         a = [[v[i][k] & Uint32(0x7FFF7FFF) for k in range(4)] for i in range(8)]

@@ -87,9 +87,7 @@ def q4(words: list, sel: list, kind: str, rcp: Float32, *, loc=None, ip=None) ->
             lines.append(f"mov.b32 f{k}, {w};")
         lines.append(f"mul.rn.f32 f{k}, f{k}, {rcp_op};")
     lines += ["cvt.rn.satfinite.e4m3x2.f32 q0, f1, f0;", "cvt.rn.satfinite.e4m3x2.f32 q1, f3, f2;", "mov.b32 $0, {q0, q1};"]
-    asm = "{\n\t" + "\n\t".join(lines) + "\n\t}"
-    constraints = "=r," + ",".join(["r"] * n) + ",f"
-    args = [Uint32(w) for w in words] + [Float32(rcp)]
+    asm, constraints, args = "{\n\t" + "\n\t".join(lines) + "\n\t}", "=r," + ",".join(["r"] * n) + ",f", [Uint32(w) for w in words] + [Float32(rcp)]
     return asm_u32(args, asm, constraints, loc, ip)
 
 
@@ -118,22 +116,14 @@ class RowwiseBlockwiseTranspose:
 
     @cute.jit
     def __call__(self, mX: cute.Tensor, mQ: cute.Tensor, mS: cute.Tensor, mQT: cute.Tensor, mST: cute.Tensor, stream) -> None:
-        M = mX.shape[0]
-        K = mX.shape[1]
-        grid_m = (M + BLOCK - 1) // BLOCK
-        grid_k = (K + BLOCK - 1) // BLOCK
+        M, K = mX.shape[0], mX.shape[1]
+        grid_m, grid_k = (M + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
         self.kernel(mX, mQ, mS, mQT, mST).launch(grid=[grid_m, grid_k, 1], block=[self.threads, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, mX: cute.Tensor, mQ: cute.Tensor, mS: cute.Tensor, mQT: cute.Tensor, mST: cute.Tensor) -> None:
-        VK = const_expr(self.vec_k)
-        VM = const_expr(self.vec_m)
-        R = const_expr(self.rows)
-        NW = const_expr(32 // self.rows)
-        esize = const_expr(self.dtype.width // 8)
-        EPW = const_expr(32 // self.dtype.width)
-        KIND = const_expr(self.kind)
-
+        VK, VM, R, NW = const_expr(self.vec_k), const_expr(self.vec_m), const_expr(self.rows), const_expr(32 // self.rows)
+        esize, EPW, KIND = const_expr(self.dtype.width // 8), const_expr(32 // self.dtype.width), const_expr(self.kind)
         tidx, _, _ = cute.arch.thread_idx()
         bm, bk, _ = cute.arch.block_idx()
         warp = tidx // 32
@@ -148,8 +138,7 @@ class RowwiseBlockwiseTranspose:
         s_ld = Int64(mS.stride[1])
         nmb = Int32(mST.shape[1])
 
-        row0 = bm * BLOCK + warp * (4 * R) + rg * R
-        col_base = bk * BLOCK + cl * 8
+        row0, col_base = bm * BLOCK + warp * (4 * R) + rg * R, bk * BLOCK + cl * 8
 
         # Register block zero-filled outside (M, K): element (row row0 + i, column col_base + h * 64 + e) at n = i * 16 + h * 8 + e.
         xr = cute.make_rmem_tensor(cute.make_layout(16 * R), self.dtype)
@@ -273,8 +262,7 @@ DISPATCH: dict[tuple, tuple] = {}
 
 def resolve(dtype: torch.dtype, M: int, K: int, sx: int, ptr: int) -> tuple:
     """(compiled kernel or None for an empty input, ceil(K/128), ceil(M/128))."""
-    nkb = (K + BLOCK - 1) // BLOCK
-    nmb = (M + BLOCK - 1) // BLOCK
+    nkb, nmb = (K + BLOCK - 1) // BLOCK, (M + BLOCK - 1) // BLOCK
     if M == 0 or K == 0:
         return None, nkb, nmb
     esize = dtype.itemsize

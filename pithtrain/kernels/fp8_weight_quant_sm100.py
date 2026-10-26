@@ -22,14 +22,9 @@ def fp8cast_blockwise_transpose_kernel(x_ptr, out_ptr, scale_ptr, out_t_ptr, sca
     """
     BLOCK: tl.constexpr = 128
 
-    pid_row = tl.program_id(0)
-    pid_col = tl.program_id(1)
-
-    row_start = pid_row * BLOCK
-    col_start = pid_col * BLOCK
-
-    row_offs = row_start + tl.arange(0, BLOCK)
-    col_offs = col_start + tl.arange(0, BLOCK)
+    pid_row, pid_col = tl.program_id(0), tl.program_id(1)
+    row_start, col_start = pid_row * BLOCK, pid_col * BLOCK
+    row_offs, col_offs = row_start + tl.arange(0, BLOCK), col_start + tl.arange(0, BLOCK)
 
     ptrs = x_ptr + row_offs[:, None] * stride_x_row + col_offs[None, :] * stride_x_col
     mask = (row_offs[:, None] < M) & (col_offs[None, :] < K)
@@ -63,8 +58,7 @@ def fp8cast_blockwise_transpose_sm100(x: torch.Tensor) -> tuple[torch.Tensor, to
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     M, K = x.shape
     BLOCK = 128
-    scale_rows = (M + BLOCK - 1) // BLOCK
-    scale_cols = (K + BLOCK - 1) // BLOCK
+    scale_rows, scale_cols = (M + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
 
     out = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=x.device)
     scale = torch.empty((scale_rows, scale_cols), dtype=torch.float32, device=x.device)
@@ -83,15 +77,9 @@ def fp8cast_blockwise_transpose_batched_kernel(x_ptr, out_ptr, scale_ptr, out_t_
     """One 128x128 tile of expert pid(2): grid (ceil(N / 128), ceil(K / 128), G)."""
     BLOCK: tl.constexpr = 128
 
-    pid_row = tl.program_id(0)
-    pid_col = tl.program_id(1)
-    pid_g = tl.program_id(2)
-
-    row_start = pid_row * BLOCK
-    col_start = pid_col * BLOCK
-
-    row_offs = row_start + tl.arange(0, BLOCK)
-    col_offs = col_start + tl.arange(0, BLOCK)
+    pid_row, pid_col, pid_g = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    row_start, col_start = pid_row * BLOCK, pid_col * BLOCK
+    row_offs, col_offs = row_start + tl.arange(0, BLOCK), col_start + tl.arange(0, BLOCK)
 
     base = x_ptr + pid_g * stride_x_g
     ptrs = base + row_offs[:, None] * stride_x_row + col_offs[None, :] * stride_x_col
@@ -128,8 +116,7 @@ def fp8cast_blockwise_transpose_batched_sm100(x: torch.Tensor) -> tuple[torch.Te
     assert x.ndim == 3, f"Expected 3D tensor, got {x.ndim}D"
     G, N, K = x.shape
     BLOCK = 128
-    scale_rows = (N + BLOCK - 1) // BLOCK
-    scale_cols = (K + BLOCK - 1) // BLOCK
+    scale_rows, scale_cols = (N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
 
     out = torch.empty((G, N, K), dtype=torch.float8_e4m3fn, device=x.device)
     scale = torch.empty((G, scale_rows, scale_cols), dtype=torch.float32, device=x.device)
@@ -154,9 +141,7 @@ def fp8_shard_tile_kernel(x_ptr, amax_ptr, out_ptr, row_offset, local_rows, K, t
     shard's rows in the tile to the grid; CAST True casts them with the reduced grid.
     """
     BLOCK: tl.constexpr = 128
-    pid_row = tl.program_id(0)
-    pid_col = tl.program_id(1)
-    pid_g = tl.program_id(2)
+    pid_row, pid_col, pid_g = tl.program_id(0), tl.program_id(1), tl.program_id(2)
 
     tr = tile_row_start + pid_row
     rows = tr * BLOCK + tl.arange(0, BLOCK) - row_offset
@@ -196,11 +181,8 @@ def fp8_scale_kernel(amax_ptr, scale_ptr, scale_t_ptr, R, C, NATIVE_E8M0: tl.con
 def fp8_pack_transpose_kernel(x_ptr, out_ptr, out_t_ptr, N, K):
     """One 128x128 byte tile of x (G, N, K) to out and, transposed, to out_t (G, K, N)."""
     BLOCK: tl.constexpr = 128
-    pid_row = tl.program_id(0)
-    pid_col = tl.program_id(1)
-    pid_g = tl.program_id(2)
-    rows = pid_row * BLOCK + tl.arange(0, BLOCK)
-    cols = pid_col * BLOCK + tl.arange(0, BLOCK)
+    pid_row, pid_col, pid_g = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    rows, cols = pid_row * BLOCK + tl.arange(0, BLOCK), pid_col * BLOCK + tl.arange(0, BLOCK)
     mask = (rows[:, None] < N) & (cols[None, :] < K)
     base = pid_g.to(tl.int64) * N * K
     tile = tl.load(x_ptr + base + rows[:, None] * K + cols[None, :], mask=mask)
@@ -213,8 +195,7 @@ def shard_tiles(shard: torch.Tensor, amax: torch.Tensor, out: Optional[torch.Ten
     g_local, local_rows, K = shard.shape
     if shard.numel() == 0:
         return
-    tile_row_start = row_offset // BLOCK
-    tile_row_end = (row_offset + local_rows + BLOCK - 1) // BLOCK
+    tile_row_start, tile_row_end = row_offset // BLOCK, (row_offset + local_rows + BLOCK - 1) // BLOCK
     grid = (tile_row_end - tile_row_start, triton.cdiv(K, BLOCK), g_local)
     fp8_shard_tile_kernel[grid](shard, amax, out if out is not None else shard, row_offset, local_rows, K, tile_row_start, group_offset, amax.stride(0), amax.shape[2], CAST=out is not None, NATIVE_E8M0=NATIVE_E8M0, num_warps=8)
 
