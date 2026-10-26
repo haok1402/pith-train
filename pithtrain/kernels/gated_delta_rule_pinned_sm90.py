@@ -20,7 +20,7 @@ from fla.ops.utils.constant import RCP_LN2
 from fla.ops.utils.cumsum import chunk_local_cumsum_scalar_kernel
 from triton import knobs
 
-from pithtrain.kernels.arch import is_sm90_device
+from pithtrain.kernels.arch import ARCH_MAJOR
 
 __all__ = ["BT", "chunk_gdr_bwd_pinned", "chunk_gdr_fwd_pinned", "gated_delta_rule_pinned_supported", "pinned_launch_supported", "pinned_shapes"]
 
@@ -91,25 +91,25 @@ def launch(name: str, grid: tuple, **kwargs) -> None:
     kernel.run(grid[0], grid[1], grid[2], stream, kernel.function, kernel.packed_metadata, metadata, enter, exit_, *args)
 
 
-supported: dict[int, bool] = {}
+supported: list[bool] = []
 
 
 @torch.compiler.assume_constant_result
-def pinned_launch_supported(device_index: int) -> bool:
+def pinned_launch_supported() -> bool:
     """
-    Whether the pinned configs apply on this device: the recorded FLA and Triton versions, SM90, and
-    FLA kernels whose wrappers and parameter lists match the launches here. Cached per device; a
+    Whether the pinned configs apply in this process: the recorded FLA and Triton versions, SM90,
+    and FLA kernels whose wrappers and parameter lists match the launches here. Computed once; a
     constant to torch.compile.
     """
-    if device_index not in supported:
-        supported[device_index] = check_supported(device_index)
-    return supported[device_index]
+    if not supported:
+        supported.append(check_supported())
+    return supported[0]
 
 
-def check_supported(device_index: int) -> bool:
+def check_supported() -> bool:
     if fla.__version__ != VERSIONS["fla"] or triton.__version__ != VERSIONS["triton"]:
         return False
-    if not is_sm90_device(device_index):
+    if ARCH_MAJOR != 9:
         return False
     for name, kernel in KERNELS.items():
         inner = getattr(getattr(kernel, "fn", None), "fn", None)
@@ -222,7 +222,7 @@ def gated_delta_rule_pinned_supported(q: torch.Tensor, k: torch.Tensor, v: torch
     """
     Whether chunk_gdr_fwd_pinned / chunk_gdr_bwd_pinned apply to this call: the recorded geometry
     (pinned_shapes) on SM90 with the recorded FLA and Triton versions (pinned_launch_supported).
-    Otherwise the caller uses FLA's autotuned entry points. Constant per device and geometry, so
+    Otherwise the caller uses FLA's autotuned entry points. Constant per geometry, so
     torch.compile evaluates it rather than tracing into it.
     """
-    return pinned_shapes(q, k, v, g, beta) and pinned_launch_supported(q.device.index)
+    return pinned_shapes(q, k, v, g, beta) and pinned_launch_supported()

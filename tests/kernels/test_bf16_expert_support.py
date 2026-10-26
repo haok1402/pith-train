@@ -42,8 +42,6 @@ def test_supported_on_h200():
     if quack_version() != VALIDATED_QUACK:
         pytest.skip(f"venv quack-kernels is {quack_version()}, not {VALIDATED_QUACK}")
     assert bf16_experts_supported()
-    assert bf16_experts_supported(device=torch.device("cuda"))
-    assert bf16_experts_supported(device=torch.device("cuda", torch.cuda.current_device()))
     for g in (1, 8, 16, 32, 64):
         assert bf16_experts_supported(g)
 

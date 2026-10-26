@@ -8,7 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
-from pithtrain.kernels.arch import sm_count
+from pithtrain.kernels.arch import SM_COUNT
 
 __all__ = ["block_segment_sum", "segment_sum_along_rows"]
 
@@ -123,7 +123,7 @@ def segment_sum_along_rows(x: torch.Tensor, grouped_mm_offs: torch.Tensor, out_d
     BLOCK_M = 128
     out = torch.empty((E, H), dtype=torch.float32, device=x.device)
     h_blocks = triton.cdiv(H, HEAD_BLOCK)
-    if E * h_blocks >= 2 * sm_count(x.device):
+    if E * h_blocks >= 2 * SM_COUNT:
         # enough groups to fill the GPU with one block per (group, h-tile)
         meta = dict(H=H, HEAD_BLOCK=HEAD_BLOCK, BLOCK_M=BLOCK_M)
         segment_sum_kernel[(E, h_blocks)](x, offs_padded, out, **meta)

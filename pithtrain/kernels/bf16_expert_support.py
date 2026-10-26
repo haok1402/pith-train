@@ -7,9 +7,8 @@ import importlib.metadata
 import warnings
 from functools import lru_cache
 
-import torch
 
-from pithtrain.kernels.arch import is_sm90_device
+from pithtrain.kernels.arch import ARCH_MAJOR
 
 __all__ = ["MAX_GROUPS", "QUACK_VERSION", "bf16_experts_supported", "quack_version"]
 
@@ -31,9 +30,9 @@ def quack_version() -> str | None:
 
 
 @lru_cache(maxsize=None)
-def supported_on(device_index: int) -> bool:
-    if not is_sm90_device(device_index):
-        reason = f"needs SM90, device {device_index} is not SM90"
+def runtime_supported() -> bool:
+    if ARCH_MAJOR != 9:
+        reason = f"needs SM90, not compute capability {ARCH_MAJOR}.x"
     elif (version := quack_version()) != QUACK_VERSION:
         reason = f"needs quack-kernels=={QUACK_VERSION}, found {version}"
     else:
@@ -42,13 +41,11 @@ def supported_on(device_index: int) -> bool:
     return False
 
 
-def bf16_experts_supported(num_groups: int | None = None, device: torch.device | None = None) -> bool:
+def bf16_experts_supported(num_groups: int | None = None) -> bool:
     """
     Whether BF16 routed experts with num_groups local experts (any count when None) can use the
-    fused bf16_expert_* kernels on device (the current device by default): needs SM90, quack-kernels
-    exactly QUACK_VERSION, and at most MAX_GROUPS (64) local experts. Warns once per device when the
-    device or the QuACK version rules it out. Returns False off SM90.
+    fused bf16_expert_* kernels in this process: needs SM90, quack-kernels exactly QUACK_VERSION,
+    and at most MAX_GROUPS (64) local experts. Warns once when the GPU or the QuACK version rules
+    it out. Returns False off SM90.
     """
-    device = device if device is not None else torch.device("cuda", torch.cuda.current_device())
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    return supported_on(index) and (num_groups is None or num_groups <= MAX_GROUPS)
+    return runtime_supported() and (num_groups is None or num_groups <= MAX_GROUPS)

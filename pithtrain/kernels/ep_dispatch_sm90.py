@@ -12,7 +12,7 @@ import cutlass.cute as cute
 import torch
 from cutlass import Int32, Int64, Uint32
 
-from pithtrain.kernels.arch import sm_count
+from pithtrain.kernels.arch import SM_COUNT
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
 from pithtrain.kernels.cute_ptx_sm90 import atom_add_u64, atom_add_u64_pred, fence_gpu, lanemask_lt, ld_b32, ld_relaxed, lds_b32, red_add_shared, red_or_shared, spin_epoch, st_b32, st_b64, sts_b32
 from pithtrain.kernels.ep_dispatch_sm100 import expert_and_expand_idx_sm100, fused_dedup_prepare_dispatch_sm100
@@ -386,7 +386,7 @@ def dispatch_index(topk_ids: torch.Tensor, num_experts: int, ep_size: int, exper
         counts.zero_()
         send_meta.zero_()
     else:
-        key = (k, ep_size, experts_per_rank, sm_count(dev))
+        key = (k, ep_size, experts_per_rank, SM_COUNT)
         fn = INDEX.get(key)
         if fn is None:
             fn = INDEX[key] = compile_index(*key)

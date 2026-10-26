@@ -24,7 +24,7 @@ from cutlass import Float32, Int32, Int64, Uint32
 from cutlass._mlir import ir
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from pithtrain.kernels.arch import sm_count
+from pithtrain.kernels.arch import SM_COUNT
 from pithtrain.kernels.clamped_swiglu import clamped_swiglu_fwd
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
 from pithtrain.kernels.cute_ptx_sm90 import abs2, asm_args_last, bf16_hi, bf16_lo, bf16_sel, cp_async8, cp_async16, f32_as_u32, ld_b32_coherent, lds_b32_pred, lds_v2, lds_v4, max2, pack_bf16, prmt_args_last, selp_args_last, st_f32, st_v2_args_last, st_v4_args_last, sts_b32_nopred, sts_v4, to_ir, u32_as_f32, unpack
@@ -471,7 +471,7 @@ def get_kernel(N: int, backward: bool, alpha: float, limit: float, device: torch
             outs = outs[:2] + (None, None)
         part = fake(Float32, (cute.sym_int(), NO), (NO, 1)) if backward else None
         offs = fake(Int32, (cute.sym_int(),), (1,), 4)
-        num_sms = sm_count(device)
+        num_sms = SM_COUNT
         fn = cute.compile(ClampedSwiGLUQuant(N, backward, alpha, limit, num_sms, KP, rowwise, kmajor), dh, gu, bias, offs, *outs, part, fake_stream(), options="--enable-tvm-ffi")
         compiled[key] = fn
     return fn

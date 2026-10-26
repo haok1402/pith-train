@@ -16,7 +16,7 @@ from cutlass import Float32, Int32, Int64, Uint32
 from cutlass._mlir import ir
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from pithtrain.kernels.arch import sm_count
+from pithtrain.kernels.arch import SM_COUNT
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
 from pithtrain.kernels.cute_ptx_sm90 import abs2, asm_args_last, bf16_hi, bf16_lo, bf16_sel, cp_async16, f32_as_u32, ld_b32_coherent, lds_b32_pred, lds_v4, max2, pack_bf16, prmt_args_last, selp_args_last, st_f32, st_v2_args_last, st_v4_args_last, sts_b32_nopred, sts_v4, to_ir, u32_as_f32, unpack
 from pithtrain.kernels.fp8_e8m0_scale_sm90 import e8m0_scale_f32, quant4_e4m3
@@ -516,7 +516,7 @@ def get_kernel(N: int, backward: bool, device: torch.device) -> object:
         fp8 = cutlass.Float8E4M3FN
         outs = (fake(fp8, (m, N), (N, 1)), fake(Float32, (m, nb), (1, cute.sym_int64()), 16), fake(fp8, (cute.sym_int(),), (1,)), fake(Float32, (N, cute.sym_int()), (1, mn_pad(N)), 16))
         offs = fake(Int32, (cute.sym_int(),), (1,), 4)
-        num_sms = sm_count(device)
+        num_sms = SM_COUNT
         fn = cute.compile(SiluMulQuant(N, backward, num_sms), bf if backward else None, bf, bf, offs, *outs, *(outs if backward else (None,) * 4), fake_stream(), options="--enable-tvm-ffi")
         compiled[key] = fn
     return fn
@@ -533,7 +533,7 @@ def get_kernel_gu(N: int, backward: bool, device: torch.device) -> object:
         fp8 = cutlass.Float8E4M3FN
         outs = (fake(fp8, (m, nc), (nc, 1)), fake(cutlass.Float32, (m, nc // BLOCK), (1, cute.sym_int64()), 16), fake(fp8, (cute.sym_int(),), (1,)), fake(cutlass.Float32, (nc, cute.sym_int()), (1, mn_pad(nc)), 16))
         offs = fake(Int32, (cute.sym_int(),), (1,), 4)
-        num_sms = sm_count(device)
+        num_sms = SM_COUNT
         fn = cute.compile(SiluMulQuantGU(N, backward, num_sms), fake(cutlass.BFloat16, (m, N), (N, 1)) if backward else None, half, half, offs, *outs, fake_stream(), options="--enable-tvm-ffi")
         compiled_gu[key] = fn
     return fn
