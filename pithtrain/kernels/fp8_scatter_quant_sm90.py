@@ -1,40 +1,16 @@
 """
-Fused MoE stage-3 input path for FP8 experts on SM90: dedup expansion + scatter by expert +
-rowwise / K-major FP8 quantization, from the received tokens straight to the quantized grouped
-layout.
+SM90 CuTe-DSL scatter_quant: dedup expansion + scatter by expert + K-major FP8 quantization in two
+launches and one read of the received tokens; the grouped bf16 input never exists.
 
-Today stage 3 runs three memory passes before the first expert GEMM::
+1. Prep (one CTA per 2048 tokens) ranks each token stably within its expert, writes grouped_mm_offs
+   and ks_tensor, each token's rank, and the inverse map inv[g * m + k] = the source row of row k of
+   group g.
+2. ScatterQuant, the rowwise_kmajor tile kernel whose row loads go through inv (padding rows load
+   zeros), quantizes and writes both scales MN-major; its column-block-0 CTAs also write
+   reverse_shuffle_idxs. It is launched as a programmatic dependent (PDL) of the prep kernel.
 
-    x = padded_index_gather(gathered, expand_idx)                    # bf16 m x N write
-    out, rsi, offs, ks, ks_t = scatter_for_grouped_gemm(x, eidx, G)  # bf16 read + M_pad x N write
-    xq = fp8cast_rowwise_kmajor(out, offs)                           # bf16 read, fp8 writes
-
-:func:`scatter_quant_sm90` produces the same ``xq``, ``rsi``, ``offs``, ``ks`` and ``ks_t`` with two
-launches and one read of the received tokens:
-
-1. a prep kernel (one CTA per 2048 tokens) that ranks tokens stably within their expert, writes
-   ``grouped_mm_offs`` / ``ks_tensor``, each token's rank, and for every expert ``g`` and rank
-   ``k`` the source row that fills row ``k`` of the group (``inv[g * m + k] = expand_idx[token]``);
-2. the ``rowwise_kmajor`` tile kernel (subclassed; its ``_tile`` does the quantization and
-   writes both scales MN-major, as ``fp8cast_rowwise_kmajor`` returns them) whose row loads go
-   through that map, so each 128 x 128 output tile reads its rows directly from the received tokens; padding
-   rows load zeros. Column-block-0 CTAs also write ``reverse_shuffle_idxs`` token-side. It is
-   launched as a programmatic dependent (PDL) of the prep kernel.
-
-Under FP8 the bf16 grouped input is only ever read to be quantized, and its backward
-(``scatter_quant_backward``, next to the autograd op that calls this) needs only
-``reverse_shuffle_idxs``, ``expand_idx`` and the row count, so it never has to exist.
-
-Inputs the fused kernels do not cover (:func:`supports_scatter_quant`) run the three-step path
-with the Triton scatter (``kernels.token_scatter.scatter_by_expert``) and the SM90
-``fp8cast_rowwise_kmajor_sm90``; ``fp8_scatter_quant_sm100`` is the same path with the Triton
-quantization.
-
-Placement. ``scatter_for_grouped_gemm`` assigns rows within a group in ``atomic_add`` order, which
-is not deterministic, and the K-major per-channel scale of a 128-row block depends on which tokens
-share the block. This kernel places tokens *stably* (token order within each group), so its output
-is deterministic and bit-identical to the three-step path run with the same placement; the
-placement-independent outputs (offs, ks, the rowwise FP8 of each token) match it outright.
+Placement is stable (token order within each group), so the output is deterministic and
+bit-identical to the unfused path run with that placement.
 
 The prep kernel orders chunks without a grid barrier: each CTA takes a ticket (chunk id in dispatch
 order), publishes its chunk histogram behind a release flag, and waits only for lower chunks, which
@@ -64,13 +40,9 @@ _PREP_CHUNK = 2048  # tokens per prep CTA
 _MAX_GROUPS = _PREP_THREADS
 _ALIGN = 128
 
-# ---------------------------------------------------------------------------
-# Prep kernel: stable per-expert ranking, group offsets, inverse map
-# ---------------------------------------------------------------------------
-
 
 class Prep:
-    """One CTA per chunk of ``_PREP_CHUNK`` tokens; ``_PREP_THREADS`` threads."""
+    """Stable per-expert ranking, group offsets and inverse map; one CTA per _PREP_CHUNK tokens."""
 
     def __init__(self, num_groups: int, has_expand: bool) -> None:
         assert 0 < num_groups <= _MAX_GROUPS
@@ -120,7 +92,7 @@ class Prep:
         c = Int32(lds_b32(s_misc))
         epoch = Int32(lds_b32(s_misc + 4))
 
-        # ---- stable rank of each token within its expert, inside this chunk ----
+        # stable rank of each token within its expert, inside this chunk
         srcs = []
         ids = []
         eids = []
@@ -162,7 +134,7 @@ class Prep:
             eids.append(es)
             rls.append(rl)
 
-        # ---- publish this chunk's histogram, then wait for every lower chunk ----
+        # publish this chunk's histogram, then wait for every lower chunk
         if tid < G:
             st_b32(hist_base + (Int64(c) * G + tid) * 4, lds_b32(s_run + tid * 4), Int32(1))
         fence_gpu()
@@ -182,14 +154,14 @@ class Prep:
             red_add_shared(s_pre + (j % G) * 4, v, ok)
         cute.arch.sync_threads()
 
-        # ---- inverse map inv[g * m + rank] = source row, and each token's rank ----
+        # inverse map inv[g * m + rank] = source row, and each token's rank
         for r in cutlass.range_constexpr(_PREP_CHUNK // NT):
             rank = Int32(lds_b32(s_pre + eids[r] * 4)) + rls[r]
             addr = inv_base + (Int64(eids[r]) * m + rank) * 4
             st_b32(addr, Uint32(srcs[r]), oks[r])
             st_b32(mRank.iterator.toint() + Int64(ids[r]) * 4, Uint32(rank), oks[r])
 
-        # ---- the last chunk has waited for all others: counts, offsets, padded sizes ----
+        # the last chunk has waited for all others: counts, offsets, padded sizes
         if c == C - 1:
             if tid < G:
                 off = Int32(0)
@@ -206,16 +178,11 @@ class Prep:
                 atom_add_u64(ctr_base, (Int64(1) << 32) - Int64(C))
 
 
-# ---------------------------------------------------------------------------
-# Main kernel: indirect-load rowwise_kmajor
-# ---------------------------------------------------------------------------
-
 
 class ScatterQuant(RowwiseKmajor):
-    """``RowwiseKmajor`` whose row ``k`` of group ``g`` is ``gathered[inv[g * m + k]]``.
-
-    With ``pdl`` it is launched as a programmatic dependent of the prep kernel: its CTAs become
-    resident while the prep runs and wait in ``griddepcontrol.wait`` for the prep's results.
+    """
+    RowwiseKmajor whose row k of group g is gathered[inv[g * m + k]]. With pdl its CTAs become
+    resident while the prep kernel runs and wait in griddepcontrol.wait for its results.
     """
 
     def __init__(self, n: int, num_groups: int, pdl: bool) -> None:
@@ -245,7 +212,7 @@ class ScatterQuant(RowwiseKmajor):
         total = Int64(ld_b32(offs_base + (G - 1) * 4, Int32(1), Int32(0)))
         row_start = Int64(pid_row) * TILE
         if row_start < total:
-            lane, warp, cv, rb = self._coords(tidx)
+            lane, _, cv, rb = self._coords(tidx)
             cnt = Int32(0)
             for c in range((G + 31) // 32):
                 idx = lane + c * 32
@@ -274,21 +241,16 @@ class ScatterQuant(RowwiseKmajor):
             self._tile(v, pid_row, pid_col, tidx, total, gp, s_red.iterator.toint())
 
 
-# ---------------------------------------------------------------------------
-# Host wrapper
-# ---------------------------------------------------------------------------
-
 _PREP: dict = {}
 _MAIN: dict = {}
 
 
 class _Scratch:
-    """Per-device prep scratch: a ticket/epoch counter, epoch flags and chunk histograms.
-
-    ``ctr`` packs ``(epoch << 32) | tickets``; the last chunk of each launch advances the epoch and
-    zeroes the tickets, and a chunk's flag holds the epoch it was published in. The state lives on
-    the device (no host-side epoch), so launches may be captured in a CUDA graph. Launches must not
-    run concurrently on two streams (the same assumption as token_scatter's pinned buffers).
+    """
+    Per-device prep scratch: a ticket/epoch counter, epoch flags and chunk histograms. ctr packs
+    (epoch << 32) | tickets; the last chunk of each launch advances the epoch and zeroes the
+    tickets, and a chunk's flag holds the epoch it was published in. The state lives on the device,
+    so launches may be captured in a CUDA graph; they must not run concurrently on two streams.
     """
 
     def __init__(self, device: torch.device, chunks: int, groups: int) -> None:
@@ -314,7 +276,7 @@ def _scratch(device: torch.device, chunks: int, groups: int) -> _Scratch:
 
 def _compile_prep(G: int, has_expand: bool) -> Callable:
     i32 = Int32
-    vec = lambda: fake(i32, (cute.sym_int(),), (1,), 4)  # noqa: E731
+    vec = lambda: fake(i32, (cute.sym_int(),), (1,), 4)
     return cute.compile(
         Prep(G, has_expand), fake(Int64, (cute.sym_int(),), (1,), 8), fake(Int64, (cute.sym_int(),), (1,), 8), vec(), vec(), fake(i32, (G,), (1,), 4), fake(i32, (G,), (1,), 4), fake(i32, (G,), (1,), 4), vec(), vec(), fake(Int64, (1,), (1,), 8),
         fake_stream(), options="--enable-tvm-ffi",
@@ -333,16 +295,14 @@ def _compile_main(n: int, G: int, pdl: bool) -> Callable:
 
 
 def _reference(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor], group_counts: Optional[list[int]]) -> tuple:
-    """The three-step path, for inputs the fused kernels do not cover: the dedup expansion, the
-    Triton scatter (``kernels.token_scatter``) and the SM90 K-major quantization."""
+    """The unfused path for inputs the fused kernels do not cover (rows in atomic_add order)."""
     x = gathered if expand_idx is None else gathered[expand_idx]
     out, rsi, offs, ks_t, ks = scatter_by_expert(x, expert_idxs, num_groups, group_counts=group_counts)
     return fp8cast_rowwise_kmajor_sm90(out, offs), rsi, offs, ks, ks_t
 
 
 def supports_scatter_quant(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor] = None) -> bool:
-    """Whether the fused kernels cover these inputs (else :func:`scatter_quant_sm90` runs the
-    three-step path)."""
+    """Whether the fused kernels cover these inputs (else scatter_quant_sm90 runs the unfused path)."""
     m, N = expert_idxs.shape[0], gathered.shape[1]
     return not (
         m == 0
@@ -361,24 +321,9 @@ def supports_scatter_quant(gathered: torch.Tensor, expert_idxs: torch.Tensor, nu
 def scatter_quant_sm90(
     gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor] = None, padding_alignment: int = 128, group_counts: Optional[list[int]] = None, _pdl: bool = True
 ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
-    """``fp8cast_rowwise_kmajor(scatter_for_grouped_gemm(gathered[expand_idx], ...))`` fused.
-
-    Args:
-        gathered: ``(m_src, N)`` bf16 received (dedup'd) tokens.
-        expert_idxs: ``(m,)`` int64 local expert of each expanded token slot.
-        num_groups: experts on this rank.
-        expand_idx: ``(m,)`` int64 row of ``gathered`` for each slot; None means identity
-            (``gathered`` already has ``m`` rows).
-        padding_alignment: must be 128 (the K-major per-channel blocks).
-        group_counts: tokens per expert on the host, if known; skips the device-to-host copy of
-            the padded sizes and sizes the outputs exactly.
-
-    Returns:
-        ``(x_fp8, x_scale, x_ch, x_ch_scale)`` exactly as ``fp8cast_rowwise_kmajor`` returns them for
-        the scattered ``(M, N)`` input, ``reverse_shuffle_idxs`` ``(m,)`` int64,
-        ``grouped_mm_offs`` ``(G,)`` int32, ``ks`` list[int], ``ks_tensor`` ``(G,)`` int32 - the
-        same order as :func:`scatter_for_grouped_gemm` with its bf16 output replaced by the
-        quantized tuple. Rows are placed stably (token order within each expert).
+    """
+    scatter_quant on SM90 (see the picker for the contract): fused where supports_scatter_quant,
+    else the unfused path. Scales are MN-major. _pdl=False launches the main kernel without PDL.
     """
     global _copy_stream, _copy_event
     assert padding_alignment == _ALIGN, "the K-major FP8 layout needs 128-row groups"
@@ -393,7 +338,7 @@ def scatter_quant_sm90(
     if not supports_scatter_quant(gathered, expert_idxs, G, expand_idx):
         return _reference(gathered, expert_idxs, G, expand_idx, group_counts)
 
-    # ---- outputs: exact when the host knows the counts, else a tight upper bound ----
+    # outputs: exact when the host knows the counts, else an upper bound
     if group_counts is not None:
         ks = [(c + _ALIGN - 1) // _ALIGN * _ALIGN for c in group_counts]
         M_alloc = sum(ks)
@@ -407,13 +352,11 @@ def scatter_quant_sm90(
     rank, inv = meta[3 * G : 3 * G + m], meta[3 * G + m :]
     rsi = torch.empty(m, dtype=torch.int64, device=dev)
     x_fp8 = torch.empty((M_alloc, N), dtype=torch.float8_e4m3fn, device=dev)
-    # MN-major scales (strides (1, align(rows, 4))), as fp8cast_rowwise_kmajor returns them; the
-    # kernel addresses the rowwise one with the device-side M, so it fits the upper bound too
+    # the kernel addresses the MN-major rowwise scale with the device-side M, so it fits the upper bound too
     x_scale = mn_major_scale(M_alloc, nb, dev)
     x_ch = torch.empty(M_alloc * N, dtype=torch.float8_e4m3fn, device=dev)
     x_ch_scale = mn_major_scale(N, M_alloc // TILE, dev)
 
-    # ---- prep ----
     chunks = (m + _PREP_CHUNK - 1) // _PREP_CHUNK
     sc = _scratch(dev, chunks, G)
     has_expand = expand_idx is not None
@@ -429,7 +372,6 @@ def scatter_quant_sm90(
             _copy_event = torch.cuda.Event()
         _copy_event.record()
 
-    # ---- main ----
     key = (N, G, _pdl)
     fn = _MAIN.get(key)
     if fn is None:

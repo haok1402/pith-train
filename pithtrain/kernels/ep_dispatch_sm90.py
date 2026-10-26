@@ -1,27 +1,8 @@
 """
-CuTe-DSL kernels for the index math of expert-parallel dispatch (SM90), launched through TVM-FFI.
-
-:func:`dispatch_index` (sender side) replaces the three Triton kernels behind
-``fused_dedup_prepare_dispatch`` with one launch (``_DispatchIndex``): each CTA builds the
-histograms of experts and of first visits per EP rank of its chunks of tokens in shared memory and
-publishes them; after a grid-wide barrier (the grid never exceeds the SM count, so all CTAs are
-resident) every CTA scans the totals into the expert / EP-rank starts and ranks its tokens within
-their expert and within the EP ranks they visit *stably* (token order) with per-warp lane
-bitmasks, writing ``idxs``, ``expand_idx``, ``dispatch_token_idxs`` and ``inv_idxs`` (the inverse
-permutation of ``idxs``).
-
-The placement is the one ``argsort(stable=True)`` / ``nonzero`` give, so every output is
-deterministic; the Triton kernels place in ``atomic_add`` order instead. A token's top-k experts
-must be distinct (as ``torch.topk`` returns them): the lane bitmasks count each expert once.
-
-:func:`expand_index` (receiver side, after the expand_idx all-to-all): per received token
-slot, its local expert and its expand_idx made global. Each CTA scans the received per-(sender,
-expert) segment counts and per-sender dedup counts in shared memory; each slot then finds its
-segment by a binary search instead of the Triton kernel's unrolled pass over every segment.
-
-The feature entries :func:`fused_dedup_prepare_dispatch_sm90` and :func:`expert_and_expand_idx_sm90`
-run these kernels for the inputs they cover and the Triton kernels of ``ep_dispatch_sm100``
-otherwise. They call ``dispatch_index`` / ``expand_index`` through this module's globals.
+CuTe-DSL kernels of the ep_dispatch feature (SM90), launched through TVM-FFI: dispatch_index, the
+sender side in one cooperative launch with stable (token-order) placement, and expand_index, the
+receiver side. Inputs they do not cover (supports_index / supports_expand) take the Triton kernels
+of ep_dispatch_sm100.
 """
 
 from typing import Callable
@@ -48,9 +29,8 @@ _MAX_SEGMENTS = 8 * _THREADS
 
 
 def _exclusive_scan(s_in: Int32, s_out: Int32, n: int, s_tmp: Int32, tid: Int32) -> None:
-    """Exclusive prefix sum of ``n`` int32 in shared memory (``s_in`` -> ``s_out``, which may be
-    the same) by the whole CTA: serial sums over consecutive runs per thread, then a Hillis-Steele
-    scan of the per-thread sums in ``s_tmp`` (``2 * _THREADS`` words). Ends with a barrier."""
+    """Exclusive prefix sum of n int32 in shared memory (s_in -> s_out, which may alias) by the
+    whole CTA; s_tmp holds 2 * _THREADS words. Ends with a barrier."""
     spt = (n + _THREADS - 1) // _THREADS
     vals = []
     part = Int32(0)
@@ -79,26 +59,20 @@ def _exclusive_scan(s_in: Int32, s_out: Int32, n: int, s_tmp: Int32, tid: Int32)
     cute.arch.sync_threads()
 
 
-# ---------------------------------------------------------------------------
-# Sender side: dispatch index (count kernel + placement kernel)
-# ---------------------------------------------------------------------------
-
-
 class _DispatchIndex:
-    """One launch. Bins ``[0, NE)`` count slots per expert, bins ``[NE, NE + EP)`` count first
-    visits (unique tokens) per EP rank.
+    """Bins [0, NE) count slots per expert, bins [NE, NE + EP) first visits (distinct tokens)
+    per EP rank. Each CTA owns chunks bid, bid + G, ... of _CHUNK tokens. Phase 1 publishes every
+    owned chunk's histogram; after a grid barrier, phase 2 scans the totals into the starts, adds
+    the lower chunks' histograms to get each owned chunk's bases, and ranks its tokens stably with
+    per-warp lane bitmasks (so a token's k experts must be distinct).
 
-    The launch is cooperative (and the grid capped at the SM count), so every CTA is resident at
-    once, which the barrier below requires; each CTA owns chunks
-    ``bid, bid + G, ...`` of ``_CHUNK`` tokens. Phase 1 publishes every owned chunk's histogram,
-    then a grid-wide barrier (an ``epoch << 32 | arrivals`` counter that the last arrival moves to
-    the next epoch, so it never needs resetting). Phase 2: every CTA sums the histograms into the
-    totals and scans them into the expert / EP-rank starts, and for each owned chunk adds the
-    histograms of the lower chunks to get the chunk's bases, then ranks and places its tokens.
+    The grid barrier needs every CTA resident: the launch is cooperative and the grid capped at the
+    SM count. Its counter is epoch << 32 | arrivals; the last arrival moves it to the next epoch,
+    so it never needs resetting.
 
-    Output layout (one int64 tensor, ``mk = m * k``): ``idxs`` ``[0, mk)``, ``expand_idx``
-    ``[mk, 2mk)``, ``inv_idxs`` ``[2mk, 3mk)``, ``dispatch_token_idxs`` ``[3mk, 3mk + m * EP)``,
-    ``send_meta`` after it. Scratch: ``hist`` (``C * NB`` int32), ``ctr`` (int64).
+    Output layout (one int64 tensor, mk = m * k): idxs [0, mk), expand_idx [mk, 2mk), inv_idxs
+    [2mk, 3mk), dispatch_token_idxs [3mk, 3mk + m * EP), send_meta after it. Scratch: hist (C * NB
+    int32), ctr (int64).
     """
 
     def __init__(self, k: int, ep_size: int, experts_per_rank: int, max_ctas: int) -> None:
@@ -112,11 +86,10 @@ class _DispatchIndex:
     def __call__(self, mE: cute.Tensor, mOut: cute.Tensor, mCounts: cute.Tensor, mHist: cute.Tensor, mCtr: cute.Tensor, stream) -> None:
         C = (mE.shape[0] + _CHUNK - 1) // _CHUNK
         G = cutlass.min(C, self.max_ctas)
-        # cooperative: the runtime guarantees all G CTAs are co-resident (the grid barrier needs it)
         self.kernel(mE, mOut, mCounts, mHist, mCtr).launch(grid=[G, 1, 1], block=[_THREADS, 1, 1], stream=stream, cooperative=True)
 
     def _load_ids(self, mE: cute.Tensor, c: Int32, tid: Int32) -> tuple:
-        """Expert ids of this thread's tokens (``_ROUNDS`` x ``K``) and the first-visit flags."""
+        """Expert ids of this thread's tokens (_ROUNDS x K), first-visit flags, validity, token index."""
         m = mE.shape[0]
         stride = Int64(mE.stride[0])
         base = mE.iterator.toint()
@@ -164,7 +137,7 @@ class _DispatchIndex:
         s_bits = smem.allocate(NB * _WARPS * 4, byte_alignment=16).toint()  # lane masks
         s_tmp = smem.allocate(2 * _THREADS * 4, byte_alignment=16).toint()
 
-        # ---- phase 1: histograms of the owned chunks ----
+        # phase 1: histograms of the owned chunks
         for c in cutlass.range(bid, C, G, unroll=1):
             for j in cutlass.range_constexpr(NBJ):
                 b = j * _THREADS + tid
@@ -183,7 +156,7 @@ class _DispatchIndex:
                 st_b32(hist + (Int64(c) * NB + b) * 4, hv, Int32(b < NB))
             cute.arch.sync_threads()
 
-        # ---- grid barrier: every chunk's histogram is published ----
+        # grid barrier: every chunk's histogram is published
         fence_gpu()
         cute.arch.sync_threads()
         if tid == 0:
@@ -197,7 +170,7 @@ class _DispatchIndex:
         cute.arch.sync_threads()
         fence_gpu()
 
-        # ---- totals and their exclusive starts (each CTA) ----
+        # totals and their exclusive starts (each CTA)
         for j in cutlass.range_constexpr(NBJ):
             b = j * _THREADS + tid
             ok = Int32(b < NB)
@@ -227,7 +200,7 @@ class _DispatchIndex:
                 cnt_b = Int32(lds_b32(s_a + cutlass.min(bb, NB - 1) * 4))
                 st_b64(meta + Int64(i) * 8, Int64(cnt_b), ok_i)
 
-        # ---- phase 2: place the owned chunks ----
+        # phase 2: place the owned chunks
         lt = lanemask_lt()
         bit = Uint32(1) << Uint32(lane)
         d0 = Int32(lds_b32(s_b + NE * 4))  # start of the EP-rank bins in the scan
@@ -251,7 +224,7 @@ class _DispatchIndex:
                 for j in cutlass.range_constexpr(K):
                     e = ids[r][j]
                     red_or_shared(s_bits + (e * _WARPS + warp) * 4, bit, oks[r])
-                    red_or_shared(s_bits + ((NE + e // EPR) * _WARPS + warp) * 4, bit, firsts[r][j])  # noqa: E501
+                    red_or_shared(s_bits + ((NE + e // EPR) * _WARPS + warp) * 4, bit, firsts[r][j])
                 cute.arch.sync_threads()
                 t = toks[r]
                 for j in cutlass.range_constexpr(K):
@@ -284,17 +257,13 @@ class _DispatchIndex:
                         for w in cutlass.range_constexpr(_WARPS):
                             n = n + Int32(cute.arch.popc(lds_b32(s_bits + (b * _WARPS + w) * 4)))
                             sts_b32(s_bits + (b * _WARPS + w) * 4, Uint32(0), Int32(1))
-                        sts_b32(s_run + b * 4, Uint32(Int32(lds_b32(s_run + b * 4)) + n), Int32(1))  # noqa: E501
+                        sts_b32(s_run + b * 4, Uint32(Int32(lds_b32(s_run + b * 4)) + n), Int32(1))
                 cute.arch.sync_threads()
 
 
-# ---------------------------------------------------------------------------
-# Receiver side: expert and global expand index
-# ---------------------------------------------------------------------------
-
-
 class _ExpertAndExpandIdx:
-    """One CTA per ``_THREADS * _SLOTS_PER_THREAD`` received slots."""
+    """One CTA per _THREADS * _SLOTS_PER_THREAD received slots; each slot finds its (sender,
+    expert) segment by a binary search over the segment starts scanned in shared memory."""
 
     def __init__(self, ep_size: int, experts_per_rank: int) -> None:
         self.ep = ep_size
@@ -337,7 +306,6 @@ class _ExpertAndExpandIdx:
         cute.arch.sync_threads()
         _exclusive_scan(s_end, s_end, NSEG, s_tmp, tid)
 
-        # ---- each slot: segment by binary search over the starts, then expert + global index ----
         top = 1 << (NSEG.bit_length() - 1)
         for i in cutlass.range_constexpr(_SLOTS_PER_THREAD):
             s = (bid * _SLOTS_PER_THREAD + i) * _THREADS + tid
@@ -358,17 +326,12 @@ class _ExpertAndExpandIdx:
             st_b64(out + (Int64(total) + Int64(s)) * 8, Int64(glob), ok)
 
 
-# ---------------------------------------------------------------------------
-# Host wrappers
-# ---------------------------------------------------------------------------
-
 _INDEX: dict = {}
 _EXPAND: dict = {}
 
 
 class _Scratch:
-    """Per-device scratch of the index kernel: chunk histograms and the barrier counter, whose
-    arrivals return to 0 at every launch (the epoch in its high word only grows)."""
+    """Per-device scratch of the index kernel: chunk histograms and the grid barrier counter."""
 
     def __init__(self, device: torch.device, chunks: int, bins: int) -> None:
         self.chunks, self.bins = chunks, bins
@@ -402,9 +365,8 @@ def supports_index(topk_ids: torch.Tensor, ep_size: int, experts_per_rank: int) 
 
 def dispatch_index(topk_ids: torch.Tensor, num_experts: int, ep_size: int, experts_per_rank: int, meta_out: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
     """
-    The contract of :func:`pithtrain.kernels.ep_dispatch.fused_dedup_prepare_dispatch` with
-    stable placement, plus ``inv_idxs`` ``(m * k,)`` (``inv_idxs[idxs[p]] == p``) as a seventh
-    output. All index outputs share one int64 allocation; ``m == 0`` launches nothing.
+    The outputs of fused_dedup_prepare_dispatch with stable placement, plus inv_idxs (m * k,)
+    (inv_idxs[idxs[p]] == p) as a seventh. All index outputs share one int64 allocation.
     """
     m, k = topk_ids.shape
     dev = topk_ids.device
@@ -439,11 +401,7 @@ def supports_expand(received_expand_idx: torch.Tensor, ep_size: int, experts_per
 
 
 def expand_index(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    (expert_idxs, expand_idx) of the received token slots; the contract of
-    :func:`pithtrain.kernels.ep_dispatch.expert_and_expand_idx`. Both outputs share one int64
-    allocation. With no slots nothing is launched.
-    """
+    """The outputs of expert_and_expand_idx, sharing one int64 allocation."""
     total = received_expand_idx.shape[0]
     out = received_expand_idx.new_empty(2 * total)
     if total == 0:
@@ -457,21 +415,14 @@ def expand_index(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_
 
 
 def fused_dedup_prepare_dispatch_sm90(topk_ids: torch.Tensor, num_experts: int, ep_size: int, experts_per_rank: int, meta_out: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
-    """
-    The outputs of ``fused_dedup_prepare_dispatch_sm100``, computed by one CuTe launch with stable
-    placement (token order within each bucket); inputs the CuTe kernel does not cover
-    (:func:`supports_index`) take the Triton kernels.
-    """
+    """dispatch_index's first six outputs, or the Triton path for inputs it does not cover."""
     if supports_index(topk_ids, ep_size, experts_per_rank):
         return dispatch_index(topk_ids, num_experts, ep_size, experts_per_rank, meta_out)[:6]
     return fused_dedup_prepare_dispatch_sm100(topk_ids, num_experts, ep_size, experts_per_rank, meta_out)
 
 
 def expert_and_expand_idx_sm90(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    (expert_idxs, expand_idx) of the received token slots by the CuTe kernel (:func:`expand_index`);
-    inputs it does not cover (:func:`supports_expand`) take ``expert_and_expand_idx_sm100``.
-    """
+    """expand_index, or the Triton path for inputs it does not cover."""
     if supports_expand(received_expand_idx, ep_size, experts_per_rank):
         return expand_index(recv_meta, received_expand_idx, ep_size, experts_per_rank)
     return expert_and_expand_idx_sm100(recv_meta, received_expand_idx, ep_size, experts_per_rank)

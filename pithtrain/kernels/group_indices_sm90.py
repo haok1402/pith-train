@@ -1,8 +1,6 @@
 """
-Per-row group ids of a grouped GEMM input (SM90), the Hopper FP8 experts' ``group_indices``, in one
-launch: ``gi[r] = min(#{g : offs[g] <= r}, G - 1)``, exactly what ``precompute_group_indices``
-computes with ``arange`` + ``searchsorted(right=True)`` + ``clamp`` (three launches). Each CTA
-loads the inclusive group ends into shared memory and every row binary-searches them.
+Per-row group ids of a grouped GEMM input in one launch (SM90): gi[r] = min(#{g : offs[g] <= r},
+G - 1), the same values as arange + searchsorted(right=True) + clamp.
 """
 
 from typing import Callable
@@ -75,7 +73,7 @@ def supports_group_indices(grouped_mm_offs: torch.Tensor, M: int) -> bool:
 
 
 def group_indices(grouped_mm_offs: torch.Tensor, M: int) -> torch.Tensor:
-    """``(M,)`` int32 group id of every row, from the inclusive group ends ``grouped_mm_offs``."""
+    """(M,) int32 group id of every row, from the inclusive group ends grouped_mm_offs."""
     G = grouped_mm_offs.shape[0]
     out = torch.empty(M, dtype=torch.int32, device=grouped_mm_offs.device)
     if M == 0:

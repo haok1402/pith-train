@@ -1,15 +1,10 @@
 """
-PithTrain's kernel library, used as a black box: ``__all__`` is its whole interface.
-
-Code outside this package imports ``from pithtrain.kernels import <name>`` with ``<name>`` in
-``__all__``, never a submodule (tests/test_import_layers.py checks it). Each name's docstring
-states its contract, and ``tests/kernels/test_<feature>.py`` verifies it against PyTorch. The
-library picks the SM90 or SM100 implementation itself; where a caller needs to know whether a fused
-path exists, it calls a capability query (``fp8_fused_experts_supported``,
-``bf16_experts_supported``, ``gated_delta_rule_pinned_supported``).
-
-Importing this package never loads cutlass or QuACK: every module imported below imports its
-``_sm90`` kernels (and FA4) inside the functions that run them.
+PithTrain's kernel library. __all__ is its whole interface: code outside this package imports
+names from pithtrain.kernels, never a submodule. Each name's docstring is its contract, verified
+against PyTorch in tests/kernels/test_<feature>.py. The library picks the SM90 or SM100
+implementation itself; callers that need to know whether a fused path exists use the capability
+queries fp8_fused_experts_supported, bf16_experts_supported and gated_delta_rule_pinned_supported.
+Importing the package never loads cutlass or QuACK.
 """
 
 from pithtrain.kernels.bf16_expert_gemm import (

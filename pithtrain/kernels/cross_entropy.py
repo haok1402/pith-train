@@ -17,16 +17,9 @@ __all__ = ["cross_entropy_fwd", "cross_entropy_fwd_inplace"]
 @triton.jit
 def cross_entropy_fwd(X_ptr, X_stride, Y_ptr, Y_stride, loss_ptr, loss_stride, n_cols, n_non_ignore_ptr, ignore_idx, BLOCK_SIZE: tl.constexpr):
     """
-    Fused cross-entropy forward: computes per-row loss and overwrites
-    the logit tensor in-place with mean-reduced gradients.
-
-    Each program processes one row (token position). The kernel performs
-    two passes over the vocabulary dimension:
-      1. Online softmax: numerically stable max (m) and sum-of-exp (d).
-      2. Gradient write: softmax(x_i) / N for all i, then correct the
-         target position to (softmax(x_y) - 1) / N.
-
-    The per-row loss is stored separately for later summation.
+    One program per row: an online softmax over the vocabulary (max m, sum of exp d), then the row
+    is overwritten with (softmax(x) - onehot(y)) / n_non_ignore and its loss stored. An ignored row
+    is zeroed with loss 0.
     """
     row = tl.program_id(0).to(tl.int64)
     X_ptr += row * X_stride
@@ -67,23 +60,18 @@ def cross_entropy_fwd(X_ptr, X_stride, Y_ptr, Y_stride, loss_ptr, loss_stride, n
 
 def cross_entropy_fwd_inplace(inp: torch.Tensor, target: torch.Tensor, ignore_index: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Mean cross-entropy of the ``(N, V)`` logits ``inp`` against ``target``, overwriting the logits
-    with the gradient of that mean. Returns ``(loss, grad)``.
+    Mean cross-entropy of the logits inp against target, overwriting the logits with the gradient
+    of that mean. Returns (loss, grad).
 
-    - ``inp``: 2-D ``(N, V)`` floating logits (bf16 or fp32). Overwritten in place when it is
-      row-contiguous; otherwise a contiguous copy is made and overwritten instead (``inp`` is then
-      left alone and the in-place saving is lost).
-    - ``target``: integer ``(N,)`` class indices in ``[0, V)``, or ``ignore_index`` (any other value
-      reads out of bounds). Not modified.
-    - ``loss``: fp32 scalar, the sum over non-ignored rows of ``logsumexp(x) - x[target]`` (fp32
-      online softmax per row) divided by ``n = max(#non-ignored rows, 1)``; 0 when every row is
-      ignored.
-    - ``grad``: ``(N, V)`` in ``inp``'s dtype, ``inp`` itself or the copy: ``(softmax(x) -
-      onehot(target)) / n`` per non-ignored row, computed in fp32 and rounded once; zero rows where
-      ``target == ignore_index``.
+    inp: (N, V) bf16 or fp32 logits, overwritten in place when row-contiguous (otherwise a
+    contiguous copy is overwritten and inp is left alone). target: integer (N,), each in [0, V) or
+    ignore_index (any other value reads out of bounds); not modified.
 
-    Matches ``F.cross_entropy(inp.float(), target, ignore_index=ignore_index)`` and its gradient to
-    fp32 rounding (not bit for bit); deterministic. Same Triton kernel on both architectures.
+    loss: fp32 scalar, the sum over non-ignored rows of logsumexp(x) - x[target] divided by
+    n = max(non-ignored rows, 1). grad: inp itself (or the copy), (softmax(x) - onehot(target)) / n
+    per non-ignored row computed in fp32 and rounded once, zero rows where target == ignore_index.
+    Matches F.cross_entropy(inp.float(), target, ignore_index=ignore_index) and its gradient to fp32
+    rounding; deterministic.
     """
     n_rows, n_cols = inp.shape
 

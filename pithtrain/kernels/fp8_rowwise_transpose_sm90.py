@@ -1,21 +1,10 @@
-"""CuTe-DSL (SM90) port of ``fp8cast_rowwise_transpose_sm100`` (rowwise FP8 of x and of x.T, one read
-of x).
+"""
+CuTe-DSL (SM90) rowwise FP8 quantization of x and of x.T from one read of x, bit-identical to the
+Triton kernel in fp8_rowwise_transpose_sm100.
 
-Bit-identical to the Triton kernel in ``pithtrain/kernels/fp8_rowwise_transpose_sm100.py`` on SM90:
-E8M0 (power-of-2) scales from ``compute_fp8_scale``'s software branch and an RN-satfinite e4m3 cast.
-
-One CTA (256 threads) per 128x128 tile of x. Thread ``(warp, lane)`` owns an 8x8 block:
-columns ``8 * (lane & 15) ..`` and rows ``8 * (2 * warp + (lane >> 4)) ..`` of the tile, loaded
-with 16-byte loads. Rows are reduced with packed bf16x2 max + four butterfly shuffles over the 16
-lanes sharing a row; columns with bf16x2 max over the thread's 8 rows, one shuffle and an 8-warp
-combine through 2 KB of smem. The rowwise output is stored from registers (8 B per lane, two full
-rows per warp). The transposed tile goes through 16 KB of bank-swizzled smem so that every warp
-writes whole 128-byte rows of x.T: storing it straight from registers (8 B per lane, 16 rows per
-warp instruction) cost about a third of the kernel time at (4096, 4096).
-
-Unaligned shapes (N % 8, M % 16, misaligned base) use runtime-alignment-dispatched accesses plus
-per-element edge handling; non-bf16, non-contiguous and empty inputs use the Triton kernel (see
-:func:`supports_rowwise_transpose`).
+One CTA (256 threads) per 128x128 tile; each thread owns an 8x8 block. The transposed tile goes
+through bank-swizzled smem so every warp writes whole 128-byte rows of x.T: storing it straight
+from registers (16 rows per warp instruction) was much slower.
 """
 
 from typing import Callable
@@ -56,7 +45,7 @@ mov.b32 $0, b;
 
 # Rowwise quantize: 4 bf16x2 words (8 consecutive columns) times one reciprocal scale -> 8 fp8
 # bytes in two words. bf16 -> f32 is a 16-bit shift; the multiply by a power of 2 is exact and
-# cvt.rn.satfinite matches Triton's `.to(tl.float8e4nv)`.
+# cvt.rn.satfinite matches Triton's .to(tl.float8e4nv).
 _QROW_PTX = """{
 .reg .f32 a0, a1, a2, a3, a4, a5, a6, a7, r;
 .reg .b16 h0, h1, h2, h3;
@@ -76,7 +65,7 @@ mov.b32 $1, {h2, h3};
 }"""
 
 # Column quantize: one half (EXTRACT = low or high bf16) of 4 words (4 consecutive rows of one
-# column) times that column's reciprocal scale -> 4 fp8 bytes in one word.
+# column) -> 4 fp8 bytes in one word.
 _QCOL_PTX = """{
 .reg .f32 a0, a1, a2, a3, r;
 .reg .b16 h0, h1;
@@ -201,7 +190,7 @@ shr.b32 t, $2, 24;
 }"""
 
 
-def _ir(v):  # noqa: ANN001, ANN202 - DSL value -> MLIR value
+def _ir(v):
     return v.ir_value()
 
 
@@ -268,7 +257,7 @@ def _st8_any(addr: Int64, w0: Uint32, w1: Uint32, pred: Int32) -> None:
     _asm_store(_ST8_ANY_PTX, "l,r,r,r", [_ir(addr), _ir(w0), _ir(w1), _ir(pred)])
 
 
-def _b(cond) -> Int32:  # noqa: ANN001 - DSL Boolean -> Int32 predicate for inline asm
+def _b(cond) -> Int32:
     return Int32(cutlass.select_(cond, Int32(1), Int32(0)))
 
 
@@ -290,7 +279,7 @@ def _st_v4(addr: Int64, w: list, pred: Int32) -> None:
 
 
 class _Thread:
-    """Trace-time bundle of the per-thread constants shared by both kernels."""
+    """Trace-time per-thread constants."""
 
     def __init__(self, tidx: Int32) -> None:
         self.warp = tidx // 32
@@ -300,7 +289,7 @@ class _Thread:
 
 
 class _Tile:
-    """Trace-time bundle of one 128x128 tile's coordinates and bounds predicates."""
+    """Trace-time coordinates and bounds predicates of one 128x128 tile."""
 
     def __init__(self, th: _Thread, tm: Int32, tn: Int32, M: Int32, N: Int32) -> None:
         self.tm = tm
@@ -340,15 +329,12 @@ def _load_global(x_base: Int64, N64: Int64, tl: _Tile, vec_n: bool) -> list:
     return v
 
 
-def _quantize_tile(v: list, th: _Thread, tl: _Tile, sred: Int32, stile: Int32, bases: tuple, M64: Int64, N64: Int64, grid_m: Int32, grid_n: Int32, vec_n: bool, m_align: int) -> None:
-    """Amax, scales and both FP8 outputs of one tile from the thread's 8x8 block ``v``.
-
-    ``sred`` is the 32-bit shared address of a 2 KB scratch for the cross-warp column amax.
-    """
+def _quantize_tile(v: list, th: _Thread, tl: _Tile, sred: Int32, stile: Int32, bases: tuple, M64: Int64, N64: Int64, vec_n: bool, m_align: int) -> None:
+    """Amax, scales and both FP8 outputs of one tile from the thread's 8x8 block v; sred is 2 KB of smem for the cross-warp column amax, stile 16 KB for the transposed tile."""
     tok_base, stok_base, t_base, st_base = bases
     a = [[v[i][k] & Uint32(0x7FFF7FFF) for k in range(4)] for i in range(8)]
 
-    # ---- column amax: own 8 rows, the other half-warp, then the 8 warps via smem ----
+    # column amax: own 8 rows, the other half-warp, then the 8 warps via smem
     cm = []
     for k in range(4):
         c = a[0][k]
@@ -359,8 +345,8 @@ def _quantize_tile(v: list, th: _Thread, tl: _Tile, sred: Int32, stile: Int32, b
     _st_shared_v4(sred + (th.warp * 64 + th.cg * 4) * 4, cm, _b(th.lane < 16))
     cute.arch.barrier()
 
-    # ---- row amax (two rows packed per word), reduced over the 16 lanes sharing the rows;
-    # independent of the smem round trip above, so it overlaps the barrier wait ----
+    # Row amax (two rows packed per word) over the 16 lanes sharing the rows; independent of the
+    # smem round trip above, so it overlaps the barrier wait.
     rm = [_bmax(_bmax(a[i][0], a[i][1]), _bmax(a[i][2], a[i][3])) for i in range(8)]
     rpk = []
     for j in range(4):
@@ -372,13 +358,11 @@ def _quantize_tile(v: list, th: _Thread, tl: _Tile, sred: Int32, stile: Int32, b
             other = Uint32(cute.arch.shuffle_sync_bfly(Int32(rpk[j]), offset=1 << s))
             rpk[j] = _bmax(rpk[j], other)
 
-    # ---- rowwise scales and output: out_tok[row, col0:col0+8] ----
     tok_scale = []
     for j in range(4):
         tok_scale.append(_scale_bits(rpk[j] << 16))
         tok_scale.append(_scale_bits(rpk[j] & Uint32(0xFFFF0000)))
-    # MN-major scales (kernels/fp8_scale_layout.py): scale[r, j] at j * align(rows, 4) + r, so
-    # lanes cg = 0..7 store 8 consecutive rows (32 B) instead of 8 words sf_k apart.
+    # MN-major scales: scale[r, j] at j * align(rows, 4) + r.
     m_pad = (M64 + 3) // 4 * 4
     n_pad = (N64 + 3) // 4 * 4
     for i in range(8):
@@ -397,7 +381,6 @@ def _quantize_tile(v: list, th: _Thread, tl: _Tile, sred: Int32, stile: Int32, b
                 w = w0 if c < 4 else w1
                 _st_b8(tok_base + row_off + c, w >> (8 * (c % 4)), part & tl.colv[c])
 
-    # ---- column scales and transposed output: out_t[col, row0:row0+8] ----
     parts = [_ld_shared_v4(sred + (w * 64 + th.cg * 4) * 4) for w in range(8)]
     for k in range(4):
         c = parts[0][k]
@@ -421,7 +404,7 @@ def _quantize_tile(v: list, th: _Thread, tl: _Tile, sred: Int32, stile: Int32, b
         w1 = _qcol([v[i][k] for i in range(4, 8)], rcp, c % 2)
         _st_shared_v2(stile + (th.cg * 8 + c) * _TILE + (th.rg ^ th.cg) * 8, w0, w1)
     cute.arch.barrier()
-    # Each warp then writes 4 contiguous 128-byte rows of out_t per pass (16 B per lane).
+    # Each warp writes 4 contiguous 128-byte rows of out_t per pass (16 B per lane).
     ch = th.lane % 8
     start = Int64(tl.tm * _TILE + ch * 16)
     for k in range(4):
@@ -458,7 +441,6 @@ def _rowwise_transpose_kernel(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: 
     N = mX.shape[1]
     tidx, _, _ = cute.arch.thread_idx()
     tn, tm, _ = cute.arch.block_idx()
-    grid_n, grid_m, _ = cute.arch.grid_dim()
     th = _Thread(tidx)
     tl = _Tile(th, tm, tn, M, N)
     smem = cutlass.memory.SmemAllocator()
@@ -466,11 +448,11 @@ def _rowwise_transpose_kernel(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: 
     stile = smem.allocate_array(cutlass.Uint8, _TILE * _TILE, byte_alignment=128).toint()
     v = _load_global(mX.iterator.toint(), Int64(N), tl, vec_n)
     bases = (mOutTok.iterator.toint(), mScaleTok.iterator.toint(), mOutT.iterator.toint(), mScaleT.iterator.toint())
-    _quantize_tile(v, th, tl, sred, stile, bases, Int64(M), Int64(N), grid_m, grid_n, vec_n, m_align)
+    _quantize_tile(v, th, tl, sred, stile, bases, Int64(M), Int64(N), vec_n, m_align)
 
 
 @cute.jit
-def _launch(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, stream, vec_n: cutlass.Constexpr[bool], m_align: cutlass.Constexpr[int]) -> None:  # noqa: ANN001 - cuda stream (tvm-ffi env stream)
+def _launch(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, stream, vec_n: cutlass.Constexpr[bool], m_align: cutlass.Constexpr[int]) -> None:
     M = mX.shape[0]
     N = mX.shape[1]
     _rowwise_transpose_kernel(mX, mOutTok, mScaleTok, mOutT, mScaleT, vec_n, m_align).launch(grid=[(N + (_TILE - 1)) // _TILE, (M + (_TILE - 1)) // _TILE, 1], block=[_THREADS, 1, 1], stream=stream)
@@ -485,10 +467,10 @@ def _compile(vec_n: bool, m_align: int) -> Callable:
     sn = cute.sym_int()
     sm = cute.sym_int()
 
-    def fake(dtype, shape, align):  # noqa: ANN001, ANN202
+    def fake(dtype, shape, align):
         return cute.runtime.make_fake_tensor(dtype, shape, stride=(cute.sym_int64(), 1), assumed_align=align)
 
-    def mn_major(rows, cols):  # noqa: ANN001, ANN202 - kernels.fp8_scale_layout (1, align(rows, 4))
+    def mn_major(rows, cols):
         return cute.runtime.make_fake_tensor(cutlass.Float32, (rows, cols), stride=(1, cute.sym_int64()), assumed_align=16)
 
     return cute.compile(
@@ -504,21 +486,13 @@ def _get_compiled(key: tuple[bool, int]) -> Callable:
 
 
 def supports_rowwise_transpose(x: torch.Tensor) -> bool:
-    """Whether the CuTe kernel covers this input: a non-empty, contiguous BF16 2D ``x``."""
+    """Whether the CuTe kernel covers x: non-empty, contiguous, bf16."""
     M, N = x.shape
     return x.dtype is torch.bfloat16 and x.is_contiguous() and bool(M) and bool(N)
 
 
 def fp8cast_rowwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused rowwise FP8 quantization of x *and* x.T (single read of *x*).
-
-    Drop-in for ``fp8cast_rowwise_transpose_sm100``. Non-bf16, non-contiguous or empty inputs are
-    forwarded to that Triton kernel.
-
-    Returns (tok_fp8 (M, N), tok_scale (M, ceil(N/128)) f32, t_fp8 (N, M),
-    t_scale (N, ceil(M/128)) f32). Both scales are MN-major and TMA-aligned
-    (``kernels.fp8_scale_layout``), the layout DeepGEMM's SM90 GEMMs read without a transpose.
-    """
+    """fp8cast_rowwise_transpose with both scales MN-major; inputs supports_rowwise_transpose rejects go to the Triton kernel."""
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     M, N = x.shape
     if not supports_rowwise_transpose(x):

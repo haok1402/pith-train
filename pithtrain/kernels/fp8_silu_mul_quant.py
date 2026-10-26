@@ -1,10 +1,8 @@
 """
-Picker of SwiGLU fused with the rowwise + K-major FP8 quantization of its consumers (the FP8
-routed experts' ``silu(g) * u`` between the gate/up and down grouped GEMMs).
-
-SM90 runs the fused CuTe-DSL kernels (``fp8_silu_mul_quant_sm90``), elsewhere the unfused Triton
-sequence (``fp8_silu_mul_quant_sm100``). FP8 bytes and scale values are bit-identical; the SM90
-kernels return both scales MN-major (``kernels/fp8_scale_layout.py``), the SM100 path row-major.
+SwiGLU silu(g) * u fused with the rowwise + K-major FP8 quantization of the grouped GEMM that
+consumes it (FP8 routed experts). SM90 runs the fused CuTe-DSL kernels, other architectures the
+unfused Triton sequence; both give the same FP8 bytes and scale values. SM90 returns both scales
+MN-major (see fp8_scale_layout), SM100 row-major.
 """
 
 import torch
@@ -33,21 +31,15 @@ def _check_gu(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> None:
 
 def silu_mul_quant_fwd(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    The grouped-GEMM FP8 input of ``h = silu(g) * u``: :func:`quantize_grouped_input`'s 4-tuple
-    ``(h_fp8, h_scale, h_ch_fp8, h_ch_scale)`` in its SM90 (K-major) layout, without writing h.
+    FP8 grouped-GEMM input of h = silu(g) * u without writing h: the 4-tuple (h_fp8, h_scale,
+    h_ch_fp8, h_ch_scale) of quantize_grouped_input(silu_mul_fwd(g, u), grouped_mm_offs) on SM90,
+    bit for bit.
 
-    - ``g``, ``u``: bf16 ``(M, N)``, contiguous, same shape, M a multiple of 128; rows grouped by
-      expert, each group a multiple of 128 rows. Not modified.
-    - ``grouped_mm_offs``: int32 ``(G,)`` contiguous cumulative group ends, multiples of 128, last
-      == M.
-    - ``h`` is :func:`silu_mul_fwd` of ``g, u`` (fp32 arithmetic, rounded once to bf16); its
-      quantization is bit-identical to ``quantize_grouped_input(h, grouped_mm_offs)`` on SM90.
-    - M == 0 or N == 0 gives empty outputs of the same shapes.
-
-    One of the fused FP8 expert ops: callers use it where :func:`fp8_fused_experts_supported`.
-    Elsewhere (SM100) it runs the unfused sequence and returns the same bytes and scale values in
-    the same K-major layout (row-major scales), which SM100's :func:`k_grouped_fp8_gemm` does not
-    read. Scale strides are unspecified. Deterministic.
+    g, u: bf16 (M, N), contiguous, same shape; rows grouped by expert. grouped_mm_offs: int32 (G,)
+    contiguous cumulative group ends, each a multiple of 128, last == M. Inputs are not modified;
+    M == 0 or N == 0 gives empty outputs. Callers use it where fp8_fused_experts_supported(); on
+    SM100 it returns the same values with row-major scales (scale strides are unspecified).
+    Deterministic.
     """
     _check([g, u], grouped_mm_offs)
     if is_sm90():
@@ -59,19 +51,13 @@ def silu_mul_quant_fwd(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.
 
 def silu_mul_bwd_quant(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
     """
-    Backward of ``h = silu(g) * u`` quantized for the gate / up projections' backward GEMMs:
-    ``(dg_quant, du_quant)``, each the 4-tuple of :func:`silu_mul_quant_fwd` (same layout) of one
-    gradient.
+    Backward of silu_mul_quant_fwd: (dg_quant, du_quant), each the 4-tuple of
+    quantize_grouped_input of one gradient of silu_mul_bwd(dh, g, u), without writing the bf16
+    gradients.
 
-    - ``dh``, ``g``, ``u``: bf16 ``(M, N)``, contiguous, same shape, M a multiple of 128; ``dh``
-      the gradient of ``h``, ``g`` / ``u`` the saved forward inputs. Not modified.
-    - ``grouped_mm_offs``: as in :func:`silu_mul_quant_fwd`.
-    - ``dg``, ``du`` are :func:`silu_mul_bwd` of ``(dh, g, u)`` (fp32 arithmetic, each rounded
-      once to bf16), then quantized bit-identically to ``quantize_grouped_input`` on SM90; the
-      bf16 gradients are never written.
-
-    Fused FP8 expert op (:func:`fp8_fused_experts_supported`); the SM100 fallback as in
-    :func:`silu_mul_quant_fwd`. Deterministic.
+    dh, g, u: bf16 (M, N), contiguous, same shape; dh the gradient of h, g / u the saved forward
+    inputs. grouped_mm_offs, layout and SM100 behaviour as in silu_mul_quant_fwd. Inputs are not
+    modified. Deterministic.
     """
     _check([dh, g, u], grouped_mm_offs)
     if is_sm90():
@@ -83,15 +69,10 @@ def silu_mul_bwd_quant(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, group
 
 def silu_mul_quant_gu_fwd(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    :func:`silu_mul_quant_fwd` of the halves of a fused gate_up output: ``g = gu[:, :N]``,
-    ``u = gu[:, N:]`` (concatenated, not interleaved).
-
-    - ``gu``: bf16 ``(M, 2N)`` contiguous, M a multiple of 128 per group; not modified.
-    - Returns the 4-tuple for the ``(M, N)`` ``h``, the same bytes and scales as
-      ``silu_mul_quant_fwd(gu[:, :N].contiguous(), gu[:, N:].contiguous(), grouped_mm_offs)``.
-
-    Fused FP8 expert op (:func:`fp8_fused_experts_supported`); the SM100 fallback as in
-    :func:`silu_mul_quant_fwd`. Deterministic.
+    silu_mul_quant_fwd of the halves of a fused gate_up output: g = gu[:, :N], u = gu[:, N:]
+    (concatenated, not interleaved). gu: bf16 (M, 2N) contiguous, not modified. Returns the 4-tuple
+    for the (M, N) h, the same as silu_mul_quant_fwd(gu[:, :N].contiguous(), gu[:, N:].contiguous(),
+    grouped_mm_offs).
     """
     _check_gu(gu, grouped_mm_offs)
     if is_sm90():
@@ -103,17 +84,11 @@ def silu_mul_quant_gu_fwd(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tu
 
 def silu_mul_bwd_quant_gu(dh: torch.Tensor, gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Backward of :func:`silu_mul_quant_gu_fwd`: the 4-tuple of :func:`silu_mul_quant_fwd` (same
-    layout) of the ``(M, 2N)`` gate_up gradient ``cat([dg, du], 1)``.
+    Backward of silu_mul_quant_gu_fwd: the 4-tuple of quantize_grouped_input(cat([dg, du], 1),
+    grouped_mm_offs) for the (M, 2N) gate_up gradient, dg, du = silu_mul_bwd(dh, g, u).
 
-    - ``dh``: bf16 ``(M, N)`` contiguous, the gradient of ``h``; ``gu``: bf16 ``(M, 2N)``
-      contiguous, the saved gate_up output (``g = gu[:, :N]``, ``u = gu[:, N:]``); M a multiple of
-      128 per group. Neither is modified.
-    - ``dg``, ``du`` are :func:`silu_mul_bwd` of ``(dh, g, u)`` rounded to bf16; the result is
-      bit-identical to ``quantize_grouped_input(cat([dg, du], 1), grouped_mm_offs)`` on SM90.
-
-    Fused FP8 expert op (:func:`fp8_fused_experts_supported`); the SM100 fallback as in
-    :func:`silu_mul_quant_fwd`. Deterministic.
+    dh: bf16 (M, N) contiguous, the gradient of h. gu: bf16 (M, 2N) contiguous, the saved gate_up
+    output. Neither is modified.
     """
     _check_gu(gu, grouped_mm_offs)
     assert dh.dtype == torch.bfloat16 and dh.is_contiguous()

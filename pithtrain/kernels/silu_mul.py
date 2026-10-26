@@ -1,12 +1,5 @@
 """
-Fused SwiGLU ``silu(gate) * up`` Triton kernels and their launchers.
-
-- :func:`silu_mul_fwd` computes ``silu(gate) * up`` in one kernel (two loads, one store);
-- :func:`silu_mul_bwd` recomputes ``silu`` / ``sigmoid`` on the fly and writes both input
-  gradients in one kernel (three loads, two stores).
-
-Both architectures run them. The autograd op is ``pithtrain.operators.silu_mul``; the fused SM90
-FP8 quantization (``fp8_silu_mul_quant_sm90``) reproduces their arithmetic bit for bit.
+SwiGLU silu(gate) * up and its backward as element-wise Triton kernels, run on both architectures.
 """
 
 from __future__ import annotations
@@ -20,7 +13,6 @@ __all__ = ["BLOCK_SIZE", "silu_mul_bwd", "silu_mul_fwd"]
 
 @triton.jit
 def _silu_mul_fwd_kernel(gate_ptr, up_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    """Compute ``out = silu(gate) * up`` element-wise in one pass."""
     block_start = tl.program_id(0).to(tl.int64) * BLOCK_SIZE
     offs = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offs < n_elements
@@ -38,12 +30,6 @@ def _silu_mul_fwd_kernel(gate_ptr, up_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.c
 
 @triton.jit
 def _silu_mul_bwd_kernel(grad_out_ptr, gate_ptr, up_ptr, grad_gate_ptr, grad_up_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    """Compute ``grad_gate`` and ``grad_up`` element-wise in one pass.
-
-    With ``s = silu(gate)`` and ``sigma = sigmoid(gate)``:
-        grad_up   = grad_out * s
-        grad_gate = grad_out * up * sigma * (1 + gate - s)
-    """
     block_start = tl.program_id(0).to(tl.int64) * BLOCK_SIZE
     offs = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offs < n_elements
@@ -71,14 +57,11 @@ BLOCK_SIZE = 1024
 
 def silu_mul_fwd(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """
-    ``silu(gate) * up``: a fresh contiguous tensor like ``gate``.
+    silu(gate) * up as a fresh contiguous tensor like gate.
 
-    - ``gate``, ``up``: contiguous, same shape and dtype (bf16 in every caller; any float dtype);
-      not modified.
-    - Computed in fp32 (``gate * sigmoid(gate) * up`` with Triton's ``sigmoid``) and rounded once
-      to the dtype; agrees with the PyTorch fp32 formula to fp32 rounding before that final
-      rounding, not bit for bit. Deterministic; same kernel on both architectures. The fused FP8
-      ops (:func:`silu_mul_quant_fwd`) reproduce this result bit for bit.
+    gate, up: contiguous, same shape and float dtype (bf16 in practice); not modified. Computed in
+    fp32 and rounded once to the dtype; close to, not bit-identical with, the PyTorch fp32 formula
+    (Triton's sigmoid). Deterministic; silu_mul_quant_fwd reproduces it bit for bit.
     """
     assert gate.shape == up.shape, f"shape mismatch: {gate.shape} vs {up.shape}"
     assert gate.dtype == up.dtype, f"dtype mismatch: {gate.dtype} vs {up.dtype}"
@@ -93,13 +76,11 @@ def silu_mul_fwd(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 
 def silu_mul_bwd(grad_output: torch.Tensor, gate: torch.Tensor, up: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Gradients of :func:`silu_mul_fwd`: fresh ``(grad_gate, grad_up)`` like ``gate`` / ``up``.
+    Gradients of silu_mul_fwd: fresh (grad_gate, grad_up) like gate / up.
 
-    - ``grad_output``, ``gate``, ``up``: contiguous, same shape and dtype; not modified.
-    - With ``s = sigmoid(gate)`` in fp32: ``grad_up = grad_output * gate * s`` and ``grad_gate =
-      grad_output * up * s * (1 + gate - gate * s)``, each rounded once to the dtype.
-      Deterministic; same kernel on both architectures; :func:`silu_mul_bwd_quant` reproduces
-      both bit for bit.
+    grad_output, gate, up: contiguous, same shape and dtype; not modified. With s = sigmoid(gate)
+    in fp32: grad_up = grad_output * gate * s, grad_gate = grad_output * up * s * (1 + gate - gate * s),
+    each rounded once to the dtype. Deterministic; silu_mul_bwd_quant reproduces both bit for bit.
     """
     assert grad_output.shape == gate.shape, (f"grad_output shape {grad_output.shape} != gate shape {gate.shape}")
     assert grad_output.dtype == gate.dtype, (f"grad_output dtype {grad_output.dtype} != gate dtype {gate.dtype}")

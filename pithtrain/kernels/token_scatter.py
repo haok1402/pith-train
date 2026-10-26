@@ -1,12 +1,6 @@
 """
-Scatter of MoE tokens into the expert-grouped, padded layout of a grouped GEMM, as Triton kernels:
-:func:`scatter_by_expert`.
-
-One prep kernel computes the per-expert counts, padded sizes and cumulative offsets (a fused
-bincount + pad + prefix sum); one scatter kernel copies each token to its row and zero-fills the
-padding rows and the tail up to the allocation alignment. Rows within an expert are placed in
-``atomic_add`` order. Both architectures run them; ``pithtrain.operators.token_scatter`` wraps them
-in an autograd function.
+Triton scatter of MoE tokens into the expert-grouped, zero-padded layout of a grouped GEMM
+(scatter_by_expert). Rows within an expert land in atomic_add order. Both architectures run it.
 """
 
 from typing import Optional
@@ -31,8 +25,8 @@ _copy_event: Optional[torch.cuda.Event] = None
 def _compute_group_offsets_kernel(
     expert_idxs_ptr,  # [m] int64
     group_counts_ptr,  # [num_groups] int64, pre-zeroed
-    grouped_mm_offs_ptr,  # [num_groups] int32, output
-    ks_ptr,  # [num_groups] int32, output: per-group padded sizes
+    grouped_mm_offs_ptr,  # [num_groups] int32
+    ks_ptr,  # [num_groups] int32, padded sizes
     completion_counter_ptr,  # [1] int64, pre-zeroed
     m,
     num_ctas,
@@ -42,17 +36,16 @@ def _compute_group_offsets_kernel(
 ):
     pid = tl.program_id(0)
 
-    # Phase 1: Bincount via atomic adds (parallel across CTAs)
+    # bincount over all CTAs
     for start in range(pid * BLOCK, m, num_ctas * BLOCK):
         offs = start + tl.arange(0, BLOCK)
         mask = offs < m
         eids = tl.load(expert_idxs_ptr + offs, mask=mask, other=0)
         tl.atomic_add(group_counts_ptr + eids, 1, mask=mask)
 
-    # Barrier: last CTA to finish Phase 1 runs Phase 2
+    # the last CTA to finish its counts does the pad + prefix sum
     is_last = tl.atomic_add(completion_counter_ptr, 1) == num_ctas - 1
     if is_last:
-        # Phase 2: Pad + prefix-sum (sequential over num_groups, trivial)
         running_sum: tl.int64 = 0
         for g in tl.static_range(NUM_GROUPS):
             count = tl.load(group_counts_ptr + g)
@@ -68,13 +61,13 @@ def _scatter_for_grouped_gemm_kernel(
     input_tokens_ptr,  # [m, hidden_size]
     expert_idxs_ptr,  # [m] int64
     grouped_mm_offs_ptr,  # [num_groups] int32, padded cumulative offsets
-    group_counters_ptr,  # [num_groups] int64, zero-initialized (for atomic positioning)
-    actual_counts_ptr,  # [num_groups] int64, actual counts from prep kernel
+    group_counters_ptr,  # [num_groups] int64, pre-zeroed (atomic row positions)
+    actual_counts_ptr,  # [num_groups] int64, from the prep kernel
     output_tokens_ptr,  # [m_padded, hidden_size]
     reverse_shuffle_idxs_ptr,  # [m] int64
     hidden_size,
-    stride_src_m,  # input_tokens.stride(0)
-    stride_dst_m,  # output_tokens.stride(0)
+    stride_src_m,
+    stride_dst_m,
     m,
     num_groups,
     BLOCK_H: tl.constexpr,
@@ -98,15 +91,14 @@ def _scatter_for_grouped_gemm_kernel(
         vals = tl.load(input_tokens_ptr + src_base + h_offs, mask=mask)
         tl.store(output_tokens_ptr + dst_base + h_offs, vals, mask=mask)
 
-    # --- Zero padding rows for this group (distributed across programs) ---
+    # this group's padding rows, split among the group's programs
     actual_count = tl.load(actual_counts_ptr + expert_id)
     end_offset = tl.load(grouped_mm_offs_ptr + expert_id).to(tl.int64)
     padded_count = end_offset - base_offset.to(tl.int64)
     pad_rows = padded_count - actual_count
 
     if pad_rows > 0:
-        # Distribute pad_rows among actual_count programs in this group
-        rows_per = (pad_rows + actual_count - 1) // actual_count  # ceil div
+        rows_per = (pad_rows + actual_count - 1) // actual_count
         my_start = pos_in_group * rows_per
         my_end = tl.minimum(my_start + rows_per, pad_rows)
 
@@ -118,7 +110,7 @@ def _scatter_for_grouped_gemm_kernel(
                 mask = h_offs < hidden_size
                 tl.store(output_tokens_ptr + row_base + h_offs, tl.zeros([BLOCK_H], dtype=input_tokens_ptr.dtype.element_ty), mask=mask)
 
-    # --- Zero rows [actual_M, M_rounded) for GEMM allocation alignment ---
+    # rows [actual_M, M_rounded) of the allocation, split among all programs
     last_group_end = tl.load(grouped_mm_offs_ptr + num_groups - 1).to(tl.int64)
     M_rounded = ((last_group_end + GEMM_ALLOC_ALIGNMENT - 1) // GEMM_ALLOC_ALIGNMENT * GEMM_ALLOC_ALIGNMENT)
     align_pad = M_rounded - last_group_end
@@ -145,29 +137,24 @@ def _get_copy_stream_and_event(device):
 
 def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, padding_alignment: int = 128, group_counts: Optional[list[int]] = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
     """
-    Reorder ``input_tokens`` by ``expert_idxs`` into expert-major groups, each padded with zero rows
-    to a multiple of ``padding_alignment``: ``(output_tokens, reverse_shuffle_idxs,
-    grouped_mm_offs, ks_tensor, ks)``.
+    Reorder input_tokens by expert_idxs into expert-major groups, each padded with zero rows to a
+    multiple of padding_alignment. Returns (output_tokens, reverse_shuffle_idxs, grouped_mm_offs,
+    ks_tensor, ks).
 
-    - ``input_tokens``: 2-D ``(m, hidden)`` with unit inner stride (any row stride, any dtype);
-      ``expert_idxs``: int64 ``(m,)`` contiguous, values in ``[0, num_groups)`` (a length other than
-      m raises ValueError). Neither is modified.
-    - ``group_counts``: the true rows per group on the host, if known; ``ks`` then follows without
-      the device-to-host copy (and host sync) of the padded sizes, and must match ``expert_idxs``.
-    - ``output_tokens``: ``(sum(ks), hidden)`` row-major in ``input_tokens``' dtype, a prefix view
-      of a larger allocation: group ``g`` occupies rows ``[offs[g - 1], offs[g])``, its tokens
-      first, then zero rows. The rows of the allocation past ``sum(ks)`` (up to a multiple of 1024)
-      are zero too.
-    - ``reverse_shuffle_idxs``: int64 ``(m,)``, the output row of each input token
-      (``output_tokens[reverse_shuffle_idxs] == input_tokens``).
-    - ``grouped_mm_offs``: int32 ``(G,)`` cumulative padded group ends; ``ks_tensor``: int32
-      ``(G,)`` padded group sizes (zero for an empty group); ``ks``: the same as a host list.
-    - ``m == 0`` returns empty tensors, ``grouped_mm_offs`` and ``ks_tensor`` of shape ``(0,)``
-      and ``ks == []``.
+    - input_tokens: (m, hidden) with unit inner stride (any row stride, any dtype). expert_idxs:
+      int64 (m,) contiguous, values in [0, num_groups); a length other than m raises ValueError.
+      Inputs are not modified.
+    - group_counts: the true rows per group on the host, if known; ks then follows without the
+      device-to-host copy (and host sync), and must match expert_idxs.
+    - output_tokens: (sum(ks), hidden) row-major in input_tokens' dtype, a prefix view of an
+      allocation whose rows past sum(ks), up to a multiple of 1024, are zero too. Group g occupies
+      rows [offs[g - 1], offs[g]), its tokens first, then zero rows.
+    - reverse_shuffle_idxs: int64 (m,), the output row of each input token.
+    - grouped_mm_offs: int32 (G,) cumulative padded group ends. ks_tensor: int32 (G,) padded group
+      sizes (zero for an empty group). ks: the same as a host list.
+    - m == 0 returns empty tensors, grouped_mm_offs and ks_tensor of shape (0,), and ks == [].
 
-    Rows are copied exactly. Placement within a group is ``atomic_add`` order, not deterministic;
-    the multiset of rows per group, the offsets and the sizes are. Same kernels on both
-    architectures.
+    Rows are copied exactly. Placement within a group is atomic_add order, not deterministic.
     """
     m = input_tokens.shape[0]
     hidden_size = input_tokens.shape[1]
@@ -180,14 +167,12 @@ def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num
         ks_tensor = torch.empty((0,), device=device, dtype=torch.int32)
         return output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks_tensor, []
 
-    # Over-allocate: tight upper bound, no GPU data needed (no .item() sync)
+    # upper bound on sum(ks) without a device sync
     max_m_padded = m + num_groups * (padding_alignment - 1)
     max_m_padded = ((max_m_padded + GEMM_ALLOC_ALIGNMENT - 1) // GEMM_ALLOC_ALIGNMENT * GEMM_ALLOC_ALIGNMENT)
 
-    # Over-allocated output - padding rows zeroed inside the scatter kernel
-    # `output_tokens` will be zeroed inside the scatter kernel.
+    # the scatter kernel zeroes the padding and tail rows
     output_tokens = torch.empty((max_m_padded, hidden_size), device=device, dtype=input_tokens.dtype)
-    # Small buffers for prep kernel
     reverse_shuffle_idxs = torch.empty((m,), device=device, dtype=torch.int64)
     grouped_mm_offs = torch.empty((num_groups,), device=device, dtype=torch.int32)
     ks_tensor = torch.empty((num_groups,), device=device, dtype=torch.int32)
@@ -196,40 +181,28 @@ def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num
     group_counts_2 = all_zeros[num_groups : num_groups * 2]
     completion_counter = all_zeros[num_groups * 2 :]
 
-    # The prep kernel masks its load of expert_idxs with m, the row count of input_tokens,
-    # not with the length of expert_idxs. A shorter one is read out of bounds and the
-    # garbage indexes group_counts, so check the length here rather than fault later.
+    # The prep kernel masks its expert_idxs loads with m: a shorter expert_idxs would be read out
+    # of bounds and the garbage would index group_counts.
     if expert_idxs.shape[0] != m:
         raise ValueError(f"{expert_idxs.shape[0]=} must equal the input row count {m=}")
 
-    # Prep kernel: fused bincount + pad + cumsum (1 launch)
     BLOCK = 1024
     num_ctas = min(triton.cdiv(m, BLOCK), 32)
     _compute_group_offsets_kernel[(num_ctas,)](expert_idxs, group_counts_1, grouped_mm_offs, ks_tensor, completion_counter, m, num_ctas, PADDING_ALIGNMENT=padding_alignment, NUM_GROUPS=num_groups, BLOCK=BLOCK)
 
-    # Async D-to-H: ks_tensor is done after the prep kernel; copy it on
-    # a separate stream so the memcpy overlaps with the scatter kernel.
+    # ks_tensor is final after the prep kernel: its copy to the host overlaps the scatter kernel
     copy_stream, copy_event = _get_copy_stream_and_event(device)
-    copy_event.record()  # marks prep kernel completion on default stream
+    copy_event.record()
 
-    # Scatter kernel (on default stream, overlaps with D-to-H copy)
     BLOCK_H = 256
     NUM_H_BLOCKS = triton.cdiv(hidden_size, BLOCK_H)
     _scatter_for_grouped_gemm_kernel[(m,)](
-        input_tokens, expert_idxs, grouped_mm_offs, group_counts_2, group_counts_1,  # actual counts from prep kernel
+        input_tokens, expert_idxs, grouped_mm_offs, group_counts_2, group_counts_1,
         output_tokens, reverse_shuffle_idxs, hidden_size, input_tokens.stride(0), output_tokens.stride(0), m, num_groups,
         BLOCK_H=BLOCK_H, NUM_H_BLOCKS=NUM_H_BLOCKS, GEMM_ALLOC_ALIGNMENT=GEMM_ALLOC_ALIGNMENT
     )
 
-    # Narrow to actual padded size (removes over-allocated tail).
-    # ``actual_M = sum(ks)`` is already a multiple of ``padding_alignment``
-    # (each group is rounded up to that alignment inside the prep kernel),
-    # so this size is sufficient for BF16 grouped GEMM AND for DeepGEMM's
-    # FP8 ``k_grouped_fp8_gemm_tn_contiguous`` which asserts the data row
-    # count equals ``sum(ks)`` exactly.
     if group_counts is not None:
-        # The caller knows the counts on the host (EP dispatch synced them already), so the
-        # padded sizes follow without a device-to-host round trip.
         a = padding_alignment
         ks = [(c + a - 1) // a * a for c in group_counts]
     else:
@@ -239,6 +212,7 @@ def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num
             ks_cpu.copy_(ks_tensor, non_blocking=True)
         copy_stream.synchronize()
         ks = ks_cpu.tolist()
+    # trimmed to sum(ks) exactly: DeepGEMM's k_grouped_fp8_gemm_tn_contiguous asserts it
     actual_M = sum(ks)
     output_tokens = output_tokens[:actual_M]
 

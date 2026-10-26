@@ -1,25 +1,12 @@
 """
-The grouped GEMMs of the BF16 SwiGLU experts, on QuACK's SM90 GEMM class with our own epilogues.
+SM90 implementations of the bf16_expert_gemm functions: QuACK's SM90 GEMM class with our own
+epilogues, compiled once per (kind, lane order, tile config, device, activation) through TVM-FFI.
+Tile configs are fixed per shape (CONFIGS); QuACK's autotuner is not used.
 
-Each GEMM is compiled once per (kind, tile config, device) with ``cute.compile(...,
-"--enable-tvm-ffi")`` against fake tensors, through a small ``cute.jit`` entry point of our own
-that turns the call's tensors into the operands the GEMM class takes. Tile configs are fixed per
-shape (``CONFIGS``); QuACK's autotuner and its Python front end are never used.
-
-Gate and up stay two parameters (and two fp32 main_grads). A GEMM that needs both reads them as one
-operand: a tensor over the lower of the two addresses whose pair mode strides to the higher one,
-so the two (G, I, H) weights act as one (G, 2I, H) weight with gate and up columns interleaved
-(TMA takes any stride that is a positive multiple of 16 bytes). Lane 0 of a pair is the lower
-address, which may be gate or up; the epilogues put the lanes in order, from a compiled variant
-picked per call from the pointer order:
-
-- the gated forward stores the preactivation as interleaved (gate, up) pairs, always in that order;
-- the dgated backward stores the preactivation gradient in the weights' address order, so that
-  the dgrad (one GEMM over K = 2I) reads it against the paired weights as they lie;
-- the gate/up wgrad swaps the lanes when the main_grads lie in the other order than the weights.
-
-The forward activation is computed from the bf16-rounded preactivation, which is what is saved, so
-the backward recomputes the same h bit for bit instead of saving it.
+Gate and up are two tensors read as one operand: a tensor over the lower address whose size-2 pair
+mode strides to the higher one, so they act as one (G, 2I, H) weight with gate and up interleaved
+(TMA takes any positive 16-byte-multiple stride). Lane 0 is the lower address, gate or up; the
+epilogue variant is picked per call from the pointer order.
 """
 
 from functools import lru_cache
@@ -41,10 +28,6 @@ from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments
 
 from pithtrain.kernels.cute_compile_sm90 import fake_stream
-
-# ---------------------------------------------------------------------------
-# Epilogues
-# ---------------------------------------------------------------------------
 
 
 def _round_bf16(v):
@@ -92,9 +75,8 @@ def _pair_swapped(acc):
     return {"D": pack(b, a)}
 
 
-# gpt-oss: a per-expert bias row added in fp32 before the one rounding, and the clamped SwiGLU
-# (swiglu_oai) with the model's alpha and limit. The weights' gate / up rows interleave, so gate is
-# always the lower address and there is no swapped variant.
+# gpt-oss: the gate / up rows interleave, so gate is always the lower address and there is no
+# swapped variant.
 
 
 @lru_cache(maxsize=None)
@@ -119,11 +101,6 @@ def _dgated_oai(alpha: float, limit: float):
     return dgated_oai
 
 
-# Output rows scattered to the received-slot order straight from the down GEMM's epilogue: the
-# tile is staged in smem as for a TMA store, then the store warp writes each row r of it to
-# out[slot_of[r]] with 16-byte stores instead of one TMA tile store.
-
-
 class _IndexArg(EpiOp):
     """A tensor handed through to the epilogue params (read by _ScatterRowStore)."""
 
@@ -135,7 +112,10 @@ class _IndexArg(EpiOp):
 
 
 class _ScatterRowStore(TileStore):
-    """TileStore of ``out`` (slots, N) whose row r of the grouped output goes to ``out[idx[r]]``."""
+    """
+    TileStore of out (slots, N) writing row r of the grouped output to out[idx[r]]: the tile is staged
+    in smem as for a TMA store, then all epilogue threads copy its rows with 16-byte stores.
+    """
 
     def __init__(self, name: str, idx_name: str):
         super().__init__(name)
@@ -156,9 +136,7 @@ class _ScatterRowStore(TileStore):
     def tma_atoms(self, gemm, params):
         return []
 
-    def store_setup(self, gemm, params, smem_tensor, tiled_copy_r2s, tiled_copy_t2r, tile_coord_mnkl, varlen_manager, tidx):  # fmt: skip
-        # Per-tile state for store_r2s: after staging a subtile in smem as for a TMA store, all
-        # epilogue threads copy its rows to their slots (nothing is left for the store warp).
+    def store_setup(self, gemm, params, smem_tensor, tiled_copy_r2s, tiled_copy_t2r, tile_coord_mnkl, varlen_manager, tidx):
         tiled_copy = self._make_tiled_copy_r2s(gemm, params, tiled_copy_r2s, tiled_copy_t2r)
         batch = tile_coord_mnkl[3]
         self._st = dict(
@@ -179,7 +157,7 @@ class _ScatterRowStore(TileStore):
         smem = st["smem"]
         thr_s = tiled_copy.get_slice(tidx).partition_D(smem)
         stage_bytes = cute.size(smem[None, None, 0]) * (smem.element_type.width // 8)
-        stage = (tRS_s_stage.iterator.toint() - thr_s[None, None, None, 0].iterator.toint()) // stage_bytes  # fmt: skip
+        stage = (tRS_s_stage.iterator.toint() - thr_s[None, None, None, 0].iterator.toint()) // stage_bytes
         sub = smem[None, None, stage]
         gemm.epilogue_barrier.arrive_and_wait()
         epi_m, epi_n = cute.size(gemm.epi_tile, mode=[0]), cute.size(gemm.epi_tile, mode=[1])
@@ -216,11 +194,6 @@ def _mint(mod, *, c=False, paired=False, packed=False, add=False, bias=False) ->
     """The QuACK SM90 GEMM class with this epilogue (its operand kinds fixed here)."""
     kind_sig = (("c", "c"),) if c else (("bias", "row"),) if bias else ()
     return mod._mint(kind_sig, 9, paired, packed, (), RoundingMode.RN, (), add)
-
-
-# ---------------------------------------------------------------------------
-# Entry points: tensors in, GEMM operands out (traced once per compile)
-# ---------------------------------------------------------------------------
 
 
 def _paired(t0: cute.Tensor, t1: cute.Tensor, shape: Callable, stride: Callable) -> cute.Tensor:
@@ -333,11 +306,6 @@ class _WgradDown(_Entry):
         self.gemm(_transposed(mDy), _transposed(mH), mG, None, epi, self.sched(), var, stream)
 
 
-# ---------------------------------------------------------------------------
-# Configs and compilation
-# ---------------------------------------------------------------------------
-
-
 class Config(NamedTuple):
     tile_m: int
     tile_n: int
@@ -347,8 +315,7 @@ class Config(NamedTuple):
 
 DEFAULT_CONFIG = Config(128, 192, 2)
 CONFIGS: dict[tuple, Config] = {
-    # qwen3-30b-a3b (H 2048, I 768), best of an offline tile sweep at 1024 rows
-    # per expert
+    # qwen3-30b-a3b (H 2048, I 768), best of an offline tile sweep at 1024 rows per expert
     ("gated", 1536, 2048): Config(128, 192, 2, True),
     ("down", 2048, 768): Config(128, 192, 2, True),
     ("dgated", 768, 2048): Config(128, 128, 2, True),
@@ -385,7 +352,7 @@ def config(kind: str, n: int, k: int) -> Config:
 
 
 def _fake(dtype, rank: int, lead: int, div: int = 8):
-    return make_fake_tensor(dtype, tuple(cute.sym_int() for _ in range(rank)), divisibility=div, leading_dim=lead)  # fmt: skip
+    return make_fake_tensor(dtype, tuple(cute.sym_int() for _ in range(rank)), divisibility=div, leading_dim=lead)
 
 
 def _ivec():
@@ -393,7 +360,6 @@ def _ivec():
 
 
 _KINDS = {
-    # kind: (entry, epilogue (False, True variant), mint kwargs, gather_A, class attrs, fake args)
     "gated": (_GatedFwd, (_gated, _gated_swapped), dict(paired=True), True, {},
               lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 3, 2), _fake(BFloat16, 3, 2), _fake(BFloat16, 2, 1), _fake(BFloat16, 2, 1), _ivec(), _ivec())),
     "dgated": (_Dgated, (_dgated, _dgated_swapped), dict(c=True, packed=True), True, dict(cd_packed="n", implicit_dtype=BFloat16, b_transposed=True),
@@ -413,7 +379,7 @@ _KINDS = {
                   lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 3, 2), _fake(BFloat16, 3, 2), _fake(BFloat16, 2, 1, 4), _fake(BFloat16, 2, 1), _fake(BFloat16, 2, 1), _ivec(), _ivec())),
     "dgated_oai": (_Dgated, (_dgated_oai, None), dict(c=True, packed=True), True, dict(cd_packed="n", implicit_dtype=BFloat16, b_transposed=True),
                    lambda: (_fake(BFloat16, 2, 1), _fake(BFloat16, 3, 2), _fake(BFloat16, 2, 1), _fake(BFloat16, 2, 1), _fake(BFloat16, 2, 1), _ivec(), _ivec())),
-}  # fmt: skip
+}
 """kind -> (entry, epilogue (lane order kept, swapped), mint kwargs, gather-A, attrs, fake args);
 an epilogue that is a function takes the activation parameters (alpha, limit)."""
 
@@ -421,7 +387,6 @@ _compiled: dict = {}
 
 
 def compiled_gemm(kind: str, swapped: bool, cfg: Config, device: torch.device, act: tuple = ()) -> Callable:
-    """The compiled GEMM for (kind, lane variant, config, device, activation parameters)."""
     key = (kind, swapped, cfg, device.index, act)
     fn = _compiled.get(key)
     if fn is None:
@@ -432,25 +397,17 @@ def compiled_gemm(kind: str, swapped: bool, cfg: Config, device: torch.device, a
         if kind == "wgrad_pair" and swapped:
             mint_kw = dict(mint_kw, paired=True)
         cls = _mint(mod, **mint_kw)
-        gemm = cls(Float32, BFloat16, (cfg.tile_m, cfg.tile_n), (cfg.cluster_m, 1, 1), pingpong=cfg.pingpong, is_persistent=True, gather_A=gather)  # fmt: skip
+        gemm = cls(Float32, BFloat16, (cfg.tile_m, cfg.tile_n), (cfg.cluster_m, 1, 1), pingpong=cfg.pingpong, is_persistent=True, gather_A=gather)
         for name, value in attrs.items():
             setattr(gemm, name, value)
         with torch.cuda.device(device):
-            fn = cute.compile(entry(gemm, cfg.cluster_m), *fakes(), fake_stream(), options="--enable-tvm-ffi")  # fmt: skip
+            fn = cute.compile(entry(gemm, cfg.cluster_m), *fakes(), fake_stream(), options="--enable-tvm-ffi")
         _compiled[key] = fn
     return fn
 
 
-# ---------------------------------------------------------------------------
-# Calls
-# ---------------------------------------------------------------------------
-
-
 def _lower_first(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, bool]:
-    """
-    (lower, higher, a is the higher) by address, for two tensors read as one operand through a
-    pair mode: same dtype, shape and strides, 16-byte aligned, a nonzero 16-byte-multiple apart.
-    """
+    """(lower, higher, a is the higher) by address; asserts the two can be read as one paired operand."""
     assert a.dtype == b.dtype and a.shape == b.shape and a.stride() == b.stride()
     assert a.data_ptr() % 16 == 0 and b.data_ptr() % 16 == 0
     da = b.data_ptr() - a.data_ptr()
@@ -459,7 +416,6 @@ def _lower_first(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.
 
 
 def bf16_expert_gated_forward_sm90(x, w_gate, w_up, cu, a_idx, bias=None, act=()):
-    """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_gemm.bf16_expert_gated_forward` (its contract)."""
     M, inter = a_idx.shape[0], w_gate.shape[1]
     w0, w1, swapped = _lower_first(w_gate, w_up)
     pre = x.new_empty(M, 2 * inter)
@@ -471,12 +427,11 @@ def bf16_expert_gated_forward_sm90(x, w_gate, w_up, cu, a_idx, bias=None, act=()
         fn = compiled_gemm("gated_oai", False, config("gated_oai", 2 * inter, x.shape[1]), x.device, act)
         fn(x, w0, w1, bias, pre, h, cu, a_idx)
     else:
-        compiled_gemm("gated", swapped, config("gated", 2 * inter, x.shape[1]), x.device)(x, w0, w1, pre, h, cu, a_idx)  # fmt: skip
+        compiled_gemm("gated", swapped, config("gated", 2 * inter, x.shape[1]), x.device)(x, w0, w1, pre, h, cu, a_idx)
     return pre, h
 
 
 def bf16_expert_down_forward_scattered_sm90(h, w_down, cu, slot_of, bias=None):
-    """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_gemm.bf16_expert_down_forward_scattered` (its contract)."""
     M, H = h.shape[0], w_down.shape[1]
     out = h.new_empty(M, H)
     if M == 0:
@@ -485,12 +440,11 @@ def bf16_expert_down_forward_scattered_sm90(h, w_down, cu, slot_of, bias=None):
         fn = compiled_gemm("down_bias_scatter", False, config("down_bias", H, h.shape[1]), h.device)
         fn(h, w_down, bias, out, slot_of, cu)
     else:
-        compiled_gemm("down_scatter", False, config("down", H, h.shape[1]), h.device)(h, w_down, out, slot_of, cu)  # fmt: skip
+        compiled_gemm("down_scatter", False, config("down", H, h.shape[1]), h.device)(h, w_down, out, slot_of, cu)
     return out
 
 
 def bf16_expert_dgated_backward_sm90(dy, w_down, preact, cu, slot_of, w_gate, w_up, act=()):
-    """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_gemm.bf16_expert_dgated_backward` (its contract)."""
     M, inter = preact.shape[0], preact.shape[1] // 2
     swapped = w_up.data_ptr() < w_gate.data_ptr()
     dpre = preact.new_empty(M, 2 * inter)
@@ -498,7 +452,7 @@ def bf16_expert_dgated_backward_sm90(dy, w_down, preact, cu, slot_of, w_gate, w_
     if M:
         if act:
             assert not swapped
-            fn = compiled_gemm("dgated_oai", False, config("dgated_oai", inter, dy.shape[1]), dy.device, act)  # fmt: skip
+            fn = compiled_gemm("dgated_oai", False, config("dgated_oai", inter, dy.shape[1]), dy.device, act)
         else:
             fn = compiled_gemm("dgated", swapped, config("dgated", inter, dy.shape[1]), dy.device)
         fn(dy, w_down, preact, dpre, h, cu, slot_of)
@@ -506,30 +460,27 @@ def bf16_expert_dgated_backward_sm90(dy, w_down, preact, cu, slot_of, w_gate, w_
 
 
 def bf16_expert_dgrad_sm90(dpre, w_gate, w_up, cu, dpre_swapped):
-    """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_gemm.bf16_expert_dgrad` (its contract)."""
     M, H = dpre.shape[0], w_gate.shape[2]
     w0, w1, swapped = _lower_first(w_gate, w_up)
     assert swapped == dpre_swapped, "the weights moved between the dgated backward and the dgrad"
     dx = dpre.new_empty(M, H)
     if M:
-        compiled_gemm("dgrad", False, config("dgrad", H, dpre.shape[1]), dpre.device)(dpre, w0, w1, dx, cu)  # fmt: skip
+        compiled_gemm("dgrad", False, config("dgrad", H, dpre.shape[1]), dpre.device)(dpre, w0, w1, dx, cu)
     return dx
 
 
 def bf16_expert_wgrad_gate_up_sm90(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a_idx):
-    """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_gemm.bf16_expert_wgrad_gate_up` (its contract)."""
     if a_idx.shape[0] == 0:
         return
     m0, m1, mg_swapped = _lower_first(mg_gate, mg_up)
-    fn = compiled_gemm("wgrad_pair", mg_swapped != dpre_swapped, config("wgrad_pair", dpre.shape[1], x.shape[1]), x.device)  # fmt: skip
+    fn = compiled_gemm("wgrad_pair", mg_swapped != dpre_swapped, config("wgrad_pair", dpre.shape[1], x.shape[1]), x.device)
     fn(x, dpre, m0, m1, cu, a_idx)
 
 
 def bf16_expert_wgrad_down_sm90(dy, h, mg_down, cu, slot_of):
-    """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_gemm.bf16_expert_wgrad_down` (its contract)."""
     if slot_of.shape[0] == 0:
         return
-    compiled_gemm("wgrad_down", False, config("wgrad_down", h.shape[1], dy.shape[1]), dy.device)(dy, h, mg_down, cu, slot_of)  # fmt: skip
+    compiled_gemm("wgrad_down", False, config("wgrad_down", h.shape[1], dy.shape[1]), dy.device)(dy, h, mg_down, cu, slot_of)
 
 
 __all__ = ["bf16_expert_gated_forward_sm90", "bf16_expert_down_forward_scattered_sm90", "bf16_expert_dgated_backward_sm90", "bf16_expert_dgrad_sm90", "bf16_expert_wgrad_gate_up_sm90", "bf16_expert_wgrad_down_sm90"]

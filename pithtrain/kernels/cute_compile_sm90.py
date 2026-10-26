@@ -1,7 +1,6 @@
 """
-Compile-time helpers shared by the SM90 CuTe-DSL kernels (``kernels/*_sm90.py``): the fake tensors
-and stream that ``cute.compile`` traces a kernel against, launched later through TVM-FFI, and the
-torch-to-CuTe element types.
+Compile-time helpers shared by the SM90 CuTe-DSL kernels: the fake tensors and stream cute.compile
+traces a kernel against (launched later through TVM-FFI), and the torch-to-CuTe element types.
 """
 
 import cutlass

@@ -1,24 +1,11 @@
 """
-Index-only grouping of the received token slots for the BF16 CuTe experts, and the gather-sum that
-takes the grouped input gradient back to the received tokens.
+SM90 implementations of the bf16_expert_slots functions.
 
-Stage 3 receives ``gathered`` (one row per deduplicated token) plus, per token slot (one per
-token and local expert), its expert and its row of ``gathered`` (``expand_idx``). The experts'
-GEMMs read their rows straight from ``gathered`` through an index (gather-A), so instead of the
-expanded and scattered copies of the tokens this module only produces maps:
-
-- ``a_idx[r]``: row of ``gathered`` read by grouped row ``r``;
-- ``row_of[i]``: grouped row of slot ``i`` (the expert output of slot ``i`` is row ``row_of[i]``);
-- ``slot_of[r]``: slot of grouped row ``r`` (the inverse of ``row_of``);
-- per token ``t``, a bitmask of its local experts and the grouped row it has in each, which the
-  backward walks in expert order to sum the token's gradient rows in fp32.
-
-Grouped rows are expert-major with no padding (``cu_seqlens``) and slots placed stably within
-their expert (slot order), so every map is deterministic, and so is the gather-sum.
-
-:func:`bf16_expert_group_slots_sm90` is one launch: one CTA per chunk of slots ranks them stably within
-their expert (the warp-level ranking of kernels/fp8_scatter_quant_sm90.py's prep kernel) and counts
-the experts of all slots itself, so it needs neither the host's counts nor the other CTAs.
+The grouping is two launches with no host sync: a per-chunk expert histogram, then one CTA per chunk
+of slots that ranks its slots stably within their expert (warp match_any votes) and derives each
+expert's base row from all the chunk histograms, so CTAs never wait for each other. For the
+gather-sum it also fills, per token, a bitmask of its local experts and its grouped row in each,
+which the gather-sum walks in expert order.
 """
 
 from typing import NamedTuple
@@ -43,10 +30,7 @@ _SUM_TOKENS = 4  # tokens per gather-sum CTA
 
 
 class _Hist:
-    """
-    Expert histogram of each ``_CHUNK``-slot chunk into ``hist[c * G + g]``, one CTA per chunk;
-    the CTAs also zero the token bitmask the grouping launch ORs into.
-    """
+    """Expert histogram of each _CHUNK-slot chunk into hist[c * G + g]; also zeroes the token bitmask the grouping launch ORs into."""
 
     def __init__(self, num_groups: int) -> None:
         self.G = num_groups
@@ -54,7 +38,7 @@ class _Hist:
     @cute.jit
     def __call__(self, mE, mHist, mMask, stream) -> None:
         C = (mE.shape[0] + _CHUNK - 1) // _CHUNK
-        self.kernel(mE, mHist, mMask).launch(grid=[C, 1, 1], block=[_THREADS, 1, 1], stream=stream)  # fmt: skip
+        self.kernel(mE, mHist, mMask).launch(grid=[C, 1, 1], block=[_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, mE, mHist, mMask) -> None:
@@ -86,11 +70,10 @@ class _Hist:
 
 
 class _Group:
-    """Grouping launch: one CTA per ``_CHUNK`` slots, ``_THREADS`` threads.
-
-    Each CTA sums the chunk histograms (_Hist, the launch before): all of them give every expert's
-    first row, those below its chunk the chunk's base within each expert, so CTAs never wait for
-    each other and the host never sends the counts; CTA 0 writes ``cu_seqlens``.
+    """
+    Grouping launch, one CTA per _CHUNK slots. Each CTA sums the chunk histograms: all of them give
+    every expert's first row, those below its chunk the chunk's base within each expert. CTA 0
+    writes cu_seqlens.
     """
 
     def __init__(self, num_groups: int, has_expand: bool) -> None:
@@ -130,21 +113,21 @@ class _Group:
         sts_b32(s_run + tid * 4, Uint32(0), Int32(tid < G))
         cute.arch.sync_threads()
 
-        # ---- expert totals and counts below this chunk, from the chunk histograms ----
+        # expert totals and counts below this chunk, from the chunk histograms
         C = (m + _CHUNK - 1) // _CHUNK
         lo = c * _CHUNK
         if tid < G:
             tot = Int32(0)
             pre = Int32(0)
             for j in cutlass.range(C, unroll=1):
-                v = ld_b32(mHist.iterator.toint() + (Int64(j) * G + Int64(tid)) * 4, Int32(1), Int32(0))  # fmt: skip
+                v = ld_b32(mHist.iterator.toint() + (Int64(j) * G + Int64(tid)) * 4, Int32(1), Int32(0))
                 tot = tot + v
                 pre = pre + v * Int32(j < c)
             sts_b32(s_tot + tid * 4, Uint32(tot), Int32(1))
             sts_b32(s_pre + tid * 4, Uint32(pre), Int32(1))
         lt_mask = lanemask_lt()
 
-        # ---- stable rank of each slot within its expert, inside this chunk ----
+        # stable rank of each slot within its expert, inside this chunk
         srcs = []
         ids = []
         eids = []
@@ -185,7 +168,7 @@ class _Group:
             eids.append(es)
             rls.append(rl)
 
-        # ---- base row of each expert for this chunk: its first row plus the lower chunks ----
+        # base row of each expert for this chunk: its first row plus the lower chunks
         if tid < G:
             first = Int32(0)
             for g in cutlass.range(tid, unroll=1):
@@ -197,7 +180,6 @@ class _Group:
                     st_b32(mCu.iterator.toint() + Int64(G) * 4, Uint32(Int32(m)), Int32(1))
         cute.arch.sync_threads()
 
-        # ---- the maps ----
         for r in cutlass.range_constexpr(_CHUNK // NT):
             row = Int32(lds_b32(s_run + eids[r] * 4)) + rls[r]
             ok = oks[r]
@@ -211,7 +193,7 @@ class _Group:
 
 
 class _GatherSum:
-    """``out[t] = sum over the token's local experts e (ascending) of grad[tab[t, e]]`` in fp32."""
+    """out[t] = sum over the token's local experts e (ascending) of grad[tab[t, e]], in fp32."""
 
     def __init__(self, hidden: int, num_groups: int, max_slots: int) -> None:
         assert hidden % 8 == 0
@@ -260,7 +242,7 @@ class _GatherSum:
 
 
 class SlotMaps(NamedTuple):
-    """Index maps of one stage-3 call; see the module docstring."""
+    """Index maps of one call; see bf16_expert_group_slots."""
 
     cu_seqlens: torch.Tensor  # (G + 1,) int32
     a_idx: torch.Tensor  # (S,) int32
@@ -279,7 +261,6 @@ def _vec(dtype: type, align: int) -> object:
 
 
 def bf16_expert_group_slots_sm90(expert_idxs: torch.Tensor, expand_idx: torch.Tensor | None, num_groups: int, num_tokens: int) -> SlotMaps:
-    """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_slots.bf16_expert_group_slots` (its contract)."""
     G = num_groups
     S = expert_idxs.shape[0]
     dev = expert_idxs.device
@@ -304,11 +285,11 @@ def bf16_expert_group_slots_sm90(expert_idxs: torch.Tensor, expand_idx: torch.Te
         return SlotMaps(cu, a_idx, row_of, slot_of, mask, table)
     fns = _GROUP.get((G, has_expand))
     if fns is None:
-        i32 = lambda: _vec(Int32, 4)  # noqa: E731
+        i32 = lambda: _vec(Int32, 4)
         fns = _GROUP[(G, has_expand)] = (
             cute.compile(_Hist(G), _vec(Int64, 8), i32(), _vec(Int64, 8), fake_stream(), options="--enable-tvm-ffi"),
             cute.compile(_Group(G, has_expand), _vec(Int64, 8), _vec(Int64, 8), i32(), i32(), i32(), i32(), i32(), _vec(Int64, 8), i32(), fake_stream(), options="--enable-tvm-ffi"),
-        )  # fmt: skip
+        )
     fns[0](expert_idxs, hist, mask if has_expand else expert_idxs[:0])
     if has_expand:
         fns[1](expert_idxs, expand_idx, hist, cu, a_idx, row_of, slot_of, mask, table)
@@ -318,7 +299,6 @@ def bf16_expert_group_slots_sm90(expert_idxs: torch.Tensor, expand_idx: torch.Te
 
 
 def bf16_expert_gather_sum_sm90(grad: torch.Tensor, maps: SlotMaps, num_groups: int, max_slots: int) -> torch.Tensor:
-    """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_slots.bf16_expert_gather_sum` (its contract)."""
     T_ = maps.mask.shape[0]
     H = grad.shape[1]
     out = grad.new_empty(T_, H)
@@ -328,7 +308,7 @@ def bf16_expert_gather_sum_sm90(grad: torch.Tensor, maps: SlotMaps, num_groups: 
     fn = _SUM.get(key)
     if fn is None:
         bf = cutlass.BFloat16
-        fn = _SUM[key] = cute.compile(_GatherSum(H, num_groups, max_slots), fake(bf, (cute.sym_int(), H), (H, 1)), _vec(Int64, 8), _vec(Int32, 4), fake(bf, (cute.sym_int(), H), (H, 1)), fake_stream(), options="--enable-tvm-ffi")  # fmt: skip
+        fn = _SUM[key] = cute.compile(_GatherSum(H, num_groups, max_slots), fake(bf, (cute.sym_int(), H), (H, 1)), _vec(Int64, 8), _vec(Int32, 4), fake(bf, (cute.sym_int(), H), (H, 1)), fake_stream(), options="--enable-tvm-ffi")
     fn(grad, maps.mask, maps.table, out)
     return out
 
@@ -338,10 +318,7 @@ _SEG_ROWS = 256  # rows per partial sum
 
 
 class _SegmentSum:
-    """
-    Partial sums of ``_SEG_ROWS``-row chunks of each segment of rows ``x[idx[r]]`` (or ``x[r]``),
-    ``r`` in ``[cu[g], cu[g + 1])``, in fp32 and row order; CTA (chunk, column block).
-    """
+    """fp32 row-order partial sums of _SEG_ROWS-row chunks of each segment of x[idx[r]] (or x[r]); one CTA per (chunk, column block)."""
 
     def __init__(self, n: int, gather: bool) -> None:
         assert n % 8 == 0
@@ -385,7 +362,6 @@ _SEG: dict = {}
 
 
 def expert_slot_segment_sum_sm90(x: torch.Tensor, cu_host: list[int], cu: torch.Tensor, idx: torch.Tensor | None = None) -> torch.Tensor:
-    """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_slots.expert_slot_segment_sum` (its contract)."""
     G, N = len(cu_host) - 1, x.shape[1]
     lengths = [-(-(cu_host[g + 1] - cu_host[g]) // _SEG_ROWS) for g in range(G)]
     chunks = [(g, k) for g in range(G) for k in range(lengths[g])]
@@ -403,7 +379,7 @@ def expert_slot_segment_sum_sm90(x: torch.Tensor, cu_host: list[int], cu: torch.
             _vec(Int32, 4), _vec(Int32, 4), fake(Int32, (cute.sym_int(), 2), (2, 1), 8),
             fake(cutlass.Float32, (cute.sym_int(), N), (N, 1)), fake_stream(),
             options="--enable-tvm-ffi",
-        )  # fmt: skip
+        )
     fn(x, idx if idx is not None else cu, cu, chunk, part)
     # the chunks of a segment are consecutive; sum them in order (an empty segment sums to 0)
     return torch.segment_reduce(part, "sum", lengths=lengths_t, initial=0.0)
@@ -414,7 +390,7 @@ _ROWS_PER_CTA = 4
 
 
 class _GatherRows:
-    """``out[i] = x[idx[i]]`` for bf16 rows, 16-byte vectors."""
+    """out[i] = x[idx[i]] for bf16 rows, 16-byte vectors."""
 
     def __init__(self, n: int) -> None:
         assert n % 8 == 0
@@ -423,7 +399,7 @@ class _GatherRows:
     @cute.jit
     def __call__(self, mX, mIdx, mOut, stream) -> None:
         grid = (mOut.shape[0] + _ROWS_PER_CTA - 1) // _ROWS_PER_CTA
-        self.kernel(mX, mIdx, mOut).launch(grid=[grid, 1, 1], block=[_ROW_THREADS, 1, 1], stream=stream)  # fmt: skip
+        self.kernel(mX, mIdx, mOut).launch(grid=[grid, 1, 1], block=[_ROW_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, mX, mIdx, mOut) -> None:
@@ -448,7 +424,6 @@ _ROWS: dict = {}
 
 
 def bf16_expert_gather_rows_sm90(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-    """SM90 implementation of :func:`pithtrain.kernels.bf16_expert_slots.bf16_expert_gather_rows` (its contract)."""
     N = x.shape[1]
     out = x.new_empty(idx.shape[0], N)
     if idx.shape[0] == 0:
@@ -456,6 +431,6 @@ def bf16_expert_gather_rows_sm90(x: torch.Tensor, idx: torch.Tensor) -> torch.Te
     fn = _ROWS.get(N)
     if fn is None:
         bf = cutlass.BFloat16
-        fn = _ROWS[N] = cute.compile(_GatherRows(N), fake(bf, (cute.sym_int(), N), (N, 1)), _vec(Int32, 4), fake(bf, (cute.sym_int(), N), (N, 1)), fake_stream(), options="--enable-tvm-ffi")  # fmt: skip
+        fn = _ROWS[N] = cute.compile(_GatherRows(N), fake(bf, (cute.sym_int(), N), (N, 1)), _vec(Int32, 4), fake(bf, (cute.sym_int(), N), (N, 1)), fake_stream(), options="--enable-tvm-ffi")
     fn(x, idx, out)
     return out

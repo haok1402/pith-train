@@ -1,39 +1,10 @@
 """
-SwiGLU fused with the Hopper FP8 quantization of its consumers, in CuTe-DSL.
-
-The routed experts compute ``h = silu(g) * u`` and hand ``h`` straight to ``down_proj``, which
-quantizes it with :func:`~pithtrain.kernels.fp8_rowwise_kmajor.fp8cast_rowwise_kmajor`. In
-backward, ``dh`` turns into ``dg`` and ``du``, which ``gate_proj`` / ``up_proj`` quantize the same
-way. Nothing else reads the BF16 ``h``, ``dg`` or ``du``, so the kernels here never write them:
-
-- :func:`silu_mul_quant_fwd_sm90` reads ``g`` and ``u`` and writes the four outputs of
-  ``fp8cast_rowwise_kmajor(silu_mul(g, u), grouped_mm_offs)``.
-- :func:`silu_mul_bwd_quant_sm90` reads ``dh``, ``g`` and ``u`` and writes the four outputs of
-  ``fp8cast_rowwise_kmajor`` for each of ``dg`` and ``du``.
-- :func:`silu_mul_quant_gu_fwd_sm90` / :func:`silu_mul_bwd_quant_gu_sm90` do the same for a fused
-  gate_up output ``gu = [g | u]`` (M, 2N) (Qwen3.5), reading g and u in place (``SiluMulQuantGU``)
-  and, in backward, writing the quantized ``[dg | du]`` as one (M, 2N) operand.
-
-All are bit-identical to the unfused Triton sequence (``pithtrain/kernels/silu_mul.py`` then
-``fp8cast_rowwise_kmajor``): the fp32 SwiGLU arithmetic reproduces the Triton kernels' PTX (see
-``SIGMOID_PTX`` for the one place a shorter, exhaustively verified sequence stands in), each
-result is rounded to BF16 exactly as the Triton kernel stores it, and the BF16 value is then
-quantized with the SM90 E8M0 scale of ``compute_fp8_scale``. As from the CuTe
-``fp8cast_rowwise_kmajor``, both scales come back MN-major (strides ``(1, align(rows, 4))``, see
-:mod:`pithtrain.kernels.fp8_scale_layout`), which DeepGEMM reads without a transpose and
-which makes every scale store coalesced.
-
-The kernel is persistent (one 512-thread CTA per SM) over 128 x 128 tiles, so a tile's 128 rows
-lie inside one expert group exactly as in the Triton kernel. Inputs are staged into shared memory
-with ``cp.async`` two tiles ahead. Rowwise amax is a 16-lane butterfly on packed ``max.bf16x2`` of
-the BF16 magnitudes; colwise amax reduces 4 rows in registers, then across the warp and the 16
-warps through shared memory. The K-major colwise FP8 tile is transposed through a swizzled 16 KB
-shared buffer so every column's 128 bytes leave as one coalesced 128-byte burst.
-
-Only ``N % 8 == 0`` (gate_up: ``N % 128 == 0``) with at most 1024 groups runs fused; anything else
-falls back to the unfused sequence (``silu_mul_fwd`` / ``silu_mul_bwd``, then the SM90
-``fp8cast_rowwise_kmajor_sm90``), which is trivially bit-identical. The Triton-only equivalent is
-``fp8_silu_mul_quant_sm100``.
+SM90 fp8_silu_mul_quant: CuTe-DSL kernels computing silu(g) * u (or its two gradients) and writing
+only its rowwise + K-major FP8 quantization, never the bf16 intermediate. Bit-identical to
+silu_mul_fwd / silu_mul_bwd followed by fp8cast_rowwise_kmajor; both scales MN-major. The
+SiluMulQuantGU variant reads g and u as the halves of a fused (M, 2N) gate_up output and writes the
+backward as one (M, 2N) operand. Shapes the fused kernels do not take (see silu_mul_quant_fusable,
+silu_mul_quant_gu_fusable) run the unfused sequence.
 """
 
 from __future__ import annotations
@@ -63,20 +34,15 @@ THREADS = 512
 VEC = 8  # BF16 columns per thread (one 16-byte load)
 
 
-# --- SwiGLU math: the exact PTX sequence of the Triton silu_mul kernels -----------------------
-
-# sigmoid(x) = 1 / (1 + exp(-x)). Triton 3.7 emits, for fp32 (see
-# workspace/kda-tasks/silu_mul_quant/runs/{fwd,bwd}.ptx):
+# sigmoid(x) = 1 / (1 + exp(-x)). Triton 3.7 emits, for fp32:
 #     sub.f32 t, 0, x;  mul.f32 t, t, log2e;  ex2.approx.f32 e, t;  add.f32 d, e, 1;
 #     div.full.f32 s, 1, d
-# which SASS expands to ~12 instructions (denormal rescaling around MUFU.EX2, range scaling
-# around MUFU.RCP). This 5-instruction sequence gives the same bits for every BF16 gate value,
-# checked exhaustively by workspace/kda-tasks/silu_mul_quant/scripts/verify_sigmoid.py:
-# - ``x * -log2e`` == ``(0 - x) * log2e``: negation is exact; ex2(+-0) = 1; NaN is canonical.
+# This 5-instruction sequence gives the same bits for every bf16 gate value (checked exhaustively):
+# - x * -log2e == (0 - x) * log2e: negation is exact; ex2(+-0) = 1; NaN is canonical.
 # - ex2 non-ftz differs from ftz only when e is subnormal, and then 1 + e == 1 either way.
 # - div.full(1, d) == 0.25 * rcp(0.25 * d) for every fp32 d >= 1 (also checked exhaustively),
 #   and 0.25 * (1 + e) == fma(e, 0.25, 0.25) because scaling by 0.25 is exact here.
-# ``.rn`` pins every mul/add so ptxas cannot contract differently from the reference.
+# .rn pins every mul/add so ptxas cannot contract differently from the Triton kernels.
 SIGMOID_PTX = (
     "mul.rn.f32 t, $G, 0fBFB8AA3B;\n"
     "ex2.approx.ftz.f32 t, t;\n"
@@ -88,13 +54,13 @@ SIGMOID_PTX = (
 
 @dsl_user_op
 def swiglu_fwd(g: Float32, u: Float32, *, loc=None, ip=None) -> Float32:
-    """``silu(g) * u`` in fp32: ``(sigmoid(g) * g) * u``, as ``_silu_mul_fwd_kernel``."""
+    """silu(g) * u in fp32 as (sigmoid(g) * g) * u, the Triton forward's exact op order."""
     return Float32(asm_args_last(T.f32(), "{\n.reg .f32 t, s;\n" + SIGMOID_PTX.replace("$G", "$1") + "mul.rn.f32 s, s, $1;\nmul.rn.f32 $0, s, $2;\n}", "=f,f,f", [to_ir(g, Float32, loc, ip), to_ir(u, Float32, loc, ip)]))
 
 
 @dsl_user_op
 def swiglu_bwd(dh: Float32, g: Float32, u: Float32, *, loc=None, ip=None) -> tuple:
-    """``(grad_gate, grad_up)`` in fp32, as ``_silu_mul_bwd_kernel`` after LLVM contraction:
+    """(grad_gate, grad_up) in fp32, the Triton backward's ops after LLVM contraction:
 
     grad_up   = dh * (s * g)
     grad_gate = ((dh * u) * s) * fma(-s, g, 1 + g)      with s = sigmoid(g)
@@ -118,25 +84,17 @@ def swiglu_bwd(dh: Float32, g: Float32, u: Float32, *, loc=None, ip=None) -> tup
     return unpack(res, 2, Float32, loc, ip)
 
 
-# ---------------------------------------------------------------------------
-# Kernel
-# ---------------------------------------------------------------------------
-
-
 G_CAP = 1024  # expert groups the shared-memory offset table holds
-_STAGES = 2  # cp.async tiles in flight per CTA (3 measured no faster; bwd cannot fit 3)
+_STAGES = 2  # cp.async tiles in flight per CTA (backward cannot fit 3 in shared memory)
 
 
 class SiluMulQuant:
-    """Persistent kernel, one compiled per (N, backward).
+    """Persistent kernel (one 512-thread CTA per SM over 128 x 128 tiles), compiled per (N, backward).
 
-    Each CTA (512 threads, one per SM) walks 128 x 128 tiles ``bid, bid + grid, ...``. Inputs are
-    staged into shared memory with ``cp.async`` ``stages`` tiles ahead, so HBM reads continue
-    through the reductions and barriers of the current tile. Every thread reads back only the
-    16-byte chunks it copied itself, so the staging needs no barrier, only ``cp.async.wait_group``.
-
-    Thread ``t``: ``cv = t % 16`` owns columns ``cv*8 .. cv*8+7``, ``rg = t // 16`` owns rows
-    ``rg*4 .. rg*4+3`` of the tile.
+    Inputs are staged into shared memory with cp.async, stages tiles ahead. Every thread reads back
+    only the 16-byte chunks it copied itself, so the staging needs no barrier, only
+    cp.async.wait_group. Thread t: cv = t % 16 owns columns cv*8 .. cv*8+7, rg = t // 16 owns rows
+    rg*4 .. rg*4+3 of the tile. A tile's 128 rows lie inside one expert group.
     """
 
     def __init__(self, N: int, backward: bool, num_ctas: int):
@@ -170,12 +128,11 @@ class SiluMulQuant:
         self.kernel(mDh, mG, mU, mOffs, mTok0, mTokS0, mKm0, mKmS0, mTok1, mTokS1, mKm1, mKmS1).launch(grid=[cutlass.min(total, self.num_ctas), 1, 1], block=[THREADS, 1, 1], stream=stream)
 
     def _tile(self, t: Int32) -> tuple:
-        """Tile ``t`` -> (row block, column block); column blocks of a row block are adjacent,
-        which measured faster than the transposed order (better read locality)."""
+        """Tile t -> (row block, column block); column blocks of a row block are adjacent for read locality."""
         return t // self.NB, t % self.NB
 
     def _issue(self, t: Int32, stage_addr: Int32, total: Int32, tid: Int32, in_base: list):
-        """cp.async tile ``t`` (zero-filled when out of range) into a stage; traced inline."""
+        """cp.async tile t (zero-filled when out of range) into a stage."""
         N = self.N
         ok = Int32(t < total)
         rb, cb = self._tile(t)
@@ -222,7 +179,7 @@ class SiluMulQuant:
         for s in cutlass.range_constexpr(S):
             self._issue(bid + s * grid, s_in + s * self.stage_bytes, total, tid, in_base)
 
-        # Expert-group offsets into shared memory (searched once per tile below).
+        # Expert-group offsets into shared memory, searched once per tile below.
         for gc in cutlass.range((G + THREADS - 1) // THREADS, unroll=1):
             j = gc * THREADS + tid
             if j < G:
@@ -249,7 +206,7 @@ class SiluMulQuant:
                 for k in cutlass.range_constexpr(4):
                     raw[x][k] = lds_v4(stage_addr + ((x * 4 + k) * THREADS + tid) * 16)
 
-            # SwiGLU in fp32, rounded to BF16 and packed in pairs: h[o][k][m].
+            # SwiGLU in fp32, rounded to bf16 and packed in pairs: h[o][k][m].
             h = [[[None] * 4 for _ in range(4)] for _ in range(self.n_out)]
             for k in cutlass.range_constexpr(4):
                 for m in cutlass.range_constexpr(4):
@@ -366,14 +323,10 @@ class SiluMulQuant:
 
 
 class SiluMulQuantGU(SiluMulQuant):
-    """``SiluMulQuant`` reading g / u as column halves of one ``(M, 2N)`` buffer and, in
-    backward, writing dg and du as the column halves of one quantized ``(M, 2N)`` operand.
-
-    Output ``o`` (0 = dg or h, 1 = du) lands at channel offset ``o * N`` of a layout with
-    ``NC = n_out * N`` channels: the rowwise FP8 at column ``o * N + c`` (row stride NC), its scale
-    at K block ``o * NB + cb``, the K-major FP8 at channel ``o * N + c`` of each group's
-    ``(NC, k_g)`` block, and its scale at row ``o * N + c`` of the ``(NC, M / 128)`` MN-major grid.
-    Requires ``N % 128 == 0`` (every tile inside one half).
+    """SiluMulQuant reading g / u as the column halves of one (M, 2N) buffer and, in backward,
+    writing dg and du as the column halves of one quantized (M, 2N) operand: output o (0 = dg or h,
+    1 = du) lands at channel offset o * N of an NC = n_out * N channel layout. Requires N % 128 == 0
+    (every tile inside one half).
     """
 
     def __init__(self, N: int, backward: bool, num_ctas: int):
@@ -388,7 +341,7 @@ class SiluMulQuantGU(SiluMulQuant):
         self.kernel(mDh, mG, mU, mOffs, mTok, mTokS, mKm, mKmS).launch(grid=[cutlass.min(total, self.num_ctas), 1, 1], block=[THREADS, 1, 1], stream=stream)
 
     def _issue(self, t: Int32, stage_addr: Int32, total: Int32, tid: Int32, in_base: list):
-        """cp.async tile ``t`` (zero-filled when out of range); dh has row stride N, g / u 2N."""
+        """cp.async tile t (zero-filled when out of range); dh has row stride N, g / u 2N."""
         N = self.N
         ok = Int32(t < total)
         rb, cb = self._tile(t)
@@ -560,10 +513,6 @@ class SiluMulQuantGU(SiluMulQuant):
         cute.arch.cp_async_wait_group(0)
 
 
-# ---------------------------------------------------------------------------
-# Host wrappers
-# ---------------------------------------------------------------------------
-
 _compiled: dict = {}
 _compiled_gu: dict = {}
 
@@ -603,36 +552,25 @@ def _get_kernel_gu(N: int, backward: bool, device: torch.device) -> object:
 
 
 def alloc_rowwise_kmajor_outputs(M: int, N: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The four outputs of ``fp8cast_rowwise_kmajor`` of an (M, N) input, both scales MN-major, each
-    its own allocation (they have different lifetimes: the rowwise pair feeds the next GEMM, the
-    K-major pair waits for wgrad)."""
+    """The four outputs of fp8cast_rowwise_kmajor of an (M, N) input, both scales MN-major, each its
+    own allocation (different lifetimes: the rowwise pair feeds the next GEMM, the K-major pair waits
+    for wgrad)."""
     nb = (N + BLOCK - 1) // BLOCK
     return (torch.empty((M, N), dtype=torch.float8_e4m3fn, device=device), mn_major_scale(M, nb, device), torch.empty(M * N, dtype=torch.float8_e4m3fn, device=device), mn_major_scale(N, M // BLOCK, device))
 
 
 def silu_mul_quant_fusable(N: int, grouped_mm_offs: torch.Tensor) -> bool:
-    """Shapes the fused kernel handles; others take the (bit-identical) unfused path."""
+    """Shapes the fused kernel handles; others take the bit-identical unfused path."""
     return N % VEC == 0 and 0 < grouped_mm_offs.shape[0] <= G_CAP
 
 
 def silu_mul_quant_gu_fusable(N: int, M: int, grouped_mm_offs: torch.Tensor) -> bool:
-    """Shapes the fused gate_up kernel handles; others take the (bit-identical) unfused path."""
+    """Shapes the fused gate_up kernel handles; others take the bit-identical unfused path."""
     return N % BLOCK == 0 and M % BLOCK == 0 and 0 < grouped_mm_offs.shape[0] <= G_CAP
 
 
 def silu_mul_quant_fwd_sm90(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``fp8cast_rowwise_kmajor(silu_mul(g, u), grouped_mm_offs)`` without materializing h.
-
-    Args:
-        g, u: BF16 (M, N) gate / up projections, M a multiple of 128.
-        grouped_mm_offs: int32 (num_groups,) cumulative row counts, multiples of 128,
-            last entry == M.
-
-    Returns:
-        (tok_fp8, tok_scale, kmajor_fp8, kmajor_scale), bit-identical to the unfused sequence;
-        both scales MN-major. Shapes the fused kernel does not take run that sequence:
-        ``silu_mul_fwd`` then ``fp8cast_rowwise_kmajor_sm90``.
-    """
+    """fp8cast_rowwise_kmajor(silu_mul_fwd(g, u), grouped_mm_offs) without writing h."""
     M, N = g.shape
     if M != 0 and N != 0 and not silu_mul_quant_fusable(N, grouped_mm_offs):
         return fp8cast_rowwise_kmajor_sm90(silu_mul_fwd(g, u), grouped_mm_offs)
@@ -644,17 +582,7 @@ def silu_mul_quant_fwd_sm90(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: t
 
 
 def silu_mul_bwd_quant_sm90(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """``fp8cast_rowwise_kmajor`` of the SwiGLU gradients without materializing them.
-
-    Args:
-        dh: BF16 (M, N) gradient of ``silu(g) * u``.
-        g, u: BF16 (M, N) saved gate / up projections.
-        grouped_mm_offs: as in :func:`silu_mul_quant_fwd_sm90`.
-
-    Returns:
-        (dg_quant, du_quant), each the 4-tuple ``fp8cast_rowwise_kmajor`` returns for the BF16
-        ``grad_gate`` / ``grad_up`` of ``silu_mul``'s backward, bit for bit.
-    """
+    """fp8cast_rowwise_kmajor of each gradient of silu_mul_bwd(dh, g, u) without writing them."""
     M, N = g.shape
     if M == 0 or N == 0:
         return (alloc_rowwise_kmajor_outputs(M, N, g.device), alloc_rowwise_kmajor_outputs(M, N, g.device))
@@ -668,7 +596,7 @@ def silu_mul_bwd_quant_sm90(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, 
 
 
 def silu_mul_quant_gu_fwd_sm90(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``fp8cast_rowwise_kmajor(silu_mul(gu[:, :N], gu[:, N:]), offs)`` for ``gu`` (M, 2N)."""
+    """fp8cast_rowwise_kmajor(silu_mul_fwd(gu[:, :N], gu[:, N:]), offs) for gu (M, 2N)."""
     M, N = gu.shape[0], gu.shape[1] // 2
     if M == 0:
         return alloc_rowwise_kmajor_outputs(0, N, gu.device)
@@ -681,8 +609,7 @@ def silu_mul_quant_gu_fwd_sm90(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) 
 
 
 def silu_mul_bwd_quant_gu_sm90(dh: torch.Tensor, gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``fp8cast_rowwise_kmajor(cat([dg, du], 1), offs)`` of the SwiGLU gradients, ``gu`` (M, 2N)
-    the saved gate_up output and ``dh`` (M, N) the gradient of ``silu(g) * u``."""
+    """fp8cast_rowwise_kmajor(cat([dg, du], 1), offs) of the SwiGLU gradients of gu (M, 2N)."""
     M, N = gu.shape[0], gu.shape[1] // 2
     if M == 0:
         return alloc_rowwise_kmajor_outputs(0, 2 * N, gu.device)

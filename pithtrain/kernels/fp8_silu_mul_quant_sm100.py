@@ -1,8 +1,6 @@
 """
-SwiGLU followed by the rowwise + K-major FP8 quantization of its consumers, unfused: the Triton
-``silu_mul`` kernels then ``fp8cast_rowwise_kmajor_sm100``. The ``fp8_silu_mul_quant`` feature's
-SM100 implementation, and the sequence ``fp8_silu_mul_quant_sm90`` fuses bit for bit. Scales come
-back row-major.
+SM100 fp8_silu_mul_quant: the unfused sequence silu_mul_fwd / silu_mul_bwd, then
+fp8cast_rowwise_kmajor_sm100. Scales are row-major.
 """
 
 import torch
@@ -16,7 +14,7 @@ _BLOCK = 128
 
 
 def _empty(M: int, N: int, device: torch.device) -> tuple[torch.Tensor, ...]:
-    """The four outputs of ``fp8cast_rowwise_kmajor_sm100`` for an empty (M, N) input."""
+    """The four outputs of fp8cast_rowwise_kmajor_sm100 for an empty (M, N) input."""
     return (
         torch.empty((M, N), dtype=torch.float8_e4m3fn, device=device),
         torch.empty((M, (N + _BLOCK - 1) // _BLOCK), dtype=torch.float32, device=device),
@@ -26,7 +24,7 @@ def _empty(M: int, N: int, device: torch.device) -> tuple[torch.Tensor, ...]:
 
 
 def silu_mul_quant_fwd_sm100(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``fp8cast_rowwise_kmajor_sm100(silu_mul_fwd(g, u), grouped_mm_offs)``."""
+    """fp8cast_rowwise_kmajor_sm100(silu_mul_fwd(g, u), grouped_mm_offs)."""
     M, N = g.shape
     if M == 0 or N == 0:
         return _empty(M, N, g.device)
@@ -34,7 +32,7 @@ def silu_mul_quant_fwd_sm100(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: 
 
 
 def silu_mul_bwd_quant_sm100(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-    """``fp8cast_rowwise_kmajor_sm100`` of each of the BF16 SwiGLU gradients ``silu_mul_bwd``."""
+    """fp8cast_rowwise_kmajor_sm100 of each gradient of silu_mul_bwd(dh, g, u)."""
     M, N = g.shape
     if M == 0 or N == 0:
         return _empty(M, N, g.device), _empty(M, N, g.device)
@@ -43,7 +41,7 @@ def silu_mul_bwd_quant_sm100(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor,
 
 
 def silu_mul_quant_gu_fwd_sm100(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """:func:`silu_mul_quant_fwd_sm100` of the halves of a fused gate_up output ``gu`` (M, 2N)."""
+    """silu_mul_quant_fwd_sm100 of the halves of a fused gate_up output gu (M, 2N)."""
     M, N = gu.shape[0], gu.shape[1] // 2
     if M == 0:
         return _empty(0, N, gu.device)
@@ -52,7 +50,7 @@ def silu_mul_quant_gu_fwd_sm100(gu: torch.Tensor, grouped_mm_offs: torch.Tensor)
 
 
 def silu_mul_bwd_quant_gu_sm100(dh: torch.Tensor, gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``fp8cast_rowwise_kmajor_sm100(cat([dg, du], 1))`` of the SwiGLU gradients of ``gu``."""
+    """fp8cast_rowwise_kmajor_sm100(cat([dg, du], 1)) of the SwiGLU gradients of gu."""
     M, N = gu.shape[0], gu.shape[1] // 2
     if M == 0:
         return _empty(0, 2 * N, gu.device)

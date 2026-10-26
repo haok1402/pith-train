@@ -1,28 +1,12 @@
 """
-The dense chunked gated delta rule through FLA's kernels launched directly with pinned configs
-(SM90).
-The custom ops around these launch sequences are ``pithtrain.operators.gated_delta_rule``.
+FLA's dense chunked gated delta rule (chunk size 64) launched directly on SM90 with the launch
+configs FLA's autotuner picks on H200, skipping FLA's per-launch Python wrappers.
 
-FLA wraps every kernel as Heuristics(CachedAutotuner(JITFunction)) behind a backend-dispatch
-wrapper, and that Python layer costs ~60-90 us per launch (autotune key build, heuristics,
-dispatch), 16 launches per forward + backward. Here the same JITFunctions are launched with the
-heuristic constexprs and the autotuned launch config passed explicitly (~20 us per launch). The op
-stays opaque to torch.compile on purpose: an Inductor-launched copy of a user kernel is compiled
-differently and is not bit-identical, and it launches no cheaper.
-
-The launch order, allocations, in-place accumulations and dtypes reproduce FLA 0.5.2's
-chunk_gated_delta_rule_fwd / chunk_gated_delta_rule_bwd (fla/ops/gated_delta_rule/chunk.py) on its
-dense path: cu_seqlens, initial and final state, CP context and the in-kernel gate all absent,
-chunk size 64. The output is therefore bit-identical as long as the pinned configs are the ones
-FLA's autotuner picks at these shapes; none of the autotune keys holds the sequence length, so one
-config per kernel covers every length. The configs were recorded on H200
-(kda-task/profile/fla-config-manifest.json); any other FLA or Triton version, GPU architecture or
-kernel signature leaves the dense path to the autotuned custom op instead
-(pinned_launch_supported).
-
-Grouped value heads (more value than key heads) run on unrepeated q / k, which the kernels index
-per group; the backward then sums the q / k gradients over each group in the order a
-repeat_interleave of q / k would, so the result matches repeating them bit for bit.
+The launch order, allocations, in-place accumulations and dtypes are those of FLA 0.5.2's
+chunk_gated_delta_rule_fwd / _bwd on the dense path (no cu_seqlens, no initial or final state), so
+the outputs are bit-identical while the pinned configs are FLA's picks (pinned_launch_supported).
+The ops stay opaque to torch.compile: an Inductor-launched copy of a Triton kernel is not
+bit-identical. Grouped value heads run on unrepeated q / k, which the kernels index per group.
 """
 
 import fla
@@ -44,8 +28,7 @@ BT = 64  # chunk size
 BC = 16  # sub-chunk of the fused kkt + triangular solve, fixed by FLA at BT = 64
 
 # Launch configs FLA's autotuner selects on H200 at H = HV = 32, K = V = 128 (bf16 q/k/v/beta,
-# fp32 gate), recorded with FLA 0.5.2 / Triton 3.7.1. Wrapper-fixed block sizes (BK/BV of the
-# w/u, dv_local, dqkwg and WY-backward kernels) are FLA's own constants on Hopper.
+# fp32 gate). The BK / BV the launches below pass explicitly are FLA's own constants on Hopper.
 VERSIONS = {"fla": "0.5.2", "triton": "3.7.1"}
 CONFIGS = {
     "cumsum_fwd": dict(num_warps=1, num_stages=3),
@@ -103,12 +86,10 @@ _keyed: dict[str, tuple[list[int], list[int]]] = {}
 
 def _launch(name: str, grid: tuple, **kwargs) -> None:
     """
-    jit[grid](**kwargs) with the compiled kernel cached per launch site. Triton's own run binds
-    the arguments and rebuilds the specialization key in Python on every launch; here the key is
-    what it specializes on for these kernels (the 16-byte alignment of each tensor and the value of
-    every other argument but the sequence length T, which is do_not_specialize, and float scalars,
-    which are never specialized), plus each tensor's dtype and the device, and a cached kernel goes
-    straight to its C launcher, on that device's current stream, with the arguments Triton passes.
+    jit[grid](**kwargs), with the compiled kernel cached and launched straight through its C
+    launcher on the device's current stream. The cache key is what Triton specializes these kernels
+    on: each tensor's dtype and 16-byte alignment, the value of every other argument except T
+    (do_not_specialize) and float scalars (never specialized), plus the device and launch config.
     """
     jit = _jit(name)
     args = [kwargs[n] for n in jit.arg_names]
@@ -119,7 +100,7 @@ def _launch(name: str, grid: tuple, **kwargs) -> None:
     tensors, values = _keyed[name]
     # A float scalar keys on its type only (None, e.g. an absent scale, is a constexpr).
     device = args[tensors[0]].device.index
-    key = (name, device, kwargs["num_warps"], kwargs["num_stages"], *(float if args[i].__class__ is float else args[i] for i in values), *((args[i].dtype, args[i].data_ptr() & 15) for i in tensors))  # fmt: skip
+    key = (name, device, kwargs["num_warps"], kwargs["num_stages"], *(float if args[i].__class__ is float else args[i] for i in values), *((args[i].dtype, args[i].data_ptr() & 15) for i in tensors))
     kernel = _compiled.get(key)
     if kernel is None:
         _compiled[key] = jit[grid](**kwargs)
@@ -128,7 +109,7 @@ def _launch(name: str, grid: tuple, **kwargs) -> None:
     stream = torch._C._cuda_getCurrentRawStream(device)
     enter, exit_ = knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook
     metadata = None if enter is None else kernel.launch_metadata(grid, stream, *args)
-    kernel.run(grid[0], grid[1], grid[2], stream, kernel.function, kernel.packed_metadata, metadata, enter, exit_, *args)  # fmt: skip
+    kernel.run(grid[0], grid[1], grid[2], stream, kernel.function, kernel.packed_metadata, metadata, enter, exit_, *args)
 
 
 _supported: dict[int, bool] = {}
@@ -137,10 +118,9 @@ _supported: dict[int, bool] = {}
 @torch.compiler.assume_constant_result
 def pinned_launch_supported(device_index: int) -> bool:
     """
-    Whether the pinned configs apply: the recorded FLA and Triton versions, SM90, and kernels
-    whose wrapper structure and parameter lists match the launches written here. Evaluated once
-    per device, and a constant to torch.compile, which calls it instead of tracing into the
-    kernel objects.
+    Whether the pinned configs apply on this device: the recorded FLA and Triton versions, SM90,
+    and FLA kernels whose wrappers and parameter lists match the launches here. Cached per device;
+    a constant to torch.compile.
     """
     if device_index not in _supported:
         _supported[device_index] = _check_supported(device_index)
@@ -168,22 +148,22 @@ def _cumsum(s: torch.Tensor, reverse: bool) -> torch.Tensor:
         s=s, o=o, scale=None if reverse else RCP_LN2, cu_seqlens=None, chunk_indices=None, T=T,
         B=B, H=H, BT=BT, REVERSE=reverse, HAS_SCALE=not reverse, IS_VARLEN=False,
         HEAD_FIRST=False, **config,
-    )  # fmt: skip
+    )
     return o
 
 
-def _w_u(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:  # fmt: skip
+def _w_u(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """recompute_w_u_fwd."""
     B, T, H, K, HV, V = *k.shape, *v.shape[2:]
     w, u = k.new_empty(B, T, HV, K), torch.empty_like(v)
     _launch("w_u", (triton.cdiv(T, BT), B * HV),
         k=k, v=v, beta=beta, w=w, u=u, A=A, g=g, cu_seqlens=None, chunk_indices=None, T=T, H=H,
         HV=HV, K=K, V=V, BT=BT, BK=64, BV=64, USE_G=True, IS_VARLEN=False, **CONFIGS["w_u"],
-    )  # fmt: skip
+    )
     return w, u
 
 
-def _fwd_h(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:  # fmt: skip
+def _fwd_h(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """chunk_gated_delta_rule_fwd_h: per-chunk states h and the transformed values."""
     B, T, H, K, HV, V = *k.shape, *u.shape[2:]
     h, v_new = k.new_empty(B, triton.cdiv(T, BT), HV, K, V), torch.empty_like(u)
@@ -193,28 +173,23 @@ def _fwd_h(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g: torch.Tensor) -
         chunk_offsets=None, T=T, H=H, HV=HV, K=K, V=V, BT=BT, USE_G=True, USE_GK=False,
         USE_INITIAL_STATE=False, STORE_FINAL_STATE=False, SAVE_NEW_VALUE=True,
         STATE_V_FIRST=False, IS_VARLEN=False, **config,
-    )  # fmt: skip
+    )
     return h, v_new
 
 
-def chunk_gdr_fwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:  # fmt: skip
+def chunk_gdr_fwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    FLA's dense chunked gated delta rule forward (``chunk_gated_delta_rule_fwd``, chunk size 64,
-    scale ``K ** -0.5``, no initial or final state, no ``cu_seqlens``): fresh ``(o, g_cum, A)``.
+    Dense chunked gated delta rule forward (chunk size 64, scale K ** -0.5, no initial or final
+    state): fresh (o, g_cum, A).
 
-    - ``q``, ``k``: bf16 ``(B, T, H, K)`` contiguous (unrepeated key heads); ``v``: bf16
-      ``(B, T, HV, V)``; ``g``: fp32 ``(B, T, HV)``, the raw per-step log gate; ``beta``: bf16
-      ``(B, T, HV)``; HV a multiple of H, value head ``j`` reading key head ``j // (HV / H)``.
-      None is modified.
-    - ``o``: bf16 ``(B, T, HV, V)``; ``g_cum``: fp32 ``(B, T, HV)``, FLA's chunk-local cumulative
-      gate; ``A``: bf16 ``(B, T, HV, 64)``, the solved WY matrix. ``g_cum`` and ``A`` are what
-      :func:`chunk_gdr_bwd_pinned` takes.
-    - Bit-identical to FLA 0.5.2's ``chunk_gated_delta_rule_fwd`` with q / k repeat-interleaved
-      to HV heads (the same kernels in the same order with the configs its autotuner picks);
-      deterministic.
+    q, k: bf16 (B, T, H, K) contiguous, unrepeated key heads. v: bf16 (B, T, HV, V). g: fp32
+    (B, T, HV), the raw log gate. beta: bf16 (B, T, HV). HV is a multiple of H; value head j reads
+    key head j // (HV / H). Inputs are not modified.
 
-    Only where :func:`gated_delta_rule_pinned_supported` (q, k, v, g, beta) is True (SM90, the
-    recorded FLA / Triton versions, B == 1, HV == 32, K == V == 128); importing the name loads FLA.
+    o: bf16 (B, T, HV, V). g_cum: fp32 (B, T, HV), the chunk-local cumulative gate. A: bf16
+    (B, T, HV, 64), the solved WY matrix. g_cum and A are inputs of chunk_gdr_bwd_pinned.
+    Bit-identical to FLA 0.5.2's chunk_gated_delta_rule_fwd on q / k repeat-interleaved to HV
+    heads; deterministic. Only where gated_delta_rule_pinned_supported is True.
     """
     B, T, H, K, HV, V = *k.shape, *v.shape[2:]
     NT = triton.cdiv(T, BT)
@@ -224,7 +199,7 @@ def chunk_gdr_fwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: t
     _launch("kkt_solve", (NT, B * HV),
         k=k, g=g_cum, beta=beta, A=A, cu_seqlens=None, chunk_indices=None, T=T, H=H, HV=HV, K=K,
         BT=BT, BC=BC, USE_G=True, IS_VARLEN=False, **CONFIGS["kkt_solve"],
-    )  # fmt: skip
+    )
     w, u = _w_u(k, v, beta, A, g_cum)
     h, v_new = _fwd_h(k, w, u, g_cum)
     o = torch.empty_like(v_new)
@@ -233,26 +208,22 @@ def chunk_gdr_fwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: t
         q=q, k=k, v=v_new, h=h, g=g_cum, g_gamma=None, o=o, cu_seqlens=None, chunk_indices=None,
         scale=K**-0.5, T=T, H=H, HV=HV, K=K, V=V, BT=BT, USE_G=True, USE_G_GAMMA=False,
         STATE_V_FIRST=False, IS_VARLEN=False, **config,
-    )  # fmt: skip
+    )
     return o, g_cum, A
 
 
-def chunk_gdr_bwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cum: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:  # fmt: skip
+def chunk_gdr_bwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cum: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    FLA's dense chunked gated delta rule backward (``chunk_gated_delta_rule_bwd``): fresh
-    ``(dq, dk, dv, dg, dbeta)``.
+    Backward of chunk_gdr_fwd_pinned: fresh (dq, dk, dv, dg, dbeta).
 
-    - ``q``, ``k``, ``v``, ``beta``: the forward inputs of :func:`chunk_gdr_fwd_pinned`;
-      ``g_cum``, ``A``: its outputs; ``do``: bf16 ``(B, T, HV, V)``, the gradient of ``o``. None is
-      modified.
-    - ``dq``, ``dk``: ``(B, T, HV, K)`` in q's / k's dtype, per value head (the caller sums each
-      group of ``HV / H`` heads, in ``repeat_interleave`` order, to get the key-head gradients);
-      ``dv`` like ``v``; ``dg``: fp32 ``(B, T, HV)``, with respect to the raw gate ``g``;
-      ``dbeta`` like ``beta``.
-    - Bit-identical to FLA 0.5.2's ``chunk_gated_delta_rule_bwd`` on repeat-interleaved q / k;
-      deterministic.
+    q, k, v, beta: the forward inputs; g_cum, A: the forward outputs; do: bf16 (B, T, HV, V), the
+    gradient of o. Inputs are not modified.
 
-    Only where :func:`gated_delta_rule_pinned_supported` is True, as for the forward.
+    dq, dk: (B, T, HV, K) in q's / k's dtype, per value head (the caller sums each group of HV / H
+    heads, in repeat_interleave order, for the key-head gradients). dv like v; dg: fp32 (B, T, HV),
+    with respect to the raw gate g; dbeta like beta. Bit-identical to FLA 0.5.2's
+    chunk_gated_delta_rule_bwd on repeat-interleaved q / k; deterministic. Only where
+    gated_delta_rule_pinned_supported is True.
     """
     B, T, H, K, HV, V = *k.shape, *v.shape[2:]
     NT, scale = triton.cdiv(T, BT), K**-0.5
@@ -263,7 +234,7 @@ def chunk_gdr_bwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cu
         q=q, k=k, g=g_cum, g_gamma=None, A=None, do=do, dv=dv_local, cu_seqlens=None,
         chunk_indices=None, scale=scale, T=T, H=H, HV=HV, K=K, V=V, BT=BT, BK=128, BV=128,
         USE_G=True, USE_G_GAMMA=False, USE_A=False, IS_VARLEN=False, **CONFIGS["dv_local"],
-    )  # fmt: skip
+    )
     dh, du = q.new_empty(B, NT, HV, K, V), torch.empty_like(dv_local)
     config = CONFIGS["bwd_dhu"]
     _launch("bwd_dhu", (triton.cdiv(V, config["BV"]), B * HV),
@@ -271,7 +242,7 @@ def chunk_gdr_bwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cu
         cu_seqlens=None, chunk_offsets=None, scale=scale, T=T, H=H, HV=HV, K=K, V=V, BT=BT,
         USE_G=True, USE_GK=False, USE_INITIAL_STATE=False, USE_FINAL_STATE_GRADIENT=False,
         STATE_V_FIRST=False, IS_VARLEN=False, **config,
-    )  # fmt: skip
+    )
     dq, dk, dw = q.new_empty(B, T, HV, K), k.new_empty(B, T, HV, K), torch.empty_like(w)
     dg_parts = torch.empty(1, *g_cum.shape, dtype=torch.float32, device=g_cum.device)
     _launch("dqkwg", (1, NT, B * HV),
@@ -279,39 +250,37 @@ def chunk_gdr_bwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cu
         dg=dg_parts, cu_seqlens=None, chunk_indices=None, scale=scale, B=B, T=T, H=H, HV=HV, K=K,
         V=V, BT=BT, BK=128, BV=128, USE_G=True, USE_G_GAMMA=False, USE_DW=True,
         STATE_V_FIRST=False, IS_VARLEN=False, **CONFIGS["dqkwg"],
-    )  # fmt: skip
+    )
     dg = dg_parts.sum(0)
-    dk2, dv, db, dg2 = k.new_empty(B, T, HV, K), torch.empty_like(v), torch.empty_like(beta), torch.empty_like(g_cum)  # fmt: skip
+    dk2, dv, db, dg2 = k.new_empty(B, T, HV, K), torch.empty_like(v), torch.empty_like(beta), torch.empty_like(g_cum)
     _launch("wy_bwd", (NT, B * HV),
         k=k, v=v, beta=beta, g=g_cum, A=A, dw=dw, du=du, dk=dk2, dv=dv, db=db, dg=dg2,
         cu_seqlens=None, chunk_indices=None, T=T, H=H, HV=HV, K=K, V=V, BT=BT, BK=64, BV=64,
         USE_G=True, IS_VARLEN=False, **CONFIGS["wy_bwd"],
-    )  # fmt: skip
+    )
     dk.add_(dk2)
     dg.add_(dg2)
     dg = _cumsum(dg, reverse=True)
     return dq, dk, dv, dg, db
 
 
-def pinned_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:  # fmt: skip
+def pinned_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
     """
-    Whether a call has the geometry the configs were recorded at (batch 1, 32 value heads, key and
-    value head dim 128, bf16 q / k / v / beta and an fp32 gate, value heads a multiple of key
-    heads): only there are they the picks of FLA's autotuner (whose keys hold B for the cumsum, and
-    H, HV, K and V), and the backward's single K block assumes K <= 128.
+    Whether a call has the geometry the configs were recorded at: B == 1, HV == 32, HV a multiple
+    of H, K == V == 128, bf16 q / k / v / beta and an fp32 gate. FLA's autotune keys hold B (cumsum),
+    H, HV, K and V, and the backward's single K block needs K <= 128.
     """
     B, _, H, K = k.shape
     HV, V = v.shape[2:]
     bf = torch.bfloat16
-    return B == 1 and HV == 32 and HV % H == 0 and K == 128 and V == 128 and q.shape == k.shape and q.dtype == k.dtype == v.dtype == beta.dtype == bf and g.dtype == torch.float32  # fmt: skip
+    return B == 1 and HV == 32 and HV % H == 0 and K == 128 and V == 128 and q.shape == k.shape and q.dtype == k.dtype == v.dtype == beta.dtype == bf and g.dtype == torch.float32
 
 
-def gated_delta_rule_pinned_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:  # fmt: skip
+def gated_delta_rule_pinned_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
     """
-    Whether :func:`chunk_gdr_fwd_pinned` / :func:`chunk_gdr_bwd_pinned` apply to this call: the
-    recorded geometry (:func:`pinned_shapes`) on a device and installation where the pinned
-    configs are FLA's autotuned picks (:func:`pinned_launch_supported`: SM90, the recorded FLA and
-    Triton versions). Otherwise the caller keeps FLA's autotuned entry points. A constant per
-    device and geometry, so torch.compile evaluates it rather than tracing into it.
+    Whether chunk_gdr_fwd_pinned / chunk_gdr_bwd_pinned apply to this call: the recorded geometry
+    (pinned_shapes) on SM90 with the recorded FLA and Triton versions (pinned_launch_supported).
+    Otherwise the caller uses FLA's autotuned entry points. Constant per device and geometry, so
+    torch.compile evaluates it rather than tracing into it.
     """
     return pinned_shapes(q, k, v, g, beta) and pinned_launch_supported(q.device.index)

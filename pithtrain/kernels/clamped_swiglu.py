@@ -1,12 +1,7 @@
 """
-Clamped SwiGLU of OpenAI's gpt-oss, ``(uc + 1) * gc * sigmoid(alpha * gc)`` with
-``gc = min(gate, L)`` and ``uc = clamp(up, +/-L)``, as Triton kernels and their launchers.
-``gate`` and ``up`` are the even/odd columns of an interleaved ``gate_up [M, 2N]`` input.
-
-One kernel each for forward and backward; the backward recomputes ``gc``, ``uc`` and the sigmoid,
-and the clamp branches contribute zero gradient at saturation. Both architectures run them. The
-autograd op is ``pithtrain.operators.clamped_swiglu``; the fused SM90 FP8 quantization
-(``fp8_clamped_swiglu_quant_sm90``) reproduces their arithmetic bit for bit.
+gpt-oss's clamped SwiGLU, (uc + 1) * gc * sigmoid(alpha * gc) with gc = min(gate, limit) and
+uc = clamp(up, -limit, limit), forward and backward Triton kernels over an interleaved gate_up
+(M, 2N). Both architectures run them.
 """
 
 from __future__ import annotations
@@ -20,8 +15,7 @@ __all__ = ["BLOCK_SIZE", "clamped_swiglu_bwd", "clamped_swiglu_fwd"]
 
 @triton.jit
 def _clamped_swiglu_fwd_kernel(gate_up_ptr, out_ptr, n_elements, alpha, limit, BLOCK_SIZE: tl.constexpr):
-    # offs indexes the flat (M, N) output; interleaved gate_up pulls
-    # gate from 2*offs and up from 2*offs + 1.
+    # offs indexes the flat (M, N) output; gate is at 2 * offs and up at 2 * offs + 1.
     block_start = tl.program_id(0).to(tl.int64) * BLOCK_SIZE
     offs = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offs < n_elements
@@ -44,9 +38,7 @@ def _clamped_swiglu_fwd_kernel(gate_up_ptr, out_ptr, n_elements, alpha, limit, B
 
 @triton.jit
 def _clamped_swiglu_bwd_kernel(grad_out_ptr, gate_up_ptr, grad_gate_up_ptr, n_elements, alpha, limit, BLOCK_SIZE: tl.constexpr):
-    # grad_uc = do * glu
-    # grad_gc = do * (uc + 1) * sigma * (1 + alpha * gc * (1 - sigma))
-    # Clamp-aware: grad_g = grad_gc if g <= L else 0; grad_u = grad_uc if |u| <= L else 0.
+    # A saturated clamp passes no gradient; the boundary itself does, as torch.clamp.
     block_start = tl.program_id(0).to(tl.int64) * BLOCK_SIZE
     offs = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offs < n_elements
@@ -82,16 +74,12 @@ BLOCK_SIZE = 1024
 
 def clamped_swiglu_fwd(gate_up: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
     """
-    gpt-oss's clamped SwiGLU of an interleaved gate_up: a fresh contiguous ``(M, N)`` tensor in
-    ``gate_up``'s dtype, ``out = (uc + 1) * gc * sigmoid(alpha * gc)`` with ``gate =
-    gate_up[:, 0::2]``, ``up = gate_up[:, 1::2]``, ``gc = min(gate, limit)``, ``uc = clamp(up,
-    -limit, limit)``.
+    Clamped SwiGLU of an interleaved gate_up: a new contiguous (M, N) tensor in gate_up's dtype,
+    (uc + 1) * gc * sigmoid(alpha * gc) with gate = gate_up[:, 0::2], up = gate_up[:, 1::2],
+    gc = min(gate, limit), uc = clamp(up, -limit, limit).
 
-    - ``gate_up``: 2-D ``(M, 2N)`` contiguous, bf16 (any float dtype); not modified. ``alpha``,
-      ``limit``: Python floats (gpt-oss: 1.702, 7.0).
-    - Computed in fp32 (Triton's ``sigmoid``) and rounded once to the input dtype; agrees with
-      the PyTorch fp32 formula to fp32 rounding before that final rounding. Deterministic; same
-      kernel on both architectures. M == 0 or N == 0 launches nothing.
+    gate_up is contiguous (M, 2N), bf16 (any float dtype). alpha and limit are Python floats
+    (gpt-oss: 1.702, 7.0). Computed in fp32 and rounded once to the input dtype. Deterministic.
     """
     assert gate_up.dim() == 2, f"gate_up must be 2-D, got shape {gate_up.shape}"
     M, two_n = gate_up.shape
@@ -112,17 +100,13 @@ def clamped_swiglu_fwd(gate_up: torch.Tensor, alpha: float, limit: float) -> tor
 
 def clamped_swiglu_bwd(grad_output: torch.Tensor, gate_up: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
     """
-    Gradient of :func:`clamped_swiglu_fwd` with respect to the interleaved ``gate_up``: a fresh
-    ``(M, 2N)`` tensor like ``gate_up``, gate gradients at the even and up gradients at the odd
-    columns.
+    Gradient of clamped_swiglu_fwd with respect to the interleaved gate_up: a new (M, 2N) tensor
+    like gate_up, gate gradients at even and up gradients at odd columns.
 
-    - ``grad_output``: ``(M, N)`` contiguous, ``gate_up``'s dtype; ``gate_up``: the saved
-      ``(M, 2N)`` contiguous forward input. Neither is modified.
-    - ``d_up = grad_output * gc * sigmoid(alpha * gc)``, zero where ``|up| > limit``; ``d_gate =
-      grad_output * (uc + 1) * s * (1 + alpha * gc * (1 - s))`` with ``s = sigmoid(alpha * gc)``,
-      zero where ``gate > limit`` (the clamp boundary itself passes the gradient, as
-      ``torch.clamp`` does). fp32 arithmetic, each rounded once to the dtype. Deterministic;
-      same kernel on both architectures.
+    grad_output is contiguous (M, N) in gate_up's dtype; gate_up is the saved contiguous (M, 2N)
+    forward input. The gate gradient is zero where gate > limit, the up gradient zero where
+    |up| > limit (the boundary itself passes the gradient, as torch.clamp does). fp32 arithmetic,
+    rounded once to the dtype. Deterministic.
     """
     assert grad_output.shape[0] == gate_up.shape[0]
     assert grad_output.shape[1] * 2 == gate_up.shape[1]

@@ -1,40 +1,12 @@
 """
-CuTe-DSL (SM90) ports of the weight-side 128x128 block-scaled FP8 quantization kernels, the
-``fp8_weight_quant`` feature's SM90 implementation.
+CuTe-DSL (SM90) kernels of the fp8_weight_quant feature, bit-identical to the Triton ones in
+fp8_weight_quant_sm100: the blockwise transposes (not wired into the picker; tests and benchmarks
+call them directly), the FP8 parameter all-gather kernels, and one-launch variants of the shard
+amax and the scales over a fixed list of tensors.
 
-Drop-in replacements, bit-identical to the Triton kernels they port (``*_sm100``):
-
-- ``fp8cast_blockwise_transpose_sm90`` / ``fp8cast_blockwise_transpose_batched_sm90``
-  (``pithtrain.kernels.fp8_weight_quant_sm100``): bf16 (or fp32) weight -> FP8 + scale grid, plus the
-  transposed FP8 + transposed scales, in one read of the weight.
-- ``fp8_shard_amax_sm90`` / ``fp8_shard_cast_sm90`` / ``fp8_scales_sm90`` / ``fp8_pack_transpose_sm90``
-  (``pithtrain.modules.fp8_param_gather``): the FP8 parameter all-gather kernels.
-- ``fp8_shard_amax_multi_sm90`` / ``fp8_scales_multi_sm90``: one launch over a list of tensors (prototype).
-
-The blockwise-transpose ports are exercised only by the tests: the ``fp8_weight_quant`` picker
-runs the Triton kernels on both architectures.
-
-Blockwise and pack-transpose kernels: one CTA per 128x128 tile. In the blockwise kernels 256
-threads each own an 8x8 sub-block (warp = 4 row groups x 8 column lanes, 8 warps = 4 x 2), load
-it with 16-byte loads, and transpose it in registers with ``prmt``. With >= 256 tiles both FP8
-tiles are staged in a swizzled 32 KB shared buffer and written back with 16-byte stores (the
-Triton kernel stores the transposed tile byte by byte); small grids store each thread's 8-byte
-rows directly, which saves the barrier. Pack-transpose uses 128 threads of 8 rows x 16 bytes:
-16-byte loads and row-major stores, transposed tile staged in shared memory. The shard kernels
-need no transpose and map a warp to one 128-column tile row (16 bytes of fp32 per lane), so a
-shard holding a few rows of a tile still spreads them over all 8 warps. Loads are plain
-``ld.global`` (``.nc`` measured slower here) and ordered ahead of all stores.
-
-Numerics follow ``compute_fp8_scale`` (SM90 branch) exactly: the tile amax is taken on the
-magnitude bits (``|x|`` of finite non-negative floats orders like its bit pattern), clamped to
-1e-4, multiplied by fp32(1/448), rounded up to a power of 2 with integer ops, and the reciprocal
-is an exponent flip; the cast is ``mul.rn.f32`` then ``cvt.rn.satfinite.e4m3x2.f32``, the
-instruction Triton emits. NaN inputs are out of contract: the integer max orders a NaN's bits
-above inf, where Triton's float max ignores it, so tiles containing NaN may differ. Inf matches.
-
-Memory is addressed through raw 64-bit addresses and inline PTX loads and stores, so vector
-widths and predication are explicit. Each wrapper compiles once per (kernel, dtype, alignment)
-key with TVM-FFI and dynamic shapes, and passes torch tensors straight to the compiled function.
+Numerics follow compute_fp8_scale (SM90 branch) exactly. The tile amax is an integer max over the
+magnitude bits (|x| of finite non-negative floats orders like its bit pattern), so a NaN orders
+above inf where Triton's float max ignores it: NaN inputs are out of contract.
 """
 
 from typing import Optional, Sequence
@@ -52,21 +24,11 @@ from pithtrain.kernels.cute_compile_sm90 import TORCH2CUTE, fake_stream
 __all__ = ["fp8cast_blockwise_transpose_sm90", "fp8cast_blockwise_transpose_batched_sm90", "fp8_shard_amax_sm90", "fp8_shard_cast_sm90", "fp8_scales_sm90", "fp8_pack_transpose_sm90", "fp8_shard_amax_multi_sm90", "fp8_scales_multi_sm90"]
 
 BLOCK = 128
-# Global-load flavour; plain ld.global measured 2-6% faster than .nc variants on H200.
-_LD_KIND = "plain"
-# Override of the store path per kernel family, e.g. {"bt": "v8", "pack": "v8"}; empty in
-# training, set by tests to exercise the alternative paths.
-_FORCE: dict[str, str] = {}
 # Below this many tiles the extra barrier of the shared-memory store path costs more than its
-# wider stores save (measured on H200: 64 and 30 tiles favour "v8", 430+ favour "smem").
+# wider stores save.
 SMEM_MIN_TILES = 256
 NUM_THREADS = 256
 FP8_MAX_RCP = 1.0 / 448.0
-
-# ---------------------------------------------------------------------------
-# Inline PTX helpers
-# ---------------------------------------------------------------------------
-
 
 def _asm(res_type, ptx: str, constraints: str, args: list, side_effects: bool = False):
     return llvm.inline_asm(res_type, [a.ir_value() for a in args], ptx, constraints, has_side_effects=side_effects, is_align_stack=False)
@@ -77,14 +39,13 @@ def _struct(res, n: int) -> list:
 
 
 @dsl_user_op
-def _ld_v4(addr: Int64, pred: Int32, l1: bool = False, *, loc=None, ip=None) -> list:
-    """Predicated 16-byte global load (zero when pred is 0); l1 keeps the line in L1."""
-    hint = {"plain": "", "nc": ".nc", "nc_na": ".nc" if l1 else ".nc.L1::no_allocate"}[_LD_KIND]
+def _ld_v4(addr: Int64, pred: Int32, *, loc=None, ip=None) -> list:
+    """Predicated 16-byte global load (zero when pred is 0)."""
     res = _asm(
         llvm.StructType.get_literal([T.i32()] * 4),
         "{\n.reg .pred p;\nsetp.ne.b32 p, $5, 0;\n"
         "mov.b32 $0, 0;\nmov.b32 $1, 0;\nmov.b32 $2, 0;\nmov.b32 $3, 0;\n"
-        f"@p ld.global{hint}.v4.b32 {{$0, $1, $2, $3}}, [$4];\n}}",
+        "@p ld.global.v4.b32 {$0, $1, $2, $3}, [$4];\n}",
         "=r,=r,=r,=r,l,r", [Int64(addr), Int32(pred)], side_effects=True,  # keep loads ahead of the stores; pure asm gets sunk to its use
     )
     return _struct(res, 4)
@@ -128,7 +89,7 @@ def _st_scalar(addr: Int64, v: Uint32, pred: Int32, nbytes: int, *, loc=None, ip
 
 @dsl_user_op
 def _sts_v2(addr: Int32, a: Uint32, b: Uint32, *, loc=None, ip=None) -> None:
-    _asm(None, "st.shared.v2.b32 [$0], {$1, $2};", "r,r,r", [Int32(addr), Uint32(a), Uint32(b)], side_effects=True)  # fmt: skip
+    _asm(None, "st.shared.v2.b32 [$0], {$1, $2};", "r,r,r", [Int32(addr), Uint32(a), Uint32(b)], side_effects=True)
 
 
 @dsl_user_op
@@ -169,7 +130,7 @@ def _f32x2_to_bf16x2(lo: Uint32, hi: Uint32, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
-def _cast4(v0: Uint32, v1: Uint32, v2: Uint32, v3: Uint32, rcp: Uint32, *, loc=None, ip=None) -> Uint32:  # fmt: skip
+def _cast4(v0: Uint32, v1: Uint32, v2: Uint32, v3: Uint32, rcp: Uint32, *, loc=None, ip=None) -> Uint32:
     """Four fp32 bit patterns times rcp -> four e4m3 bytes, v0 in bits [7:0]."""
     return Uint32(
         _asm(
@@ -215,13 +176,9 @@ def _f32_hex(x: float) -> str:
     return struct.pack(">f", x).hex().upper()
 
 
-# ---------------------------------------------------------------------------
-# Shared tile machinery (256 threads per 128x128 tile, 8x8 elements per thread)
-# ---------------------------------------------------------------------------
-
-
 @cute.jit
 def _thread_coords() -> tuple:
+    """256 threads per 128x128 tile, each owning an 8x8 block at (r0, c0)."""
     tidx, _, _ = cute.arch.thread_idx()
     warp = tidx // 32
     lane = tidx % 32
@@ -249,7 +206,7 @@ def _load_rows(base: Int64, row0: Int32, col0: Int32, row_lo: Int32, row_hi: Int
             if const_expr(in_bytes == 2):
                 words = _ld_v4(addr, pred)
             elif const_expr(in_bytes == 4):
-                words = _ld_v4(addr, pred, True) + _ld_v4(addr + 16, pred, True)
+                words = _ld_v4(addr, pred) + _ld_v4(addr + 16, pred)
             else:
                 words = _ld_v2(addr, pred)
         else:
@@ -322,7 +279,7 @@ def _transpose4(a0: Uint32, a1: Uint32, a2: Uint32, a3: Uint32) -> list:
     t1 = _prmt(a0, a1, 0x7362)
     t2 = _prmt(a2, a3, 0x5140)
     t3 = _prmt(a2, a3, 0x7362)
-    return [_prmt(t0, t2, 0x5410), _prmt(t0, t2, 0x7632), _prmt(t1, t3, 0x5410), _prmt(t1, t3, 0x7632)]  # fmt: skip
+    return [_prmt(t0, t2, 0x5410), _prmt(t0, t2, 0x7632), _prmt(t1, t3, 0x5410), _prmt(t1, t3, 0x7632)]
 
 
 @cute.jit
@@ -387,16 +344,11 @@ def _smem_store_tile(base: Int32, gtile: Int64, row_lo: Int32, row_hi: Int32, co
         _st_v4(gtile + Int64(row) * Int64(ld) + Int64(c * 16), w, pred)
 
 
-# ---------------------------------------------------------------------------
-# fp8cast_blockwise_transpose[_batched]
-# ---------------------------------------------------------------------------
-
-
 class _BlockwiseTranspose:
     """
-    One CTA per 128x128 tile. ``mode`` picks the store path: "smem" stages both FP8 tiles in
-    shared memory and writes them with 16-byte stores (needs dims % 16 == 0), "v8" stores each
-    thread's 8-byte rows directly (dims % 8 == 0), "scalar" stores bytes (any shape).
+    One CTA per 128x128 tile. mode picks the store path: "smem" stages both FP8 tiles in shared
+    memory for 16-byte stores (dims % 16 == 0), "v8" stores each thread's 8-byte rows (dims % 8 ==
+    0), "scalar" stores bytes (any shape).
     """
 
     def __init__(self, in_bytes: int, mode: str, batched: bool) -> None:
@@ -491,18 +443,11 @@ def _store_mode(tiles: int, M: int, K: int, *tensors: torch.Tensor) -> str:
         mode = "smem"
     else:
         mode = "v8" if M % 8 == 0 and K % 8 == 0 else "scalar"
-    if mode != "scalar" and "bt" in _FORCE:
-        mode = _FORCE["bt"]
     return mode
 
 
 def fp8cast_blockwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused blockwise FP8 quantization of x *and* x.T (single read of *x*).
-
-    Same contract as ``fp8cast_blockwise_transpose_sm100``: x is 2D (M, K) bf16/fp32;
-    returns (fp8 (M, K), scale (ceil(M/128), ceil(K/128)), fp8_t (K, M), scale_t (ceil(K/128),
-    ceil(M/128))).
-    """
+    """CuTe-DSL fp8cast_blockwise_transpose: x 2-D (M, K) bf16 / fp32."""
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     if x.stride(1) != 1:
         x = x.contiguous()
@@ -522,10 +467,7 @@ def fp8cast_blockwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Tensor, tor
 
 
 def fp8cast_blockwise_transpose_batched_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused blockwise FP8 quantization of x *and* x.transpose(1,2) for batched (G, N, K).
-
-    Same contract as ``fp8cast_blockwise_transpose_batched_sm100``.
-    """
+    """CuTe-DSL fp8cast_blockwise_transpose_batched: x 3-D (G, N, K) bf16 / fp32."""
     assert x.ndim == 3, f"Expected 3D tensor, got {x.ndim}D"
     if not x.is_contiguous():
         x = x.contiguous()
@@ -542,11 +484,6 @@ def fp8cast_blockwise_transpose_batched_sm90(x: torch.Tensor) -> tuple[torch.Ten
     fn = _compile_blockwise(x.dtype, _store_mode(G * sr * sc, N, K, x, out, out_t), True)
     fn(x, out, scale, out_t, scale_t)
     return out, scale, out_t, scale_t
-
-
-# ---------------------------------------------------------------------------
-# FP8 parameter all-gather: shard amax / shard cast / scales / pack-transpose
-# ---------------------------------------------------------------------------
 
 
 @dsl_user_op
@@ -581,10 +518,9 @@ def _shard_tile(shard: Int64, amax_tile: Int64, out: Int64, local_rows: Int32, K
 @cute.jit
 def _shard_tile_row(shard: Int64, amax_tile: Int64, out: Int64, local_rows: Int32, K: Int32, tr: Int32, by: Int32, bz: Int32, row_offset: Int32, cast: cutlass.Constexpr[bool]):
     """
-    Row-major variant for the shard kernels, which need no transpose: a warp covers one 128-column
-    row of the tile (4 fp32 = 16 bytes per lane, one 512-byte load per row), warps take rows
-    round-robin. A shard holding only part of a tile (e.g. 32 of its 128 rows) thus still spreads
-    its rows over all 8 warps. Needs K % 4 == 0 and a 16-byte aligned shard.
+    Row-major variant of _shard_tile: a warp loads one 128-column tile row (16 bytes per lane),
+    warps take rows round-robin, so a shard holding a few rows of a tile still uses all 8 warps.
+    Needs K % 4 == 0 and a 16-byte aligned shard.
     """
     tidx, _, _ = cute.arch.thread_idx()
     warp = tidx // 32
@@ -642,7 +578,7 @@ class _ShardTile:
         bx, by, bz = cute.arch.block_idx()
         tr = trs + bx
         a_off = (Int64(group_offset + bz) * Int64(R) + Int64(tr)) * Int64(C) + Int64(by)
-        _shard_tile(shard, amax + a_off * 4, out, local_rows, K, tr, by, bz, row_offset, self.cast, self.mode)  # fmt: skip
+        _shard_tile(shard, amax + a_off * 4, out, local_rows, K, tr, by, bz, row_offset, self.cast, self.mode)
 
 
 def _shard_tiles(shard: torch.Tensor, amax: torch.Tensor, out: Optional[torch.Tensor], row_offset: int, group_offset: int) -> None:
@@ -662,13 +598,13 @@ def _shard_tiles(shard: torch.Tensor, amax: torch.Tensor, out: Optional[torch.Te
     fn(shard, amax, out if cast else shard, row_offset, group_offset)
 
 
-def fp8_shard_amax_sm90(shard: torch.Tensor, amax: torch.Tensor, row_offset: int, group_offset: int) -> None:  # fmt: skip
-    """Drop-in for ``fp8_weight_quant_sm100.fp8_shard_amax_sm100`` (shard (g_local, local_rows, K) fp32)."""
+def fp8_shard_amax_sm90(shard: torch.Tensor, amax: torch.Tensor, row_offset: int, group_offset: int) -> None:
+    """CuTe-DSL fp8_shard_amax."""
     _shard_tiles(shard, amax, None, row_offset, group_offset)
 
 
-def fp8_shard_cast_sm90(shard: torch.Tensor, amax: torch.Tensor, out: torch.Tensor, row_offset: int, group_offset: int) -> None:  # fmt: skip
-    """Drop-in for ``fp8_weight_quant_sm100.fp8_shard_cast_sm100``."""
+def fp8_shard_cast_sm90(shard: torch.Tensor, amax: torch.Tensor, out: torch.Tensor, row_offset: int, group_offset: int) -> None:
+    """CuTe-DSL fp8_shard_cast."""
     _shard_tiles(shard, amax, out, row_offset, group_offset)
 
 
@@ -676,7 +612,7 @@ class _Scales:
     @cute.jit
     def __call__(self, mAmax: cute.Tensor, mScale: cute.Tensor, mScaleT: cute.Tensor, stream: cuda.CUstream):
         G, R, C = mAmax.shape[0], mAmax.shape[1], mAmax.shape[2]
-        self.kernel(mAmax.iterator.toint(), mScale.iterator.toint(), mScaleT.iterator.toint(), Int32(R), Int32(C)).launch(grid=[(R * C + NUM_THREADS - 1) // NUM_THREADS, G, 1], block=[NUM_THREADS, 1, 1], stream=stream)  # fmt: skip
+        self.kernel(mAmax.iterator.toint(), mScale.iterator.toint(), mScaleT.iterator.toint(), Int32(R), Int32(C)).launch(grid=[(R * C + NUM_THREADS - 1) // NUM_THREADS, G, 1], block=[NUM_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, amax: Int64, scale: Int64, scale_t: Int64, R: Int32, C: Int32):
@@ -686,7 +622,7 @@ class _Scales:
 
 
 @cute.jit
-def _scale_elem(amax: Int64, scale: Int64, scale_t: Int64, g: Int64, idx: Int32, R: Int32, C: Int32):  # fmt: skip
+def _scale_elem(amax: Int64, scale: Int64, scale_t: Int64, g: Int64, idx: Int32, R: Int32, C: Int32):
     rc = R * C
     ok = Int32(idx < rc)
     base = g * Int64(rc)
@@ -698,7 +634,7 @@ def _scale_elem(amax: Int64, scale: Int64, scale_t: Int64, g: Int64, idx: Int32,
 
 
 def fp8_scales_sm90(amax: torch.Tensor, scale: torch.Tensor, scale_t: torch.Tensor) -> None:
-    """Drop-in for ``fp8_weight_quant_sm100.fp8_scales_sm100``: (G, R, C) amax -> scale (G, R, C), scale_t (G, C, R)."""
+    """CuTe-DSL fp8_scales."""
     fn = _COMPILED.get("scales")
     if fn is None:
         f = [_fake(cutlass.Float32, 3, 4) for _ in range(3)]
@@ -729,8 +665,7 @@ class _PackTranspose:
 
     @cute.jit
     def _kernel_w16(self, x: Int64, out: Int64, N: Int32, K: Int32, G: Int32):
-        """128 threads, each owning 8 rows x 16 bytes: 16-byte loads and row-major stores, the
-        transposed tile staged in shared memory for 16-byte stores."""
+        """128 threads, each owning 8 rows x 16 bytes; the transposed tile is staged in shared memory for 16-byte stores."""
         bx, by, bz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         warp = tidx // 32
@@ -765,7 +700,7 @@ class _PackTranspose:
     @cute.jit
     def _kernel_8x8(self, x: Int64, out: Int64, N: Int32, K: Int32, G: Int32):
         bx, by, bz = cute.arch.block_idx()
-        tidx, warp, lane, r0, c0 = _thread_coords()
+        _, _, _, r0, c0 = _thread_coords()
         row0 = bx * BLOCK + r0
         col0 = by * BLOCK + c0
         nk = Int64(N) * Int64(K)
@@ -779,7 +714,7 @@ class _PackTranspose:
 
 
 def fp8_pack_transpose_sm90(x: torch.Tensor, out: torch.Tensor) -> None:
-    """Drop-in for ``fp8_weight_quant_sm100.fp8_pack_transpose_sm100``: x (G, N, K) and its transpose into out."""
+    """CuTe-DSL fp8_pack_transpose."""
     G, N, K = x.shape
     if x.numel() == 0:
         return
@@ -789,8 +724,6 @@ def fp8_pack_transpose_sm90(x: torch.Tensor, out: torch.Tensor) -> None:
         mode = "v8"
     else:
         mode = "scalar"
-    if mode != "scalar" and "pack" in _FORCE:
-        mode = _FORCE["pack"]
     key = ("pack", mode, x.dtype, out.dtype)
     fn = _COMPILED.get(key)
     if fn is None:
@@ -799,17 +732,15 @@ def fp8_pack_transpose_sm90(x: torch.Tensor, out: torch.Tensor) -> None:
     fn(x, out)
 
 
-# ---------------------------------------------------------------------------
-# Multi-tensor launches (prototype): one launch over a fixed list of tensors
-# ---------------------------------------------------------------------------
-
 _DESC = 8  # int64 words per descriptor row
 
 
 class _ShardAmaxMulti:
-    """Shard amax over n shards; table rows: shard, amax, local_rows, K, row_offset,
-    tile_row_start, R*C*group_offset + 0 (amax grid base offset), first CTA index; plus
-    R, C, ct packed in a second row block."""
+    """
+    Shard amax over n shards. The table holds two rows per shard: (shard, amax, local_rows, K,
+    row_offset, first tile row, element offset of group_offset in the grid, first CTA) and (R, C,
+    column tiles, tile rows, 0, 0, 0, 0).
+    """
 
     @cute.jit
     def __call__(self, mTable: cute.Tensor, n: Int32, total: Int32, stream: cuda.CUstream):
@@ -844,24 +775,21 @@ class _ShardAmaxMulti:
         bz = rest // ntr
         tr = trs + bxr
         a_off = a_base + (Int64(bz) * Int64(R) + Int64(tr)) * Int64(C) + Int64(by)
-        _shard_tile(shard, amax + a_off * 4, amax, local_rows, K, tr, by, bz, row_offset, False, "row")  # fmt: skip
+        _shard_tile(shard, amax + a_off * 4, amax, local_rows, K, tr, by, bz, row_offset, False, "row")
 
 
 class FP8ShardAmaxGroup:
     """
-    One launch computing ``fp8_shard_amax`` for a fixed list of shards (e.g. every FP8 weight of
-    one FSDP shard group). The descriptor table holds raw addresses, so it is built once and stays
-    valid as long as the shard and amax tensors are not reallocated (true for FSDP2's sharded
-    parameters and the packed amax buffer in modules/fp8_param_gather.py). Requires K % 4 == 0 and 16-byte aligned
-    shards; anything else falls back to one launch per tensor.
+    One launch of fp8_shard_amax over a fixed list of shards. The table holds raw addresses, so it
+    is valid only while the tensors are not reallocated. Shards with K % 4 != 0 or not 16-byte
+    aligned get one launch each.
     """
 
     def __init__(self, shards: Sequence[torch.Tensor], amaxes: Sequence[torch.Tensor], row_offsets: Sequence[int], group_offsets: Sequence[int]) -> None:
-        self.args = list(zip(shards, amaxes, row_offsets, group_offsets))
         rows = []
         first = 0
         self.fallback = []
-        for shard, amax, ro, go in self.args:
+        for shard, amax, ro, go in zip(shards, amaxes, row_offsets, group_offsets):
             g_local, local_rows, K = shard.shape
             if shard.numel() == 0:
                 continue
@@ -872,7 +800,7 @@ class FP8ShardAmaxGroup:
             trs = ro // BLOCK
             ntr = (ro + local_rows + BLOCK - 1) // BLOCK - trs
             ct = (K + BLOCK - 1) // BLOCK
-            rows.append([shard.data_ptr(), amax.data_ptr(), local_rows, K, ro, trs, go * R * C, first])  # fmt: skip
+            rows.append([shard.data_ptr(), amax.data_ptr(), local_rows, K, ro, trs, go * R * C, first])
             rows.append([R, C, ct, ntr, 0, 0, 0, 0])
             first += ntr * ct * g_local
         self.total = first
@@ -893,6 +821,8 @@ class FP8ShardAmaxGroup:
 
 
 class _ScalesMulti:
+    """Scales over n grids. The table holds one row per grid: (amax, scale, scale_t, R, C, CTAs per group, 0, first CTA)."""
+
     @cute.jit
     def __call__(self, mTable: cute.Tensor, n: Int32, total: Int32, stream: cuda.CUstream):
         self.kernel(mTable.iterator.toint(), n).launch(grid=[total, 1, 1], block=[NUM_THREADS, 1, 1], stream=stream)
@@ -921,7 +851,7 @@ class _ScalesMulti:
 
 
 class FP8ScalesGroup:
-    """One launch computing ``fp8_scales`` for a fixed list of (amax, scale, scale_t) triples."""
+    """One launch of fp8_scales over a fixed list of (amax, scale, scale_t) grids; same address caveat as FP8ShardAmaxGroup."""
 
     def __init__(self, amaxes: Sequence[torch.Tensor], scales: Sequence[torch.Tensor], scales_t: Sequence[torch.Tensor]) -> None:
         rows = []
@@ -929,7 +859,7 @@ class FP8ScalesGroup:
         for amax, scale, scale_t in zip(amaxes, scales, scales_t):
             G, R, C = amax.shape
             bpg = (R * C + NUM_THREADS - 1) // NUM_THREADS
-            rows.append([amax.data_ptr(), scale.data_ptr(), scale_t.data_ptr(), R, C, bpg, 0, first])  # fmt: skip
+            rows.append([amax.data_ptr(), scale.data_ptr(), scale_t.data_ptr(), R, C, bpg, 0, first])
             first += G * bpg
         self.total = first
         self.n = len(rows)
@@ -946,10 +876,10 @@ class FP8ScalesGroup:
 
 
 def fp8_shard_amax_multi_sm90(shards: Sequence[torch.Tensor], amaxes: Sequence[torch.Tensor], row_offsets: Sequence[int], group_offsets: Sequence[int]) -> FP8ShardAmaxGroup:
-    """Build (once) a single-launch amax over a list of shards; call the result to launch."""
+    """CuTe-DSL fp8_shard_amax_multi."""
     return FP8ShardAmaxGroup(shards, amaxes, row_offsets, group_offsets)
 
 
 def fp8_scales_multi_sm90(amaxes: Sequence[torch.Tensor], scales: Sequence[torch.Tensor], scales_t: Sequence[torch.Tensor]) -> FP8ScalesGroup:
-    """Build (once) a single-launch scales computation over a list of grids."""
+    """CuTe-DSL fp8_scales_multi."""
     return FP8ScalesGroup(amaxes, scales, scales_t)

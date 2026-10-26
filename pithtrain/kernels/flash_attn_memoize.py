@@ -1,12 +1,7 @@
 """
-Record / replay of FlashAttention-4's host path (``memoized_launch``): host-side memoization of
-FA4's compile caches, so a repeated call signature skips FA4's Python entry and launches the
-compiled kernels directly. FA4 runs on SM90 and SM100, so this has no architecture suffix; the
-custom ops that call it are ``pithtrain.operators.flash_attn_v4``.
-
-It wraps ``flash_attn.cute.interface``'s compile caches during one recorded call. That is global
-and not thread-safe, and the path is pinned to the FA4 version it was validated on
-(``_VALIDATED_FA4``); any other version keeps calling FA4's entry.
+Host-side memoization of FlashAttention-4's Python entry (memoized_launch): a repeated call
+signature replays the recorded compiled-kernel launches instead of running FA4's Python. Pinned to
+the validated FA4 version; process-global and not thread-safe. FA4 runs on SM90 and SM100.
 """
 
 import dataclasses
@@ -18,23 +13,10 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 __all__ = ["FAST_PATH", "MISSING", "memoized_launch", "plans", "signature"]
 
-# fmt: off
-
-# ------------------------------------------------------------
-# MEMOIZED CALL PATH
-# ------------------------------------------------------------
-#
-# FA4's Python entry spends tens of microseconds per call deriving tile sizes, building the
-# compile key and looking the compiled kernels up, all of which is a pure function of the call's
-# signature; the kernels themselves cost a few microseconds to launch. The first call of each
-# signature runs FA4's own entry while recording what it did: every compiled-kernel call (the
-# compile caches are wrapped for that one call) and every aten op (a dispatch mode). If it did
-# nothing but allocate (empty or zeros), take views and call cached kernels, the recording becomes
-# a plan; later calls of the signature allocate the same buffers afresh, exactly as FA4 does
-# (zero-filled where FA4 zero-fills them), and call the same compiled kernels with the same
-# argument layout and the live tensors. Nothing captured is replayed except compiled kernels
-# and immutable arguments. A signature whose first clean recording shows anything else, or a
-# version other than the one this was validated on, keeps calling FA4's entry.
+# FA4's entry spends tens of microseconds per call deriving tile sizes and the compile key, a pure
+# function of the call's signature, while its kernels take a few microseconds to launch. A recorded
+# call becomes a plan only if FA4 did nothing but allocate, take views and call cached kernels;
+# nothing captured is replayed except compiled kernels and immutable arguments.
 
 _VALIDATED_FA4 = "4.0.0b28"
 
@@ -111,8 +93,8 @@ class _Plan:
     allocs: Tuple[Tuple[torch.Size, Tuple[int, ...], torch.dtype, bool], ...]
     calls: Tuple[Tuple[Callable, Any, Any], ...]
     outputs: Tuple[Any, ...]
-    # calls flattened for replay: (kernel, argument list with the constants filled in, the
-    # (position, template) of every argument rebuilt per call)
+    # calls flattened for replay: (kernel, arguments with the constants filled in, (position,
+    # template) of every argument rebuilt per call)
     fast_calls: Tuple[Tuple[Callable, Tuple[Any, ...], Tuple[Tuple[int, Any], ...]], ...] = dataclasses.field(compare=False, default=())
 
 
@@ -123,7 +105,7 @@ class _Unsupported(Exception):
 def _template(x: Any, inputs: Dict[str, torch.Tensor], allocs: List[torch.Tensor]) -> Any:
     """How to rebuild x from the live inputs and fresh allocations of a later call."""
     if isinstance(x, torch.Tensor):
-        same = lambda t: t.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()  # noqa: E731
+        same = lambda t: t.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()
         meta = (x.shape, x.stride(), x.storage_offset())
         for ref, t in inputs.items():
             if t is not None and same(t) and meta == (t.shape, t.stride(), t.storage_offset()):
@@ -234,25 +216,19 @@ def signature(kind: str, inputs: Dict[str, Optional[torch.Tensor]], *scalars) ->
 
 def memoized_launch(kind: str, inputs: Dict[str, Optional[torch.Tensor]], scalars: Tuple, entry: Callable[[], Tuple[torch.Tensor, ...]]) -> Tuple[torch.Tensor, ...]:
     """
-    ``entry()``, the call into FA4's Python entry, replayed through a recorded host-side plan once
-    one exists for this call's signature. Returns ``entry()``'s output tuple.
+    entry() (a call into FA4's Python entry), replayed through a recorded host-side plan once one
+    exists for this call's signature. Returns entry()'s output tuple.
 
-    - ``kind``: the FA4 entry point's name; ``scalars``: a hashable tuple of every non-tensor
-      argument of the call; ``inputs``: name -> tensor (or None) of every tensor argument, with
-      ``"q"`` present. ``entry`` must be a function of exactly these (its tensors taken from
-      ``inputs``), and must return freshly allocated tensors.
-    - The signature is ``kind``, ``scalars``, the device and each input's shape, strides, dtype and
-      address modulo 16. The first call of a signature runs ``entry()``; the second runs it while
-      recording; once a clean recording exists (FA4 only allocated, took views and called compiled
-      kernels), later calls allocate the same buffers afresh (zero-filled where FA4 zero-fills
-      them) and call the same compiled kernels with the same argument layout and the live input
-      tensors, skipping FA4's Python. A signature that recorded anything else keeps calling
-      ``entry()``.
-    - The outputs are therefore those of ``entry()`` (the same kernels on the same arguments; bit
-      for bit wherever FA4 itself is deterministic). Inputs are never modified by the replay
-      machinery itself.
-    - Only with the validated FA4 version (``_VALIDATED_FA4``); otherwise every call is ``entry()``.
-      The plan cache is process-global and not thread-safe. Runs on SM90 and SM100.
+    kind: the FA4 entry point's name. scalars: a hashable tuple of every non-tensor argument.
+    inputs: name -> tensor (or None) for every tensor argument, "q" included. entry must be a
+    function of exactly these and return freshly allocated tensors.
+
+    The signature is kind, scalars, the device and each input's shape, strides, dtype and address
+    modulo 16. Its first call runs entry(), the second runs it while recording, and once a clean
+    recording exists (FA4 only allocated, took views and called compiled kernels) later calls
+    allocate the same buffers afresh and call the same kernels on the live inputs. The outputs are
+    entry()'s (bit for bit where FA4 is deterministic). With any FA4 version other than the
+    validated one, every call is entry().
     """
     if not FAST_PATH:
         return entry()

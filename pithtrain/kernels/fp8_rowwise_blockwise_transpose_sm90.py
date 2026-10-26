@@ -1,22 +1,11 @@
 """
-CuTe-DSL (SM90) port of ``fp8cast_rowwise_blockwise_transpose_sm100`` (SM90 E8M0 path).
+CuTe-DSL (SM90) rowwise FP8 quantization of x and 128x128 blockwise FP8 quantization of x.T from one
+read of x, bit-identical to the Triton kernel in fp8_rowwise_blockwise_transpose_sm100. Covers every
+input, so there is no fallback.
 
-One read of ``x (M, K)`` produces
-  * the 1x128 rowwise FP8 copy ``tok_fp8 (M, K)`` with scales ``tok_scale (M, ceil(K/128))``
-    (MN-major, see ``kernels/fp8_scale_layout.py``),
-  * the transposed copy ``blk_t_fp8 (K, M)`` quantized with one scale per 128x128 block,
-    ``blk_t_scale (ceil(K/128), ceil(M/128))``,
-bit-identical to the Triton kernel in ``pithtrain/kernels/fp8_rowwise_blockwise_transpose_sm100.py``.
-Every input is covered (a non-unit inner stride is made contiguous here), so there is no fallback.
-
-Kernel layout: one CTA of ``1024 / R`` threads per 128x128 tile, ``R`` = 8 (large grids) or 4
-(small grids). Lane ``l`` of warp ``w`` owns the R rows ``w*4R + (l//8)*R + [0, R)`` and the two
-8-column chunks ``(l%8)*8 + [0, 8)`` and ``64 + (l%8)*8 + [0, 8)``: an R x 16 register block kept
-as packed input-dtype words. Row amax is a 3-step butterfly over the 8 lanes sharing a row; tile
-amax adds two more shuffles and one shared-memory exchange (the only barrier). The transposed
-store needs no shared-memory transpose: each thread already holds R consecutive rows of every
-column it owns and writes them as one R-byte vector; with R = 8 the 4 lanes of a column chunk
-cover one full 32-byte sector.
+One CTA of 1024 / R threads per 128x128 tile, R = 8 (large grids) or 4 (small grids); each thread
+owns R consecutive rows of 16 columns, so the transposed store needs no smem transpose: it writes
+each column's R rows as one R-byte vector.
 """
 
 from typing import Callable
@@ -39,21 +28,15 @@ _BLOCK = 128
 _SMALL_GRID_TILES = 200
 
 
-# ---------------------------------------------------------------------------
-# Device helpers (pure inline PTX, so LLVM may CSE / schedule them freely)
-# ---------------------------------------------------------------------------
-
-
 def _asm_u32(args: list, asm: str, constraints: str, loc=None, ip=None) -> Uint32:
     res = llvm.inline_asm(T.i32(), [a.ir_value(loc=loc, ip=ip) for a in args], asm, constraints, has_side_effects=False, is_align_stack=False, loc=loc, ip=ip)
     return Uint32(res)
 
 
-# The register block is kept as packed 32-bit words of the input dtype ("bf16", "f16": two
-# elements per word, low half first; "f32": one). Every helper below consumes packed words and
-# widens to fp32 only inside its own asm block, so LLVM cannot hoist the widening and keep an
-# fp32 copy of the block live: that copy doubled the register footprint (166 regs/thread,
-# 3 CTAs/SM) and forcing fewer registers made ptxas spill.
+# The register block is kept as packed 32-bit words of the input dtype (bf16 / f16: two elements
+# per word, low half first; f32: one). Every helper widens to fp32 only inside its own asm block,
+# so LLVM cannot hoist the widening and keep an fp32 copy of the block live: that copy doubled the
+# register footprint, and forcing fewer registers made ptxas spill.
 
 
 @dsl_user_op
@@ -82,12 +65,10 @@ def _amax_f32(acc: Uint32, kind: str, *, loc=None, ip=None) -> Float32:
 
 @dsl_user_op
 def _q4(words: list, sel: list, kind: str, rcp: Float32, *, loc=None, ip=None) -> Uint32:
-    """Quantize 4 elements to 4 packed e4m3 bytes (element 0 in the lowest byte).
-
-    ``sel[k] = (j, half)`` picks element k from ``words[j]`` (``half`` 0 = low 16 bits). Each is
-    widened to fp32, multiplied by ``rcp`` (an exact power of 2) and converted with
-    ``cvt.rn.satfinite.e4m3x2.f32`` (RNE, saturate to +-448) -- the instruction Triton emits for
-    ``.to(tl.float8e4nv)`` on SM90. The first source of ``e4m3x2`` lands in the upper byte.
+    """
+    Quantize 4 elements to 4 packed e4m3 bytes (element 0 in the lowest byte). sel[k] = (j, half)
+    picks element k from words[j] (half 0 = low 16 bits); rcp is an exact power of 2. The cvt is the
+    one Triton emits for .to(tl.float8e4nv) on SM90; its first source lands in the upper byte.
     """
     n = len(words)
     rcp_op = f"${n + 1}"
@@ -113,20 +94,13 @@ def _q4(words: list, sel: list, kind: str, rcp: Float32, *, loc=None, ip=None) -
 
 
 def _gptr(base: cute.Pointer, offset: Int64, esize: int, dtype: type, align: int) -> cute.Pointer:
-    """Global pointer ``offset`` elements (of ``esize`` bytes) past ``base``, re-typed to
-    ``dtype`` and asserted ``align``-byte aligned (the host picked widths that make it true)."""
+    """Global pointer offset elements (of esize bytes) past base, as dtype, asserted align-byte aligned."""
     addr = base.toint() + offset * esize
     return cute.make_ptr(dtype, addr, cute.AddressSpace.gmem, assumed_align=align)
 
 
-# ---------------------------------------------------------------------------
-# Kernel
-# ---------------------------------------------------------------------------
-
-
 class RowwiseBlockwiseTranspose:
-    """``vec_k`` / ``vec_m``: element counts every global vector access along K (x and tok rows)
-    / along M (blk_t rows) may use; chosen on the host so no vector straddles the edge."""
+    """vec_k / vec_m: elements per global vector access along K (x and tok rows) / along M (blk_t rows), chosen on the host so no vector straddles the edge."""
 
     def __init__(self, dtype: type, vec_k: int, vec_m: int, rows: int = 8) -> None:
         self.dtype = dtype
@@ -164,16 +138,14 @@ class RowwiseBlockwiseTranspose:
         M = Int32(mX.shape[0])
         K = Int32(mX.shape[1])
         sx = Int64(mX.stride[0])
-        # mS is the MN-major tok_scale (M, nkb), strides (1, align(M, 4)): scale[r, bk] at
-        # bk * s_ld + r, the layout DeepGEMM's SM90 GEMMs read as is.
+        # mS is the MN-major tok_scale: scale[r, bk] at bk * s_ld + r.
         s_ld = Int64(mS.stride[1])
         nmb = Int32(mST.shape[1])
 
         row0 = bm * _BLOCK + warp * (4 * R) + rg * R
         col_base = bk * _BLOCK + cl * 8
 
-        # ---- load the 8x16 register block, zero-filled outside (M, K) ----
-        # Element (i, h, e) -- row row0 + i, column col_base + h * 64 + e -- sits at n = i*16+h*8+e.
+        # Register block zero-filled outside (M, K): element (row row0 + i, column col_base + h * 64 + e) at n = i * 16 + h * 8 + e.
         xr = cute.make_rmem_tensor(cute.make_layout(16 * R), self.dtype)
         xr.fill(0.0)
         for i in cutlass.range_constexpr(R):
@@ -189,7 +161,6 @@ class RowwiseBlockwiseTranspose:
                             cute.autovec_copy(src, dst)
         xw = cute.recast_tensor(xr, Uint32)
 
-        # ---- rowwise: amax over the 128 columns of each row ----
         row_amax = cute.make_rmem_tensor(cute.make_layout(8), Float32)
         for i in cutlass.range_constexpr(R):
             acc = Uint32(0)
@@ -221,7 +192,6 @@ class RowwiseBlockwiseTranspose:
                             src = cute.make_tensor(qb.iterator + p * VK, cute.make_layout(VK))
                             cute.autovec_copy(src, dst)
 
-        # ---- blockwise: amax of the whole 128x128 tile ----
         bmax = row_amax[0]
         for i in cutlass.range_constexpr(1, R):
             bmax = cute.arch.fmax(bmax, row_amax[i])
@@ -242,8 +212,6 @@ class RowwiseBlockwiseTranspose:
             st = cute.make_tensor(_gptr(mST.iterator, Int64(bk) * Int64(nmb) + Int64(bm), 4, Float32, 4), cute.make_layout(1))
             st[0] = bscale
 
-        # ---- transposed store: column c of x becomes row c of blk_t ----
-        # (threads whose rows all lie past M have nothing to store)
         if row0 < M:
             for h in cutlass.range_constexpr(2):
                 for e in cutlass.range_constexpr(8):
@@ -260,7 +228,7 @@ class RowwiseBlockwiseTranspose:
                                 cute.autovec_copy(src, dst)
 
     def _quant4(self, xw: cute.Tensor, elems: list, rcp: Float32) -> Uint32:
-        """Quantize the 4 register-block elements at flat indices ``elems``."""
+        """Quantize the 4 register-block elements at flat indices elems."""
         epw = 32 // self.dtype.width
         words: list = []
         sel: list = []
@@ -271,10 +239,6 @@ class RowwiseBlockwiseTranspose:
             sel.append((words.index(w), n % epw))
         return _q4([xw[w] for w in words], sel, self.kind, rcp)
 
-
-# ---------------------------------------------------------------------------
-# Host wrapper
-# ---------------------------------------------------------------------------
 
 _COMPILED: dict[tuple, Callable] = {}
 
@@ -312,8 +276,7 @@ def _resolve(dtype: torch.dtype, M: int, K: int, sx: int, ptr: int) -> tuple:
     vec_k = _vec(sx, vec_k)
     vec_k = _vec(ptr // esize, vec_k)
     # 128 threads x 8 rows wins once the grid fills the GPU (fewer, fuller stores); a small grid
-    # is latency-bound, so split each tile over 256 threads x 4 rows (H200 measurements in
-    # workspace/kda-tasks/rowwise_blockwise_transpose/benchmark.csv).
+    # is latency-bound, so split each tile over 256 threads x 4 rows.
     rows = 4 if nmb * nkb <= _SMALL_GRID_TILES else 8
     vec_m = _vec(M, rows)
     ckey = (dtype, vec_k, vec_m, rows)
@@ -326,21 +289,7 @@ def _resolve(dtype: torch.dtype, M: int, K: int, sx: int, ptr: int) -> tuple:
 
 
 def fp8cast_rowwise_blockwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused rowwise FP8 quant of *x* and blockwise FP8 quant of *x*.T.
-
-    Drop-in replacement for ``fp8cast_rowwise_blockwise_transpose_sm100``.
-
-    Args:
-        x: 2D tensor (M, K) in BF16/FP16/FP32.
-
-    Returns:
-        (tok_fp8, tok_scale, blk_t_fp8, blk_t_scale):
-            tok_fp8     -- float8_e4m3fn (M, K),
-            tok_scale   -- float32 (M, ceil(K/128)), MN-major and TMA-aligned
-                           (``kernels.fp8_scale_layout``: strides (1, align(M, 4))),
-            blk_t_fp8   -- float8_e4m3fn (K, M),
-            blk_t_scale -- float32 (ceil(K/128), ceil(M/128)).
-    """
+    """fp8cast_rowwise_blockwise_transpose with the rowwise scale MN-major."""
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     M, K = x.shape
     sx, sk = x.stride()
@@ -349,8 +298,7 @@ def fp8cast_rowwise_blockwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Ten
         x = x.contiguous().as_strided((M, K), (K, 1))
         sx = K
     dtype = x.dtype
-    # Host cost matters at ~770 calls/step: resolve everything per (dtype, shape, row stride,
-    # pointer alignment) once, so the steady state is one dict lookup + 4 allocs + the call.
+    # Host cost matters (hundreds of calls per step): resolve once per (dtype, shape, row stride, pointer alignment).
     key = (dtype, M, K, sx, x.data_ptr() & 15)
     entry = _DISPATCH.get(key)
     if entry is None:
