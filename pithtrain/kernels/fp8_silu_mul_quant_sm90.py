@@ -57,7 +57,8 @@ def swiglu_fwd(g: Float32, u: Float32, *, loc=None, ip=None) -> Float32:
 
 @dsl_user_op
 def swiglu_bwd(dh: Float32, g: Float32, u: Float32, *, loc=None, ip=None) -> tuple:
-    """(grad_gate, grad_up) in fp32, the Triton backward's ops after LLVM contraction:
+    """
+    (grad_gate, grad_up) in fp32, the Triton backward's ops after LLVM contraction:
 
     grad_up   = dh * (s * g)
     grad_gate = ((dh * u) * s) * fma(-s, g, 1 + g)      with s = sigmoid(g)
@@ -82,11 +83,12 @@ def swiglu_bwd(dh: Float32, g: Float32, u: Float32, *, loc=None, ip=None) -> tup
 
 
 G_CAP = 1024  # expert groups the shared-memory offset table holds
-_STAGES = 2  # cp.async tiles in flight per CTA (backward cannot fit 3 in shared memory)
+STAGES = 2  # cp.async tiles in flight per CTA (backward cannot fit 3 in shared memory)
 
 
 class SiluMulQuant:
-    """Persistent kernel (one 512-thread CTA per SM over 128 x 128 tiles), compiled per (N, backward).
+    """
+    Persistent kernel (one 512-thread CTA per SM over 128 x 128 tiles), compiled per (N, backward).
 
     Inputs are staged into shared memory with cp.async, stages tiles ahead. Every thread reads back
     only the 16-byte chunks it copied itself, so the staging needs no barrier, only
@@ -100,7 +102,7 @@ class SiluMulQuant:
         self.NB = (N + BLOCK - 1) // BLOCK
         self.n_in = 3 if backward else 2
         self.n_out = 2 if backward else 1
-        self.stages = _STAGES
+        self.stages = STAGES
         self.num_ctas = num_ctas
         self.stage_bytes = self.n_in * 4 * THREADS * 16
 
@@ -110,7 +112,10 @@ class SiluMulQuant:
         self.kernel(mDh, mG, mU, mOffs, mTok0, mTokS0, mKm0, mKmS0, mTok1, mTokS1, mKm1, mKmS1).launch(grid=[cutlass.min(total, self.num_ctas), 1, 1], block=[THREADS, 1, 1], stream=stream)
 
     def _tile(self, t: Int32) -> tuple:
-        """Tile t -> (row block, column block); column blocks of a row block are adjacent for read locality."""
+        """
+        Tile t -> (row block, column block); column blocks of a row block are adjacent
+        for read locality.
+        """
         return t // self.NB, t % self.NB
 
     def _issue(self, t: Int32, stage_addr: Int32, total: Int32, tid: Int32, in_base: list):
@@ -305,10 +310,11 @@ class SiluMulQuant:
 
 
 class SiluMulQuantGU(SiluMulQuant):
-    """SiluMulQuant reading g / u as the column halves of one (M, 2N) buffer and, in backward,
-    writing dg and du as the column halves of one quantized (M, 2N) operand: output o (0 = dg or h,
-    1 = du) lands at channel offset o * N of an NC = n_out * N channel layout. Requires N % 128 == 0
-    (every tile inside one half).
+    """
+    SiluMulQuant reading g / u as the column halves of one (M, 2N) buffer and, in backward, writing
+    dg and du as the column halves of one quantized (M, 2N) operand: output o (0 = dg or h, 1 = du)
+    lands at channel offset o * N of an NC = n_out * N channel layout. Requires N % 128 == 0 (every
+    tile inside one half).
     """
 
     def __init__(self, N: int, backward: bool, num_ctas: int):
@@ -495,14 +501,14 @@ class SiluMulQuantGU(SiluMulQuant):
         cute.arch.cp_async_wait_group(0)
 
 
-_compiled: dict = {}
-_compiled_gu: dict = {}
+compiled: dict = {}
+compiled_gu: dict = {}
 
 
-def _get_kernel(N: int, backward: bool, device: torch.device) -> object:
+def get_kernel(N: int, backward: bool, device: torch.device) -> object:
     """Compiled kernel for (N, direction, device); M and the group count stay dynamic."""
     key = (N, backward, device.index)
-    fn = _compiled.get(key)
+    fn = compiled.get(key)
     if fn is None:
         m = cute.sym_int()
         nb = (N + BLOCK - 1) // BLOCK
@@ -512,14 +518,14 @@ def _get_kernel(N: int, backward: bool, device: torch.device) -> object:
         offs = fake(Int32, (cute.sym_int(),), (1,), 4)
         num_sms = sm_count(device)
         fn = cute.compile(SiluMulQuant(N, backward, num_sms), bf if backward else None, bf, bf, offs, *outs, *(outs if backward else (None,) * 4), fake_stream(), options="--enable-tvm-ffi")
-        _compiled[key] = fn
+        compiled[key] = fn
     return fn
 
 
-def _get_kernel_gu(N: int, backward: bool, device: torch.device) -> object:
+def get_kernel_gu(N: int, backward: bool, device: torch.device) -> object:
     """Compiled gate_up kernel for (N, direction, device); M and the group count stay dynamic."""
     key = (N, backward, device.index)
-    fn = _compiled_gu.get(key)
+    fn = compiled_gu.get(key)
     if fn is None:
         m = cute.sym_int()
         nc = 2 * N if backward else N
@@ -529,14 +535,16 @@ def _get_kernel_gu(N: int, backward: bool, device: torch.device) -> object:
         offs = fake(Int32, (cute.sym_int(),), (1,), 4)
         num_sms = sm_count(device)
         fn = cute.compile(SiluMulQuantGU(N, backward, num_sms), fake(cutlass.BFloat16, (m, N), (N, 1)) if backward else None, half, half, offs, *outs, fake_stream(), options="--enable-tvm-ffi")
-        _compiled_gu[key] = fn
+        compiled_gu[key] = fn
     return fn
 
 
 def alloc_rowwise_kmajor_outputs(M: int, N: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The four outputs of fp8cast_rowwise_kmajor of an (M, N) input, both scales MN-major, each its
-    own allocation (different lifetimes: the rowwise pair feeds the next GEMM, the K-major pair waits
-    for wgrad)."""
+    """
+    The four outputs of fp8cast_rowwise_kmajor of an (M, N) input, both scales MN-major, each its
+    own allocation (different lifetimes: the rowwise pair feeds the next GEMM, the K-major pair
+    waits for wgrad).
+    """
     nb = (N + BLOCK - 1) // BLOCK
     return (torch.empty((M, N), dtype=torch.float8_e4m3fn, device=device), mn_major_scale(M, nb, device), torch.empty(M * N, dtype=torch.float8_e4m3fn, device=device), mn_major_scale(N, M // BLOCK, device))
 
@@ -559,7 +567,7 @@ def silu_mul_quant_fwd_sm90(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: t
     out = alloc_rowwise_kmajor_outputs(M, N, g.device)
     if M == 0 or N == 0:
         return out
-    _get_kernel(N, False, g.device)(None, g, u, grouped_mm_offs, *out, None, None, None, None)
+    get_kernel(N, False, g.device)(None, g, u, grouped_mm_offs, *out, None, None, None, None)
     return out
 
 
@@ -573,7 +581,7 @@ def silu_mul_bwd_quant_sm90(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, 
         return fp8cast_rowwise_kmajor_sm90(dg, grouped_mm_offs), fp8cast_rowwise_kmajor_sm90(du, grouped_mm_offs)
     dg_q = alloc_rowwise_kmajor_outputs(M, N, g.device)
     du_q = alloc_rowwise_kmajor_outputs(M, N, g.device)
-    _get_kernel(N, True, g.device)(dh, g, u, grouped_mm_offs, *dg_q, *du_q)
+    get_kernel(N, True, g.device)(dh, g, u, grouped_mm_offs, *dg_q, *du_q)
     return dg_q, du_q
 
 
@@ -586,7 +594,7 @@ def silu_mul_quant_gu_fwd_sm90(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) 
         g, u = gu[:, :N].contiguous(), gu[:, N:].contiguous()
         return fp8cast_rowwise_kmajor_sm90(silu_mul_fwd(g, u), grouped_mm_offs)
     out = alloc_rowwise_kmajor_outputs(M, N, gu.device)
-    _get_kernel_gu(N, False, gu.device)(None, gu[:, :N], gu[:, N:], grouped_mm_offs, *out)
+    get_kernel_gu(N, False, gu.device)(None, gu[:, :N], gu[:, N:], grouped_mm_offs, *out)
     return out
 
 
@@ -600,5 +608,5 @@ def silu_mul_bwd_quant_gu_sm90(dh: torch.Tensor, gu: torch.Tensor, grouped_mm_of
         dg, du = silu_mul_bwd(dh, g, u)
         return fp8cast_rowwise_kmajor_sm90(torch.cat([dg, du], 1), grouped_mm_offs)
     out = alloc_rowwise_kmajor_outputs(M, 2 * N, gu.device)
-    _get_kernel_gu(N, True, gu.device)(dh, gu[:, :N], gu[:, N:], grouped_mm_offs, *out)
+    get_kernel_gu(N, True, gu.device)(dh, gu[:, :N], gu[:, N:], grouped_mm_offs, *out)
     return out

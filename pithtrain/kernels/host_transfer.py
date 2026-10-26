@@ -8,7 +8,9 @@ would race and corrupt the read-back.
 
 import torch
 
-_pinned_buffers: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
+__all__ = ["get_pinned_buffer"]
+
+pinned_buffers: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
 
 
 def get_pinned_buffer(name: str, numel: int, dtype: torch.dtype) -> torch.Tensor:
@@ -17,8 +19,8 @@ def get_pinned_buffer(name: str, numel: int, dtype: torch.dtype) -> torch.Tensor
     Cached because freeing a pinned tensor costs a cudaEventRecordWithFlags in PyTorch's allocator.
     """
     key = (name, dtype, numel)
-    buf = _pinned_buffers.get(key)
+    buf = pinned_buffers.get(key)
     if buf is None:
         buf = torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True)
-        _pinned_buffers[key] = buf
+        pinned_buffers[key] = buf
     return buf

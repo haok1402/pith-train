@@ -1,4 +1,7 @@
-"""CuTe-DSL (SM90) kernel of fp8cast_rowwise_kmajor (contract in fp8_rowwise_kmajor), bit-identical to the Triton kernel, with both scales returned MN-major."""
+"""
+CuTe-DSL (SM90) kernel of fp8cast_rowwise_kmajor (contract in fp8_rowwise_kmajor), bit-identical to
+the Triton kernel, with both scales returned MN-major.
+"""
 
 from typing import Callable
 
@@ -15,18 +18,21 @@ from pithtrain.kernels.fp8_e8m0_scale_sm90 import e8m0_scale_bf16x2
 from pithtrain.kernels.fp8_rowwise_kmajor_sm100 import fp8cast_rowwise_kmajor_sm100
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale, mn_pad, to_mn_major
 
-__all__ = ["RowwiseKmajor", "fp8cast_rowwise_kmajor_sm90", "supports_rowwise_kmajor"]
+__all__ = ["RowwiseKmajor", "THREADS", "TILE", "fp8cast_rowwise_kmajor_sm90", "supports_rowwise_kmajor"]
 
 THREADS = 256
 TILE = 128
 
 
 @dsl_user_op
-def _qblock(words: list, rr: list, cr: list, *, loc=None, ip=None) -> tuple:
+def qblock(words: list, rr: list, cr: list, *, loc=None, ip=None) -> tuple:
     """
     Quantize a 4 x 4 bf16 block for both outputs, widening each element to fp32 once.
 
-    words[r * 2 + q] holds row r, columns 2q and 2q + 1. Returns four rowwise words (row r, columns 0..3, times rr[r]) and four K-major words (column c, rows 0..3, times cr[c]); byte k of a word is its element k. cvt.rn.satfinite.e4m3x2.f32 is what Triton's .to(tl.float8e4nv) lowers to on SM90, which keeps the bytes identical.
+    words[r * 2 + q] holds row r, columns 2q and 2q + 1. Returns four rowwise words (row r, columns
+    0..3, times rr[r]) and four K-major words (column c, rows 0..3, times cr[c]); byte k of a word
+    is its element k. cvt.rn.satfinite.e4m3x2.f32 is what Triton's .to(tl.float8e4nv) lowers to on
+    SM90, which keeps the bytes identical.
     """
     L = ["{", ".reg .b32 x<16>;", ".reg .f32 y<4>;", ".reg .b16 l, h;"]
     for r in range(4):  # x[r * 4 + c] = element (r, c) as fp32
@@ -52,9 +58,13 @@ def _qblock(words: list, rr: list, cr: list, *, loc=None, ip=None) -> tuple:
 
 class RowwiseKmajor:
     """
-    One 128 x 128 tile per CTA; 256 threads, each owning an 8 x 8 sub-block, so the K-major bytes of eight consecutive rows of a column come out without a transpose.
+    One 128 x 128 tile per CTA; 256 threads, each owning an 8 x 8 sub-block, so the K-major bytes of
+    eight consecutive rows of a column come out without a transpose.
 
-    Lane l of warp w owns column vector cv = l % 8 + 8 * (w % 2) (8 columns) and row block rb = l // 8 + 4 * (w // 2) (8 rows). The grid walks column blocks fastest, so co-resident CTAs cover whole rows of the input and outputs (and long runs of each K-major column), which keeps DRAM access local.
+    Lane l of warp w owns column vector cv = l % 8 + 8 * (w % 2) (8 columns) and row block rb =
+    l // 8 + 4 * (w // 2) (8 rows). The grid walks column blocks fastest, so co-resident CTAs
+    cover whole rows of the input and outputs (and long runs of each K-major column), which
+    keeps DRAM access local.
     """
 
     RED_WORDS = 64 * 6
@@ -184,7 +194,7 @@ class RowwiseKmajor:
         for m in range(2):
             for h in range(2):
                 words = [v[4 * m + r][2 * h + q] for r in range(4) for q in range(2)]
-                t4, k4 = _qblock(words, row_rcp[4 * m : 4 * m + 4], col_rcp[4 * h : 4 * h + 4])
+                t4, k4 = qblock(words, row_rcp[4 * m : 4 * m + 4], col_rcp[4 * h : 4 * h + 4])
                 for r in range(4):
                     tok[4 * m + r][h] = t4[r]
                 for c in range(4):
@@ -196,10 +206,10 @@ class RowwiseKmajor:
             st_v2(km_row + Int64(col0 + j) * k_g, km[j][0], km[j][1], col_ok)
 
 
-_COMPILED: dict = {}
+COMPILED: dict = {}
 
 
-def _compile(n: int, num_groups: int) -> Callable:
+def compile_kernel(n: int, num_groups: int) -> Callable:
     fake = cute.runtime.make_fake_tensor
     m = cute.sym_int()
     mn = cute.sym_int()
@@ -214,33 +224,39 @@ def _compile(n: int, num_groups: int) -> Callable:
     return cute.compile(RowwiseKmajor(n, num_groups), x, offs, tok, tok_scale, km, km_scale, fake_stream(), options="--enable-tvm-ffi")
 
 
-def _empty_outputs(x: torch.Tensor, M: int, N: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def empty_outputs(x: torch.Tensor, M: int, N: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     dev = x.device
     return (torch.empty((M, N), dtype=torch.float8_e4m3fn, device=dev), mn_major_scale(M, (N + TILE - 1) // TILE, dev), torch.empty(M * N, dtype=torch.float8_e4m3fn, device=dev), mn_major_scale(N, M // TILE, dev))
 
 
 def supports_rowwise_kmajor(x: torch.Tensor, grouped_mm_offs: torch.Tensor) -> bool:
-    """Whether the CuTe kernel covers this input: contiguous, 16-byte aligned bf16 x with N % 8 == 0, and non-empty contiguous int32 grouped_mm_offs."""
+    """
+    Whether the CuTe kernel covers this input: contiguous, 16-byte aligned bf16 x with N % 8 == 0,
+    and non-empty contiguous int32 grouped_mm_offs.
+    """
     return not (x.dtype != torch.bfloat16 or x.shape[1] % 8 != 0 or not x.is_contiguous() or x.data_ptr() % 16 != 0 or grouped_mm_offs.dtype != torch.int32 or grouped_mm_offs.shape[0] == 0 or not grouped_mm_offs.is_contiguous())
 
 
 def fp8cast_rowwise_kmajor_sm90(x: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """fp8cast_rowwise_kmajor on SM90; both scales MN-major. Inputs supports_rowwise_kmajor rejects take the Triton kernel, with its scales converted to the same layout."""
+    """
+    fp8cast_rowwise_kmajor on SM90; both scales MN-major. Inputs supports_rowwise_kmajor rejects
+    take the Triton kernel, with its scales converted to the same layout.
+    """
     assert x.ndim == 2 and x.shape[0] % 128 == 0, (f"Expected 2D tensor with M%128==0, got shape {x.shape}")
     M, N = x.shape
     if M == 0:
-        return _empty_outputs(x, M, N)
+        return empty_outputs(x, M, N)
     G = grouped_mm_offs.shape[0]
     if not supports_rowwise_kmajor(x, grouped_mm_offs):
         tok, s_tok, km, s_km = fp8cast_rowwise_kmajor_sm100(x, grouped_mm_offs)
         return tok, to_mn_major(s_tok), km, to_mn_major(s_km)
 
-    out = _empty_outputs(x, M, N)
+    out = empty_outputs(x, M, N)
     if N == 0:
         return out
     key = (N, G)
-    fn = _COMPILED.get(key)
+    fn = COMPILED.get(key)
     if fn is None:
-        fn = _COMPILED[key] = _compile(N, G)
+        fn = COMPILED[key] = compile_kernel(N, G)
     fn(x, grouped_mm_offs, *out)
     return out

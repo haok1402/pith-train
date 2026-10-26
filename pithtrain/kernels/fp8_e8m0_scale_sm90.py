@@ -1,5 +1,7 @@
 """
-Inline-PTX E8M0 scale math for the SM90 CuTe-DSL quantization kernels: the SM90 branch of compute_fp8_scale (fp8_scale.py) bit for bit, and the RN-satfinite e4m3 cast Triton's .to(tl.float8e4nv) lowers to.
+Inline-PTX E8M0 scale math for the SM90 CuTe-DSL quantization kernels: the SM90 branch of
+compute_fp8_scale (fp8_scale.py) bit for bit, and the RN-satfinite e4m3 cast Triton's
+.to(tl.float8e4nv) lowers to.
 """
 
 import struct
@@ -14,13 +16,13 @@ from pithtrain.kernels.cute_ptx_sm90 import asm, asm_args_last, f32_hex, to_ir, 
 __all__ = ["AMAX_MIN", "FP8_MAX_RCP", "e8m0_scale", "e8m0_scale_bf16x2", "e8m0_scale_f32", "exact_rcp", "quant4_e4m3"]
 
 
-def _f32_hex(x: float) -> str:
+def ptx_f32(x: float) -> str:
     """PTX hex literal of the float32 nearest to x."""
     return "0f%08X" % struct.unpack("<I", struct.pack("<f", x))[0]
 
 
-FP8_MAX_RCP = _f32_hex(1.0 / 448.0)
-AMAX_MIN = _f32_hex(1e-4)
+FP8_MAX_RCP = ptx_f32(1.0 / 448.0)
+AMAX_MIN = ptx_f32(1e-4)
 
 
 @dsl_user_op
@@ -68,13 +70,16 @@ def quant4_e4m3(x0: Float32, x1: Float32, x2: Float32, x3: Float32, r: tuple, *,
 
 
 # fp32 constants of compute_fp8_scale as hex bit patterns, for the integer-compare form below.
-_AMAX_MIN_BITS = f32_hex(1e-4)  # tl.maximum(amax, 1e-4) as fp32
-_FP8_MAX_RCP_BITS = f32_hex(1.0 / 448.0)  # FP8_MAX_RCP as fp32
+AMAX_MIN_BITS = f32_hex(1e-4)  # tl.maximum(amax, 1e-4) as fp32
+FP8_MAX_RCP_BITS = f32_hex(1.0 / 448.0)  # FP8_MAX_RCP as fp32
 
 
 @dsl_user_op
 def e8m0_scale_bf16x2(amax2: Uint32, hi: Int32, *, loc=None, ip=None) -> tuple:
-    """E8M0 scale of the bf16 amax in the low (hi == 0) or high half of amax2, as the fp32 bit patterns (scale, reciprocal); matches compute_fp8_scale's SM90 branch bit for bit."""
+    """
+    E8M0 scale of the bf16 amax in the low (hi == 0) or high half of amax2, as the fp32 bit patterns
+    (scale, reciprocal); matches compute_fp8_scale's SM90 branch bit for bit.
+    """
     st = llvm.StructType.get_literal([T.i32(), T.i32()])
     r = asm(
         st, [Uint32(amax2).ir_value(loc=loc, ip=ip), Int32(hi).ir_value(loc=loc, ip=ip)],
@@ -83,9 +88,9 @@ def e8m0_scale_bf16x2(amax2: Uint32, hi: Int32, *, loc=None, ip=None) -> tuple:
         "and.b32 a, $2, 0xFFFF0000;\n\t"
         "shl.b32 b, $2, 16;\n\t"
         "selp.b32 a, a, b, q;\n\t"
-        f"max.u32 a, a, {_AMAX_MIN_BITS};\n\t"  # amax >= 0, so integer max == float max
+        f"max.u32 a, a, {AMAX_MIN_BITS};\n\t"  # amax >= 0, so integer max == float max
         "mov.b32 f, a;\n\t"
-        f"mul.rn.f32 f, f, 0f{_FP8_MAX_RCP_BITS[2:]};\n\t"
+        f"mul.rn.f32 f, f, 0f{FP8_MAX_RCP_BITS[2:]};\n\t"
         "mov.b32 a, f;\n\t"
         "and.b32 m, a, 0x007FFFFF;\n\t"
         "and.b32 s, a, 0x7F800000;\n\t"
@@ -104,7 +109,9 @@ def e8m0_scale(amax: Float32, *, loc=None, ip=None) -> Float32:
     """
     SM90 branch of compute_fp8_scale: power-of-2 ceil of max(amax, 1e-4) / 448.
 
-    0f38D1B717 is fp32(1e-4) and 0f3B124925 is fp32(1/448), the constants Triton folds. The final max.u32 with 0x00800000 clamps to the smallest normal (2^-126); on non-negative floats an unsigned compare of the bits orders like the float compare.
+    0f38D1B717 is fp32(1e-4) and 0f3B124925 is fp32(1/448), the constants Triton folds. The final
+    max.u32 with 0x00800000 clamps to the smallest normal (2^-126); on non-negative floats an
+    unsigned compare of the bits orders like the float compare.
     """
     res = llvm.inline_asm(
         T.f32(), [Float32(amax).ir_value(loc=loc, ip=ip)],

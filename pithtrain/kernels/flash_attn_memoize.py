@@ -18,25 +18,25 @@ __all__ = ["FAST_PATH", "MISSING", "memoized_launch", "plans", "signature"]
 # call becomes a plan only if FA4 did nothing but allocate, take views and call cached kernels;
 # nothing captured is replayed except compiled kernels and immutable arguments.
 
-_VALIDATED_FA4 = "4.0.0b28"
+VALIDATED_FA4 = "4.0.0b28"
 
 
-def _fast_path_enabled() -> bool:
+def fast_path_enabled() -> bool:
     try:
-        return importlib.metadata.version("flash-attn-4") == _VALIDATED_FA4
+        return importlib.metadata.version("flash-attn-4") == VALIDATED_FA4
     except importlib.metadata.PackageNotFoundError:
         return False
 
 
-FAST_PATH = _fast_path_enabled()
+FAST_PATH = fast_path_enabled()
 
 # aten ops FA4's entry may run without disqualifying a plan: allocations and views.
-_ALLOC_OPS = {"empty.memory_format", "empty_like.default", "empty_strided.default", "zeros.default", "zeros_like.default", "new_empty.default", "new_zeros.default"}
-_ZERO_OPS = {"zero_.default"}
-_VIEW_OPS = {"detach.default", "alias.default", "view.default", "_unsafe_view.default", "t.default", "transpose.int", "permute.default", "as_strided.default", "slice.Tensor", "select.int", "squeeze.dim", "unsqueeze.default", "expand.default"}
+ALLOC_OPS = {"empty.memory_format", "empty_like.default", "empty_strided.default", "zeros.default", "zeros_like.default", "new_empty.default", "new_zeros.default"}
+ZERO_OPS = {"zero_.default"}
+VIEW_OPS = {"detach.default", "alias.default", "view.default", "_unsafe_view.default", "t.default", "transpose.int", "permute.default", "as_strided.default", "slice.Tensor", "select.int", "squeeze.dim", "unsqueeze.default", "expand.default"}
 
 
-class _Recording(TorchDispatchMode):
+class Recording(TorchDispatchMode):
     """Logs the aten ops run under it: allocations (and whether zero-filled) and anything else."""
 
     def __init__(self) -> None:
@@ -48,18 +48,18 @@ class _Recording(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         out = func(*args, **(kwargs or {}))
         name = str(func).removeprefix("aten.")
-        if name in _ALLOC_OPS:
+        if name in ALLOC_OPS:
             self.allocs.append(out)
             if name.startswith(("zeros", "new_zeros")):
                 self.zeroed.add(out.data_ptr())
-        elif name in _ZERO_OPS:
+        elif name in ZERO_OPS:
             self.zeroed.add(args[0].data_ptr())
-        elif name not in _VIEW_OPS:
+        elif name not in VIEW_OPS:
             self.other.append(name)
         return out
 
 
-class _Recorder:
+class Recorder:
     def __init__(self, fn: Callable, log: list) -> None:
         self.fn, self.log = fn, log
 
@@ -68,7 +68,7 @@ class _Recorder:
         return self.fn(*args, **kwargs)
 
 
-class _RecordingCache:
+class RecordingCache:
     """Stands in for one FA4 compile cache during a recorded call."""
 
     def __init__(self, inner: Any, log: list) -> None:
@@ -78,7 +78,7 @@ class _RecordingCache:
         return key in self.inner
 
     def __getitem__(self, key):
-        return _Recorder(self.inner[key], self.log)
+        return Recorder(self.inner[key], self.log)
 
     def __setitem__(self, key, fn) -> None:
         self.inserted = True
@@ -89,7 +89,7 @@ class _RecordingCache:
 
 
 @dataclasses.dataclass(frozen=True)
-class _Plan:
+class Plan:
     allocs: Tuple[Tuple[torch.Size, Tuple[int, ...], torch.dtype, bool], ...]
     calls: Tuple[Tuple[Callable, Any, Any], ...]
     outputs: Tuple[Any, ...]
@@ -98,11 +98,11 @@ class _Plan:
     fast_calls: Tuple[Tuple[Callable, Tuple[Any, ...], Tuple[Tuple[int, Any], ...]], ...] = dataclasses.field(compare=False, default=())
 
 
-class _Unsupported(Exception):
+class Unsupported(Exception):
     pass
 
 
-def _template(x: Any, inputs: Dict[str, torch.Tensor], allocs: List[torch.Tensor]) -> Any:
+def template(x: Any, inputs: Dict[str, torch.Tensor], allocs: List[torch.Tensor]) -> Any:
     """How to rebuild x from the live inputs and fresh allocations of a later call."""
     if isinstance(x, torch.Tensor):
         same = lambda t: t.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()
@@ -115,25 +115,25 @@ def _template(x: Any, inputs: Dict[str, torch.Tensor], allocs: List[torch.Tensor
                 view = None if meta == (t.shape, t.stride(), t.storage_offset()) else (tuple(x.shape), tuple(x.stride()), x.storage_offset())
                 return ("new", ref, view)
         # Inputs only ever pass through whole: a view of one (or a copy) is not planned.
-        raise _Unsupported("argument tensor that is no input and no allocation of FA4")
+        raise Unsupported("argument tensor that is no input and no allocation of FA4")
     if isinstance(x, (list, tuple)):
-        parts = tuple(_template(e, inputs, allocs) for e in x)
+        parts = tuple(template(e, inputs, allocs) for e in x)
         if hasattr(x, "_fields"):
             return ("namedtuple", type(x), parts)
         return ("seq", type(x), parts)
     if dataclasses.is_dataclass(x) and not isinstance(x, type):
-        fields = {f.name: _template(getattr(x, f.name), inputs, allocs) for f in dataclasses.fields(x)}
+        fields = {f.name: template(getattr(x, f.name), inputs, allocs) for f in dataclasses.fields(x)}
         if all(v[0] == "const" for v in fields.values()):
             return ("const", x)
         return ("dataclass", type(x), fields)
     if x is None or isinstance(x, (bool, int, float, str)):
         return ("const", x)
     if hasattr(x, "__dict__") and any(isinstance(v, torch.Tensor) for v in vars(x).values()):
-        raise _Unsupported(f"argument object {type(x).__name__} holds tensors")
+        raise Unsupported(f"argument object {type(x).__name__} holds tensors")
     return ("const", x)
 
 
-def _build(t: Any, inputs: Dict[str, torch.Tensor], allocs: List[torch.Tensor]) -> Any:
+def build(t: Any, inputs: Dict[str, torch.Tensor], allocs: List[torch.Tensor]) -> Any:
     kind = t[0]
     if kind == "const":
         return t[1]
@@ -144,23 +144,23 @@ def _build(t: Any, inputs: Dict[str, torch.Tensor], allocs: List[torch.Tensor]) 
         shape, stride, offset = t[2]
         return base.detach().as_strided(shape, stride, offset)
     if kind == "namedtuple":
-        return t[1](*(_build(e, inputs, allocs) for e in t[2]))
+        return t[1](*(build(e, inputs, allocs) for e in t[2]))
     if kind == "seq":
-        return t[1](_build(e, inputs, allocs) for e in t[2])
-    return t[1](**{k: _build(v, inputs, allocs) for k, v in t[2].items()})
+        return t[1](build(e, inputs, allocs) for e in t[2])
+    return t[1](**{k: build(v, inputs, allocs) for k, v in t[2].items()})
 
 
-def _record(entry: Callable[[], Tuple[torch.Tensor, ...]], inputs: Dict[str, torch.Tensor]):
+def record(entry: Callable[[], Tuple[torch.Tensor, ...]], inputs: Dict[str, torch.Tensor]):
     """Run FA4's entry once, returning (its outputs, a plan or None)."""
     # Imported here, not at the top: FA4 loads cutlass, and importing pithtrain.kernels must not.
     from flash_attn.cute import interface as _fa4
     owners = [f for f in vars(_fa4).values() if callable(f) and hasattr(f, "compile_cache")]
     log: list = []
-    caches = [_RecordingCache(f.compile_cache, log) for f in owners]
+    caches = [RecordingCache(f.compile_cache, log) for f in owners]
     for f, cache in zip(owners, caches):
         f.compile_cache = cache
     try:
-        with _Recording() as rec:
+        with Recording() as rec:
             outs = entry()
     finally:
         for f, cache in zip(owners, caches):
@@ -172,9 +172,9 @@ def _record(entry: Callable[[], Tuple[torch.Tensor, ...]], inputs: Dict[str, tor
     try:
         allocs = rec.allocs
         alloc_meta = tuple((t.shape, t.stride(), t.dtype, t.data_ptr() in rec.zeroed) for t in allocs)
-        calls = tuple((fn, _template(args, inputs, allocs), _template(kwargs, inputs, allocs)) for fn, args, kwargs in log)
-        outputs = tuple(_template(o, inputs, allocs) for o in outs)
-    except _Unsupported:
+        calls = tuple((fn, template(args, inputs, allocs), template(kwargs, inputs, allocs)) for fn, args, kwargs in log)
+        outputs = tuple(template(o, inputs, allocs) for o in outs)
+    except Unsupported:
         return outs, None
     if any(o[0] != "new" for o in outputs) or any(kwargs for _, _, kwargs in log):
         return outs, None
@@ -183,10 +183,10 @@ def _record(entry: Callable[[], Tuple[torch.Tensor, ...]], inputs: Dict[str, tor
         consts = tuple(a[1] if a[0] == "const" else None for a in args[2])
         slots = tuple((i, a) for i, a in enumerate(args[2]) if a[0] != "const")
         fast_calls.append((fn, consts, slots))
-    return outs, _Plan(alloc_meta, calls, outputs, tuple(fast_calls))
+    return outs, Plan(alloc_meta, calls, outputs, tuple(fast_calls))
 
 
-def _replay(plan: _Plan, inputs: Dict[str, torch.Tensor], device: torch.device) -> Tuple[torch.Tensor, ...]:
+def replay(plan: Plan, inputs: Dict[str, torch.Tensor], device: torch.device) -> Tuple[torch.Tensor, ...]:
     allocs = [torch.zeros(shape, dtype=dtype, device=device) if zeroed else torch.empty_strided(shape, stride, dtype=dtype, device=device) for shape, stride, dtype, zeroed in plan.allocs]
     detached = {name: t.detach() for name, t in inputs.items() if t is not None}
     for fn, consts, slots in plan.fast_calls:
@@ -198,13 +198,13 @@ def _replay(plan: _Plan, inputs: Dict[str, torch.Tensor], device: torch.device) 
             elif kind == "new" and view is None:
                 args[i] = allocs[ref]
             else:
-                args[i] = _build(t, inputs, allocs)
+                args[i] = build(t, inputs, allocs)
         fn(*args)
-    return tuple(allocs[o[1]] if o[2] is None else _build(o, inputs, allocs) for o in plan.outputs)
+    return tuple(allocs[o[1]] if o[2] is None else build(o, inputs, allocs) for o in plan.outputs)
 
 
 MISSING, _SEEN = object(), object()
-plans: Dict[Tuple, Optional[_Plan]] = {}
+plans: Dict[Tuple, Optional[Plan]] = {}
 
 
 def signature(kind: str, inputs: Dict[str, Optional[torch.Tensor]], *scalars) -> Tuple:
@@ -238,10 +238,10 @@ def memoized_launch(kind: str, inputs: Dict[str, Optional[torch.Tensor]], scalar
         plans[key] = _SEEN
         return entry()
     if plan is _SEEN:
-        outs, plan = _record(entry, inputs)
+        outs, plan = record(entry, inputs)
         if plan is not MISSING:
             plans[key] = plan
         return outs
     if plan is None:
         return entry()
-    return _replay(plan, inputs, inputs["q"].device)
+    return replay(plan, inputs, inputs["q"].device)

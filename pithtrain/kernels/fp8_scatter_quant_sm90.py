@@ -3,8 +3,8 @@ SM90 CuTe-DSL scatter_quant: dedup expansion + scatter by expert + K-major FP8 q
 launches and one read of the received tokens; the grouped bf16 input never exists.
 
 1. Prep (one CTA per 2048 tokens) ranks each token stably within its expert, writes grouped_mm_offs
-   and ks_tensor, each token's rank, and the inverse map inv[g * m + k] = the source row of row k of
-   group g.
+   and ks_tensor, each token's rank, and the inverse map inv[g * m + k] = the source row of row k
+   of group g.
 2. ScatterQuant, the rowwise_kmajor tile kernel whose row loads go through inv (padding rows load
    zeros), quantizes and writes both scales MN-major; its column-block-0 CTAs also write
    reverse_shuffle_idxs. It is launched as a programmatic dependent (PDL) of the prep kernel.
@@ -34,36 +34,36 @@ from pithtrain.kernels.token_scatter import scatter_by_expert
 
 __all__ = ["Prep", "ScatterQuant", "scatter_quant_sm90", "supports_scatter_quant"]
 
-_PREP_THREADS = 512
-_PREP_WARPS = _PREP_THREADS // 32
-_PREP_CHUNK = 2048  # tokens per prep CTA
-_MAX_GROUPS = _PREP_THREADS
-_ALIGN = 128
+PREP_THREADS = 512
+PREP_WARPS = PREP_THREADS // 32
+PREP_CHUNK = 2048  # tokens per prep CTA
+MAX_GROUPS = PREP_THREADS
+ALIGN = 128
 
 
 class Prep:
-    """Stable per-expert ranking, group offsets and inverse map; one CTA per _PREP_CHUNK tokens."""
+    """Stable per-expert ranking, group offsets and inverse map; one CTA per PREP_CHUNK tokens."""
 
     def __init__(self, num_groups: int, has_expand: bool) -> None:
-        assert 0 < num_groups <= _MAX_GROUPS
+        assert 0 < num_groups <= MAX_GROUPS
         self.G = num_groups
         self.has_expand = has_expand
 
     @cute.jit
     def __call__(self, mE: cute.Tensor, mExp: cute.Tensor, mInv: cute.Tensor, mRank: cute.Tensor, mOffs: cute.Tensor, mKs: cute.Tensor, mCnt: cute.Tensor, mFlags: cute.Tensor, mHist: cute.Tensor, mCtr: cute.Tensor, stream) -> None:
-        C = (mE.shape[0] + _PREP_CHUNK - 1) // _PREP_CHUNK
+        C = (mE.shape[0] + PREP_CHUNK - 1) // PREP_CHUNK
         args = (mE, mExp, mInv, mRank, mOffs, mKs, mCnt, mFlags, mHist, mCtr)
-        self.kernel(*args).launch(grid=[C, 1, 1], block=[_PREP_THREADS, 1, 1], stream=stream)
+        self.kernel(*args).launch(grid=[C, 1, 1], block=[PREP_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, mE: cute.Tensor, mExp: cute.Tensor, mInv: cute.Tensor, mRank: cute.Tensor, mOffs: cute.Tensor, mKs: cute.Tensor, mCnt: cute.Tensor, mFlags: cute.Tensor, mHist: cute.Tensor, mCtr: cute.Tensor) -> None:
         G = self.G
-        NT = _PREP_THREADS
-        NW = _PREP_WARPS
+        NT = PREP_THREADS
+        NW = PREP_WARPS
         tid, _, _ = cute.arch.thread_idx()
         warp = tid // 32
         m = mE.shape[0]
-        C = (m + _PREP_CHUNK - 1) // _PREP_CHUNK
+        C = (m + PREP_CHUNK - 1) // PREP_CHUNK
         e_base = mE.iterator.toint()
         inv_base = mInv.iterator.toint()
         flags_base = mFlags.iterator.toint()
@@ -100,8 +100,8 @@ class Prep:
         rls = []
         lt_mask = lanemask_lt()
         es_in = []
-        for r in cutlass.range_constexpr(_PREP_CHUNK // NT):  # all loads in flight at once
-            i = c * _PREP_CHUNK + r * NT + tid
+        for r in cutlass.range_constexpr(PREP_CHUNK // NT):  # all loads in flight at once
+            i = c * PREP_CHUNK + r * NT + tid
             ok = Int32(i < m)
             e = ld_b32(e_base + Int64(i) * 8, ok, Int32(-1))
             src = i
@@ -111,7 +111,7 @@ class Prep:
             srcs.append(src)
             ids.append(i)
             oks.append(ok)
-        for r in cutlass.range_constexpr(_PREP_CHUNK // NT):
+        for r in cutlass.range_constexpr(PREP_CHUNK // NT):
             e, ok = es_in[r], oks[r]
             peers = match_any(e)
             lt = cute.arch.popc(peers & lt_mask)
@@ -155,7 +155,7 @@ class Prep:
         cute.arch.sync_threads()
 
         # inverse map inv[g * m + rank] = source row, and each token's rank
-        for r in cutlass.range_constexpr(_PREP_CHUNK // NT):
+        for r in cutlass.range_constexpr(PREP_CHUNK // NT):
             rank = Int32(lds_b32(s_pre + eids[r] * 4)) + rls[r]
             addr = inv_base + (Int64(eids[r]) * m + rank) * 4
             st_b32(addr, Uint32(srcs[r]), oks[r])
@@ -167,9 +167,9 @@ class Prep:
                 off = Int32(0)
                 for g in cutlass.range(tid + 1, unroll=1):
                     cg = Int32(lds_b32(s_pre + g * 4)) + Int32(lds_b32(s_run + g * 4))
-                    off = off + (cg + (_ALIGN - 1)) // _ALIGN * _ALIGN
+                    off = off + (cg + (ALIGN - 1)) // ALIGN * ALIGN
                 own = Int32(lds_b32(s_pre + tid * 4)) + Int32(lds_b32(s_run + tid * 4))
-                pad = (own + (_ALIGN - 1)) // _ALIGN * _ALIGN
+                pad = (own + (ALIGN - 1)) // ALIGN * ALIGN
                 st_b32(mOffs.iterator.toint() + Int64(tid) * 4, Uint32(off), Int32(1))
                 st_b32(mKs.iterator.toint() + Int64(tid) * 4, Uint32(pad), Int32(1))
                 st_b32(mCnt.iterator.toint() + Int64(tid) * 4, Uint32(own), Int32(1))
@@ -241,11 +241,11 @@ class ScatterQuant(RowwiseKmajor):
             self._tile(v, pid_row, pid_col, tidx, total, gp, s_red.iterator.toint())
 
 
-_PREP: dict = {}
-_MAIN: dict = {}
+PREP: dict = {}
+MAIN: dict = {}
 
 
-class _Scratch:
+class Scratch:
     """
     Per-device prep scratch: a ticket/epoch counter, epoch flags and chunk histograms. ctr packs
     (epoch << 32) | tickets; the last chunk of each launch advances the epoch and zeroes the
@@ -260,34 +260,34 @@ class _Scratch:
         self.hist = torch.empty(chunks * groups, dtype=torch.int32, device=device)
 
 
-_SCRATCH: dict = {}
-_copy_stream: Optional[torch.cuda.Stream] = None
-_copy_event: Optional[torch.cuda.Event] = None
+SCRATCH: dict = {}
+copy_stream: Optional[torch.cuda.Stream] = None
+copy_event: Optional[torch.cuda.Event] = None
 
 
-def _scratch(device: torch.device, chunks: int, groups: int) -> _Scratch:
-    s = _SCRATCH.get(device.index)
+def scratch(device: torch.device, chunks: int, groups: int) -> Scratch:
+    s = SCRATCH.get(device.index)
     if s is None or s.chunks < chunks or s.groups < groups:
         chunks = max(chunks, s.chunks if s is not None else 0, 64)
         groups = max(groups, s.groups if s is not None else 0)
-        s = _SCRATCH[device.index] = _Scratch(device, chunks, groups)
+        s = SCRATCH[device.index] = Scratch(device, chunks, groups)
     return s
 
 
-def _compile_prep(G: int, has_expand: bool) -> Callable:
+def compile_prep(G: int, has_expand: bool) -> Callable:
     i32 = Int32
     vec = lambda: fake(i32, (cute.sym_int(),), (1,), 4)
     return cute.compile(Prep(G, has_expand), fake(Int64, (cute.sym_int(),), (1,), 8), fake(Int64, (cute.sym_int(),), (1,), 8), vec(), vec(), fake(i32, (G,), (1,), 4), fake(i32, (G,), (1,), 4), fake(i32, (G,), (1,), 4), vec(), vec(), fake(Int64, (1,), (1,), 8), fake_stream(), options="--enable-tvm-ffi")
 
 
-def _compile_main(n: int, G: int, pdl: bool) -> Callable:
+def compile_main(n: int, G: int, pdl: bool) -> Callable:
     mp = cute.sym_int()
     nb = (n + TILE - 1) // TILE
     fp8 = cutlass.Float8E4M3FN
     return cute.compile(ScatterQuant(n, G, pdl), fake(cutlass.BFloat16, (cute.sym_int(), n), (n, 1)), fake(Int64, (cute.sym_int(),), (1,), 8), fake(Int32, (cute.sym_int(),), (1,), 4), fake(Int32, (cute.sym_int(),), (1,), 4), fake(Int32, (G,), (1,), 4), fake(Int32, (G,), (1,), 4), fake(Int64, (cute.sym_int(),), (1,), 8), fake(fp8, (mp, n), (n, 1)), fake(cutlass.Float32, (cute.sym_int(), nb), (1, cute.sym_int64())), fake(fp8, (cute.sym_int(),), (1,)), fake(cutlass.Float32, (n, cute.sym_int()), (1, mn_pad(n))), fake_stream(), options="--enable-tvm-ffi")
 
 
-def _reference(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor], group_counts: Optional[list[int]]) -> tuple:
+def reference(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor], group_counts: Optional[list[int]]) -> tuple:
     """The unfused path for inputs the fused kernels do not cover (rows in atomic_add order)."""
     x = gathered if expand_idx is None else gathered[expand_idx]
     out, rsi, offs, ks_t, ks = scatter_by_expert(x, expert_idxs, num_groups, group_counts=group_counts)
@@ -295,9 +295,11 @@ def _reference(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: in
 
 
 def supports_scatter_quant(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor] = None) -> bool:
-    """Whether the fused kernels cover these inputs (else scatter_quant_sm90 runs the unfused path)."""
+    """
+    Whether the fused kernels cover these inputs (else scatter_quant_sm90 runs the unfused path).
+    """
     m, N = expert_idxs.shape[0], gathered.shape[1]
-    return not (m == 0 or N == 0 or not 0 < num_groups <= _MAX_GROUPS or gathered.dtype != torch.bfloat16 or N % 8 != 0 or not gathered.is_contiguous() or gathered.data_ptr() % 16 != 0 or expert_idxs.dtype != torch.int64 or not expert_idxs.is_contiguous() or (expand_idx is not None and (expand_idx.dtype != torch.int64 or not expand_idx.is_contiguous())))
+    return not (m == 0 or N == 0 or not 0 < num_groups <= MAX_GROUPS or gathered.dtype != torch.bfloat16 or N % 8 != 0 or not gathered.is_contiguous() or gathered.data_ptr() % 16 != 0 or expert_idxs.dtype != torch.int64 or not expert_idxs.is_contiguous() or (expand_idx is not None and (expand_idx.dtype != torch.int64 or not expand_idx.is_contiguous())))
 
 
 def scatter_quant_sm90(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor] = None, padding_alignment: int = 128, group_counts: Optional[list[int]] = None, _pdl: bool = True) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
@@ -305,8 +307,8 @@ def scatter_quant_sm90(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_gr
     scatter_quant on SM90 (see the picker for the contract): fused where supports_scatter_quant,
     else the unfused path. Scales are MN-major. _pdl=False launches the main kernel without PDL.
     """
-    global _copy_stream, _copy_event
-    assert padding_alignment == _ALIGN, "the K-major FP8 layout needs 128-row groups"
+    global copy_stream, copy_event
+    assert padding_alignment == ALIGN, "the K-major FP8 layout needs 128-row groups"
     G = num_groups
     m = expert_idxs.shape[0]
     N = gathered.shape[1]
@@ -316,15 +318,15 @@ def scatter_quant_sm90(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_gr
     if expand_idx is not None and expand_idx.shape[0] != m:
         raise ValueError(f"{expand_idx.shape[0]=} must equal {m=}")
     if not supports_scatter_quant(gathered, expert_idxs, G, expand_idx):
-        return _reference(gathered, expert_idxs, G, expand_idx, group_counts)
+        return reference(gathered, expert_idxs, G, expand_idx, group_counts)
 
     # outputs: exact when the host knows the counts, else an upper bound
     if group_counts is not None:
-        ks = [(c + _ALIGN - 1) // _ALIGN * _ALIGN for c in group_counts]
+        ks = [(c + ALIGN - 1) // ALIGN * ALIGN for c in group_counts]
         M_alloc = sum(ks)
     else:
         ks = None
-        M_alloc = (m + G * (_ALIGN - 1) + _ALIGN - 1) // _ALIGN * _ALIGN
+        M_alloc = (m + G * (ALIGN - 1) + ALIGN - 1) // ALIGN * ALIGN
     nb = (N + TILE - 1) // TILE
     # one int32 allocation: offs | ks | counts | rank (m) | inv (G * m)
     meta = torch.empty(3 * G + m + G * m, dtype=torch.int32, device=dev)
@@ -337,33 +339,33 @@ def scatter_quant_sm90(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_gr
     x_ch = torch.empty(M_alloc * N, dtype=torch.float8_e4m3fn, device=dev)
     x_ch_scale = mn_major_scale(N, M_alloc // TILE, dev)
 
-    chunks = (m + _PREP_CHUNK - 1) // _PREP_CHUNK
-    sc = _scratch(dev, chunks, G)
+    chunks = (m + PREP_CHUNK - 1) // PREP_CHUNK
+    sc = scratch(dev, chunks, G)
     has_expand = expand_idx is not None
-    prep = _PREP.get((G, has_expand))
+    prep = PREP.get((G, has_expand))
     if prep is None:
-        prep = _PREP[(G, has_expand)] = _compile_prep(G, has_expand)
+        prep = PREP[(G, has_expand)] = compile_prep(G, has_expand)
     exp = expand_idx if has_expand else expert_idxs
     prep(expert_idxs, exp, inv, rank, offs, ks_t, cnt, sc.flags, sc.hist, sc.ctr)
 
     if ks is None:
-        if _copy_stream is None:
-            _copy_stream = torch.cuda.Stream(device=dev)
-            _copy_event = torch.cuda.Event()
-        _copy_event.record()
+        if copy_stream is None:
+            copy_stream = torch.cuda.Stream(device=dev)
+            copy_event = torch.cuda.Event()
+        copy_event.record()
 
     key = (N, G, _pdl)
-    fn = _MAIN.get(key)
+    fn = MAIN.get(key)
     if fn is None:
-        fn = _MAIN[key] = _compile_main(N, G, _pdl)
+        fn = MAIN[key] = compile_main(N, G, _pdl)
     fn(gathered, expert_idxs, rank, inv, cnt, offs, rsi, x_fp8, x_scale, x_ch, x_ch_scale)
 
     if ks is None:
         ks_cpu = get_pinned_buffer("scatter_quant_ks", G, torch.int32)
-        with torch.cuda.stream(_copy_stream):
-            _copy_stream.wait_event(_copy_event)
+        with torch.cuda.stream(copy_stream):
+            copy_stream.wait_event(copy_event)
             ks_cpu.copy_(ks_t, non_blocking=True)
-        _copy_stream.synchronize()
+        copy_stream.synchronize()
         ks = ks_cpu.tolist()
         M = sum(ks)
         if M != M_alloc:

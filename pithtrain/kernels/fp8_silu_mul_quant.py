@@ -11,18 +11,18 @@ from pithtrain.kernels.arch import ARCH_MAJOR
 
 __all__ = ["silu_mul_bwd_quant", "silu_mul_bwd_quant_gu", "silu_mul_quant_fwd", "silu_mul_quant_gu_fwd"]
 
-_BLOCK = 128
+BLOCK = 128
 
 
-def _check(xs: list[torch.Tensor], grouped_mm_offs: torch.Tensor) -> None:
+def check(xs: list[torch.Tensor], grouped_mm_offs: torch.Tensor) -> None:
     for x in xs:
         assert x.dtype == torch.bfloat16 and x.ndim == 2 and x.is_contiguous()
         assert x.shape == xs[0].shape
-    assert xs[0].shape[0] % _BLOCK == 0, f"M must be a multiple of 128, got {xs[0].shape}"
+    assert xs[0].shape[0] % BLOCK == 0, f"M must be a multiple of 128, got {xs[0].shape}"
     assert grouped_mm_offs.dtype == torch.int32 and grouped_mm_offs.is_contiguous()
 
 
-def _check_gu(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> None:
+def check_gu(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> None:
     assert gu.dtype == torch.bfloat16 and gu.ndim == 2 and gu.is_contiguous()
     assert gu.shape[1] % 2 == 0
     assert grouped_mm_offs.dtype == torch.int32 and grouped_mm_offs.is_contiguous()
@@ -35,12 +35,11 @@ def silu_mul_quant_fwd(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.
     bit for bit.
 
     g, u: bf16 (M, N), contiguous, same shape; rows grouped by expert. grouped_mm_offs: int32 (G,)
-    contiguous cumulative group ends, each a multiple of 128, last == M. Inputs are not modified;
-    M == 0 or N == 0 gives empty outputs. Callers use it where fp8_fused_experts_supported(); on
-    SM100 it returns the same values with row-major scales (scale strides are unspecified).
-    Deterministic.
+    contiguous cumulative group ends, each a multiple of 128, last == M. Inputs are not modified; M
+    == 0 or N == 0 gives empty outputs. Callers use it where fp8_fused_experts_supported(); on SM100
+    it returns the same values with row-major scales (scale strides are unspecified). Deterministic.
     """
-    _check([g, u], grouped_mm_offs)
+    check([g, u], grouped_mm_offs)
     match ARCH_MAJOR:
         case 9:
             from pithtrain.kernels.fp8_silu_mul_quant_sm90 import silu_mul_quant_fwd_sm90
@@ -54,15 +53,14 @@ def silu_mul_quant_fwd(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.
 
 def silu_mul_bwd_quant(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
     """
-    Backward of silu_mul_quant_fwd: (dg_quant, du_quant), each the 4-tuple of
-    quantize_grouped_input of one gradient of silu_mul_bwd(dh, g, u), without writing the bf16
-    gradients.
+    Backward of silu_mul_quant_fwd: (dg_quant, du_quant), each the 4-tuple of quantize_grouped_input
+    of one gradient of silu_mul_bwd(dh, g, u), without writing the bf16 gradients.
 
-    dh, g, u: bf16 (M, N), contiguous, same shape; dh the gradient of h, g / u the saved forward
-    inputs. grouped_mm_offs, layout and SM100 behaviour as in silu_mul_quant_fwd. Inputs are not
-    modified. Deterministic.
+    dh, g, u: bf16 (M, N), contiguous, same shape; dh the gradient of h, g / u the saved
+    forward inputs. grouped_mm_offs, layout and SM100 behaviour as in silu_mul_quant_fwd.
+    Inputs are not modified. Deterministic.
     """
-    _check([dh, g, u], grouped_mm_offs)
+    check([dh, g, u], grouped_mm_offs)
     match ARCH_MAJOR:
         case 9:
             from pithtrain.kernels.fp8_silu_mul_quant_sm90 import silu_mul_bwd_quant_sm90
@@ -76,12 +74,12 @@ def silu_mul_bwd_quant(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, group
 
 def silu_mul_quant_gu_fwd(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    silu_mul_quant_fwd of the halves of a fused gate_up output: g = gu[:, :N], u = gu[:, N:]
-    (concatenated, not interleaved). gu: bf16 (M, 2N) contiguous, not modified. Returns the 4-tuple
-    for the (M, N) h, the same as silu_mul_quant_fwd(gu[:, :N].contiguous(), gu[:, N:].contiguous(),
-    grouped_mm_offs).
+    silu_mul_quant_fwd of the halves of a fused gate_up output: g = gu[:, :N], u = gu[:,
+    N:] (concatenated, not interleaved). gu: bf16 (M, 2N) contiguous, not modified. Returns
+    the 4-tuple for the (M, N) h, the same as silu_mul_quant_fwd(gu[:, :N].contiguous(),
+    gu[:, N:].contiguous(), grouped_mm_offs).
     """
-    _check_gu(gu, grouped_mm_offs)
+    check_gu(gu, grouped_mm_offs)
     match ARCH_MAJOR:
         case 9:
             from pithtrain.kernels.fp8_silu_mul_quant_sm90 import silu_mul_quant_gu_fwd_sm90
@@ -101,7 +99,7 @@ def silu_mul_bwd_quant_gu(dh: torch.Tensor, gu: torch.Tensor, grouped_mm_offs: t
     dh: bf16 (M, N) contiguous, the gradient of h. gu: bf16 (M, 2N) contiguous, the saved gate_up
     output. Neither is modified.
     """
-    _check_gu(gu, grouped_mm_offs)
+    check_gu(gu, grouped_mm_offs)
     assert dh.dtype == torch.bfloat16 and dh.is_contiguous()
     assert dh.shape == (gu.shape[0], gu.shape[1] // 2)
     match ARCH_MAJOR:

@@ -12,7 +12,7 @@ __all__ = ["BLOCK_SIZE", "silu_mul_bwd", "silu_mul_fwd"]
 
 
 @triton.jit
-def _silu_mul_fwd_kernel(gate_ptr, up_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+def silu_mul_fwd_kernel(gate_ptr, up_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     block_start = tl.program_id(0).to(tl.int64) * BLOCK_SIZE
     offs = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offs < n_elements
@@ -29,7 +29,7 @@ def _silu_mul_fwd_kernel(gate_ptr, up_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.c
 
 
 @triton.jit
-def _silu_mul_bwd_kernel(grad_out_ptr, gate_ptr, up_ptr, grad_gate_ptr, grad_up_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+def silu_mul_bwd_kernel(grad_out_ptr, gate_ptr, up_ptr, grad_gate_ptr, grad_up_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     block_start = tl.program_id(0).to(tl.int64) * BLOCK_SIZE
     offs = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offs < n_elements
@@ -70,7 +70,7 @@ def silu_mul_fwd(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(gate)
     n = gate.numel()
     grid = (triton.cdiv(n, BLOCK_SIZE),)
-    _silu_mul_fwd_kernel[grid](gate, up, out, n, BLOCK_SIZE=BLOCK_SIZE)
+    silu_mul_fwd_kernel[grid](gate, up, out, n, BLOCK_SIZE=BLOCK_SIZE)
     return out
 
 
@@ -79,8 +79,9 @@ def silu_mul_bwd(grad_output: torch.Tensor, gate: torch.Tensor, up: torch.Tensor
     Gradients of silu_mul_fwd: fresh (grad_gate, grad_up) like gate / up.
 
     grad_output, gate, up: contiguous, same shape and dtype; not modified. With s = sigmoid(gate)
-    in fp32: grad_up = grad_output * gate * s, grad_gate = grad_output * up * s * (1 + gate - gate * s),
-    each rounded once to the dtype. Deterministic; silu_mul_bwd_quant reproduces both bit for bit.
+    in fp32: grad_up = grad_output * gate * s, grad_gate = grad_output * up * s * (1 + gate -
+    gate * s), each rounded once to the dtype. Deterministic; silu_mul_bwd_quant reproduces both
+    bit for bit.
     """
     assert grad_output.shape == gate.shape, (f"grad_output shape {grad_output.shape} != gate shape {gate.shape}")
     assert grad_output.dtype == gate.dtype, (f"grad_output dtype {grad_output.dtype} != gate dtype {gate.dtype}")
@@ -89,5 +90,5 @@ def silu_mul_bwd(grad_output: torch.Tensor, gate: torch.Tensor, up: torch.Tensor
     grad_up = torch.empty_like(up)
     n = gate.numel()
     grid = (triton.cdiv(n, BLOCK_SIZE),)
-    _silu_mul_bwd_kernel[grid](grad_output, gate, up, grad_gate, grad_up, n, BLOCK_SIZE=BLOCK_SIZE)
+    silu_mul_bwd_kernel[grid](grad_output, gate, up, grad_gate, grad_up, n, BLOCK_SIZE=BLOCK_SIZE)
     return grad_gate, grad_up

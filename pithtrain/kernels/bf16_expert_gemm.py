@@ -12,10 +12,10 @@ def bf16_expert_gated_forward(x, w_gate, w_up, cu, a_idx, bias=None, act=()):
     Gate/up grouped GEMM of the gathered rows x[a_idx] with SwiGLU fused in the epilogue. Returns
     fresh bf16 (preact (M, 2I), h (M, I)), M = a_idx.shape[0].
 
-    - x: bf16 (T, H) row-major. a_idx: int32 (M,) and cu: int32 (G + 1,) from bf16_expert_group_slots;
-      grouped row r of expert g (cu[g] <= r < cu[g + 1]) reads x[a_idx[r]].
-    - w_gate, w_up: bf16 (G, I, H) with the same strides, each 16-byte aligned and a nonzero multiple
-      of 16 bytes apart (asserted), in either address order. H and I multiples of 8.
+    - x: bf16 (T, H) row-major. a_idx: int32 (M,) and cu: int32 (G + 1,) from
+      bf16_expert_group_slots; grouped row r of expert g (cu[g] <= r < cu[g + 1]) reads x[a_idx[r]].
+    - w_gate, w_up: bf16 (G, I, H) with the same strides, each 16-byte aligned and a nonzero
+      multiple of 16 bytes apart (asserted), in either address order. H and I multiples of 8.
     - preact[r, 2i] / preact[r, 2i + 1] are the gate / up dot products, accumulated in fp32 and
       rounded once to bf16, always in (gate, up) order.
     - h is swiglu of the bf16-rounded gate and up, rounded to bf16; bf16_expert_dgated_backward
@@ -47,10 +47,11 @@ def bf16_expert_down_forward_scattered(h, w_down, cu, slot_of, bias=None):
 
 def bf16_expert_dgated_backward(dy, w_down, preact, cu, slot_of, w_gate, w_up, act=()):
     """
-    Down-projection dgrad with the SwiGLU backward fused in the epilogue. Returns (dpre, h, swapped).
+    Down-projection dgrad with the SwiGLU backward fused in the epilogue. Returns
+    (dpre, h, swapped).
 
-    - dy: bf16 (M, H) row-major in received-slot order. w_down: bf16 (G, H, I). preact: the bf16
-      (M, 2I) of bf16_expert_gated_forward. cu, slot_of: as in bf16_expert_down_forward_scattered.
+    - dy: bf16 (M, H) row-major in received-slot order. w_down: bf16 (G, H, I). preact: the bf16 (M,
+      2I) of bf16_expert_gated_forward. cu, slot_of: as in bf16_expert_down_forward_scattered.
       w_gate / w_up are read only for their address order.
     - Per grouped row r of expert g: dh = dy[slot_of[r]] @ w_down[g] in fp32, then dswiglu (or the
       clamped dswiglu_oai with act = (alpha, limit), which requires w_gate at the lower address) of
@@ -85,10 +86,10 @@ def bf16_expert_wgrad_gate_up(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a_idx):
     In place, returns None: mg_gate[g] += dg_g^T @ x[a_idx]_g and mg_up[g] += du_g^T @ x[a_idx]_g
     over the grouped rows of each expert, accumulated in fp32 onto the existing values.
 
-    - x, a_idx, cu: as in bf16_expert_gated_forward. dpre, dpre_swapped: as returned by
-      bf16_expert_dgated_backward.
-    - mg_gate, mg_up: fp32 (G, I, H) with the same strides, 16-byte aligned and a nonzero multiple of
-      16 bytes apart, in either address order.
+    - x, a_idx, cu: as in bf16_expert_gated_forward. dpre, dpre_swapped: as
+      returned by bf16_expert_dgated_backward.
+    - mg_gate, mg_up: fp32 (G, I, H) with the same strides, 16-byte aligned and a nonzero multiple
+      of 16 bytes apart, in either address order.
 
     M == 0 is a no-op. Deterministic.
     """
@@ -98,8 +99,8 @@ def bf16_expert_wgrad_gate_up(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a_idx):
 
 def bf16_expert_wgrad_down(dy, h, mg_down, cu, slot_of):
     """
-    In place, returns None: mg_down[g] += dy[slot_of]_g^T @ h_g over the grouped rows of each expert,
-    accumulated in fp32.
+    In place, returns None: mg_down[g] += dy[slot_of]_g^T @ h_g over the grouped rows of each
+    expert, accumulated in fp32.
 
     - dy: bf16 (M, H) in received-slot order. h: bf16 (M, I) grouped rows (the h of
       bf16_expert_dgated_backward). cu, slot_of: as in bf16_expert_down_forward_scattered.

@@ -17,12 +17,12 @@ GEMM_ALLOC_ALIGNMENT = 1024
 """Row alignment of the scattered output's allocation (the tail rows are zeroed)."""
 
 # The padded sizes are copied to the host on a side stream so the copy overlaps the scatter kernel.
-_copy_stream: Optional[torch.cuda.Stream] = None
-_copy_event: Optional[torch.cuda.Event] = None
+shared_copy_stream: Optional[torch.cuda.Stream] = None
+shared_copy_event: Optional[torch.cuda.Event] = None
 
 
 @triton.jit
-def _compute_group_offsets_kernel(
+def compute_group_offsets_kernel(
     expert_idxs_ptr,  # [m] int64
     group_counts_ptr,  # [num_groups] int64, pre-zeroed
     grouped_mm_offs_ptr,  # [num_groups] int32
@@ -57,7 +57,7 @@ def _compute_group_offsets_kernel(
 
 
 @triton.jit
-def _scatter_for_grouped_gemm_kernel(
+def scatter_for_grouped_gemm_kernel(
     input_tokens_ptr,  # [m, hidden_size]
     expert_idxs_ptr,  # [m] int64
     grouped_mm_offs_ptr,  # [num_groups] int32, padded cumulative offsets
@@ -127,19 +127,19 @@ def _scatter_for_grouped_gemm_kernel(
                 tl.store(output_tokens_ptr + row_base + h_offs, tl.zeros([BLOCK_H], dtype=input_tokens_ptr.dtype.element_ty), mask=mask)
 
 
-def _get_copy_stream_and_event(device):
-    global _copy_stream, _copy_event
-    if _copy_stream is None:
-        _copy_stream = torch.cuda.Stream(device=device)
-        _copy_event = torch.cuda.Event()
-    return _copy_stream, _copy_event
+def get_copy_stream_and_event(device):
+    global shared_copy_stream, shared_copy_event
+    if shared_copy_stream is None:
+        shared_copy_stream = torch.cuda.Stream(device=device)
+        shared_copy_event = torch.cuda.Event()
+    return shared_copy_stream, shared_copy_event
 
 
 def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, padding_alignment: int = 128, group_counts: Optional[list[int]] = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
     """
-    Reorder input_tokens by expert_idxs into expert-major groups, each padded with zero rows to a
-    multiple of padding_alignment. Returns (output_tokens, reverse_shuffle_idxs, grouped_mm_offs,
-    ks_tensor, ks).
+    Reorder input_tokens by expert_idxs into expert-major groups, each padded with zero rows to
+    a multiple of padding_alignment. Returns (output_tokens, reverse_shuffle_idxs,
+    grouped_mm_offs, ks_tensor, ks).
 
     - input_tokens: (m, hidden) with unit inner stride (any row stride, any dtype). expert_idxs:
       int64 (m,) contiguous, values in [0, num_groups); a length other than m raises ValueError.
@@ -188,15 +188,15 @@ def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num
 
     BLOCK = 1024
     num_ctas = min(triton.cdiv(m, BLOCK), 32)
-    _compute_group_offsets_kernel[(num_ctas,)](expert_idxs, group_counts_1, grouped_mm_offs, ks_tensor, completion_counter, m, num_ctas, PADDING_ALIGNMENT=padding_alignment, NUM_GROUPS=num_groups, BLOCK=BLOCK)
+    compute_group_offsets_kernel[(num_ctas,)](expert_idxs, group_counts_1, grouped_mm_offs, ks_tensor, completion_counter, m, num_ctas, PADDING_ALIGNMENT=padding_alignment, NUM_GROUPS=num_groups, BLOCK=BLOCK)
 
     # ks_tensor is final after the prep kernel: its copy to the host overlaps the scatter kernel
-    copy_stream, copy_event = _get_copy_stream_and_event(device)
+    copy_stream, copy_event = get_copy_stream_and_event(device)
     copy_event.record()
 
     BLOCK_H = 256
     NUM_H_BLOCKS = triton.cdiv(hidden_size, BLOCK_H)
-    _scatter_for_grouped_gemm_kernel[(m,)](input_tokens, expert_idxs, grouped_mm_offs, group_counts_2, group_counts_1, output_tokens, reverse_shuffle_idxs, hidden_size, input_tokens.stride(0), output_tokens.stride(0), m, num_groups, BLOCK_H=BLOCK_H, NUM_H_BLOCKS=NUM_H_BLOCKS, GEMM_ALLOC_ALIGNMENT=GEMM_ALLOC_ALIGNMENT)
+    scatter_for_grouped_gemm_kernel[(m,)](input_tokens, expert_idxs, grouped_mm_offs, group_counts_2, group_counts_1, output_tokens, reverse_shuffle_idxs, hidden_size, input_tokens.stride(0), output_tokens.stride(0), m, num_groups, BLOCK_H=BLOCK_H, NUM_H_BLOCKS=NUM_H_BLOCKS, GEMM_ALLOC_ALIGNMENT=GEMM_ALLOC_ALIGNMENT)
 
     if group_counts is not None:
         a = padding_alignment

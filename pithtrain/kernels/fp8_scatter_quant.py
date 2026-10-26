@@ -15,16 +15,17 @@ __all__ = ["scatter_quant"]
 
 def scatter_quant(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor] = None, padding_alignment: int = 128, group_counts: Optional[list[int]] = None) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
     """
-    The MoE stage-3 FP8 input: x = gathered[expand_idx] scattered by expert as scatter_by_expert does,
-    then quantized as quantize_grouped_input does on SM90. Returns ((x_fp8, x_scale, x_ch_fp8,
+    The MoE stage-3 FP8 input: x = gathered[expand_idx] scattered by expert as scatter_by_expert
+    does, then quantized as quantize_grouped_input does on SM90. Returns ((x_fp8, x_scale, x_ch_fp8,
     x_ch_scale), reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor).
 
-    - gathered: bf16 (m_src, N) received (deduplicated) tokens. expert_idxs: int64 (m,), the local
-      expert (< num_groups) of each token slot. expand_idx: int64 (m,), the row of gathered of each
-      slot, or None for the identity (then m_src must equal m, else ValueError). Inputs are not modified.
-    - padding_alignment must be 128. group_counts: the true per-expert slot counts on the host, if
-      known; it avoids the device-to-host copy (and host sync) of the padded sizes and must match
-      expert_idxs.
+    - gathered: bf16 (m_src, N) received (deduplicated) tokens. expert_idxs: int64 (m,), the
+      local expert (< num_groups) of each token slot. expand_idx: int64 (m,), the row of gathered
+      of each slot, or None for the identity (then m_src must equal m, else ValueError). Inputs
+      are not modified.
+    - padding_alignment must be 128. group_counts: the true per-expert slot counts on the
+      host, if known; it avoids the device-to-host copy (and host sync) of the padded sizes
+      and must match expert_idxs.
     - The 4-tuple is quantize_grouped_input's SM90 K-major layout over the M = sum(ks) grouped rows
       (each group padded with zero rows to a multiple of 128). reverse_shuffle_idxs: int64 (m,), the
       grouped row of each slot. grouped_mm_offs: int32 (G,) cumulative padded group ends. ks: host

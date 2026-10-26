@@ -60,18 +60,18 @@ def cross_entropy_fwd(X_ptr, X_stride, Y_ptr, Y_stride, loss_ptr, loss_stride, n
 
 def cross_entropy_fwd_inplace(inp: torch.Tensor, target: torch.Tensor, ignore_index: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Mean cross-entropy of the logits inp against target, overwriting the logits with the gradient
-    of that mean. Returns (loss, grad).
+    Mean cross-entropy of the logits inp against target, overwriting the logits with the gradient of
+    that mean. Returns (loss, grad).
 
     inp: (N, V) bf16 or fp32 logits, overwritten in place when row-contiguous (otherwise a
     contiguous copy is overwritten and inp is left alone). target: integer (N,), each in [0, V) or
     ignore_index (any other value reads out of bounds); not modified.
 
-    loss: fp32 scalar, the sum over non-ignored rows of logsumexp(x) - x[target] divided by
-    n = max(non-ignored rows, 1). grad: inp itself (or the copy), (softmax(x) - onehot(target)) / n
-    per non-ignored row computed in fp32 and rounded once, zero rows where target == ignore_index.
-    Matches F.cross_entropy(inp.float(), target, ignore_index=ignore_index) and its gradient to fp32
-    rounding; deterministic.
+    loss: fp32 scalar, the sum over non-ignored rows of logsumexp(x) - x[target] divided by n =
+    max(non-ignored rows, 1). grad: inp itself (or the copy), (softmax(x) - onehot(target)) / n per
+    non-ignored row computed in fp32 and rounded once, zero rows where target == ignore_index.
+    Matches F.cross_entropy(inp.float(), target, ignore_index=ignore_index) and its gradient to
+    fp32 rounding; deterministic.
     """
     n_rows, n_cols = inp.shape
 

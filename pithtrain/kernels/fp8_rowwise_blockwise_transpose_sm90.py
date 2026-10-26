@@ -23,12 +23,12 @@ from pithtrain.kernels.fp8_scale_layout import mn_major_scale
 
 __all__ = ["fp8cast_rowwise_blockwise_transpose_sm90"]
 
-_BLOCK = 128
+BLOCK = 128
 
-_SMALL_GRID_TILES = 200
+SMALL_GRID_TILES = 200
 
 
-def _asm_u32(args: list, asm: str, constraints: str, loc=None, ip=None) -> Uint32:
+def asm_u32(args: list, asm: str, constraints: str, loc=None, ip=None) -> Uint32:
     res = llvm.inline_asm(T.i32(), [a.ir_value(loc=loc, ip=ip) for a in args], asm, constraints, has_side_effects=False, is_align_stack=False, loc=loc, ip=ip)
     return Uint32(res)
 
@@ -40,16 +40,16 @@ def _asm_u32(args: list, asm: str, constraints: str, loc=None, ip=None) -> Uint3
 
 
 @dsl_user_op
-def _absmax_acc(acc: Uint32, w: Uint32, kind: str, *, loc=None, ip=None) -> Uint32:
+def absmax_acc(acc: Uint32, w: Uint32, kind: str, *, loc=None, ip=None) -> Uint32:
     """acc = max(acc, |w|) lane-wise in the input dtype (maxNum semantics, as tl.max)."""
     op = {"bf16": "max.bf16x2", "f16": "max.f16x2", "f32": "max.f32"}[kind]
     mask = "0x7FFFFFFF" if kind == "f32" else "0x7FFF7FFF"
     asm = f"{{\n\t.reg .b32 t;\n\tand.b32 t, $2, {mask};\n\t{op} $0, $1, t;\n\t}}"
-    return _asm_u32([Uint32(acc), Uint32(w)], asm, "=r,r,r", loc, ip)
+    return asm_u32([Uint32(acc), Uint32(w)], asm, "=r,r,r", loc, ip)
 
 
 @dsl_user_op
-def _amax_f32(acc: Uint32, kind: str, *, loc=None, ip=None) -> Float32:
+def amax_f32(acc: Uint32, kind: str, *, loc=None, ip=None) -> Float32:
     """Reduce a packed |max| word to one fp32 value (exact widening)."""
     if kind == "f32":
         body = "mov.b32 $0, $1;"
@@ -64,7 +64,7 @@ def _amax_f32(acc: Uint32, kind: str, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
-def _q4(words: list, sel: list, kind: str, rcp: Float32, *, loc=None, ip=None) -> Uint32:
+def q4(words: list, sel: list, kind: str, rcp: Float32, *, loc=None, ip=None) -> Uint32:
     """
     Quantize 4 elements to 4 packed e4m3 bytes (element 0 in the lowest byte). sel[k] = (j, half)
     picks element k from words[j] (half 0 = low 16 bits); rcp is an exact power of 2. The cvt is the
@@ -90,17 +90,23 @@ def _q4(words: list, sel: list, kind: str, rcp: Float32, *, loc=None, ip=None) -
     asm = "{\n\t" + "\n\t".join(lines) + "\n\t}"
     constraints = "=r," + ",".join(["r"] * n) + ",f"
     args = [Uint32(w) for w in words] + [Float32(rcp)]
-    return _asm_u32(args, asm, constraints, loc, ip)
+    return asm_u32(args, asm, constraints, loc, ip)
 
 
-def _gptr(base: cute.Pointer, offset: Int64, esize: int, dtype: type, align: int) -> cute.Pointer:
-    """Global pointer offset elements (of esize bytes) past base, as dtype, asserted align-byte aligned."""
+def gptr(base: cute.Pointer, offset: Int64, esize: int, dtype: type, align: int) -> cute.Pointer:
+    """
+    Global pointer offset elements (of esize bytes) past base, as dtype,
+    asserted align-byte aligned.
+    """
     addr = base.toint() + offset * esize
     return cute.make_ptr(dtype, addr, cute.AddressSpace.gmem, assumed_align=align)
 
 
 class RowwiseBlockwiseTranspose:
-    """vec_k / vec_m: elements per global vector access along K (x and tok rows) / along M (blk_t rows), chosen on the host so no vector straddles the edge."""
+    """
+    vec_k / vec_m: elements per global vector access along K (x and tok rows) / along M (blk_t
+    rows), chosen on the host so no vector straddles the edge.
+    """
 
     def __init__(self, dtype: type, vec_k: int, vec_m: int, rows: int = 8) -> None:
         self.dtype = dtype
@@ -114,8 +120,8 @@ class RowwiseBlockwiseTranspose:
     def __call__(self, mX: cute.Tensor, mQ: cute.Tensor, mS: cute.Tensor, mQT: cute.Tensor, mST: cute.Tensor, stream) -> None:
         M = mX.shape[0]
         K = mX.shape[1]
-        grid_m = (M + _BLOCK - 1) // _BLOCK
-        grid_k = (K + _BLOCK - 1) // _BLOCK
+        grid_m = (M + BLOCK - 1) // BLOCK
+        grid_k = (K + BLOCK - 1) // BLOCK
         self.kernel(mX, mQ, mS, mQT, mST).launch(grid=[grid_m, grid_k, 1], block=[self.threads, 1, 1], stream=stream)
 
     @cute.kernel
@@ -142,8 +148,8 @@ class RowwiseBlockwiseTranspose:
         s_ld = Int64(mS.stride[1])
         nmb = Int32(mST.shape[1])
 
-        row0 = bm * _BLOCK + warp * (4 * R) + rg * R
-        col_base = bk * _BLOCK + cl * 8
+        row0 = bm * BLOCK + warp * (4 * R) + rg * R
+        col_base = bk * BLOCK + cl * 8
 
         # Register block zero-filled outside (M, K): element (row row0 + i, column col_base + h * 64 + e) at n = i * 16 + h * 8 + e.
         xr = cute.make_rmem_tensor(cute.make_layout(16 * R), self.dtype)
@@ -156,7 +162,7 @@ class RowwiseBlockwiseTranspose:
                     if r < M:
                         if c < K:
                             off = Int64(r) * sx + Int64(c)
-                            src = cute.make_tensor(_gptr(mX.iterator, off, esize, self.dtype, VK * esize), cute.make_layout(VK))
+                            src = cute.make_tensor(gptr(mX.iterator, off, esize, self.dtype, VK * esize), cute.make_layout(VK))
                             dst = cute.make_tensor(xr.iterator + (i * 16 + h * 8 + p * VK), cute.make_layout(VK))
                             cute.autovec_copy(src, dst)
         xw = cute.recast_tensor(xr, Uint32)
@@ -165,8 +171,8 @@ class RowwiseBlockwiseTranspose:
         for i in cutlass.range_constexpr(R):
             acc = Uint32(0)
             for n in cutlass.range_constexpr(i * 16, i * 16 + 16, EPW):
-                acc = _absmax_acc(acc, xw[n // EPW], KIND)
-            m = _amax_f32(acc, KIND)
+                acc = absmax_acc(acc, xw[n // EPW], KIND)
+            m = amax_f32(acc, KIND)
             for off in cutlass.range_constexpr(3):
                 m = cute.arch.fmax(m, cute.arch.shuffle_sync_bfly(m, offset=1 << off))
             row_amax[i] = m
@@ -179,7 +185,7 @@ class RowwiseBlockwiseTranspose:
             rcp = exact_rcp(scale)
             if r < M:
                 if cl == i:
-                    stile = cute.make_tensor(_gptr(mS.iterator, Int64(bk) * s_ld + Int64(r), 4, Float32, 4), cute.make_layout(1))
+                    stile = cute.make_tensor(gptr(mS.iterator, Int64(bk) * s_ld + Int64(r), 4, Float32, 4), cute.make_layout(1))
                     stile[0] = scale
                 for h in cutlass.range_constexpr(2):
                     for g in cutlass.range_constexpr(2):
@@ -188,7 +194,7 @@ class RowwiseBlockwiseTranspose:
                     for p in cutlass.range_constexpr(8 // VK):
                         c = col_base + h * 64 + p * VK
                         if c < K:
-                            dst = cute.make_tensor(_gptr(mQ.iterator, Int64(r) * Int64(K) + Int64(c), 1, Uint8, VK), cute.make_layout(VK))
+                            dst = cute.make_tensor(gptr(mQ.iterator, Int64(r) * Int64(K) + Int64(c), 1, Uint8, VK), cute.make_layout(VK))
                             src = cute.make_tensor(qb.iterator + p * VK, cute.make_layout(VK))
                             cute.autovec_copy(src, dst)
 
@@ -209,7 +215,7 @@ class RowwiseBlockwiseTranspose:
         bscale = e8m0_scale(bmax)
         brcp = exact_rcp(bscale)
         if tidx == 0:
-            st = cute.make_tensor(_gptr(mST.iterator, Int64(bk) * Int64(nmb) + Int64(bm), 4, Float32, 4), cute.make_layout(1))
+            st = cute.make_tensor(gptr(mST.iterator, Int64(bk) * Int64(nmb) + Int64(bm), 4, Float32, 4), cute.make_layout(1))
             st[0] = bscale
 
         if row0 < M:
@@ -223,7 +229,7 @@ class RowwiseBlockwiseTranspose:
                             r = row0 + p * VM
                             if r < M:
                                 off = Int64(c) * Int64(M) + Int64(r)
-                                dst = cute.make_tensor(_gptr(mQT.iterator, off, 1, Uint8, VM), cute.make_layout(VM))
+                                dst = cute.make_tensor(gptr(mQT.iterator, off, 1, Uint8, VM), cute.make_layout(VM))
                                 src = cute.make_tensor(qb.iterator + p * VM, cute.make_layout(VM))
                                 cute.autovec_copy(src, dst)
 
@@ -237,20 +243,20 @@ class RowwiseBlockwiseTranspose:
             if w not in words:
                 words.append(w)
             sel.append((words.index(w), n % epw))
-        return _q4([xw[w] for w in words], sel, self.kind, rcp)
+        return q4([xw[w] for w in words], sel, self.kind, rcp)
 
 
-_COMPILED: dict[tuple, Callable] = {}
+COMPILED: dict[tuple, Callable] = {}
 
 
-def _vec(n: int, cap: int) -> int:
+def vec(n: int, cap: int) -> int:
     v = cap
     while n % v:
         v //= 2
     return v
 
 
-def _compile(dtype: type, vec_k: int, vec_m: int, rows: int) -> Callable:
+def compile_kernel(dtype: type, vec_k: int, vec_m: int, rows: int) -> Callable:
     m_sym, k_sym, kb_sym, mb_sym = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
     esize = dtype.width // 8
     fake = cute.runtime.make_fake_tensor
@@ -262,29 +268,29 @@ def _compile(dtype: type, vec_k: int, vec_m: int, rows: int) -> Callable:
     return cute.compile(RowwiseBlockwiseTranspose(dtype, vec_k, vec_m, rows), x, q, s, qt, st, fake_stream(), options="--enable-tvm-ffi")
 
 
-_DISPATCH: dict[tuple, tuple] = {}
+DISPATCH: dict[tuple, tuple] = {}
 
 
-def _resolve(dtype: torch.dtype, M: int, K: int, sx: int, ptr: int) -> tuple:
+def resolve(dtype: torch.dtype, M: int, K: int, sx: int, ptr: int) -> tuple:
     """(compiled kernel or None for an empty input, ceil(K/128), ceil(M/128))."""
-    nkb = (K + _BLOCK - 1) // _BLOCK
-    nmb = (M + _BLOCK - 1) // _BLOCK
+    nkb = (K + BLOCK - 1) // BLOCK
+    nmb = (M + BLOCK - 1) // BLOCK
     if M == 0 or K == 0:
         return None, nkb, nmb
     esize = dtype.itemsize
-    vec_k = _vec(K, min(16 // esize, 8))
-    vec_k = _vec(sx, vec_k)
-    vec_k = _vec(ptr // esize, vec_k)
+    vec_k = vec(K, min(16 // esize, 8))
+    vec_k = vec(sx, vec_k)
+    vec_k = vec(ptr // esize, vec_k)
     # 128 threads x 8 rows wins once the grid fills the GPU (fewer, fuller stores); a small grid
     # is latency-bound, so split each tile over 256 threads x 4 rows.
-    rows = 4 if nmb * nkb <= _SMALL_GRID_TILES else 8
-    vec_m = _vec(M, rows)
+    rows = 4 if nmb * nkb <= SMALL_GRID_TILES else 8
+    vec_m = vec(M, rows)
     ckey = (dtype, vec_k, vec_m, rows)
-    fn = _COMPILED.get(ckey)
+    fn = COMPILED.get(ckey)
     if fn is None:
-        fn = _COMPILED[ckey] = _compile(TORCH2CUTE[dtype], vec_k, vec_m, rows)
-    if len(_DISPATCH) > 4096:
-        _DISPATCH.clear()
+        fn = COMPILED[ckey] = compile_kernel(TORCH2CUTE[dtype], vec_k, vec_m, rows)
+    if len(DISPATCH) > 4096:
+        DISPATCH.clear()
     return fn, nkb, nmb
 
 
@@ -300,9 +306,9 @@ def fp8cast_rowwise_blockwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Ten
     dtype = x.dtype
     # Host cost matters (hundreds of calls per step): resolve once per (dtype, shape, row stride, pointer alignment).
     key = (dtype, M, K, sx, x.data_ptr() & 15)
-    entry = _DISPATCH.get(key)
+    entry = DISPATCH.get(key)
     if entry is None:
-        entry = _DISPATCH[key] = _resolve(dtype, M, K, sx, x.data_ptr())
+        entry = DISPATCH[key] = resolve(dtype, M, K, sx, x.data_ptr())
     fn, nkb, nmb = entry
     dev = x.device
     out_tok = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=dev)

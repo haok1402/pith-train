@@ -16,8 +16,10 @@ __all__ = ["fp8_pack_transpose_sm100", "fp8_scales_sm100", "fp8_shard_amax_sm100
 
 
 @triton.jit
-def _fp8cast_blockwise_transpose_kernel(x_ptr, out_ptr, scale_ptr, out_t_ptr, scale_t_ptr, M, K, stride_x_row, stride_x_col, stride_out_row, scale_cols, stride_out_t_row, scale_t_cols, NATIVE_E8M0: tl.constexpr):
-    """One 128x128 tile of x: its FP8 to out (M, K) and out_t (K, M), its scale to scale and scale_t."""
+def fp8cast_blockwise_transpose_kernel(x_ptr, out_ptr, scale_ptr, out_t_ptr, scale_t_ptr, M, K, stride_x_row, stride_x_col, stride_out_row, scale_cols, stride_out_t_row, scale_t_cols, NATIVE_E8M0: tl.constexpr):
+    """
+    One 128x128 tile of x: its FP8 to out (M, K) and out_t (K, M), its scale to scale and scale_t.
+    """
     BLOCK: tl.constexpr = 128
 
     pid_row = tl.program_id(0)
@@ -71,13 +73,13 @@ def fp8cast_blockwise_transpose_sm100(x: torch.Tensor) -> tuple[torch.Tensor, to
 
     grid = (scale_rows, scale_cols)
 
-    _fp8cast_blockwise_transpose_kernel[grid](x_ptr=x, out_ptr=out, scale_ptr=scale, out_t_ptr=out_t, scale_t_ptr=scale_t, M=M, K=K, stride_x_row=x.stride(0), stride_x_col=x.stride(1), stride_out_row=K, scale_cols=scale_cols, stride_out_t_row=M, scale_t_cols=scale_rows, NATIVE_E8M0=NATIVE_E8M0, num_warps=4, num_stages=2)
+    fp8cast_blockwise_transpose_kernel[grid](x_ptr=x, out_ptr=out, scale_ptr=scale, out_t_ptr=out_t, scale_t_ptr=scale_t, M=M, K=K, stride_x_row=x.stride(0), stride_x_col=x.stride(1), stride_out_row=K, scale_cols=scale_cols, stride_out_t_row=M, scale_t_cols=scale_rows, NATIVE_E8M0=NATIVE_E8M0, num_warps=4, num_stages=2)
 
     return out, scale, out_t, scale_t
 
 
 @triton.jit
-def _fp8cast_blockwise_transpose_batched_kernel(x_ptr, out_ptr, scale_ptr, out_t_ptr, scale_t_ptr, G, N, K, stride_x_g, stride_x_row, stride_x_col, stride_out_g, stride_out_row, scale_cols, stride_scale_g, stride_out_t_g, stride_out_t_row, scale_t_cols, stride_scale_t_g, NATIVE_E8M0: tl.constexpr):
+def fp8cast_blockwise_transpose_batched_kernel(x_ptr, out_ptr, scale_ptr, out_t_ptr, scale_t_ptr, G, N, K, stride_x_g, stride_x_row, stride_x_col, stride_out_g, stride_out_row, scale_cols, stride_scale_g, stride_out_t_g, stride_out_t_row, scale_t_cols, stride_scale_t_g, NATIVE_E8M0: tl.constexpr):
     """One 128x128 tile of expert pid(2): grid (ceil(N / 128), ceil(K / 128), G)."""
     BLOCK: tl.constexpr = 128
 
@@ -136,7 +138,7 @@ def fp8cast_blockwise_transpose_batched_sm100(x: torch.Tensor) -> tuple[torch.Te
 
     grid = (scale_rows, scale_cols, G)
 
-    _fp8cast_blockwise_transpose_batched_kernel[grid](x_ptr=x, out_ptr=out, scale_ptr=scale, out_t_ptr=out_t, scale_t_ptr=scale_t, G=G, N=N, K=K, stride_x_g=x.stride(0), stride_x_row=x.stride(1), stride_x_col=x.stride(2), stride_out_g=N * K, stride_out_row=K, scale_cols=scale_cols, stride_scale_g=scale_rows * scale_cols, stride_out_t_g=K * N, stride_out_t_row=N, scale_t_cols=scale_rows, stride_scale_t_g=scale_cols * scale_rows, NATIVE_E8M0=NATIVE_E8M0, num_warps=4, num_stages=2)
+    fp8cast_blockwise_transpose_batched_kernel[grid](x_ptr=x, out_ptr=out, scale_ptr=scale, out_t_ptr=out_t, scale_t_ptr=scale_t, G=G, N=N, K=K, stride_x_g=x.stride(0), stride_x_row=x.stride(1), stride_x_col=x.stride(2), stride_out_g=N * K, stride_out_row=K, scale_cols=scale_cols, stride_scale_g=scale_rows * scale_cols, stride_out_t_g=K * N, stride_out_t_row=N, scale_t_cols=scale_rows, stride_scale_t_g=scale_cols * scale_rows, NATIVE_E8M0=NATIVE_E8M0, num_warps=4, num_stages=2)
 
     return out, scale, out_t, scale_t
 
@@ -145,7 +147,7 @@ BLOCK = 128
 
 
 @triton.jit
-def _fp8_shard_tile_kernel(x_ptr, amax_ptr, out_ptr, row_offset, local_rows, K, tile_row_start, amax_g_offset, amax_stride_g, amax_cols, CAST: tl.constexpr, NATIVE_E8M0: tl.constexpr):
+def fp8_shard_tile_kernel(x_ptr, amax_ptr, out_ptr, row_offset, local_rows, K, tile_row_start, amax_g_offset, amax_stride_g, amax_cols, CAST: tl.constexpr, NATIVE_E8M0: tl.constexpr):
     """
     One 128x128 tile (global rows [tr * 128, tr * 128 + 128) of local expert pid(2)) of a row shard
     holding global rows [row_offset, row_offset + local_rows). CAST False writes the amax of the
@@ -176,8 +178,10 @@ def _fp8_shard_tile_kernel(x_ptr, amax_ptr, out_ptr, row_offset, local_rows, K, 
 
 
 @triton.jit
-def _fp8_scale_kernel(amax_ptr, scale_ptr, scale_t_ptr, R, C, NATIVE_E8M0: tl.constexpr):
-    """Scales of the (R, C) amax grid of group pid(1), written as (R, C) and transposed as (C, R)."""
+def fp8_scale_kernel(amax_ptr, scale_ptr, scale_t_ptr, R, C, NATIVE_E8M0: tl.constexpr):
+    """
+    Scales of the (R, C) amax grid of group pid(1), written as (R, C) and transposed as (C, R).
+    """
     offs = tl.program_id(0) * 1024 + tl.arange(0, 1024)
     g = tl.program_id(1)
     mask = offs < R * C
@@ -189,7 +193,7 @@ def _fp8_scale_kernel(amax_ptr, scale_ptr, scale_t_ptr, R, C, NATIVE_E8M0: tl.co
 
 
 @triton.jit
-def _fp8_pack_transpose_kernel(x_ptr, out_ptr, out_t_ptr, N, K):
+def fp8_pack_transpose_kernel(x_ptr, out_ptr, out_t_ptr, N, K):
     """One 128x128 byte tile of x (G, N, K) to out and, transposed, to out_t (G, K, N)."""
     BLOCK: tl.constexpr = 128
     pid_row = tl.program_id(0)
@@ -205,31 +209,31 @@ def _fp8_pack_transpose_kernel(x_ptr, out_ptr, out_t_ptr, N, K):
     tl.store(out_t_ptr + base + cols[None, :] * N + rows[:, None], tile, mask=mask)
 
 
-def _shard_tiles(shard: torch.Tensor, amax: torch.Tensor, out: Optional[torch.Tensor], row_offset: int, group_offset: int) -> None:
+def shard_tiles(shard: torch.Tensor, amax: torch.Tensor, out: Optional[torch.Tensor], row_offset: int, group_offset: int) -> None:
     g_local, local_rows, K = shard.shape
     if shard.numel() == 0:
         return
     tile_row_start = row_offset // BLOCK
     tile_row_end = (row_offset + local_rows + BLOCK - 1) // BLOCK
     grid = (tile_row_end - tile_row_start, triton.cdiv(K, BLOCK), g_local)
-    _fp8_shard_tile_kernel[grid](shard, amax, out if out is not None else shard, row_offset, local_rows, K, tile_row_start, group_offset, amax.stride(0), amax.shape[2], CAST=out is not None, NATIVE_E8M0=NATIVE_E8M0, num_warps=8)
+    fp8_shard_tile_kernel[grid](shard, amax, out if out is not None else shard, row_offset, local_rows, K, tile_row_start, group_offset, amax.stride(0), amax.shape[2], CAST=out is not None, NATIVE_E8M0=NATIVE_E8M0, num_warps=8)
 
 
 def fp8_shard_amax_sm100(shard: torch.Tensor, amax: torch.Tensor, row_offset: int, group_offset: int) -> None:
     """Triton fp8_shard_amax."""
-    _shard_tiles(shard, amax, None, row_offset, group_offset)
+    shard_tiles(shard, amax, None, row_offset, group_offset)
 
 
 def fp8_shard_cast_sm100(shard: torch.Tensor, amax: torch.Tensor, out: torch.Tensor, row_offset: int, group_offset: int) -> None:
     """Triton fp8_shard_cast."""
-    _shard_tiles(shard, amax, out, row_offset, group_offset)
+    shard_tiles(shard, amax, out, row_offset, group_offset)
 
 
 def fp8_scales_sm100(amax: torch.Tensor, scale: torch.Tensor, scale_t: torch.Tensor) -> None:
     """Triton fp8_scales."""
     G, R, C = amax.shape
     grid = (triton.cdiv(R * C, 1024), G)
-    _fp8_scale_kernel[grid](amax, scale, scale_t, R, C, NATIVE_E8M0=NATIVE_E8M0)
+    fp8_scale_kernel[grid](amax, scale, scale_t, R, C, NATIVE_E8M0=NATIVE_E8M0)
 
 
 def fp8_pack_transpose_sm100(x: torch.Tensor, out: torch.Tensor) -> None:
@@ -238,4 +242,4 @@ def fp8_pack_transpose_sm100(x: torch.Tensor, out: torch.Tensor) -> None:
     x = x.view(torch.uint8)
     out = out.view(torch.uint8)
     grid = (triton.cdiv(N, BLOCK), triton.cdiv(K, BLOCK), G)
-    _fp8_pack_transpose_kernel[grid](x, out, out[x.numel() :], N, K, num_warps=4)
+    fp8_pack_transpose_kernel[grid](x, out, out[x.numel() :], N, K, num_warps=4)

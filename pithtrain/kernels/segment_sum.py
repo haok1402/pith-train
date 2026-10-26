@@ -14,7 +14,7 @@ __all__ = ["block_segment_sum", "segment_sum_along_rows"]
 
 
 @triton.jit
-def _segment_sum_kernel(x_ptr, offs_padded_ptr, out_ptr, H: tl.constexpr, HEAD_BLOCK: tl.constexpr, BLOCK_M: tl.constexpr):
+def segment_sum_kernel(x_ptr, offs_padded_ptr, out_ptr, H: tl.constexpr, HEAD_BLOCK: tl.constexpr, BLOCK_M: tl.constexpr):
     """One block reduces rows [start, end) of group g over HEAD_BLOCK columns, in fp32."""
     g = tl.program_id(0)
     h_blk = tl.program_id(1)
@@ -37,7 +37,7 @@ def _segment_sum_kernel(x_ptr, offs_padded_ptr, out_ptr, H: tl.constexpr, HEAD_B
 
 
 @triton.jit
-def _segment_tile(offs_padded_ptr, E, BLOCK_M: tl.constexpr, BLOCK_E: tl.constexpr):
+def segment_tile(offs_padded_ptr, E, BLOCK_M: tl.constexpr, BLOCK_E: tl.constexpr):
     """
     Groups are cut into BLOCK_M-row tiles from their own start, numbered consecutively across
     groups. Returns (tiles before each group, tiles per group, group starts, group ends) as BLOCK_E
@@ -52,14 +52,14 @@ def _segment_tile(offs_padded_ptr, E, BLOCK_M: tl.constexpr, BLOCK_E: tl.constex
 
 
 @triton.jit
-def _segment_tile_sum_kernel(x_ptr, offs_padded_ptr, part_ptr, E, H: tl.constexpr, HEAD_BLOCK: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_E: tl.constexpr):
+def segment_tile_sum_kernel(x_ptr, offs_padded_ptr, part_ptr, E, H: tl.constexpr, HEAD_BLOCK: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_E: tl.constexpr):
     """
-    fp32 column sums of row tile t of x, written to row t of part. The tile is the one the
-    per-group loop of _segment_sum_kernel would take, so its sum has the same bits.
+    fp32 column sums of row tile t of x, written to row t of part. The tile is the one the per-group
+    loop of segment_sum_kernel would take, so its sum has the same bits.
     """
     t = tl.program_id(0)
     h_blk = tl.program_id(1)
-    first, ntiles, starts, ends = _segment_tile(offs_padded_ptr, E, BLOCK_M, BLOCK_E)
+    first, ntiles, starts, ends = segment_tile(offs_padded_ptr, E, BLOCK_M, BLOCK_E)
     e = tl.arange(0, BLOCK_E)
     g = tl.sum(((first + ntiles) <= t).to(tl.int32), axis=0)
     if g >= E:
@@ -78,11 +78,11 @@ def _segment_tile_sum_kernel(x_ptr, offs_padded_ptr, part_ptr, E, H: tl.constexp
 
 
 @triton.jit
-def _segment_tile_reduce_kernel(part_ptr, offs_padded_ptr, out_ptr, E, H: tl.constexpr, HEAD_BLOCK: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_E: tl.constexpr):
+def segment_tile_reduce_kernel(part_ptr, offs_padded_ptr, out_ptr, E, H: tl.constexpr, HEAD_BLOCK: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_E: tl.constexpr):
     """out[g] = the tile sums of group g added in row order, starting from zero (fp32)."""
     g = tl.program_id(0)
     h_blk = tl.program_id(1)
-    first, ntiles, _, _ = _segment_tile(offs_padded_ptr, E, BLOCK_M, BLOCK_E)
+    first, ntiles, _, _ = segment_tile(offs_padded_ptr, E, BLOCK_M, BLOCK_E)
     sel = tl.arange(0, BLOCK_E) == g
     t0 = tl.sum(tl.where(sel, first, 0), axis=0)
     n = tl.sum(tl.where(sel, ntiles, 0), axis=0)
@@ -97,9 +97,9 @@ def _segment_tile_reduce_kernel(part_ptr, offs_padded_ptr, out_ptr, E, H: tl.con
 
 def segment_sum_along_rows(x: torch.Tensor, grouped_mm_offs: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     """
-    Per-group column sums of rows already sorted by group (the bias gradient of
-    x + bias[group_ids]): a new (G, H) tensor of out_dtype, row g the sum of rows
-    [offs[g - 1], offs[g]) of x (offs[-1] = 0).
+    Per-group column sums of rows already sorted by group (the bias gradient of x +
+    bias[group_ids]): a new (G, H) tensor of out_dtype, row g the sum of rows [offs[g - 1], offs[g])
+    of x (offs[-1] = 0).
 
     - x: (M, H) contiguous, any float dtype; not modified.
     - grouped_mm_offs: integer (G,) non-decreasing cumulative group ends; ends past M are clamped to
@@ -126,20 +126,20 @@ def segment_sum_along_rows(x: torch.Tensor, grouped_mm_offs: torch.Tensor, out_d
     if E * h_blocks >= 2 * sm_count(x.device):
         # enough groups to fill the GPU with one block per (group, h-tile)
         meta = dict(H=H, HEAD_BLOCK=HEAD_BLOCK, BLOCK_M=BLOCK_M)
-        _segment_sum_kernel[(E, h_blocks)](x, offs_padded, out, **meta)
+        segment_sum_kernel[(E, h_blocks)](x, offs_padded, out, **meta)
     else:
         BLOCK_E = max(16, triton.next_power_of_2(E))
         # each group has at most one partial tile: a bound on the tile count without a sync
         max_tiles = triton.cdiv(M, BLOCK_M) + E
         part = torch.empty((max_tiles, H), dtype=torch.float32, device=x.device)
         meta = dict(H=H, HEAD_BLOCK=HEAD_BLOCK, BLOCK_M=BLOCK_M, BLOCK_E=BLOCK_E)
-        _segment_tile_sum_kernel[(max_tiles, h_blocks)](x, offs_padded, part, E, **meta)
-        _segment_tile_reduce_kernel[(E, h_blocks)](part, offs_padded, out, E, **meta)
+        segment_tile_sum_kernel[(max_tiles, h_blocks)](x, offs_padded, part, E, **meta)
+        segment_tile_reduce_kernel[(E, h_blocks)](part, offs_padded, out, E, **meta)
     return out.to(out_dtype) if out_dtype is not torch.float32 else out
 
 
 @triton.jit
-def _block_segment_sum_kernel(part_ptr, offs_ptr, out_ptr, H, BLOCK_H: tl.constexpr):
+def block_segment_sum_kernel(part_ptr, offs_ptr, out_ptr, H, BLOCK_H: tl.constexpr):
     """out[g] = sum of the 128-row-block partials of expert g, in row order (fp32)."""
     g = tl.program_id(0)
     h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -159,5 +159,5 @@ def block_segment_sum(partials: torch.Tensor, grouped_mm_offs: torch.Tensor, dty
     """
     G, H = grouped_mm_offs.shape[0], partials.shape[1]
     out = torch.empty((G, H), dtype=dtype, device=partials.device)
-    _block_segment_sum_kernel[(G, triton.cdiv(H, 512))](partials, grouped_mm_offs, out, H, BLOCK_H=512)
+    block_segment_sum_kernel[(G, triton.cdiv(H, 512))](partials, grouped_mm_offs, out, H, BLOCK_H=512)
     return out

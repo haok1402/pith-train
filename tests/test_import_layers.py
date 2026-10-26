@@ -19,6 +19,10 @@ of ``pithtrain/kernels/`` and its black-box interface:
 - every name in ``__all__`` is exercised (imported and used) by ``tests/kernels/test_<feature>.py``,
   ``<feature>`` its module's stem without ``_sm90`` / ``_sm100``, and ``tests/kernels/`` imports
   nothing from pithtrain but ``pithtrain.kernels``;
+- inside ``kernels/`` every module lists what it exports in a literal ``__all__``, defines no
+  module-level ``_name`` (``__all__`` marks what is internal, not an underscore), and imports from a
+  sibling only names in that sibling's ``__all__`` (``from pithtrain.kernels.x import n`` or ``x.n``
+  through a module alias);
 - importing ``pithtrain.kernels`` loads neither cutlass, QuACK nor FA4: no module it imports at
   module level, transitively, imports them at module level (the ``_sm90`` CuTe kernels and FA4
   are imported inside the functions that run them);
@@ -425,6 +429,64 @@ def _violations() -> set[tuple[str, str, str]]:
         heavy = [t for t in _top_level_imports(MODULES[mod]) if t.split(".")[0] in HEAVY]
         if heavy:
             found.add(("kernels-eager-heavy", mod, heavy[0]))
+
+    # Inside kernels/: a literal __all__ per module, no module-level _names, sibling imports only
+    # of names in the sibling's __all__.
+    module_all: dict[str, set[str]] = {}
+    for path in sorted(KERNELS.glob("*.py")):
+        if path.name == "__init__.py":
+            continue
+        tree = ast.parse(path.read_text())
+        decl = [
+            n
+            for n in tree.body
+            if isinstance(n, ast.Assign)
+            and [getattr(t, "id", None) for t in n.targets] == ["__all__"]
+        ]
+        try:
+            module_all[path.stem] = set(ast.literal_eval(decl[0].value)) if decl else set()
+        except ValueError:
+            module_all[path.stem] = set()
+        if not decl:
+            found.add(("kernels-module-all", f"pithtrain.kernels.{path.stem}", "missing __all__"))
+        for name in sorted(_top_level_names(path)):
+            if name.startswith("_") and not name.startswith("__") and name != "_":
+                found.add(("kernels-underscore-name", f"pithtrain.kernels.{path.stem}", name))
+    for path in sorted(KERNELS.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        aliases: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                if node.module.startswith("pithtrain.kernels."):
+                    target = node.module.rpartition(".")[2]
+                    for a in node.names:
+                        if a.name not in module_all.get(target, set()):
+                            found.add(
+                                (
+                                    "kernels-sibling-import",
+                                    f"pithtrain.kernels.{path.stem}",
+                                    f"{target}.{a.name}",
+                                )
+                            )
+                elif node.module == "pithtrain.kernels":
+                    aliases.update(
+                        {a.asname or a.name: a.name for a in node.names if a.name in module_all}
+                    )
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id in aliases
+            ):
+                target = aliases[node.value.id]
+                if node.attr not in module_all[target]:
+                    found.add(
+                        (
+                            "kernels-sibling-import",
+                            f"pithtrain.kernels.{path.stem}",
+                            f"{target}.{node.attr}",
+                        )
+                    )
 
     # Tests are named for the feature, never for an architecture.
     for mod in TEST_MODULES:

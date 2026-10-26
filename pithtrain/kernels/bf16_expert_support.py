@@ -1,6 +1,6 @@
 """
-Capability query for the fused BF16 routed experts (the SM90 CuTe-DSL bf16_expert_* kernels, built on
-QuACK). Never imports QuACK or cutlass, so it is safe to call on every architecture.
+Capability query for the fused BF16 routed experts (the SM90 CuTe-DSL bf16_expert_* kernels, built
+on QuACK). Never imports QuACK or cutlass, so it is safe to call on every architecture.
 """
 
 import importlib.metadata
@@ -17,7 +17,10 @@ MAX_GROUPS = 64
 """Most local experts the fused path takes (one int64 bitmask per token in its backward)."""
 
 QUACK_VERSION = "0.6.5"
-"""The quack-kernels version the kernels were validated against (its GEMM classes are not a stable API); any other version is unsupported."""
+"""
+The quack-kernels version the kernels were validated against (its GEMM classes are not a stable
+API); any other version is unsupported.
+"""
 
 
 def quack_version() -> str | None:
@@ -28,7 +31,7 @@ def quack_version() -> str | None:
 
 
 @lru_cache(maxsize=None)
-def _supported_on(device_index: int) -> bool:
+def supported_on(device_index: int) -> bool:
     if not is_sm90_device(device_index):
         reason = f"needs SM90, device {device_index} is not SM90"
     elif (version := quack_version()) != QUACK_VERSION:
@@ -48,4 +51,4 @@ def bf16_experts_supported(num_groups: int | None = None, device: torch.device |
     """
     device = device if device is not None else torch.device("cuda", torch.cuda.current_device())
     index = device.index if device.index is not None else torch.cuda.current_device()
-    return _supported_on(index) and (num_groups is None or num_groups <= MAX_GROUPS)
+    return supported_on(index) and (num_groups is None or num_groups <= MAX_GROUPS)

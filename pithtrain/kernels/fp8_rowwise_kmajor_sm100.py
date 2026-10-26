@@ -1,4 +1,7 @@
-"""Triton implementation of fp8cast_rowwise_kmajor (contract in fp8_rowwise_kmajor), the reference the SM90 kernel is bit-identical to."""
+"""
+Triton implementation of fp8cast_rowwise_kmajor (contract in fp8_rowwise_kmajor), the reference the
+SM90 kernel is bit-identical to.
+"""
 
 import torch
 

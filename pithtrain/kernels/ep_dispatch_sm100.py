@@ -13,7 +13,7 @@ __all__ = ["expert_and_expand_idx_sm100", "fused_dedup_prepare_dispatch_sm100"]
 
 
 @triton.jit
-def _dedup_bincount_kernel(
+def dedup_bincount_kernel(
     topk_ids_ptr,
     per_cta_expert_hist_ptr,  # [num_ctas * NE_PADDED] int64, output
     per_cta_gpu_hist_ptr,  # [num_ctas * EP_PADDED] int64, output
@@ -64,7 +64,7 @@ def _dedup_bincount_kernel(
 
 
 @triton.jit
-def _reduce_and_prefix_sum_kernel(
+def reduce_and_prefix_sum_kernel(
     per_cta_expert_hist_ptr,  # [num_ctas * NE_PADDED] int64
     per_cta_gpu_hist_ptr,  # [num_ctas * EP_PADDED] int64
     dedup_tokens_per_gpu_ptr,  # [EP_SIZE] int64
@@ -81,8 +81,10 @@ def _reduce_and_prefix_sum_kernel(
     EP_SIZE: tl.constexpr,
     EXPERTS_PER_RANK: tl.constexpr,
 ):
-    """Single CTA: reduce the per-CTA histograms into the counts, their exclusive starts and
-    send_meta, and zero kernel 3's atomic counters."""
+    """
+    Single CTA: reduce the per-CTA histograms into the counts, their exclusive starts and send_meta,
+    and zero kernel 3's atomic counters.
+    """
     expert_prefix = tl.zeros([], dtype=tl.int64)
     gpu_prefix = tl.zeros([], dtype=tl.int64)
     for g in tl.static_range(EP_SIZE):
@@ -113,7 +115,7 @@ def _reduce_and_prefix_sum_kernel(
 
 
 @triton.jit
-def _dedup_scatter_expand_kernel(
+def dedup_scatter_expand_kernel(
     topk_ids_ptr,
     expert_starts_ptr,  # [num_experts] int64 (from kernel 1)
     gpu_starts_ptr,  # [ep_size] int64 (from kernel 1)
@@ -130,9 +132,11 @@ def _dedup_scatter_expand_kernel(
     EXPERTS_PER_RANK: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
-    """Pass 1 places each token once per visited rank in dispatch_token_idxs and records its
-    position in dedup_local_pos; pass 2 counting-sorts the slots by expert into idxs and looks up
-    expand_idx from dedup_local_pos."""
+    """
+    Pass 1 places each token once per visited rank in dispatch_token_idxs and records its position
+    in dedup_local_pos; pass 2 counting-sorts the slots by expert into idxs and looks up
+    expand_idx from dedup_local_pos.
+    """
     pid = tl.program_id(0)
     tok_start = pid * BLOCK_M
     tok_offs = tok_start + tl.arange(0, BLOCK_M)
@@ -172,13 +176,13 @@ def _dedup_scatter_expand_kernel(
 # Scratch of fused_dedup_prepare_dispatch_sm100, one int64 allocation per shape and stream. Only
 # temporaries consumed in stream order before the next call on the same stream live here (and
 # send_meta, documented as valid until then); outputs that outlive the call are fresh.
-_scratch: dict[tuple, tuple[torch.Tensor, ...]] = {}
-_SCRATCH_ENTRIES = 8
+scratch: dict[tuple, tuple[torch.Tensor, ...]] = {}
+SCRATCH_ENTRIES = 8
 
 
-def _dispatch_scratch(device: torch.device, m: int, num_ctas: int, ne_padded: int, ep_padded: int, num_experts: int, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, ...]:
+def dispatch_scratch(device: torch.device, m: int, num_ctas: int, ne_padded: int, ep_padded: int, num_experts: int, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, ...]:
     key = (device, torch.cuda.current_stream(device).cuda_stream, m, num_experts, ep_size)
-    views = _scratch.get(key)
+    views = scratch.get(key)
     if views is None:
         sizes = (
             num_ctas * ne_padded,  # per_cta_expert_hist
@@ -192,9 +196,9 @@ def _dispatch_scratch(device: torch.device, m: int, num_ctas: int, ne_padded: in
         )
         flat = torch.empty(sum(sizes), dtype=torch.int64, device=device)
         views = tuple(flat.split(sizes))
-        if len(_scratch) >= _SCRATCH_ENTRIES:
-            _scratch.clear()
-        _scratch[key] = views
+        if len(scratch) >= SCRATCH_ENTRIES:
+            scratch.clear()
+        scratch[key] = views
     return views
 
 
@@ -218,15 +222,15 @@ def fused_dedup_prepare_dispatch_sm100(topk_ids: torch.Tensor, num_experts: int,
     ne_padded = triton.next_power_of_2(num_experts + 1)
     ep_padded = triton.next_power_of_2(ep_size + 1)
 
-    (per_cta_expert_hist, per_cta_gpu_hist, expert_starts, gpu_starts, dedup_counters, sort_counters, send_meta, dedup_local_pos) = _dispatch_scratch(device, m, num_ctas, ne_padded, ep_padded, num_experts, ep_size, experts_per_rank)
+    (per_cta_expert_hist, per_cta_gpu_hist, expert_starts, gpu_starts, dedup_counters, sort_counters, send_meta, dedup_local_pos) = dispatch_scratch(device, m, num_ctas, ne_padded, ep_padded, num_experts, ep_size, experts_per_rank)
 
-    _dedup_bincount_kernel[(num_ctas,)](topk_ids, per_cta_expert_hist, per_cta_gpu_hist, m, topk_ids.stride(0), K=k, EP_SIZE=ep_size, EXPERTS_PER_RANK=experts_per_rank, NUM_EXPERTS=num_experts, NE_PADDED=ne_padded, EP_PADDED=ep_padded, BLOCK=BLOCK)
+    dedup_bincount_kernel[(num_ctas,)](topk_ids, per_cta_expert_hist, per_cta_gpu_hist, m, topk_ids.stride(0), K=k, EP_SIZE=ep_size, EXPERTS_PER_RANK=experts_per_rank, NUM_EXPERTS=num_experts, NE_PADDED=ne_padded, EP_PADDED=ep_padded, BLOCK=BLOCK)
 
     if meta_out is None:
         meta_out = torch.empty(2 * ep_size, dtype=torch.int64, device=device)
     tokens_per_ep_rank, dedup_tokens_per_gpu = meta_out[:ep_size], meta_out[ep_size : 2 * ep_size]
 
-    _reduce_and_prefix_sum_kernel[(1,)](per_cta_expert_hist, per_cta_gpu_hist, dedup_tokens_per_gpu, tokens_per_ep_rank, expert_starts, gpu_starts, dedup_counters, sort_counters, send_meta, NUM_CTAS=num_ctas, NE_PADDED=ne_padded, EP_PADDED=ep_padded, NUM_EXPERTS=num_experts, EP_SIZE=ep_size, EXPERTS_PER_RANK=experts_per_rank)
+    reduce_and_prefix_sum_kernel[(1,)](per_cta_expert_hist, per_cta_gpu_hist, dedup_tokens_per_gpu, tokens_per_ep_rank, expert_starts, gpu_starts, dedup_counters, sort_counters, send_meta, NUM_CTAS=num_ctas, NE_PADDED=ne_padded, EP_PADDED=ep_padded, NUM_EXPERTS=num_experts, EP_SIZE=ep_size, EXPERTS_PER_RANK=experts_per_rank)
 
     dispatch_token_idxs = torch.empty(m * ep_size, dtype=torch.int64, device=device)
     idxs = torch.empty(m * k, dtype=torch.int64, device=device)
@@ -234,13 +238,13 @@ def fused_dedup_prepare_dispatch_sm100(topk_ids: torch.Tensor, num_experts: int,
 
     BLOCK_M = 128
     grid = (triton.cdiv(m, BLOCK_M),)
-    _dedup_scatter_expand_kernel[grid](topk_ids, expert_starts, gpu_starts, dedup_counters, sort_counters, dispatch_token_idxs, dedup_local_pos, idxs, expand_idx, m, topk_ids.stride(0), K=k, EP_SIZE=ep_size, EXPERTS_PER_RANK=experts_per_rank, BLOCK_M=BLOCK_M)
+    dedup_scatter_expand_kernel[grid](topk_ids, expert_starts, gpu_starts, dedup_counters, sort_counters, dispatch_token_idxs, dedup_local_pos, idxs, expand_idx, m, topk_ids.stride(0), K=k, EP_SIZE=ep_size, EXPERTS_PER_RANK=experts_per_rank, BLOCK_M=BLOCK_M)
 
     return (tokens_per_ep_rank, dedup_tokens_per_gpu, dispatch_token_idxs, idxs, expand_idx, send_meta)
 
 
 @triton.jit
-def _expert_and_expand_idx_kernel(
+def expert_and_expand_idx_kernel(
     recv_meta_ptr,  # [EP_SIZE * (EXPERTS_PER_RANK + 1)] int64, the received metadata
     received_expand_idx_ptr,  # [total] int64, input
     expert_idxs_ptr,  # [total] int64, output
@@ -250,11 +254,12 @@ def _expert_and_expand_idx_kernel(
     EXPERTS_PER_RANK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Per received slot: its local expert, found by an unrolled pass over the (sender, expert)
+    """
+    Per received slot: its local expert, found by an unrolled pass over the (sender, expert)
     segments, and its expand_idx plus the dedup counts of the preceding senders.
 
-    total is a kernel argument, not a device-side sum, so the store mask and the caller's
-    allocation are the same number (a mismatch would write out of bounds).
+    total is a kernel argument, not a device-side sum, so the store mask and the caller's allocation
+    are the same number (a mismatch would write out of bounds).
     """
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -288,5 +293,5 @@ def expert_and_expand_idx_sm100(recv_meta: torch.Tensor, received_expand_idx: to
     if total == 0:
         return expert_idxs, expand_idx
     BLOCK = 1024
-    _expert_and_expand_idx_kernel[(triton.cdiv(total, BLOCK),)](recv_meta, received_expand_idx, expert_idxs, expand_idx, total, EP_SIZE=ep_size, EXPERTS_PER_RANK=experts_per_rank, BLOCK=BLOCK)
+    expert_and_expand_idx_kernel[(triton.cdiv(total, BLOCK),)](recv_meta, received_expand_idx, expert_idxs, expand_idx, total, EP_SIZE=ep_size, EXPERTS_PER_RANK=experts_per_rank, BLOCK=BLOCK)
     return expert_idxs, expand_idx

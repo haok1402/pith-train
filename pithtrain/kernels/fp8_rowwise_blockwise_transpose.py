@@ -12,13 +12,13 @@ __all__ = ["fp8cast_rowwise_blockwise_transpose"]
 
 def fp8cast_rowwise_blockwise_transpose(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Rowwise 1x128 FP8 of x and 128x128 blockwise FP8 of x.T from one read of x, returning
-    (x_fp8, x_scale, xt_fp8, xt_scale): the activation operands of the dense FP8 linear.
+    Rowwise 1x128 FP8 of x and 128x128 blockwise FP8 of x.T from one read of x, returning (x_fp8,
+    x_scale, xt_fp8, xt_scale): the activation operands of the dense FP8 linear.
 
-    x is 2-D (M, K) bf16 (fp16 / fp32 also accepted), any M and K, any strides; not modified.
-    x_fp8 is e4m3 (M, K) contiguous with fp32 x_scale of logical shape (M, ceil(K / 128)), strides
-    unspecified (MN-major on SM90, row-major on SM100).
-    xt_fp8 is e4m3 (K, M) contiguous with one scale per 128x128 tile: fp32 xt_scale (ceil(K / 128), ceil(M / 128)), row-major.
+    x is 2-D (M, K) bf16 (fp16 / fp32 also accepted), any M and K, any strides; not modified. x_fp8
+    is e4m3 (M, K) contiguous with fp32 x_scale of logical shape (M, ceil(K / 128)), strides
+    unspecified (MN-major on SM90, row-major on SM100). xt_fp8 is e4m3 (K, M) contiguous with one
+    scale per 128x128 tile: fp32 xt_scale (ceil(K / 128), ceil(M / 128)), row-major.
 
     Per block (a partial block uses its valid elements): scale = 2^ceil(log2(max(amax, 1e-4) / 448))
     (E8M0), fp8 = e4m3(x / scale) rounded to nearest even with saturation. Both architectures return

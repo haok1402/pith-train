@@ -3,8 +3,8 @@ Causal depthwise conv1d of the Qwen3.5 Gated DeltaNet on the channels-last (B, S
 Triton pass forward, writing the (B, C, S) storage a sliced nn.Conv1d output has, and one pass
 backward (dx and per-block partials of dw). Both architectures run these kernels.
 
-offset is the number of leading rows of x that are history (the K - 1 tokens of conv state
-prepended under context parallelism), not outputs.
+offset is the number of leading rows of x that are history (the K - 1 tokens of conv state prepended
+under context parallelism), not outputs.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ __all__ = ["BLOCK_C", "BLOCK_T", "BWD", "causal_conv1d_bwd", "causal_conv1d_fwd"
 
 
 @triton.jit
-def _conv_fwd_kernel(x_ptr, w_ptr, y_ptr, L, S, C, offset, sy_b, sy_t, sy_c, K: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr):
+def conv_fwd_kernel(x_ptr, w_ptr, y_ptr, L, S, C, offset, sy_b, sy_t, sy_c, K: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr):
     pid_t, pid_c, b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
     c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
@@ -37,9 +37,11 @@ def _conv_fwd_kernel(x_ptr, w_ptr, y_ptr, L, S, C, offset, sy_b, sy_t, sy_c, K: 
 
 
 @triton.jit
-def _conv_bwd_kernel(g_ptr, x_ptr, w_ptr, dx_ptr, dw_ptr, L, S, C, offset, n_t, sg_b, sg_t, sg_c, K: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr):
-    """dx of input rows [pid_t * BLOCK_T, +BLOCK_T), and the fp32 partial dw of the outputs in the
-    same row range (one partial per (b, t block))."""
+def conv_bwd_kernel(g_ptr, x_ptr, w_ptr, dx_ptr, dw_ptr, L, S, C, offset, n_t, sg_b, sg_t, sg_c, K: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr):
+    """
+    dx of input rows [pid_t * BLOCK_T, +BLOCK_T), and the fp32 partial dw of the outputs in the same
+    row range (one partial per (b, t block)).
+    """
     pid_t, pid_c, b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     r = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)  # input row (dx) / output row (dw)
     c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
@@ -84,20 +86,20 @@ def causal_conv1d_out_like(x: torch.Tensor, offset: int) -> torch.Tensor:
 
 def causal_conv1d_fwd(x: torch.Tensor, w: torch.Tensor, offset: int) -> torch.Tensor:
     """
-    Causal depthwise conv y[b, t, c] = sum over k = 0 .. K - 1 of w[c, k] * x[b, t + offset - (K - 1) + k, c],
-    taps at negative positions skipped.
+    Causal depthwise conv y[b, t, c] = sum over k = 0 .. K - 1 of w[c, k] * x[b, t + offset - (K -
+    1) + k, c], taps at negative positions skipped.
 
     x: bf16 (B, offset + S, C) contiguous, its first offset rows history. w: (C, 1, K) or (C, K)
-    contiguous, any float dtype (read as fp32). Neither is modified. Returns a fresh bf16
-    (B, S, C) in the layout of causal_conv1d_out_like, bit-identical to ATen's CUDA
-    conv1d(x.transpose(1, 2), w, padding=K - 1, groups=C)[..., offset:offset + S].transpose(1, 2).
+    contiguous, any float dtype (read as fp32). Neither is modified. Returns a fresh bf16 (B, S, C)
+    in the layout of causal_conv1d_out_like, bit-identical to ATen's CUDA conv1d(x.transpose(1, 2),
+    w, padding=K - 1, groups=C)[..., offset:offset + S].transpose(1, 2).
     """
     B, L, C = x.shape
     K = w.shape[-1]
     S = L - offset
     y = causal_conv1d_out_like(x, offset)
     grid = (triton.cdiv(S, BLOCK_T), triton.cdiv(C, BLOCK_C), B)
-    _conv_fwd_kernel[grid](x, w, y, L, S, C, offset, *y.stride(), K=K, BLOCK_T=BLOCK_T, BLOCK_C=BLOCK_C)
+    conv_fwd_kernel[grid](x, w, y, L, S, C, offset, *y.stride(), K=K, BLOCK_T=BLOCK_T, BLOCK_C=BLOCK_C)
     return y
 
 
@@ -117,6 +119,6 @@ def causal_conv1d_bwd(g: torch.Tensor, x: torch.Tensor, w: torch.Tensor, offset:
     dx = torch.empty_like(x)
     part = torch.empty((B * n_t, C, K), dtype=torch.float32, device=x.device)
     grid = (n_t, triton.cdiv(C, BWD["BLOCK_C"]), B)
-    _conv_bwd_kernel[grid](g, x, w, dx, part, L, S, C, offset, n_t, *g.stride(), K=K, **BWD)
+    conv_bwd_kernel[grid](g, x, w, dx, part, L, S, C, offset, n_t, *g.stride(), K=K, **BWD)
     dw = part.sum(0).to(w.dtype).view(w.shape)
     return dx, dw

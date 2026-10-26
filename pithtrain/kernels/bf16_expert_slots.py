@@ -16,16 +16,16 @@ def bf16_expert_group_slots(expert_idxs: torch.Tensor, expand_idx: torch.Tensor 
     Index maps of the grouped expert input (no rows are copied), as a record whose fields callers
     read and pass back to the bf16_expert_* kernels.
 
-    - expert_idxs: int64 (S,) contiguous, the local expert of each token slot, values in
-      [0, num_groups), 0 < num_groups <= 64 (asserted).
+    - expert_idxs: int64 (S,) contiguous, the local expert of each token slot, values in [0,
+      num_groups), 0 < num_groups <= 64 (asserted).
     - expand_idx: int64 (S,) contiguous, the received-token row (< num_tokens) each slot reads, or
       None for the identity (the received tokens are the slots).
-    - Grouped rows are expert-major with no padding, stable (slot order) within each expert. Fields:
-      cu_seqlens int32 (G + 1,), cumulative slot counts per expert; a_idx int32 (S,), the
-      received-token row read by grouped row r; row_of int32 (S,), the grouped row of slot i;
-      slot_of int32 (S,), its inverse; mask int64 (num_tokens,), per token the bitmask of its local
-      experts, and table, an internal per-(token, expert) grouped-row table (both None without
-      expand_idx).
+    - Grouped rows are expert-major with no padding, stable (slot order) within each expert.
+      Fields: cu_seqlens int32 (G + 1,), cumulative slot counts per expert; a_idx int32 (S,),
+      the received-token row read by grouped row r; row_of int32 (S,), the grouped row of slot
+      i; slot_of int32 (S,), its inverse; mask int64 (num_tokens,), per token the bitmask of
+      its local experts, and table, an internal per-(token, expert) grouped-row table (both
+      None without expand_idx).
     - Exact and deterministic; no host sync. S == 0 gives zero cu_seqlens (and mask).
     """
     from pithtrain.kernels.bf16_expert_slots_sm90 import bf16_expert_group_slots_sm90
@@ -43,9 +43,9 @@ def bf16_expert_gather_rows(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
 
 def bf16_expert_gather_sum(grad: torch.Tensor, maps: NamedTuple, num_groups: int, max_slots: int) -> torch.Tensor:
     """
-    The received tokens' gradient from the grouped input gradient: a fresh bf16 (num_tokens, H) whose
-    row t sums the rows of grad of token t's slots, in fp32 in ascending local-expert order starting
-    from zero, rounded once; a token with no slot gets zeros.
+    The received tokens' gradient from the grouped input gradient: a fresh bf16 (num_tokens, H)
+    whose row t sums the rows of grad of token t's slots, in fp32 in ascending local-expert order
+    starting from zero, rounded once; a token with no slot gets zeros.
 
     - grad: bf16 (S, H) contiguous in grouped-row order, H a multiple of 8.
     - maps: from bf16_expert_group_slots with an expand_idx (mask and table required).
@@ -59,8 +59,8 @@ def bf16_expert_gather_sum(grad: torch.Tensor, maps: NamedTuple, num_groups: int
 
 def expert_slot_segment_sum(x: torch.Tensor, cu_host: list[int], cu: torch.Tensor, idx: torch.Tensor | None = None) -> torch.Tensor:
     """
-    Per-segment column sums (the bias gradient of grouped rows): a fresh fp32 (G, N) whose row g sums
-    rows r in [cu[g], cu[g + 1]) of x, read as x[idx[r]] when idx is given.
+    Per-segment column sums (the bias gradient of grouped rows): a fresh fp32 (G, N) whose row g
+    sums rows r in [cu[g], cu[g + 1]) of x, read as x[idx[r]] when idx is given.
 
     - x: bf16 (rows, N) contiguous, N a multiple of 8. idx: optional int32 row index into x.
     - cu: int32 (G + 1,) on the device, and cu_host the same values as a host list (it sizes the

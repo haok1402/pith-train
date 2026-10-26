@@ -7,6 +7,8 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
+__all__ = ["TORCH2CUTE", "fake", "fake_stream"]
+
 
 def fake(dtype: type, shape: tuple, stride: tuple, align: int = 16) -> object:
     return cute.runtime.make_fake_tensor(dtype, shape, stride=stride, assumed_align=align)

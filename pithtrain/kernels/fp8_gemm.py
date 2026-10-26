@@ -4,8 +4,8 @@ fp8_dgrad_wgrad), m-grouped (fp8_m_grouped_gemm, m_grouped_group_indices) and k-
 (k_grouped_fp8_gemm, fp8_grouped_wgrad_buffer) GEMMs, plus the grouped-input quantization
 (quantize_grouped_input). The architecture-specific entry points are chosen here.
 
-Every 1x128 activation scale is fp32 of logical shape (rows, ceil(K / 128)) with unspecified
-strides (MN-major on SM90, row-major on SM100); the GEMMs take either.
+Every 1x128 activation scale is fp32 of logical shape (rows, ceil(K / 128)) with unspecified strides
+(MN-major on SM90, row-major on SM100); the GEMMs take either.
 """
 
 from typing import Tuple
@@ -41,11 +41,11 @@ def fp8_act_weight_gemm(input_2d: torch.Tensor, weight_fp8: torch.Tensor, scale_
     Forward FP8 linear y = x @ W.T, returning (output, input_t_fp8, scale_input_t).
 
     - input_2d: x, bf16 (m, K), quantized rowwise 1x128.
-    - weight_fp8, scale_weight: W, e4m3 (n, K) with its 128x128 scale as fp8cast_blockwise_transpose
-      returns it.
+    - weight_fp8, scale_weight: W, e4m3 (n, K) with its 128x128 scale as
+      fp8cast_blockwise_transpose returns it.
     - output: fresh (m, n) in input_2d's dtype.
-    - input_t_fp8, scale_input_t: x.T (K, m) e4m3 quantized per 128x128 tile, scale fp32
-      (ceil(K / 128), ceil(m / 128)) row-major; the activation operand of fp8_dgrad_wgrad.
+    - input_t_fp8, scale_input_t: x.T (K, m) e4m3 quantized per 128x128 tile, scale fp32 (ceil(K /
+      128), ceil(m / 128)) row-major; the activation operand of fp8_dgrad_wgrad.
     """
     m, n = input_2d.shape[0], weight_fp8.shape[0]
     input_fp8, scale_input, input_t_fp8, scale_input_t = fp8cast_rowwise_blockwise_transpose(input_2d)
@@ -58,8 +58,8 @@ def fp8_dgrad_wgrad(grad_2d: torch.Tensor, weight_t_fp8: torch.Tensor, scale_wei
     Backward FP8 linear of y = x @ W.T, returning (grad_input, weight_grad).
 
     - grad_2d: the gradient of y, bf16 (m, n).
-    - weight_t_fp8, scale_weight_t: W.T, e4m3 (k, n) with its 128x128 scale (the transpose pair of
-      fp8cast_blockwise_transpose).
+    - weight_t_fp8, scale_weight_t: W.T, e4m3 (k, n) with its 128x128 scale (the transpose
+      pair of fp8cast_blockwise_transpose).
     - input_t_fp8, scale_input_t: x.T (k, m) blockwise, as fp8_act_weight_gemm returns them.
     - k: the input features.
     - grad_input = grad @ W, fresh (m, k); weight_grad = grad.T @ x, fresh (n, k) (not accumulated);
@@ -115,19 +115,19 @@ def pad_k_major_channels(x: tuple[torch.Tensor, torch.Tensor], ks: list, channel
 def k_grouped_runs_transposed(m: int, n: int) -> bool:
     """
     Whether the SM90 k-grouped FP8 GEMM of an (m, n) output runs as the transposed product (see
-    _k_grouped_call): an odd 128-block count on m and an even one on n.
+    k_grouped_call): an odd 128-block count on m and an even one on n.
     """
     return -(-m // 128) % 2 == 1 and -(-n // 128) % 2 == 0
 
 
-def _k_grouped_call(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tensor, torch.Tensor], d: torch.Tensor, ks: list, ks_tensor: torch.Tensor) -> None:
+def k_grouped_call(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tensor, torch.Tensor], d: torch.Tensor, ks: list, ks_tensor: torch.Tensor) -> None:
     """
     One deep_gemm.k_grouped_fp8_gemm_nt_contiguous call accumulating into d, made safe from a
     DeepGEMM SM90 deadlock: the kernel runs 2-CTA clusters along M (block_m = 128, cluster_m = 2)
     and never finishes when ceil(M / 128) * ceil(N / block_n) is odd, M being the first operand's
-    channels (e.g. (M, N) = (2880, 2880), (2880, 1024), (5760, 2880) hang). An even M-block count
-    is always safe, so when a's is odd the call computes the transposed product b a^T if b's is
-    even, and otherwise pads a's channels to a multiple of 256 with zeros.
+    channels (e.g. (M, N) = (2880, 2880), (2880, 1024), (5760, 2880) hang). An even M-block count is
+    always safe, so when a's is odd the call computes the transposed product b a^T if b's is even,
+    and otherwise pads a's channels to a multiple of 256 with zeros.
     """
     m, n = a[1].shape[0], b[1].shape[0]
     if -(-m // 128) % 2 == 0:
@@ -153,13 +153,13 @@ def _k_grouped_call(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tensor,
 def k_grouped_fp8_gemm_nt(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tensor, torch.Tensor], d: torch.Tensor, ks: list, ks_tensor: torch.Tensor, c: torch.Tensor) -> None:
     """
     SM90 k-grouped FP8 GEMM NT accumulating into d (d is c), split into calls of at most
-    K_GROUPED_MAX_ROWS rows, each through _k_grouped_call. Runs of whole groups are contiguous
-    slices of the K-major operands; a group longer than the limit is cut along k and accumulates
-    chunk by chunk. Scale slices keep the parent's MN-major strides, so DeepGEMM reads them as is.
+    K_GROUPED_MAX_ROWS rows, each through k_grouped_call. Runs of whole groups are contiguous slices
+    of the K-major operands; a group longer than the limit is cut along k and accumulates chunk by
+    chunk. Scale slices keep the parent's MN-major strides, so DeepGEMM reads them as is.
     """
     assert d is c
     if sum(ks) <= K_GROUPED_MAX_ROWS:
-        _k_grouped_call(a, b, d, ks, ks_tensor)
+        k_grouped_call(a, b, d, ks, ks_tensor)
         return
     channels = (a[1].shape[0], b[1].shape[0])
 
@@ -177,7 +177,7 @@ def k_grouped_fp8_gemm_nt(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.T
         sub_ks = ks[g0:g1] if chunk is None else [chunk[1] - chunk[0]]
         sub_t = ks_tensor[g0:g1] if chunk is None else torch.tensor(sub_ks, dtype=ks_tensor.dtype, device=ks_tensor.device)
         out = d[g0:g1]
-        _k_grouped_call(ops[0], ops[1], out, sub_ks, sub_t)
+        k_grouped_call(ops[0], ops[1], out, sub_ks, sub_t)
 
     g0, row0, row = 0, 0, 0
     for g, k in enumerate(ks):
@@ -201,9 +201,9 @@ def k_grouped_fp8_gemm(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tens
     of ks rows.
 
     - d: fp32 (G, N, K), contiguous or as fp8_grouped_wgrad_buffer returns it.
-    - a, b: the per-channel FP8 data and scales (x_ch_fp8, x_ch_scale) of quantize_grouped_input
-      (or of the fused quantization ops) of the grad_output (N channels) and of the input (K
-      channels), over the same grouped rows.
+    - a, b: the per-channel FP8 data and scales (x_ch_fp8, x_ch_scale) of quantize_grouped_input (or
+      of the fused quantization ops) of the grad_output (N channels) and of the input (K channels),
+      over the same grouped rows.
     - ks (host list) and ks_tensor (int32, device): per-group row counts, multiples of 128.
     - Either operand may have more channels than d (zero-padded, as the fused ops' padded=True
       writes it); the extra channels are dropped. Only the SM90 fused ops produce such operands.
@@ -253,13 +253,13 @@ def fp8_fused_experts_supported() -> bool:
 
 def quantize_grouped_input(input: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    The FP8 operands of a grouped-GEMM input from one read of it: (x_fp8, x_scale, x_ch_fp8,
-    x_ch_scale).
+    The FP8 operands of a grouped-GEMM input from one read of it: (x_fp8,
+    x_scale, x_ch_fp8, x_ch_scale).
 
     - input: bf16 (M, K) contiguous, rows grouped by expert, each group padded to a multiple of 128
       rows; grouped_mm_offs: int32 cumulative group ends (last = M).
-    - x_fp8 e4m3 (M, K), x_scale fp32 (M, ceil(K / 128)): rowwise 1x128, the a operand of
-      fp8_m_grouped_gemm.
+    - x_fp8 e4m3 (M, K), x_scale fp32 (M, ceil(K / 128)): rowwise 1x128, the a
+      operand of fp8_m_grouped_gemm.
     - x_ch_fp8, x_ch_scale: per-channel (128 rows x 1 within each group), the operand of
       k_grouped_fp8_gemm. SM90: K-major per group (group g's (K, ks[g]) row-major block flat at
       offs[g-1] * K), scale (K, M / 128). SM100: (M, K), scale (M / 128, K).
@@ -278,8 +278,8 @@ def quantize_grouped_input(input: torch.Tensor, grouped_mm_offs: torch.Tensor) -
 
 def fp8_m_grouped_gemm(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tensor, torch.Tensor], n: int, grouped_mm_offs: torch.Tensor, group_indices: torch.Tensor | None = None) -> torch.Tensor:
     """
-    m-grouped FP8 GEMM into a fresh bf16 (M, n) tensor: rows [offs[g-1], offs[g]) are a_g @ b[g].T,
-    fp32 accumulation.
+    m-grouped FP8 GEMM into a fresh bf16 (M, n) tensor: rows [offs[g-1], offs[g]) are a_g @
+    b[g].T, fp32 accumulation.
 
     - a: (fp8 (M, K), 1x128 scale (M, ceil(K / 128))) as quantize_grouped_input returns them.
     - b: (fp8 (G, n, K), 128x128 scale (G, ceil(n / 128), ceil(K / 128))) as
@@ -296,8 +296,7 @@ def fp8_m_grouped_gemm(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tens
 def k_grouped_safe_size(n: int) -> int:
     """
     Channel count (a multiple of 256) to lay out a k-grouped wgrad operand with so DeepGEMM's SM90
-    k-grouped GEMM can take it as the first operand without the 2-CTA deadlock (see
-    _k_grouped_call).
+    k-grouped GEMM can take it as the first operand without the 2-CTA deadlock (see k_grouped_call).
     """
     return -(-n // 256) * 256
 
@@ -307,8 +306,8 @@ def m_grouped_group_indices(grouped_mm_offs: torch.Tensor, M: int) -> torch.Tens
     The group-id hint of fp8_m_grouped_gemm, reusable by every m-grouped GEMM over the same rows;
     None on SM100, which takes none.
 
-    On SM90: int32 (M,) per-row group ids, e.g. grouped_mm_offs = [128, 256, 384, 512] gives
-    [0, ..., 1, ..., 2, ..., 3, ...]; rows at or past the last offset get the last group.
+    On SM90: int32 (M,) per-row group ids, e.g. grouped_mm_offs = [128, 256, 384, 512] gives [0,
+    ..., 1, ..., 2, ..., 3, ...]; rows at or past the last offset get the last group.
     """
     if ARCH_MAJOR != 9:
         return None

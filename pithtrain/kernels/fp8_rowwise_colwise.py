@@ -1,4 +1,7 @@
-"""Fused rowwise + colwise FP8 quantization from one read of the input (Triton, run on both architectures). fp8_rowwise_kmajor_sm100 launches the same kernel with the K-major colwise output."""
+"""
+Fused rowwise + colwise FP8 quantization from one read of the input (Triton, run on both
+architectures). fp8_rowwise_kmajor_sm100 launches the same kernel with the K-major colwise output.
+"""
 
 import torch
 import triton
@@ -15,7 +18,9 @@ def fp8cast_rowwise_colwise_kernel(x_ptr, out_tok_ptr, scale_tok_ptr, out_ch_ptr
     """
     One 128 x BLOCK_N tile per program: 1x128 rowwise and 128x1 colwise quantization. M % 128 == 0.
 
-    With WRITE_KMAJOR the colwise output is written K-major (each group's (K_g, N) block stored as (N, K_g), concatenated) with scales (N, M / 128); this needs block_to_group_ptr and cumsum_ptr (grouped_mm_offs). Otherwise colwise is (M, N) with scales (M / 128, N).
+    With WRITE_KMAJOR the colwise output is written K-major (each group's (K_g, N) block stored as
+    (N, K_g), concatenated) with scales (N, M / 128); this needs block_to_group_ptr and cumsum_ptr
+    (grouped_mm_offs). Otherwise colwise is (M, N) with scales (M / 128, N).
     """
     BLOCK_ROWS: tl.constexpr = 128
     CHUNKS: tl.constexpr = BLOCK_N // BLOCK_ROWS
@@ -86,9 +91,12 @@ def fp8cast_rowwise_colwise_kernel(x_ptr, out_tok_ptr, scale_tok_ptr, out_ch_ptr
 
 def fp8cast_rowwise_colwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Rowwise and colwise FP8 quantization of x from one read. x is bf16 or fp32 (M, N) with M % 128 == 0.
+    Rowwise and colwise FP8 quantization of x from one read. x is bf16 or fp32 (M, N) with M %
+    128 == 0.
 
-    Returns (tok_fp8, tok_scale, ch_fp8, ch_scale): tok_fp8 float8_e4m3fn (M, N) with 1x128 row blocks and tok_scale float32 (M, ceil(N / 128)); ch_fp8 float8_e4m3fn (M, N) with 128x1 column blocks and ch_scale float32 (M / 128, N). Scales are row-major.
+    Returns (tok_fp8, tok_scale, ch_fp8, ch_scale): tok_fp8 float8_e4m3fn (M, N) with 1x128 row
+    blocks and tok_scale float32 (M, ceil(N / 128)); ch_fp8 float8_e4m3fn (M, N) with 128x1 column
+    blocks and ch_scale float32 (M / 128, N). Scales are row-major.
     """
     assert x.ndim == 2 and x.shape[0] % 128 == 0, (f"Expected 2D tensor with M%128==0, got shape {x.shape}")
     M, N = x.shape

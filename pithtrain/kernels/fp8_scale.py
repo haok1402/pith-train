@@ -6,13 +6,15 @@ function. The SM90 CuTe-DSL kernels reproduce its SM90 branch bit for bit.
 import triton
 import triton.language as tl
 
+__all__ = ["compute_fp8_scale"]
+
 
 @triton.jit
 def compute_fp8_scale(amax, NATIVE_E8M0: tl.constexpr):
     """
-    (scale, reciprocal_scale) from per-block amax: scale is the power of two at or above
-    max(amax, 1e-4) / 448, at least 2^-126; both are exact powers of two. NATIVE_E8M0 selects the
-    native PTX conversion (SM100) or the bit-manipulation emulation (SM90); the results are equal.
+    (scale, reciprocal_scale) from per-block amax: scale is the power of two at or above max(amax,
+    1e-4) / 448, at least 2^-126; both are exact powers of two. NATIVE_E8M0 selects the native PTX
+    conversion (SM100) or the bit-manipulation emulation (SM90); the results are equal.
     """
     FP8_MAX_RCP: tl.constexpr = 1.0 / 448.0
 

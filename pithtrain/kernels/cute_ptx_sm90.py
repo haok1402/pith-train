@@ -15,6 +15,8 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+__all__ = ["abs2", "asm", "asm_args_last", "atom_add_u64", "atom_add_u64_pred", "bf16_hi", "bf16_lo", "bf16_sel", "bf16x2_to_f32", "cp_async16", "cp_async8", "ctz64", "f32_as_u32", "f32_bits", "f32_hex", "f32x2_to_bf16x2", "fence_gpu", "lanemask_lt", "ld_b32", "ld_b32_coherent", "ld_b64", "ld_relaxed", "ld_v4", "lds_b32", "lds_b32_pred", "lds_v2", "lds_v4", "match_any", "max2", "max_u16x2", "pack_bf16", "prmt", "prmt_args_last", "red_add_shared", "red_or_shared", "red_or_u64", "selp", "selp_args_last", "spin_epoch", "spin_until", "st_b32", "st_b64", "st_f32", "st_release", "st_v2", "st_v2_args_last", "st_v4", "st_v4_args_last", "sts_b32", "sts_b32_nopred", "sts_v4", "to_ir", "u32_as_f32", "unpack"]
+
 # ---------------------------------------------------------------------------
 # asm(res_type, args, ptx, constraints)
 # ---------------------------------------------------------------------------
@@ -30,7 +32,10 @@ def asm(res_type, args, ptx: str, cons: str, side_effects: bool = False):
 
 @dsl_user_op
 def ld_v4(addr: Int64, pred: Int32, *, loc=None, ip=None) -> tuple:
-    """16-byte global load; zeros where pred == 0. A plain L1-allocating ld.global: measured faster than the .nc no-allocate path."""
+    """
+    16-byte global load; zeros where pred == 0. A plain L1-allocating ld.global: measured faster
+    than the .nc no-allocate path.
+    """
     st = llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()])
     r = asm(
         st, [Int64(addr).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip)],

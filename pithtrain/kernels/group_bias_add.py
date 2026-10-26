@@ -11,7 +11,7 @@ __all__ = ["group_bias_add_"]
 
 
 @triton.jit
-def _group_bias_add_kernel(y_ptr, bias_ptr, gi_ptr, H, BLOCK_M: tl.constexpr, BLOCK_H: tl.constexpr):
+def group_bias_add_kernel(y_ptr, bias_ptr, gi_ptr, H, BLOCK_M: tl.constexpr, BLOCK_H: tl.constexpr):
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     mask = cols[None, :] < H
@@ -36,4 +36,4 @@ def group_bias_add_(y: torch.Tensor, bias: torch.Tensor, group_indices: torch.Te
     if y.dtype != bias.dtype or M % 128 != 0 or not y.is_contiguous() or not bias.is_contiguous():
         y.copy_(y + bias[group_indices])
         return
-    _group_bias_add_kernel[(M // 32, triton.cdiv(H, 256))](y, bias, group_indices, H, BLOCK_M=32, BLOCK_H=256)
+    group_bias_add_kernel[(M // 32, triton.cdiv(H, 256))](y, bias, group_indices, H, BLOCK_M=32, BLOCK_H=256)

@@ -1,10 +1,10 @@
-"""
-Device capability of this process, the one place in pithtrain that probes it (SM90 and SM100).
-"""
+"""Device capability of this process, the one place in pithtrain that probes it (SM90 and SM100)."""
 
 import functools
 
 import torch
+
+__all__ = ["ARCH_MAJOR", "NATIVE_E8M0", "is_sm90_device", "sm_count"]
 
 ARCH_MAJOR, _ = torch.cuda.get_device_capability()
 """Compute-capability major of the current device at import: 9 on SM90, 10 on SM100."""

@@ -1,4 +1,7 @@
-"""Picker of the fused rowwise + K-major colwise FP8 quantization (the SM90 grouped-GEMM input): the CuTe-DSL kernel on SM90, the Triton kernel on SM100."""
+"""
+Picker of the fused rowwise + K-major colwise FP8 quantization (the SM90 grouped-GEMM input): the
+CuTe-DSL kernel on SM90, the Triton kernel on SM100.
+"""
 
 import torch
 
@@ -11,13 +14,19 @@ def fp8cast_rowwise_kmajor(x: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tu
     """
     Rowwise and K-major colwise FP8 quantization of x from one read.
 
-    x is bf16 or fp32 (M, N) with M % 128 == 0. grouped_mm_offs is int32 (num_groups,), the cumulative group ends (no leading zero, last entry M), each a multiple of 128.
+    x is bf16 or fp32 (M, N) with M % 128 == 0. grouped_mm_offs is int32 (num_groups,), the
+    cumulative group ends (no leading zero, last entry M), each a multiple of 128.
 
     Returns (tok_fp8, tok_scale, kmajor_fp8, kmajor_scale):
-    - tok_fp8 float8_e4m3fn (M, N) and tok_scale float32 (M, ceil(N / 128)): 1x128 blocks along each row.
-    - kmajor_fp8 float8_e4m3fn (M * N,) and kmajor_scale float32 (N, M / 128): 128x1 blocks down each column within a group; group g is stored as its (N, K_g) row-major block starting at offs[g - 1] * N.
+    - tok_fp8 float8_e4m3fn (M, N) and tok_scale float32 (M, ceil(N / 128)): 1x128 blocks
+      along each row.
+    - kmajor_fp8 float8_e4m3fn (M * N,) and kmajor_scale float32 (N, M / 128): 128x1 blocks down
+      each column within a group; group g is stored as its (N, K_g) row-major block starting at
+      offs[g - 1] * N.
 
-    FP8 bytes and scale values are the same on both architectures, the scale strides are not: SM90 returns both scales MN-major (see fp8_scale_layout), the layout DeepGEMM's SM90 GEMMs read without a transpose; SM100 returns them row-major.
+    FP8 bytes and scale values are the same on both architectures, the scale strides are not: SM90
+    returns both scales MN-major (see fp8_scale_layout), the layout DeepGEMM's SM90 GEMMs read
+    without a transpose; SM100 returns them row-major.
     """
     match ARCH_MAJOR:
         case 9:
