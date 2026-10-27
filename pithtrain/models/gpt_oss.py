@@ -37,10 +37,6 @@ from pithtrain.operators.token_scatter import (
 from pithtrain.pipeline.dualpipev import layer_partition
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
 
-# Inductor's C++ wrapper launches the compiled regions' kernels from C++ instead of a generated
-# Python function: the same kernels and bits, less host time per call on a host-bound step (as in
-# qwen3_moe.py).
-COMPILE_OPTIONS = {"cpp_wrapper": True}
 EDGE_LAYER_COST = 3.5
 """
 Step time of the stage-edge work (embedding, final norm, BF16 lm_head and cross-entropy) in units
@@ -200,8 +196,6 @@ class GptOssExperts(nn.Module):
         quantized_input: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
         if training.fp8 and fp8_fused_experts_supported() and x.shape[0]:
-            # Hopper FP8: bias + clamped SwiGLU fused into the quantization of the neighbouring
-            # GEMMs (operators/fp8_experts.py); bit-identical to the unfused path below.
             gi = precompute_group_indices(grouped_mm_offs, x.shape[0])
             q_gu = self._quantized_weight("gate_up_proj", self.gate_up_proj)
             q_down = self._quantized_weight("down_proj", self.down_proj)
@@ -239,13 +233,9 @@ class GptOssExperts(nn.Module):
         expert_counts: list[int] | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
-        Hopper stage 3 from the received tokens. FP8: expand, scatter by expert and quantize in one
-        pass (fp8_scatter_quant), then the experts; returns (expert outputs in grouped order,
-        reverse_shuffle_idxs). BF16 (uses_bf16_cute): the fused CuTe experts with the biases and
-        the clamped SwiGLU in their epilogues, which read the received tokens through an index and
-        return the outputs in slot order, with None. A forward method of its own, registered with
-        FSDP, so the quantized input never crosses the FSDP boundary, whose mixed-precision cast
-        would turn it to bf16.
+        Stage 3 from the received tokens on Hopper: returns (expert outputs, reverse_shuffle_idxs),
+        or the outputs in slot order with None for the BF16 CuTe experts. A method of its own,
+        registered with FSDP, so the FP8 input never meets FSDP's bf16 input cast.
         """
         if not training.fp8:
             from pithtrain.operators.bf16_experts import bf16_clamped_swiglu_experts
@@ -270,7 +260,7 @@ class GptOssTopKRouter(nn.Module):
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size)), requires_grad=True)
         self.bias = nn.Parameter(torch.zeros(num_experts))
 
-    @torch.compile(fullgraph=True, options=COMPILE_OPTIONS)
+    @torch.compile(fullgraph=True, options={"cpp_wrapper": True})
     def forward(
         self, hidden_states: torch.Tensor, replay_idx: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -356,7 +346,6 @@ class GptOssAttention(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, S, _ = hidden_states.size()
-        # q/k/v read the same input; under FP8 it is quantized once for all three.
         xq = training.Linear.quantize_input(hidden_states)
         query_states = self.q_proj(hidden_states, xq).view(B, S, self.num_heads, self.head_dim)
         key_states = self.k_proj(hidden_states, xq).view(B, S, self.num_kv_heads, self.head_dim)
@@ -383,7 +372,7 @@ class GptOssDecoderLayer(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    @torch.compile(fullgraph=True, options=COMPILE_OPTIONS)
+    @torch.compile(fullgraph=True, options={"cpp_wrapper": True})
     def forward_stage1_compute(
         self,
         hidden_states: torch.Tensor,
@@ -414,9 +403,8 @@ class GptOssDecoderLayer(nn.Module):
 
     def keeps_stage3_input(self) -> bool:
         """
-        Whether forward_stage3 keeps gathered_tokens for the backward, so the pipeline must not
-        free its storage after the forward: the fused BF16 CuTe experts read the received tokens
-        again in their weight gradient.
+        Whether forward_stage3 keeps gathered_tokens for the backward (the BF16 CuTe experts read
+        them again in their weight gradient), so the pipeline must not free them.
         """
         return not training.fp8 and self.mlp.experts.uses_bf16_cute()
 
@@ -428,15 +416,11 @@ class GptOssDecoderLayer(nn.Module):
         expert_counts: list[int] | None = None,
     ) -> torch.Tensor:
         if training.fp8 and fp8_fused_experts_supported():
-            # Expand, scatter by expert and quantize in one pass; the bf16 expert input is never
-            # written, and x inside only carries its gradient.
             expand = expand_idx if distributed.ep_size > 1 else None
             outs, rsi = self.mlp.experts.forward_from_tokens(gathered_tokens, expert_idxs, expand, expert_counts)  # fmt: skip
             del gathered_tokens
             return padded_index_gather(outs, rsi)
         if self.keeps_stage3_input():
-            # BF16 on SM90: the fused CuTe experts read the received tokens in place (kept for
-            # the weight gradient, see keeps_stage3_input) and return the outputs in slot order.
             expand = expand_idx if distributed.ep_size > 1 else None
             return self.mlp.experts.forward_from_tokens(gathered_tokens, expert_idxs, expand, expert_counts)[0]  # fmt: skip
         if distributed.ep_size > 1:
@@ -448,7 +432,7 @@ class GptOssDecoderLayer(nn.Module):
 
     # Not fused with the next layer's forward_stage1 into one compiled region as qwen3_moe does:
     # for this model the fused region changes the forward bits at its layer boundaries.
-    @torch.compile(fullgraph=True, options=COMPILE_OPTIONS)
+    @torch.compile(fullgraph=True, options={"cpp_wrapper": True})
     def forward_stage5(
         self,
         moe_outs: torch.Tensor,
