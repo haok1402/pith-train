@@ -77,8 +77,6 @@ def pair_swapped(acc):
 
 # gpt-oss: the gate / up rows interleave, so gate is always the lower address and there is no
 # swapped variant.
-
-
 @lru_cache(maxsize=None)
 def make_gated_oai(alpha: float, limit: float):
     @gemm_epilogue(outputs=("postact",), mode="acc_pair", ops={"bias": RowVecLoad("bias")})
@@ -142,7 +140,7 @@ class ScatterRowStore(TileStore):
         tiled_copy = self._make_tiled_copy_r2s(gemm, params, tiled_copy_r2s, tiled_copy_t2r)
         expert_idx = tile_coord_mnkl[3]
         self.store_state = dict(s_epi=smem_tensor, out=getattr(params, self.name), slot_of=getattr(params, self.idx_name), group_start=varlen_manager.params.cu_seqlens_m[expert_idx], num_rows=varlen_manager.len_m(expert_idx), row_start=tile_coord_mnkl[0] * gemm.cta_tile_shape_mnk[0], col_start=tile_coord_mnkl[1] * gemm.cta_tile_shape_mnk[1], subtile_layout=cute.make_ordered_layout(cute.ceil_div(gemm.cta_tile_shape_mnk[:2], gemm.epi_tile), order=(0, 1) if gemm.epi_m_major else (1, 0)), num_stored=0)
-        tRS_s = tiled_copy.get_slice(tidx).partition_D(smem_tensor)
+        tRS_s = tiled_copy.get_slice(tidx).partition_D(smem_tensor)  # (CPY, CPY_M, CPY_N, STAGE)
         return (tiled_copy, tRS_s, lambda src_idx, dst_idx: None, None)
 
     @cute.jit
@@ -153,8 +151,8 @@ class ScatterRowStore(TileStore):
         # (tiles before + epi_idx) % epi_stage like its TMA stores
         epi_coord = state["subtile_layout"].get_hier_coord(state["num_stored"] % cute.size(state["subtile_layout"]))
         state["num_stored"] += 1
-        s_epi = state["s_epi"]
-        thr_s = tiled_copy.get_slice(tidx).partition_D(s_epi)
+        s_epi = state["s_epi"]  # (EPI_M, EPI_N, STAGE)
+        thr_s = tiled_copy.get_slice(tidx).partition_D(s_epi)  # (CPY, CPY_M, CPY_N, STAGE)
         stage_bytes = cute.size(s_epi[None, None, 0]) * (s_epi.element_type.width // 8)
         stage_idx = (tRS_s_stage.iterator.toint() - thr_s[None, None, None, 0].iterator.toint()) // stage_bytes
         s_stage = s_epi[None, None, stage_idx]

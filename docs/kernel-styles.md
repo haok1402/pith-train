@@ -253,7 +253,12 @@ Code that appears in more than one file lives once, in the shared module for its
   (over about 256 columns) may be packed onto a few full lines.
 - **Multi-line PTX stays as written**: triple-quoted assembly, and assembly built one string per
   line, are never joined.
-- **No blank line after a function-local import.**
+- **Blank lines mark steps, not decoration.** One blank line separates the steps of a function
+  (the phases of a kernel entry; the load, reduce and store of a phase); a step has no blank line
+  inside it, a block opener (`if`, `for`, `with`) is not followed by one, and a function-local
+  import is not followed by one. Two blank lines separate top-level definitions, one separates
+  methods, never more. A comment about one definition sits directly above it; a comment about a
+  group of definitions stands alone, with two blank lines on each side.
 - **Parallel assignment** for consecutive, independent, aligned assignments:
   ```python
   pid_row, pid_col = tl.program_id(0), tl.program_id(1)
@@ -282,6 +287,9 @@ Code that appears in more than one file lives once, in the shared module for its
   its gate. An implementation behind a picker gets one line, or only what differs. A phase function
   gets one line saying what it does when its name does not say it all.
 - **No history**: no round numbers, branch names, measurement stories or paths.
+- **CuTe tensors whose layout is not obvious get their modes in a trailing comment**, the one
+  annotation that says what rather than why, because a tensor's mode order cannot be read off its
+  name: `tOrP = thr_mma.partition_A(sP)  # (MMA, MMA_M, MMA_K)`.
 - **Comments explain a non-obvious why**: a numerical trick, a hardware constraint, a race, why an
   order matters, why a constant has its value. Comments restating code, section banners and stale
   `# noqa` / `# fmt: skip` markers go.
