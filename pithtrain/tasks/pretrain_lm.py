@@ -15,6 +15,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, logging, training
+from pithtrain.kernels import tune_kernels
 from pithtrain.modules.checkpoint import (
     find_checkpoint,
     load_checkpoint,
@@ -344,7 +345,14 @@ def launch(cfg: PretrainLMCfg) -> None:
     gc.collect()
     gc.freeze()
     gc.disable()
+    # Kernel launch configs: install the choices this setup cached, the same on every rank; tune
+    # what the first step used that the cache lacked (that step ran it on its default, the same on
+    # every rank) once after it.
+    tune_kernels()
+    first_step = step
     while step < cfg.training.max_steps:
         train_step(cfg, dataset, step)
+        if step == first_step:
+            tune_kernels()
         step += 1
     gc.enable()

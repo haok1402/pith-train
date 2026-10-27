@@ -167,7 +167,15 @@ def _eager_closure(root: str) -> set[str]:
     return seen
 
 
+VERIFIER_OF = {"tuning": "bf16_expert_gemm"}
+"""
+Modules verified through another feature's verifier: launch-config tuning by the GEMMs it tunes.
+"""
+
+
 def _feature(stem: str) -> str:
+    if stem in VERIFIER_OF:
+        return VERIFIER_OF[stem]
     for suffix in ("_sm90", "_sm100"):
         if stem.endswith(suffix):
             return stem[: -len(suffix)]

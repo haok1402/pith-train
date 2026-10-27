@@ -1,7 +1,8 @@
 """
 SM90 implementations of the bf16_expert_gemm functions: QuACK's SM90 GEMM class with our own
 epilogues, compiled once per (kind, lane order, tile config, device, activation) through TVM-FFI.
-Tile configs are fixed per shape (CONFIGS); QuACK's autotuner is not used.
+Every launch runs DEFAULT_CONFIG until tune_kernels() picks, per kind, shape and bucket of rows per
+expert, one of CANDIDATES; QuACK's own autotuner is not used.
 
 Gate and up are two tensors read as one operand: a tensor over the lower address whose size-2 pair
 mode strides to the higher one, so they act as one (G, 2I, H) weight with gate and up interleaved
@@ -27,6 +28,7 @@ from quack.rounding import RoundingMode
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments
 
+from pithtrain.kernels.tuning import Tunable
 from pithtrain.kernels.cute_compile_sm90 import fake_stream
 
 
@@ -329,44 +331,17 @@ class Config(NamedTuple):
     pingpong: bool = False
 
 
-DEFAULT_CONFIG = Config(128, 192, 2)
-CONFIGS: dict[tuple, Config] = {
-    # qwen3-30b-a3b (H 2048, I 768), best of an offline tile sweep at 1024 rows per expert
-    ("gated", 1536, 2048): Config(128, 192, 2, True),
-    ("down", 2048, 768): Config(128, 192, 2, True),
-    ("dgated", 768, 2048): Config(128, 128, 2, True),
-    ("dgrad", 2048, 1536): Config(128, 192, 2, True),
-    ("wgrad_pair", 1536, 2048): Config(128, 192, 2, True),
-    ("wgrad_down", 768, 2048): Config(128, 256, 1, False),
-    # deepseek-v2-lite (H 2048, I 1408), 1536 rows per expert
-    ("gated", 2816, 2048): Config(128, 192, 2, True),
-    ("down", 2048, 1408): Config(128, 192, 1, True),
-    ("dgated", 1408, 2048): Config(128, 128, 2, True),
-    ("dgrad", 2048, 2816): Config(128, 192, 2, True),
-    ("wgrad_pair", 2816, 2048): Config(128, 192, 2, True),
-    ("wgrad_down", 1408, 2048): Config(256, 192, 2, False),
-    # qwen3.5-35b-a3b (H 2048, I 512), 512 rows per expert
-    ("gated", 1024, 2048): Config(128, 256, 2, False),
-    ("down", 2048, 512): Config(128, 192, 1, True),
-    ("dgated", 512, 2048): Config(128, 128, 2, True),
-    ("dgrad", 2048, 1024): Config(128, 128, 2, True),
-    ("wgrad_pair", 1024, 2048): Config(256, 192, 1, False),
-    ("wgrad_down", 512, 2048): Config(128, 256, 1, False),
-    # gpt-oss-20b (H 2880, I 2880), 2048 rows per expert
-    ("gated_oai", 5760, 2880): Config(128, 192, 2, True),
-    ("down_bias", 2880, 2880): Config(128, 192, 2, True),
-    ("dgated_oai", 2880, 2880): Config(128, 128, 2, True),
-    ("dgrad", 2880, 5760): Config(128, 192, 2, True),
-    ("wgrad_pair", 5760, 2880): Config(128, 192, 2, True),
-    ("wgrad_down", 2880, 2880): Config(128, 192, 1, True),
-}
+DEFAULT_CONFIG = Config(128, 192, 2, True)
 """
-(kind, GEMM N, GEMM K) -> Config, fixed offline; shapes not listed take DEFAULT_CONFIG.
+The config of every launch until tune_kernels() has run: the same on every rank and every shape; the
+candidate that is fastest most often across kinds and sizes.
 """
 
-
-def pick_config(kind: str, N: int, K: int) -> Config:
-    return CONFIGS.get((kind, N, K), DEFAULT_CONFIG)
+CANDIDATES = (Config(128, 128, 2, True), Config(128, 192, 1, True), Config(128, 192, 2, False), Config(128, 192, 2, True), Config(128, 256, 1, False), Config(128, 256, 2, False), Config(256, 192, 1, False), Config(256, 192, 2, False))
+"""
+The configs tune_kernels() chooses among, for every kind and shape; each compiles and computes every
+kind correctly (tests/kernels/test_bf16_expert_gemm.py loads each in turn).
+"""
 
 
 def fake_matrix(dtype, divisibility: int = 8):
@@ -444,6 +419,72 @@ def compile_gemm(kind: str, swapped: bool, config: Config, device: torch.device,
     return fn
 
 
+MAX_SYNTHETIC_BYTES = 4 << 30
+
+
+def default_config(key: tuple) -> Config:
+    return DEFAULT_CONFIG
+
+
+def gemm_config(kind: str, swapped: bool, N: int, K: int, G: int, act: tuple, rows: int) -> Config:
+    """
+    The config of one launch: tuned per (kind, lane order, N, K, local experts, activation) and
+    bucket of rows per expert, the default until the first tuning round.
+    """
+    return TUNING.pick((kind, swapped, N, K, G, act), rows // max(G, 1))
+
+
+def prepare_launch(key: tuple, rows_per_expert: int) -> Callable | None:
+    """
+    launch(config) for synthetic inputs of this kind with rows_per_expert rows in every expert, laid
+    out as the exported functions pass them; it returns the outputs (the weight gradients zeroed
+    first, so each launch gives them afresh). None when a tensor would pass MAX_SYNTHETIC_BYTES.
+    """
+    kind, swapped, N, K, G, act = key
+    M, device = rows_per_expert * G, torch.device("cuda", torch.cuda.current_device())
+    if max(M * max(N, K), G * N * K) * 4 > MAX_SYNTHETIC_BYTES:
+        return None
+
+    def randn(*shape, dtype=torch.bfloat16):
+        return (torch.randn(*shape, device=device) * shape[-1] ** -0.5).to(dtype)
+
+    cu, rows_idx = (torch.arange(G + 1, device=device) * rows_per_expert).to(torch.int32), torch.arange(M, device=device, dtype=torch.int32)
+    if kind == "gated":
+        pair = randn(2, G, N // 2, K)
+        args, outputs = (randn(M, K), pair[0], pair[1], randn(M, N), randn(M, N // 2), cu, rows_idx), (3, 4)
+    elif kind == "gated_oai":
+        pair = randn(G, N, K)
+        args, outputs = (randn(M, K), pair[:, 0::2], pair[:, 1::2], randn(G, N), randn(M, N), randn(M, N // 2), cu, rows_idx), (4, 5)
+    elif kind == "down_scatter":
+        args, outputs = (randn(M, K), randn(G, N, K), randn(M, N), rows_idx, cu), (2,)
+    elif kind == "down_bias_scatter":
+        args, outputs = (randn(M, K), randn(G, N, K), randn(G, N), randn(M, N), rows_idx, cu), (3,)
+    elif kind in ("dgated", "dgated_oai"):
+        args, outputs = (randn(M, K), randn(G, K, N), randn(M, 2 * N), randn(M, 2 * N), randn(M, N), cu, rows_idx), (3, 4)
+    elif kind == "dgrad":
+        pair = randn(2, G, K // 2, N)
+        args, outputs = (randn(M, K), pair[0], pair[1], randn(M, N), cu), (3,)
+    elif kind == "wgrad_pair":
+        pair = randn(2, G, N // 2, K, dtype=torch.float32)
+        args, outputs = (randn(M, K), randn(M, N), pair[0], pair[1], cu, rows_idx), (2, 3)
+    else:
+        assert kind == "wgrad_down"
+        args, outputs = (randn(M, K), randn(M, N), randn(G, K, N, dtype=torch.float32), cu, rows_idx), (2,)
+    accumulated = kind in ("wgrad_pair", "wgrad_down")
+
+    def launch(config: Config) -> tuple:
+        if accumulated:
+            for idx in outputs:
+                args[idx].zero_()
+        compile_gemm(kind, swapped, config, device, act)(*args)
+        return tuple(args[idx] for idx in outputs)
+
+    return launch
+
+
+TUNING = Tunable("bf16_expert_gemm", CANDIDATES, default_config, prepare_launch)
+
+
 def order_by_address(first: torch.Tensor, second: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, bool]:
     """
     (lower, higher, first is the higher) by address; asserts the two can be read as
@@ -464,10 +505,10 @@ def bf16_expert_gated_forward_sm90(x, w_gate, w_up, cu, a_idx, bias=None, act=()
         return preact, h
     if act:
         assert not swapped and bias is not None
-        fn = compile_gemm("gated_oai", False, pick_config("gated_oai", 2 * inter, x.shape[1]), x.device, act)
+        fn = compile_gemm("gated_oai", False, gemm_config("gated_oai", False, 2 * inter, x.shape[1], w_gate.shape[0], act, M), x.device, act)
         fn(x, w_lower, w_higher, bias, preact, h, cu, a_idx)
     else:
-        compile_gemm("gated", swapped, pick_config("gated", 2 * inter, x.shape[1]), x.device)(x, w_lower, w_higher, preact, h, cu, a_idx)
+        compile_gemm("gated", swapped, gemm_config("gated", swapped, 2 * inter, x.shape[1], w_gate.shape[0], (), M), x.device)(x, w_lower, w_higher, preact, h, cu, a_idx)
     return preact, h
 
 
@@ -477,10 +518,10 @@ def bf16_expert_down_forward_scattered_sm90(h, w_down, cu, slot_of, bias=None):
     if M == 0:
         return out
     if bias is not None:
-        fn = compile_gemm("down_bias_scatter", False, pick_config("down_bias", H, h.shape[1]), h.device)
+        fn = compile_gemm("down_bias_scatter", False, gemm_config("down_bias_scatter", False, H, h.shape[1], w_down.shape[0], (), M), h.device)
         fn(h, w_down, bias, out, slot_of, cu)
     else:
-        compile_gemm("down_scatter", False, pick_config("down", H, h.shape[1]), h.device)(h, w_down, out, slot_of, cu)
+        compile_gemm("down_scatter", False, gemm_config("down_scatter", False, H, h.shape[1], w_down.shape[0], (), M), h.device)(h, w_down, out, slot_of, cu)
     return out
 
 
@@ -491,9 +532,9 @@ def bf16_expert_dgated_backward_sm90(dy, w_down, preact, cu, slot_of, w_gate, w_
     if M:
         if act:
             assert not swapped
-            fn = compile_gemm("dgated_oai", False, pick_config("dgated_oai", inter, dy.shape[1]), dy.device, act)
+            fn = compile_gemm("dgated_oai", False, gemm_config("dgated_oai", False, inter, dy.shape[1], w_down.shape[0], act, M), dy.device, act)
         else:
-            fn = compile_gemm("dgated", swapped, pick_config("dgated", inter, dy.shape[1]), dy.device)
+            fn = compile_gemm("dgated", swapped, gemm_config("dgated", swapped, inter, dy.shape[1], w_down.shape[0], (), M), dy.device)
         fn(dy, w_down, preact, dpre, h, cu, slot_of)
     return dpre, h, swapped
 
@@ -504,7 +545,7 @@ def bf16_expert_dgrad_sm90(dpre, w_gate, w_up, cu, dpre_swapped):
     assert swapped == dpre_swapped, "the weights moved between the dgated backward and the dgrad"
     dx = dpre.new_empty(M, H)
     if M:
-        compile_gemm("dgrad", False, pick_config("dgrad", H, dpre.shape[1]), dpre.device)(dpre, w_lower, w_higher, dx, cu)
+        compile_gemm("dgrad", False, gemm_config("dgrad", False, H, dpre.shape[1], w_gate.shape[0], (), M), dpre.device)(dpre, w_lower, w_higher, dx, cu)
     return dx
 
 
@@ -512,14 +553,15 @@ def bf16_expert_wgrad_gate_up_sm90(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a_
     if a_idx.shape[0] == 0:
         return
     mg_lower, mg_higher, mg_swapped = order_by_address(mg_gate, mg_up)
-    fn = compile_gemm("wgrad_pair", mg_swapped != dpre_swapped, pick_config("wgrad_pair", dpre.shape[1], x.shape[1]), x.device)
+    swapped = mg_swapped != dpre_swapped
+    fn = compile_gemm("wgrad_pair", swapped, gemm_config("wgrad_pair", swapped, dpre.shape[1], x.shape[1], mg_gate.shape[0], (), a_idx.shape[0]), x.device)
     fn(x, dpre, mg_lower, mg_higher, cu, a_idx)
 
 
 def bf16_expert_wgrad_down_sm90(dy, h, mg_down, cu, slot_of):
     if slot_of.shape[0] == 0:
         return
-    compile_gemm("wgrad_down", False, pick_config("wgrad_down", h.shape[1], dy.shape[1]), dy.device)(dy, h, mg_down, cu, slot_of)
+    compile_gemm("wgrad_down", False, gemm_config("wgrad_down", False, h.shape[1], dy.shape[1], mg_down.shape[0], (), slot_of.shape[0]), dy.device)(dy, h, mg_down, cu, slot_of)
 
 
 __all__ = ["bf16_expert_gated_forward_sm90", "bf16_expert_down_forward_scattered_sm90", "bf16_expert_dgated_backward_sm90", "bf16_expert_dgrad_sm90", "bf16_expert_wgrad_gate_up_sm90", "bf16_expert_wgrad_down_sm90"]

@@ -37,6 +37,7 @@ from pithtrain.kernels import (
     bf16_expert_wgrad_down,
     bf16_expert_wgrad_gate_up,
     bf16_experts_supported,
+    tune_kernels,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -422,3 +423,17 @@ def test_wrong_group_offsets_fail():
     pre, _ = bf16_expert_gated_forward(x, wg, wu, bad, a_idx)
     with pytest.raises(AssertionError):
         assert_within(pre[:, 0::2], g_ref, g_abs, "preact gate")
+
+
+def test_after_tuning(tmp_path, monkeypatch):
+    """
+    After a tuning round, the GEMMs run on their tuned configs and still pass every check.
+    """
+    monkeypatch.setenv("PITHTRAIN_TUNING_DIR", str(tmp_path))
+    test_swiglu_forward_backward("qwen3-g32-balanced", "separate")
+    test_swiglu_wgrads("qwen3-g32-balanced", "separate", "swapped")
+    test_gptoss("g8-edges", 7.0)
+    tune_kernels()
+    test_swiglu_forward_backward("qwen3-g32-balanced", "separate")
+    test_swiglu_wgrads("qwen3-g32-balanced", "separate", "swapped")
+    test_gptoss("g8-edges", 7.0)
