@@ -67,8 +67,8 @@ class Tunable:
 
     def __init__(self, name: str, candidates: tuple, default: Callable, prepare: Callable) -> None:
         self.name, self.candidates, self.default, self.prepare = name, candidates, default, prepare
-        self.table: dict[tuple, object] = {}  # (key, bucket) -> installed config
-        self.tuned: dict[tuple, list] = {}  # key -> its installed buckets
+        self.table: dict[tuple, object] = {}  # (key, bucket) -> config, filled by each bucket's first pick
+        self.installed: dict[tuple, dict] = {}  # key -> {bucket: config} of the tuned or cached choices
         self.seen: dict[tuple, set] = {}  # key -> buckets pick() was asked for on this rank
         self.fingerprint = hashlib.sha256((repr(candidates) + inspect.getsource(inspect.getmodule(prepare))).encode()).hexdigest()[:16]
         TUNABLES[name] = self
@@ -82,9 +82,8 @@ class Tunable:
         """
         installed = {}
         for name, fingerprint, key, bucket, idx in entries:
-            if name == self.name and fingerprint == self.fingerprint and bucket not in self.tuned.get(key, ()):
-                self.table[(key, bucket)] = self.candidates[idx]
-                self.tuned.setdefault(key, []).append(bucket)
+            if name == self.name and fingerprint == self.fingerprint and bucket not in self.installed.get(key, ()):
+                self.installed.setdefault(key, {})[bucket] = self.candidates[idx]
                 installed[(name, key, bucket)] = (self.candidates[idx], self.default(key))
         return installed
 
@@ -98,15 +97,16 @@ class Tunable:
 
     def pick_untuned(self, key: tuple, bucket: int):
         """
-        A launch whose key and bucket have no entry: before tuning (recording the key for
-        tune_kernels()) the default, after it the nearest tuned bucket of the key, or the default
-        for a key no rank used in the first step.
+        The first launch of a key and bucket (recording both, so tune_kernels() tunes and compiles
+        what this rank runs): the installed choice of the bucket or else of the nearest installed
+        bucket of the key, from then on found in the table; the default for a key with none.
         """
         self.seen.setdefault(key, set()).add(bucket)
-        if key in self.tuned:
-            nearest = self.table[(key, min(self.tuned[key], key=lambda b: (abs(b - bucket), b)))]
-            self.table[(key, bucket)] = nearest  # every rank computes the same, so the lookup is cached
-            return nearest
+        buckets = self.installed.get(key)
+        if buckets:
+            config = buckets[bucket if bucket in buckets else min(buckets, key=lambda b: (abs(b - bucket), b))]
+            self.table[(key, bucket)] = config  # every rank computes the same, so the lookup is cached
+            return config
         return self.default(key)
 
 
@@ -224,7 +224,7 @@ def tune_kernels() -> dict:
     chosen = {}
     for tunable in TUNABLES.values():
         chosen.update(tunable.install(CACHED))
-    pending = sorted(((name, key, sorted(buckets)) for name, tunable in TUNABLES.items() for key, buckets in tunable.seen.items() if key not in tunable.tuned), key=repr)
+    pending = sorted(((name, key, sorted(buckets)) for name, tunable in TUNABLES.items() for key, buckets in tunable.seen.items() if key not in tunable.installed), key=repr)
     buckets_of: dict[tuple, set] = {}
     for name, key, buckets in (entry for entries in gather(pending) for entry in entries):
         for bucket in buckets:
@@ -246,16 +246,15 @@ def tune_kernels() -> dict:
         default, fastest = tunable.default(key), min(times, key=lambda idx: (times[idx], idx))
         default_idx = tunable.candidates.index(default) if default in tunable.candidates else None
         config = default if default_idx in times and times[default_idx] <= times[fastest] * (1 + MARGIN) else tunable.candidates[fastest]
-        tunable.table[(key, bucket)] = config
-        tunable.tuned.setdefault(key, []).append(bucket)
+        tunable.installed.setdefault(key, {})[bucket] = config
         chosen[(name, key, bucket)] = (config, default)
 
     if rank == 0 and times_of:
-        entries = {(name, tunable.fingerprint, key, bucket): tunable.candidates.index(config) for name, tunable in TUNABLES.items() for (key, bucket), config in tunable.table.items()}
+        entries = {(name, tunable.fingerprint, key, bucket): tunable.candidates.index(config) for name, tunable in TUNABLES.items() for key, buckets in tunable.installed.items() for bucket, config in buckets.items()}
         for name, fingerprint, key, bucket, idx in read_cache():  # keep what other runs added meanwhile
             entries.setdefault((name, fingerprint, key, bucket), idx)
         write_cache([(*entry, idx) for entry, idx in entries.items()])
-    for name, key, config in sorted({(name, key, config) for (name, key, _), (config, _) in chosen.items() if key in TUNABLES[name].seen}, key=repr):
+    for name, key, config in sorted({(name, key, config) for name, tunable in TUNABLES.items() for key in tunable.seen for config in tunable.installed.get(key, {}).values()}, key=repr):
         launch = TUNABLES[name].prepare(key, 1 << MIN_BUCKET)
         if launch is not None:
             launch(config)  # compile now, not in the next step
