@@ -20,4 +20,3 @@ NATIVE_E8M0 = ARCH_MAJOR >= 10
 """
 Whether the E8M0 FP8 scale has a native PTX conversion (SM100+); SM90 emulates it.
 """
-
