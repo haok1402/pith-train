@@ -3,9 +3,9 @@ Fused clamped SwiGLU used in OpenAI's gpt-oss: ``(uc + 1) * gc * sigmoid(alpha *
 with ``gc = min(gate, L)`` and ``uc = clamp(up, +/-L)``, where ``gate`` and
 ``up`` are the even/odd columns of an interleaved ``gate_up [M, 2N]`` input.
 
-One Triton kernel each for forward and backward (``pithtrain/kernels/clamped_swiglu.py``). Only
-``gate_up`` is saved for backward; ``gc``, ``uc`` and the sigmoid are recomputed, and the clamp
-branches contribute zero gradient at saturation.
+One Triton kernel each for forward and backward (clamped_swiglu_fwd, clamped_swiglu_bwd). Only
+gate_up is saved for backward; gc, uc and the sigmoid are recomputed, and the clamp branches
+contribute zero gradient at saturation.
 """
 
 from __future__ import annotations

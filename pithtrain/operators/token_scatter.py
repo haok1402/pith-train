@@ -1,7 +1,7 @@
 """
 Token movement around the MoE grouped GEMMs, as autograd functions: the scatter of tokens into the
-expert-grouped padded layout (kernels in ``pithtrain/kernels/token_scatter.py``), the padded index
-gather of the dedup expansion, and the per-row group ids of the Hopper FP8 grouped GEMM.
+expert-grouped padded layout (the scatter_by_expert kernel), the padded index gather of the dedup
+expansion, and the per-row group ids of the Hopper FP8 grouped GEMM.
 """
 
 from typing import Optional
@@ -143,7 +143,7 @@ def precompute_group_indices(grouped_mm_offs: torch.Tensor, M: int) -> Optional[
     ``grouped_mm_offs = [128, 256, 384, 512]`` -> ``[0,0,...,1,1,...,2,2,...,3,3,...]``.
 
     Only FP8 training's m-grouped GEMMs read it, and only where the kernel library's GEMM takes it
-    (``m_grouped_group_indices`` returns None otherwise); None in BF16 training.
+    (m_grouped_group_indices returns None otherwise); None in BF16 training.
     """
     if training.fp8:
         return m_grouped_group_indices(grouped_mm_offs, M)

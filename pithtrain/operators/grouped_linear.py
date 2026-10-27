@@ -103,41 +103,42 @@ class GroupedLinear(nn.Module):
 
 
 def fp8_grouped_wgrad(
-    a: tuple[torch.Tensor, torch.Tensor],
-    b: tuple[torch.Tensor, torch.Tensor],
+    grad_ch: tuple[torch.Tensor, torch.Tensor],
+    input_ch: tuple[torch.Tensor, torch.Tensor],
     ks: list,
     ks_tensor: torch.Tensor,
     weight: torch.Tensor,
     shape: tuple[int, int, int],
 ) -> None:
     """
-    Weight gradient of an FP8 grouped linear from per-channel FP8 grad_output (a) and input (b),
-    deferred to DualPipeV's W phase when WeightGradStore is on. With an fp32 main_grad on the
-    weight (FP8GroupedLinear sets weight.main_grad when wgrad_accumulation installed one), the
-    GEMM accumulates straight into it, so no bf16 .grad and no fp32 temporary exist; otherwise the
-    result is added into weight.grad in bf16. The operands are the per-channel FP8 of
-    ``quantize_grouped_input``, in whatever layout the kernel library's k-grouped GEMM reads.
+    Weight gradient of an FP8 grouped linear from the per-channel FP8 (data, scale) pairs of
+    grad_output (grad_ch) and input (input_ch), deferred to DualPipeV's W phase when
+    WeightGradStore is on. With an fp32 main_grad on the weight (FP8GroupedLinear sets
+    weight.main_grad when wgrad_accumulation installed one), the GEMM accumulates straight into
+    it, so no bf16 .grad and no fp32 temporary exist; otherwise the (G, N, K) result of the given
+    shape is added into weight.grad in bf16. The operands are the per-channel FP8 of
+    quantize_grouped_input, in whatever layout the kernel library's k-grouped GEMM reads.
     """
     main_grad = getattr(weight, "main_grad", None)
 
-    def grad_weight_fn(a, b, ks, ks_tensor):
+    def grad_weight_fn(grad_ch, input_ch, ks, ks_tensor):
         if main_grad is not None:
-            k_grouped_fp8_gemm(a, b, main_grad, ks, ks_tensor)
+            k_grouped_fp8_gemm(grad_ch, input_ch, main_grad, ks, ks_tensor)
             return
-        c = torch.zeros(shape, device=a[0].device, dtype=torch.float32)
-        k_grouped_fp8_gemm(a, b, c, ks, ks_tensor)
-        weight_grad_bf16 = c.to(torch.bfloat16)
+        weight_grad = torch.zeros(shape, device=grad_ch[0].device, dtype=torch.float32)
+        k_grouped_fp8_gemm(grad_ch, input_ch, weight_grad, ks, ks_tensor)
+        weight_grad_bf16 = weight_grad.to(torch.bfloat16)
         if weight.grad is None:
             weight.grad = weight_grad_bf16
         else:
             weight.grad += weight_grad_bf16
 
     if WeightGradStore.enabled:
-        a = (a[0].detach(), a[1].detach())
-        b = (b[0].detach(), b[1].detach())
-        WeightGradStore.put(partial(grad_weight_fn, a, b, ks, ks_tensor.detach()))
+        grad_ch = (grad_ch[0].detach(), grad_ch[1].detach())
+        input_ch = (input_ch[0].detach(), input_ch[1].detach())
+        WeightGradStore.put(partial(grad_weight_fn, grad_ch, input_ch, ks, ks_tensor.detach()))
     else:
-        grad_weight_fn(a, b, ks, ks_tensor)
+        grad_weight_fn(grad_ch, input_ch, ks, ks_tensor)
 
 
 class FP8GroupedLinearFunc(torch.autograd.Function):
@@ -231,12 +232,15 @@ class FP8GroupedLinear(nn.Module):
     Drop-in replacement for ``GroupedLinear`` using FP8 GEMM via DeepGEMM.
     Weight shape: ``(num_groups, out_features, in_features)``.
     Quantized weights are cached and reused across micro-batches within a single pipeline step.
-    With fp8_param_gather set (see ``fp8_param``), the weight arrives already quantized.
+    With fp8_param_gather set (see pithtrain/modules/fp8_param_gather.py), the weight arrives
+    already quantized.
     """
 
     fp8_param_gather: bool = False
     main_grad: Optional[torch.Tensor] = None
-    """fp32 gradient buffer set by wgrad_accumulation; the wgrad GEMM accumulates into it."""
+    """
+    fp32 gradient buffer set by wgrad_accumulation; the wgrad GEMM accumulates into it.
+    """
 
     def __init__(self, num_groups: int, in_features: int, out_features: int):
         super().__init__()
@@ -281,6 +285,12 @@ class FP8GroupedLinear(nn.Module):
             return input @ weight.T
         quantized_weight = self._get_quantized_weight()
         return FP8GroupedLinearFunc.apply(
-            input, self.weight, grouped_mm_offs, ks, ks_tensor, quantized_weight, group_indices,
+            input,
+            self.weight,
+            grouped_mm_offs,
+            ks,
+            ks_tensor,
+            quantized_weight,
+            group_indices,
             quantized_input,
-        )  # fmt: skip
+        )

@@ -7,7 +7,7 @@ are memory-bound. In addition, autograd saves ``sigmoid(gate)``, ``silu(gate)``,
 and ``up`` for backward, which wastes activation memory on a recomputable
 intermediate.
 
-The kernels (``pithtrain/kernels/silu_mul.py``):
+The kernels behind silu_mul_fwd and silu_mul_bwd:
 
 - fuse the forward ``silu(gate) * up`` into one Triton kernel (two loads,
   one store), and

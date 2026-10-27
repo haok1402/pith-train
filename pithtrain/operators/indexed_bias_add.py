@@ -8,9 +8,7 @@ Autograd's default bias[group_ids] backward lowers to index_put_ with
 bf16 atomic adds on bias rows — for GPT-OSS expert biases that's the
 single dominant kernel by a wide margin (~48% of GPU time, vs <2% for
 the actual expert GEMMs).  We replace it with a Triton-fused per-group
-reduction (one block per (group, h-tile), or per (row tile, h-tile) followed
-by an ordered per-group pass when there are few groups) that is fully
-parallel and atomic-free.
+reduction (segment_sum_along_rows) that is fully parallel and atomic-free.
 """
 
 import torch
