@@ -23,12 +23,12 @@ NVIDIA Hopper (SM90) or Blackwell (SM100) GPUs are required. CUDA >= 13.0 and Py
 
 ```bash
 git clone https://github.com/mlc-ai/pith-train.git && cd pith-train
-uv venv  # skip if you already have a virtual environment
 ```
 
 **For users:**
 
 ```bash
+uv venv  # skip if you already have a virtual environment
 uv pip install .
 ```
 

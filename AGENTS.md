@@ -9,7 +9,7 @@ This file provides guidance to coding agents (Claude Code and other assistants) 
 ## Setup
 
 ```bash
-uv venv && uv sync
+uv sync
 ```
 
 ## Common Commands
