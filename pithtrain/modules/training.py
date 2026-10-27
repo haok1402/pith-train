@@ -292,24 +292,47 @@ class TrainingCfg(SlottedDefault):
     """
 
 
-def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02) -> None:
+def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02, seed: int = 0) -> None:
     """
-    Apply scaled normal initialization to one pipeline-stage module, for example a DeepSeekV2Model.
+    Apply scaled normal initialization to this rank's pipeline-stage modules (an nn.Sequential of
+    its V-chunks, for example two DeepSeekV2Model chunks) before FSDP shards them.
 
     Every 2-D weight draws from N(0, init_std), except the output projections o_proj and down_proj,
     which use N(0, init_std / sqrt(2 * num_layers)) to keep variance from growing with depth.
     num_layers is the layer count of the full model, not of this stage alone. 1-D parameters,
     meaning layer-norm weights and biases, are left untouched.
+
+    The initialization does not depend on the parallel layout: each weight draws from its own
+    stream, keyed by its name in the full model (layers.<global layer id>.<...>), and each routed
+    expert by that name and its global expert index, so any pipeline, expert or data parallel
+    layout starts from the same weights.
     """
     # Scale down residual-stream projections (o_proj, down_proj) to bound variance growth.
     output_std = init_std / math.sqrt(2.0 * num_layers)
-    for name, param in model.named_parameters():
+    for chunk_name, param in model.named_parameters():
         if param.dim() < 2:
             continue  # skip biases, layer-norm weights, etc.
-        if "o_proj" in name or "down_proj" in name:
-            torch.nn.init.normal_(param, mean=0.0, std=output_std)
+        name = chunk_name.split(".", 1)[1]  # drop the V-chunk index
+        std = output_std if "o_proj" in name or "down_proj" in name else init_std
+        # Routed experts are stacked (local experts, ...) and sharded over the expert ranks.
+        if ".experts." in name and param.dim() == 3:
+            first_expert = distributed.ep_rank * param.shape[0]
+            for local_idx in range(param.shape[0]):
+                generator = weight_generator(seed, name, param.device, first_expert + local_idx)
+                torch.nn.init.normal_(param[local_idx], mean=0.0, std=std, generator=generator)
         else:
-            torch.nn.init.normal_(param, mean=0.0, std=init_std)
+            generator = weight_generator(seed, name, param.device)
+            torch.nn.init.normal_(param, mean=0.0, std=std, generator=generator)
+
+
+def weight_generator(seed: int, name: str, device: torch.device, *index: int) -> torch.Generator:
+    """
+    A generator for the weight called name (and an expert index within it), seeded through numpy's
+    SeedSequence from the run seed with the name's bytes and the index as the stream key.
+    """
+    key = (*name.encode(), *index)
+    state = np.random.SeedSequence(seed, spawn_key=key).generate_state(1, np.uint64)[0]
+    return torch.Generator(device=device).manual_seed(int(state))
 
 
 def split_replicas(mesh: DeviceMesh, hsdp_replica: int) -> DeviceMesh:
@@ -430,12 +453,9 @@ def setup_model(
     modules.append(ModelClass(module_config, phase=0))
     modules.append(ModelClass(module_config, phase=1))
 
-    # Apply scaled normal weight initialization before FSDP sharding.
-    num_layers = module_config.num_hidden_layers
-    for module in modules:
-        init_weights(module, num_layers, cfg.init_std)
-
     modules = nn.Sequential(*modules)
+    # Apply scaled normal weight initialization before FSDP sharding.
+    init_weights(modules, module_config.num_hidden_layers, cfg.init_std, cfg.seed)
     apply_fsdp(modules, distributed_cfg.hsdp_replica)
     install_wgrad_accumulation(modules)
     install_raw_main_grad(modules)  # gpt-oss raw expert weights; no-op elsewhere
