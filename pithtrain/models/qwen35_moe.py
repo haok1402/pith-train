@@ -12,6 +12,7 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5Moe
 
 from pithtrain.contexts import distributed, training
 from pithtrain.kernels import bf16_experts_supported, fp8_fused_experts_supported
+from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.load_balance import (
     MoELoadBalanceLossInjector,
     MoELoadBalanceLossTracker,
@@ -30,7 +31,6 @@ from pithtrain.operators.fp8_experts import fp8_scatter_quant, fp8_swiglu_gate_u
 from pithtrain.operators.gated_delta_rule import gated_delta_rule
 from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.ring_attention import ring_attention_func
-from pithtrain.operators.routing import RoutingInfo
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
     padded_index_gather,

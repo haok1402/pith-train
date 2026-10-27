@@ -26,9 +26,8 @@ from torch.autograd import Variable
 
 from pithtrain.contexts import distributed
 from pithtrain.contexts.weight_grad_store import WeightGradStore
-from pithtrain.models.interface import LayerProtocol, ModelProtocol
+from pithtrain.models.interface import AllToAllSplits, LayerProtocol, ModelProtocol, RoutingInfo
 from pithtrain.operators.all_to_all import all_to_all_async, direct_all_to_all
-from pithtrain.operators.routing import AllToAllSplits, RoutingInfo
 
 # fmt: off
 

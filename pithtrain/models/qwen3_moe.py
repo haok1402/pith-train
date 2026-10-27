@@ -11,6 +11,7 @@ from pithtrain.kernels import (
     fp8_fused_experts_supported,
     quantize_grouped_input,
 )
+from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.load_balance import (
     MoELoadBalanceLossInjector,
     MoELoadBalanceLossTracker,
@@ -24,7 +25,6 @@ from pithtrain.operators.fp8_experts import fp8_scatter_quant, fp8_swiglu_expert
 from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.qwen3_attention import fp8_o_proj, fp8_qkv_projection
 from pithtrain.operators.ring_attention import ring_attention_func, ring_attention_varlen_func
-from pithtrain.operators.routing import RoutingInfo
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
     padded_index_gather,

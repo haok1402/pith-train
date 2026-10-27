@@ -40,7 +40,7 @@ class LayerProtocol(Protocol):
     ) -> Tensor: ...
 ```
 
-`forward_stage1` returns `(dispatch_tokens, residual, routing)`, where `routing` is a `RoutingInfo` (from `pithtrain.operators.routing`) for an MoE layer or `None` for a dense layer. `RoutingInfo` is a `NamedTuple`:
+`forward_stage1` returns `(dispatch_tokens, residual, routing)`, where `routing` is a `RoutingInfo` (from `pithtrain.models.interface`) for an MoE layer or `None` for a dense layer. `RoutingInfo` is a `NamedTuple`:
 
 ```python
 class RoutingInfo(NamedTuple):

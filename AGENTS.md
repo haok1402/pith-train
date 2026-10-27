@@ -134,7 +134,7 @@ Only what training code calls directly: autograd functions and custom ops with t
 - **MLA** — Multi-head Latent Attention is implemented inside the DeepSeek model (`models/deepseek_v2.py`), with MLA-aware ring attention in `ring_attention.py`
 - **Linear attention** — `gated_delta_rule.py` (Qwen3.5 Gated DeltaNet, including the dense path through FLA's kernels with pinned configs), `causal_conv1d.py` (channels-last causal depthwise conv)
 - **AllToAll** (`all_to_all.py`) — Differentiable collective wrapper
-- **EP Dispatch** (`ep_dispatch.py`) — orchestration of expert-parallel token dispatch with deduplication (index math: `fused_dedup_prepare_dispatch`, `expert_and_expand_idx`); `routing.py` holds the `RoutingInfo` / `AllToAllSplits` types
+- **EP Dispatch** (`ep_dispatch.py`) — orchestration of expert-parallel token dispatch with deduplication (index math: `fused_dedup_prepare_dispatch`, `expert_and_expand_idx`)
 - **Token Scatter** (`token_scatter.py`) — scatter of tokens by expert ahead of the grouped GEMM, padded index gather, per-row group ids
 - **Fused activations / heads** — `silu_mul.py`, `clamped_swiglu.py`, `indexed_bias_add.py`, `cross_entropy.py`, `log_prob.py`, `qwen3_attention.py` (FP8 q/k/v and o projections)
 

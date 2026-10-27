@@ -16,8 +16,8 @@ import torch
 import torch.distributed as dist
 
 from pithtrain.kernels import expert_and_expand_idx, fused_dedup_prepare_dispatch
+from pithtrain.models.interface import AllToAllSplits, RoutingInfo
 from pithtrain.operators.all_to_all import all_to_all_sync
-from pithtrain.operators.routing import AllToAllSplits, RoutingInfo
 from pithtrain.operators.token_scatter import padded_index_gather
 
 # At most one deferred dispatch is outstanding per process: its metadata lands in the single

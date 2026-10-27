@@ -14,6 +14,7 @@ from pithtrain.kernels import (
     fp8_fused_experts_supported,
     fp8cast_blockwise_transpose_batched,
 )
+from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.fp8_param_gather import fp8_param_operands
 from pithtrain.modules.load_balance import (
     MoELoadBalanceLossInjector,
@@ -28,7 +29,6 @@ from pithtrain.operators.grouped_linear import FP8GroupedLinearFunc, GroupedLine
 from pithtrain.operators.indexed_bias_add import indexed_bias_add
 from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.main_grad import raw_main_grad
-from pithtrain.operators.routing import RoutingInfo
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
     precompute_group_indices,

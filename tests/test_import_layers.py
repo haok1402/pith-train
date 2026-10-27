@@ -72,7 +72,7 @@ SM90_CROSS_EDGES = {
 }
 # What models/ may import from modules/ (from kernels/: only the package, like everyone else).
 MODELS_MODULES = {"load_balance", "recompute", "fp8_param_gather"}
-PIPELINE_OPERATORS = {"all_to_all", "routing"}
+PIPELINE_OPERATORS = {"all_to_all"}
 
 # Violations of the current tree, as (rule, module, detail). Shrinks as the restructure lands; the
 # test also fails on an entry that no longer occurs, so the list stays exact.
@@ -408,7 +408,9 @@ def _violations() -> set[tuple[str, str, str]]:
                 found.add(("kernels-imports", mod, t))
             elif layer == "contexts" and t != mod:
                 found.add(("contexts-imports", mod, t))
-            elif layer == "operators" and tl not in ("kernels", "contexts", "operators"):
+            elif layer == "operators" and not (
+                tl in ("kernels", "contexts", "operators") or t == "pithtrain.models.interface"
+            ):
                 found.add(("operators-imports", mod, t))
             elif layer == "pipeline" and not (
                 tl in ("contexts", "pipeline")
