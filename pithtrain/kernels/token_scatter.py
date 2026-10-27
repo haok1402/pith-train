@@ -25,12 +25,12 @@ shared_copy_event: Optional[torch.cuda.Event] = None
 
 @triton.jit
 def compute_group_offsets_kernel(
-    expert_idxs_ptr,  # [m] int64
+    expert_idx_ptr,  # [num_tokens] int64
     group_counts_ptr,  # [num_groups] int64, pre-zeroed
     grouped_mm_offs_ptr,  # [num_groups] int32
     ks_ptr,  # [num_groups] int32, padded sizes
     completion_counter_ptr,  # [1] int64, pre-zeroed
-    m,
+    num_tokens,
     num_ctas,
     PADDING_ALIGNMENT: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
@@ -39,92 +39,102 @@ def compute_group_offsets_kernel(
     pid = tl.program_id(0)
 
     # bincount over all CTAs
-    for start in range(pid * BLOCK, m, num_ctas * BLOCK):
-        offs = start + tl.arange(0, BLOCK)
-        mask = offs < m
-        eids = tl.load(expert_idxs_ptr + offs, mask=mask, other=0)
-        tl.atomic_add(group_counts_ptr + eids, 1, mask=mask)
+    for token_start in range(pid * BLOCK, num_tokens, num_ctas * BLOCK):
+        token_offs = token_start + tl.arange(0, BLOCK)
+        token_mask = token_offs < num_tokens
+        expert_idx = tl.load(expert_idx_ptr + token_offs, mask=token_mask, other=0)
+        tl.atomic_add(group_counts_ptr + expert_idx, 1, mask=token_mask)
 
     # the last CTA to finish its counts does the pad + prefix sum
     is_last = tl.atomic_add(completion_counter_ptr, 1) == num_ctas - 1
     if is_last:
-        running_sum: tl.int64 = 0
-        for g in tl.static_range(NUM_GROUPS):
-            count = tl.load(group_counts_ptr + g)
-            padded = ((count + PADDING_ALIGNMENT - 1) // PADDING_ALIGNMENT) * PADDING_ALIGNMENT
-            running_sum, off_mm = running_sum + padded, g + tl.arange(0, 1)
-            tl.store(grouped_mm_offs_ptr + off_mm, running_sum.to(tl.int32))
-            tl.store(ks_ptr + off_mm, padded.to(tl.int32))
+        group_end: tl.int64 = 0
+        for group_idx in tl.static_range(NUM_GROUPS):
+            count = tl.load(group_counts_ptr + group_idx)
+            padded_count = ((count + PADDING_ALIGNMENT - 1) // PADDING_ALIGNMENT) * PADDING_ALIGNMENT
+            group_end, group_offs = group_end + padded_count, group_idx + tl.arange(0, 1)
+            tl.store(grouped_mm_offs_ptr + group_offs, group_end.to(tl.int32))
+            tl.store(ks_ptr + group_offs, padded_count.to(tl.int32))
+
+
+@triton.jit
+def split_rows(num_rows, num_parts, part_idx):
+    """
+    The range [row_start, row_end) of part part_idx when num_rows rows are cut into num_parts
+    equal ceil-sized parts.
+    """
+    rows_per_part = (num_rows + num_parts - 1) // num_parts
+    row_start = part_idx * rows_per_part
+    row_end = tl.minimum(row_start + rows_per_part, num_rows)
+    return row_start, row_end
+
+
+@triton.jit
+def zero_rows(output_tokens_ptr, first_row, row_start, row_end, dst_row_stride, hidden_size, zero_dtype: tl.constexpr, BLOCK_H: tl.constexpr, NUM_H_BLOCKS: tl.constexpr):
+    """
+    Zero output rows first_row + [row_start, row_end).
+    """
+    for row_idx in range(row_start, row_end):
+        row_base = (first_row + row_idx) * dst_row_stride
+        for i in tl.static_range(NUM_H_BLOCKS):
+            h_offs = i * BLOCK_H + tl.arange(0, BLOCK_H)
+            h_mask = h_offs < hidden_size
+            tl.store(output_tokens_ptr + row_base + h_offs, tl.zeros([BLOCK_H], dtype=zero_dtype), mask=h_mask)
 
 
 @triton.jit
 def scatter_for_grouped_gemm_kernel(
-    input_tokens_ptr,  # [m, hidden_size]
-    expert_idxs_ptr,  # [m] int64
+    input_tokens_ptr,  # [num_tokens, hidden_size]
+    expert_idx_ptr,  # [num_tokens] int64
     grouped_mm_offs_ptr,  # [num_groups] int32, padded cumulative offsets
-    group_counters_ptr,  # [num_groups] int64, pre-zeroed (atomic row positions)
-    actual_counts_ptr,  # [num_groups] int64, from the prep kernel
-    output_tokens_ptr,  # [m_padded, hidden_size]
-    reverse_shuffle_idxs_ptr,  # [m] int64
+    group_cursors_ptr,  # [num_groups] int64, pre-zeroed (atomic row positions)
+    group_counts_ptr,  # [num_groups] int64, from the prep kernel
+    output_tokens_ptr,  # [max_rows, hidden_size]
+    reverse_shuffle_idxs_ptr,  # [num_tokens] int64
     hidden_size,
-    stride_src_m,
-    stride_dst_m,
-    m,
+    src_row_stride,
+    dst_row_stride,
+    num_tokens,
     num_groups,
     BLOCK_H: tl.constexpr,
     NUM_H_BLOCKS: tl.constexpr,
     GEMM_ALLOC_ALIGNMENT: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
+    token_idx = tl.program_id(axis=0)
+    zero_dtype = input_tokens_ptr.dtype.element_ty
 
-    expert_id = tl.load(expert_idxs_ptr + pid)
-    pos_in_group = tl.atomic_add(group_counters_ptr + expert_id, 1)
-    safe_idx = tl.maximum(expert_id - 1, 0)
-    base_offset = tl.load(grouped_mm_offs_ptr + safe_idx, mask=expert_id > 0, other=0)
-    global_pos = pos_in_group + base_offset.to(tl.int64)
-    tl.store(reverse_shuffle_idxs_ptr + pid, global_pos)
+    expert_idx = tl.load(expert_idx_ptr + token_idx)
+    pos_in_group = tl.atomic_add(group_cursors_ptr + expert_idx, 1)
+    prev_group_idx = tl.maximum(expert_idx - 1, 0)
+    group_start = tl.load(grouped_mm_offs_ptr + prev_group_idx, mask=expert_idx > 0, other=0)
+    out_row_idx = pos_in_group + group_start.to(tl.int64)
+    tl.store(reverse_shuffle_idxs_ptr + token_idx, out_row_idx)
 
-    src_base, dst_base = pid * stride_src_m, global_pos * stride_dst_m
+    src_row_base, dst_row_base = token_idx * src_row_stride, out_row_idx * dst_row_stride
     for i in tl.static_range(NUM_H_BLOCKS):
         h_offs = i * BLOCK_H + tl.arange(0, BLOCK_H)
-        mask = h_offs < hidden_size
-        vals = tl.load(input_tokens_ptr + src_base + h_offs, mask=mask)
-        tl.store(output_tokens_ptr + dst_base + h_offs, vals, mask=mask)
+        h_mask = h_offs < hidden_size
+        token_vals = tl.load(input_tokens_ptr + src_row_base + h_offs, mask=h_mask)
+        tl.store(output_tokens_ptr + dst_row_base + h_offs, token_vals, mask=h_mask)
 
     # this group's padding rows, split among the group's programs
-    actual_count = tl.load(actual_counts_ptr + expert_id)
-    end_offset = tl.load(grouped_mm_offs_ptr + expert_id).to(tl.int64)
-    padded_count = end_offset - base_offset.to(tl.int64)
-    pad_rows = padded_count - actual_count
+    num_group_tokens = tl.load(group_counts_ptr + expert_idx)
+    group_end = tl.load(grouped_mm_offs_ptr + expert_idx).to(tl.int64)
+    padded_count = group_end - group_start.to(tl.int64)
+    num_pad_rows = padded_count - num_group_tokens
 
-    if pad_rows > 0:
-        rows_per = (pad_rows + actual_count - 1) // actual_count
-        my_start = pos_in_group * rows_per
-        my_end = tl.minimum(my_start + rows_per, pad_rows)
-
-        pad_base = base_offset.to(tl.int64) + actual_count
-        for row_off in range(my_start, my_end):
-            row_base = (pad_base + row_off) * stride_dst_m
-            for i in tl.static_range(NUM_H_BLOCKS):
-                h_offs = i * BLOCK_H + tl.arange(0, BLOCK_H)
-                mask = h_offs < hidden_size
-                tl.store(output_tokens_ptr + row_base + h_offs, tl.zeros([BLOCK_H], dtype=input_tokens_ptr.dtype.element_ty), mask=mask)
+    if num_pad_rows > 0:
+        pad_start, pad_end = split_rows(num_pad_rows, num_group_tokens, pos_in_group)
+        zero_rows(output_tokens_ptr, group_start.to(tl.int64) + num_group_tokens, pad_start, pad_end, dst_row_stride, hidden_size, zero_dtype, BLOCK_H, NUM_H_BLOCKS)
 
     # rows [actual_M, M_rounded) of the allocation, split among all programs
     last_group_end = tl.load(grouped_mm_offs_ptr + num_groups - 1).to(tl.int64)
     M_rounded = ((last_group_end + GEMM_ALLOC_ALIGNMENT - 1) // GEMM_ALLOC_ALIGNMENT * GEMM_ALLOC_ALIGNMENT)
-    align_pad = M_rounded - last_group_end
+    num_tail_rows = M_rounded - last_group_end
 
-    if align_pad > 0:
-        rows_per = (align_pad + m - 1) // m
-        my_start = pid * rows_per
-        my_end = tl.minimum(my_start + rows_per, align_pad)
-        for row_off in range(my_start, my_end):
-            row_base = (last_group_end + row_off) * stride_dst_m
-            for i in tl.static_range(NUM_H_BLOCKS):
-                h_offs = i * BLOCK_H + tl.arange(0, BLOCK_H)
-                mask = h_offs < hidden_size
-                tl.store(output_tokens_ptr + row_base + h_offs, tl.zeros([BLOCK_H], dtype=input_tokens_ptr.dtype.element_ty), mask=mask)
+    if num_tail_rows > 0:
+        tail_start, tail_end = split_rows(num_tail_rows, num_tokens, token_idx)
+        zero_rows(output_tokens_ptr, last_group_end, tail_start, tail_end, dst_row_stride, hidden_size, zero_dtype, BLOCK_H, NUM_H_BLOCKS)
 
 
 def get_copy_stream_and_event(device):
@@ -141,25 +151,26 @@ def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num
     a multiple of padding_alignment. Returns (output_tokens, reverse_shuffle_idxs,
     grouped_mm_offs, ks_tensor, ks).
 
-    - input_tokens: (m, hidden) with unit inner stride (any row stride, any dtype). expert_idxs:
-      int64 (m,) contiguous, values in [0, num_groups); a length other than m raises ValueError.
-      Inputs are not modified.
+    - input_tokens: (num_tokens, hidden) with unit inner stride (any row stride, any dtype).
+      expert_idxs: int64 (num_tokens,) contiguous, values in [0, num_groups); a length other than
+      num_tokens raises ValueError. Inputs are not modified.
     - group_counts: the true rows per group on the host, if known; ks then follows without the
       device-to-host copy (and host sync), and must match expert_idxs.
     - output_tokens: (sum(ks), hidden) row-major in input_tokens' dtype, a prefix view of an
       allocation whose rows past sum(ks), up to a multiple of 1024, are zero too. Group g occupies
       rows [offs[g - 1], offs[g]), its tokens first, then zero rows.
-    - reverse_shuffle_idxs: int64 (m,), the output row of each input token.
+    - reverse_shuffle_idxs: int64 (num_tokens,), the output row of each input token.
     - grouped_mm_offs: int32 (G,) cumulative padded group ends. ks_tensor: int32 (G,) padded group
       sizes (zero for an empty group). ks: the same as a host list.
-    - m == 0 returns empty tensors, grouped_mm_offs and ks_tensor of shape (0,), and ks == [].
+    - num_tokens == 0 returns empty tensors, grouped_mm_offs and ks_tensor of shape (0,), and
+      ks == [].
 
     Rows are copied exactly. Placement within a group is atomic_add order, not deterministic.
     """
-    m, hidden_size = input_tokens.shape[0], input_tokens.shape[1]
+    num_tokens, hidden_size = input_tokens.shape[0], input_tokens.shape[1]
     device = input_tokens.device
 
-    if m == 0:
+    if num_tokens == 0:
         output_tokens = torch.empty((0, hidden_size), device=device, dtype=input_tokens.dtype)
         reverse_shuffle_idxs = torch.empty((0,), device=device, dtype=torch.int64)
         grouped_mm_offs = torch.empty((0,), device=device, dtype=torch.int32)
@@ -167,25 +178,25 @@ def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num
         return output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks_tensor, []
 
     # upper bound on sum(ks) without a device sync
-    max_m_padded = m + num_groups * (padding_alignment - 1)
-    max_m_padded = ((max_m_padded + GEMM_ALLOC_ALIGNMENT - 1) // GEMM_ALLOC_ALIGNMENT * GEMM_ALLOC_ALIGNMENT)
+    max_rows = num_tokens + num_groups * (padding_alignment - 1)
+    max_rows = ((max_rows + GEMM_ALLOC_ALIGNMENT - 1) // GEMM_ALLOC_ALIGNMENT * GEMM_ALLOC_ALIGNMENT)
 
     # the scatter kernel zeroes the padding and tail rows
-    output_tokens = torch.empty((max_m_padded, hidden_size), device=device, dtype=input_tokens.dtype)
-    reverse_shuffle_idxs = torch.empty((m,), device=device, dtype=torch.int64)
+    output_tokens = torch.empty((max_rows, hidden_size), device=device, dtype=input_tokens.dtype)
+    reverse_shuffle_idxs = torch.empty((num_tokens,), device=device, dtype=torch.int64)
     grouped_mm_offs = torch.empty((num_groups,), device=device, dtype=torch.int32)
     ks_tensor = torch.empty((num_groups,), device=device, dtype=torch.int32)
     all_zeros = torch.zeros((num_groups * 2 + 1,), device=device, dtype=torch.int64)
-    group_counts_1, group_counts_2, completion_counter = all_zeros[:num_groups], all_zeros[num_groups : num_groups * 2], all_zeros[num_groups * 2 :]
+    device_group_counts, group_cursors, completion_counter = all_zeros[:num_groups], all_zeros[num_groups : num_groups * 2], all_zeros[num_groups * 2 :]
 
-    # The prep kernel masks its expert_idxs loads with m: a shorter expert_idxs would be read out
-    # of bounds and the garbage would index group_counts.
-    if expert_idxs.shape[0] != m:
-        raise ValueError(f"{expert_idxs.shape[0]=} must equal the input row count {m=}")
+    # The prep kernel masks its expert_idxs loads with num_tokens: a shorter expert_idxs would be
+    # read out of bounds and the garbage would index group_counts.
+    if expert_idxs.shape[0] != num_tokens:
+        raise ValueError(f"{expert_idxs.shape[0]=} must equal the input row count {num_tokens=}")
 
     BLOCK = 1024
-    num_ctas = min(triton.cdiv(m, BLOCK), 32)
-    compute_group_offsets_kernel[(num_ctas,)](expert_idxs, group_counts_1, grouped_mm_offs, ks_tensor, completion_counter, m, num_ctas, PADDING_ALIGNMENT=padding_alignment, NUM_GROUPS=num_groups, BLOCK=BLOCK)
+    num_ctas = min(triton.cdiv(num_tokens, BLOCK), 32)
+    compute_group_offsets_kernel[(num_ctas,)](expert_idxs, device_group_counts, grouped_mm_offs, ks_tensor, completion_counter, num_tokens, num_ctas, PADDING_ALIGNMENT=padding_alignment, NUM_GROUPS=num_groups, BLOCK=BLOCK)
 
     # ks_tensor is final after the prep kernel: its copy to the host overlaps the scatter kernel
     copy_stream, copy_event = get_copy_stream_and_event(device)
@@ -193,18 +204,17 @@ def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num
 
     BLOCK_H = 256
     NUM_H_BLOCKS = triton.cdiv(hidden_size, BLOCK_H)
-    scatter_for_grouped_gemm_kernel[(m,)](input_tokens, expert_idxs, grouped_mm_offs, group_counts_2, group_counts_1, output_tokens, reverse_shuffle_idxs, hidden_size, input_tokens.stride(0), output_tokens.stride(0), m, num_groups, BLOCK_H=BLOCK_H, NUM_H_BLOCKS=NUM_H_BLOCKS, GEMM_ALLOC_ALIGNMENT=GEMM_ALLOC_ALIGNMENT)
+    scatter_for_grouped_gemm_kernel[(num_tokens,)](input_tokens, expert_idxs, grouped_mm_offs, group_cursors, device_group_counts, output_tokens, reverse_shuffle_idxs, hidden_size, input_tokens.stride(0), output_tokens.stride(0), num_tokens, num_groups, BLOCK_H=BLOCK_H, NUM_H_BLOCKS=NUM_H_BLOCKS, GEMM_ALLOC_ALIGNMENT=GEMM_ALLOC_ALIGNMENT)
 
     if group_counts is not None:
-        a = padding_alignment
-        ks = [(c + a - 1) // a * a for c in group_counts]
+        ks = [(count + padding_alignment - 1) // padding_alignment * padding_alignment for count in group_counts]
     else:
-        ks_cpu = get_pinned_buffer("ks", num_groups, torch.int32)
+        ks_host = get_pinned_buffer("ks", num_groups, torch.int32)
         with torch.cuda.stream(copy_stream):
             copy_stream.wait_event(copy_event)
-            ks_cpu.copy_(ks_tensor, non_blocking=True)
+            ks_host.copy_(ks_tensor, non_blocking=True)
         copy_stream.synchronize()
-        ks = ks_cpu.tolist()
+        ks = ks_host.tolist()
     # trimmed to sum(ks) exactly: DeepGEMM's k_grouped_fp8_gemm_tn_contiguous asserts it
     actual_M = sum(ks)
     output_tokens = output_tokens[:actual_M]

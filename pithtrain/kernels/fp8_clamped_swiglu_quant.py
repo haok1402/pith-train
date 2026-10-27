@@ -18,7 +18,7 @@ __all__ = ["clamped_swiglu_bwd_quant", "clamped_swiglu_quant_fwd", "clamped_swig
 BLOCK = 128
 
 
-def check(gate_up: torch.Tensor) -> None:
+def check_gate_up(gate_up: torch.Tensor) -> None:
     assert gate_up.ndim == 2 and gate_up.shape[1] % 2 == 0 and gate_up.shape[0] % BLOCK == 0
 
 
@@ -27,7 +27,7 @@ def clamped_swiglu_quant_fwd(gate_up: torch.Tensor, bias: torch.Tensor, grouped_
     All four outputs (rowwise pair, K-major pair) of fp8cast_rowwise_kmajor(clamped_swiglu(gate_up +
     bias[group], alpha, limit), grouped_mm_offs).
     """
-    check(gate_up)
+    check_gate_up(gate_up)
     match ARCH_MAJOR:
         case 9:
             from pithtrain.kernels.fp8_clamped_swiglu_quant_sm90 import clamped_swiglu_quant_fwd_sm90

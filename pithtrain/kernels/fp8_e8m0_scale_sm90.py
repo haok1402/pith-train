@@ -13,7 +13,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from pithtrain.kernels.cute_ptx_sm90 import asm, asm_args_last, f32_hex, to_ir, unpack
 
-__all__ = ["AMAX_MIN", "FP8_MAX_RCP", "e8m0_scale", "e8m0_scale_bf16x2", "e8m0_scale_f32", "exact_rcp", "quant4_e4m3"]
+__all__ = ["AMAX_MIN", "FP8_MAX_RCP", "e8m0_scale", "e8m0_scale_bf16x2", "e8m0_scale_f32", "exact_rcp", "ptx_f32", "quant4_e4m3"]
 
 
 def ptx_f32(x: float) -> str:
@@ -31,9 +31,9 @@ def e8m0_scale_f32(amax: Float32, *, loc=None, ip=None) -> tuple:
     """
     SM90 branch of compute_fp8_scale: (scale, reciprocal), both exact powers of 2.
     """
-    ty = ir.Type.parse("!llvm.struct<(f32, f32)>")
-    res = asm_args_last(
-        ty,
+    pair_type = ir.Type.parse("!llvm.struct<(f32, f32)>")
+    scale_pair = asm_args_last(
+        pair_type,
         "{\n.reg .f32 a, s;\n.reg .b32 b, m, e;\n.reg .pred p;\n"
         f"max.f32 a, $2, {AMAX_MIN};\n"
         f"mul.rn.f32 s, a, {FP8_MAX_RCP};\n"
@@ -50,16 +50,17 @@ def e8m0_scale_f32(amax: Float32, *, loc=None, ip=None) -> tuple:
         "mov.b32 $1, e;\n}",
         "=f,=f,f", [to_ir(amax, Float32, loc, ip)],
     )
-    return unpack(res, 2, Float32, loc, ip)
+    return unpack(scale_pair, 2, Float32, loc, ip)
 
 
 @dsl_user_op
 def quant4_e4m3(x0: Float32, x1: Float32, x2: Float32, x3: Float32, r: tuple, *, loc=None, ip=None) -> Uint32:
     """
-    Four cvt.rn.satfinite.e4m3 of x_i * r_i, packed little-endian into one word.
+    Four cvt.rn.satfinite.e4m3 of x_i * r[i], r holding the four reciprocal scales, packed
+    little-endian into one word.
     """
-    args = [to_ir(v, Float32, loc, ip) for v in (x0, x1, x2, x3)]
-    args += [to_ir(v, Float32, loc, ip) for v in r]
+    args = [to_ir(value, Float32, loc, ip) for value in (x0, x1, x2, x3)]
+    args += [to_ir(value, Float32, loc, ip) for value in r]
     return Uint32(
         asm_args_last(
             T.i32(),
@@ -75,8 +76,8 @@ def quant4_e4m3(x0: Float32, x1: Float32, x2: Float32, x3: Float32, r: tuple, *,
 
 
 # fp32 constants of compute_fp8_scale as hex bit patterns, for the integer-compare form below.
-AMAX_MIN_BITS = f32_hex(1e-4)  # tl.maximum(amax, 1e-4) as fp32
-FP8_MAX_RCP_BITS = f32_hex(1.0 / 448.0)  # FP8_MAX_RCP as fp32
+AMAX_MIN_BITS = f32_hex(1e-4)
+FP8_MAX_RCP_BITS = f32_hex(1.0 / 448.0)
 
 
 @dsl_user_op
@@ -85,9 +86,9 @@ def e8m0_scale_bf16x2(amax2: Uint32, hi: Int32, *, loc=None, ip=None) -> tuple:
     E8M0 scale of the bf16 amax in the low (hi == 0) or high half of amax2, as the fp32 bit patterns
     (scale, reciprocal); matches compute_fp8_scale's SM90 branch bit for bit.
     """
-    st = llvm.StructType.get_literal([T.i32(), T.i32()])
-    r = asm(
-        st, [Uint32(amax2).ir_value(loc=loc, ip=ip), Int32(hi).ir_value(loc=loc, ip=ip)],
+    pair_type = llvm.StructType.get_literal([T.i32(), T.i32()])
+    scale_bits_pair = asm(
+        pair_type, [Uint32(amax2).ir_value(loc=loc, ip=ip), Int32(hi).ir_value(loc=loc, ip=ip)],
         "{\n\t.reg .b32 a, b, m, s;\n\t.reg .f32 f;\n\t.reg .pred p, q;\n\t"
         "setp.ne.b32 q, $3, 0;\n\t"
         "and.b32 a, $2, 0xFFFF0000;\n\t"
@@ -106,7 +107,7 @@ def e8m0_scale_bf16x2(amax2: Uint32, hi: Int32, *, loc=None, ip=None) -> tuple:
         "sub.u32 $1, 0x7F000000, s;\n\t}",
         "=r,=r,r,r",
     )
-    return (Uint32(llvm.extractvalue(T.i32(), r, [0], loc=loc, ip=ip)), Uint32(llvm.extractvalue(T.i32(), r, [1], loc=loc, ip=ip)))
+    return (Uint32(llvm.extractvalue(T.i32(), scale_bits_pair, [0], loc=loc, ip=ip)), Uint32(llvm.extractvalue(T.i32(), scale_bits_pair, [1], loc=loc, ip=ip)))
 
 
 @dsl_user_op
@@ -118,7 +119,7 @@ def e8m0_scale(amax: Float32, *, loc=None, ip=None) -> Float32:
     max.u32 with 0x00800000 clamps to the smallest normal (2^-126); on non-negative floats an
     unsigned compare of the bits orders like the float compare.
     """
-    res = llvm.inline_asm(
+    scale = llvm.inline_asm(
         T.f32(), [Float32(amax).ir_value(loc=loc, ip=ip)],
         "{\n\t"
         ".reg .f32 t;\n\t"
@@ -136,7 +137,7 @@ def e8m0_scale(amax: Float32, *, loc=None, ip=None) -> Float32:
         "}",
         "=f,f", has_side_effects=False, is_align_stack=False, loc=loc, ip=ip,
     )
-    return Float32(res)
+    return Float32(scale)
 
 
 @dsl_user_op
@@ -144,7 +145,7 @@ def exact_rcp(scale: Float32, *, loc=None, ip=None) -> Float32:
     """
     Exact reciprocal of a power of 2 by exponent flip: bits -> (254 << 23) - bits.
     """
-    res = llvm.inline_asm(
+    rcp = llvm.inline_asm(
         T.f32(), [Float32(scale).ir_value(loc=loc, ip=ip)],
         "{\n\t"
         ".reg .b32 b, c;\n\t"
@@ -155,4 +156,4 @@ def exact_rcp(scale: Float32, *, loc=None, ip=None) -> Float32:
         "}",
         "=f,f", has_side_effects=False, is_align_stack=False, loc=loc, ip=ip,
     )
-    return Float32(res)
+    return Float32(rcp)

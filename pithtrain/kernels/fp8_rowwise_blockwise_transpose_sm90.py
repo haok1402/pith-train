@@ -13,7 +13,7 @@ from typing import Callable
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32, Int64, Uint8, Uint32, const_expr
+from cutlass import Float32, Int32, Int64, Uint8, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -28,9 +28,9 @@ BLOCK = 128
 SMALL_GRID_TILES = 200
 
 
-def asm_u32(args: list, asm: str, constraints: str, loc=None, ip=None) -> Uint32:
-    res = llvm.inline_asm(T.i32(), [a.ir_value(loc=loc, ip=ip) for a in args], asm, constraints, has_side_effects=False, is_align_stack=False, loc=loc, ip=ip)
-    return Uint32(res)
+def asm_u32(operands: list, ptx: str, constraints: str, loc=None, ip=None) -> Uint32:
+    result = llvm.inline_asm(T.i32(), [operand.ir_value(loc=loc, ip=ip) for operand in operands], ptx, constraints, has_side_effects=False, is_align_stack=False, loc=loc, ip=ip)
+    return Uint32(result)
 
 
 # The register block is kept as packed 32-bit words of the input dtype (bf16 / f16: two elements
@@ -40,68 +40,82 @@ def asm_u32(args: list, asm: str, constraints: str, loc=None, ip=None) -> Uint32
 
 
 @dsl_user_op
-def absmax_acc(acc: Uint32, w: Uint32, kind: str, *, loc=None, ip=None) -> Uint32:
+def accumulate_absmax(acc: Uint32, word: Uint32, kind: str, *, loc=None, ip=None) -> Uint32:
     """
-    acc = max(acc, |w|) lane-wise in the input dtype (maxNum semantics, as tl.max).
+    acc = max(acc, |word|) lane-wise in the input dtype (maxNum semantics, as tl.max).
     """
-    op = {"bf16": "max.bf16x2", "f16": "max.f16x2", "f32": "max.f32"}[kind]
+    max_op = {"bf16": "max.bf16x2", "f16": "max.f16x2", "f32": "max.f32"}[kind]
     mask = "0x7FFFFFFF" if kind == "f32" else "0x7FFF7FFF"
-    asm = f"{{\n\t.reg .b32 t;\n\tand.b32 t, $2, {mask};\n\t{op} $0, $1, t;\n\t}}"
-    return asm_u32([Uint32(acc), Uint32(w)], asm, "=r,r,r", loc, ip)
+    ptx = f"{{\n\t.reg .b32 t;\n\tand.b32 t, $2, {mask};\n\t{max_op} $0, $1, t;\n\t}}"
+    return asm_u32([Uint32(acc), Uint32(word)], ptx, "=r,r,r", loc, ip)
 
 
 @dsl_user_op
-def amax_f32(acc: Uint32, kind: str, *, loc=None, ip=None) -> Float32:
+def widen_amax(acc: Uint32, kind: str, *, loc=None, ip=None) -> Float32:
     """
     Reduce a packed |max| word to one fp32 value (exact widening).
     """
     if kind == "f32":
-        body = "mov.b32 $0, $1;"
+        ptx_body = "mov.b32 $0, $1;"
     else:
-        ty = {"bf16": "bf16", "f16": "f16"}[kind]
-        body = (
+        ptx_type = {"bf16": "bf16", "f16": "f16"}[kind]
+        ptx_body = (
             ".reg .b16 l, h, m;\n\tmov.b32 {l, h}, $1;\n\t"
-            f"max.{ty} m, l, h;\n\tcvt.f32.{ty} $0, m;"
+            f"max.{ptx_type} m, l, h;\n\tcvt.f32.{ptx_type} $0, m;"
         )
-    res = llvm.inline_asm(T.f32(), [Uint32(acc).ir_value(loc=loc, ip=ip)], "{\n\t" + body + "\n\t}", "=f,r", has_side_effects=False, is_align_stack=False, loc=loc, ip=ip)
-    return Float32(res)
+    result = llvm.inline_asm(T.f32(), [Uint32(acc).ir_value(loc=loc, ip=ip)], "{\n\t" + ptx_body + "\n\t}", "=f,r", has_side_effects=False, is_align_stack=False, loc=loc, ip=ip)
+    return Float32(result)
 
 
 @dsl_user_op
-def q4(words: list, sel: list, kind: str, rcp: Float32, *, loc=None, ip=None) -> Uint32:
+def quantize4_words(words: list, elem_picks: list, kind: str, rcp: Float32, *, loc=None, ip=None) -> Uint32:
     """
-    Quantize 4 elements to 4 packed e4m3 bytes (element 0 in the lowest byte). sel[k] = (j, half)
-    picks element k from words[j] (half 0 = low 16 bits); rcp is an exact power of 2. The cvt is the
-    one Triton emits for .to(tl.float8e4nv) on SM90; its first source lands in the upper byte.
+    Quantize 4 elements to 4 packed e4m3 bytes (element 0 in the lowest byte). elem_picks[k] =
+    (j, half) picks element k from words[j] (half 0 = low 16 bits); rcp is an exact power of 2.
+    The cvt is the one Triton emits for .to(tl.float8e4nv) on SM90; its first source lands in
+    the upper byte.
     """
-    n = len(words)
-    rcp_op = f"${n + 1}"
-    lines = [".reg .b32 f0, f1, f2, f3;", ".reg .b16 l, h, q0, q1;"]
-    for k, (j, half) in enumerate(sel):
-        w = f"${j + 1}"
+    num_words = len(words)
+    rcp_operand = f"${num_words + 1}"
+    ptx_lines = [".reg .b32 f0, f1, f2, f3;", ".reg .b16 l, h, q0, q1;"]
+    for k, (j, half) in enumerate(elem_picks):
+        word_operand = f"${j + 1}"
         if kind == "bf16":
             if half == 0:
-                lines.append(f"shl.b32 f{k}, {w}, 16;")
+                ptx_lines.append(f"shl.b32 f{k}, {word_operand}, 16;")
             else:
-                lines.append(f"and.b32 f{k}, {w}, 0xFFFF0000;")
+                ptx_lines.append(f"and.b32 f{k}, {word_operand}, 0xFFFF0000;")
         elif kind == "f16":
-            lines.append(f"mov.b32 {{l, h}}, {w};")
-            lines.append(f"cvt.f32.f16 f{k}, {'l' if half == 0 else 'h'};")
+            ptx_lines.append(f"mov.b32 {{l, h}}, {word_operand};")
+            ptx_lines.append(f"cvt.f32.f16 f{k}, {'l' if half == 0 else 'h'};")
         else:
-            lines.append(f"mov.b32 f{k}, {w};")
-        lines.append(f"mul.rn.f32 f{k}, f{k}, {rcp_op};")
-    lines += ["cvt.rn.satfinite.e4m3x2.f32 q0, f1, f0;", "cvt.rn.satfinite.e4m3x2.f32 q1, f3, f2;", "mov.b32 $0, {q0, q1};"]
-    asm, constraints, args = "{\n\t" + "\n\t".join(lines) + "\n\t}", "=r," + ",".join(["r"] * n) + ",f", [Uint32(w) for w in words] + [Float32(rcp)]
-    return asm_u32(args, asm, constraints, loc, ip)
+            ptx_lines.append(f"mov.b32 f{k}, {word_operand};")
+        ptx_lines.append(f"mul.rn.f32 f{k}, f{k}, {rcp_operand};")
+    ptx_lines += ["cvt.rn.satfinite.e4m3x2.f32 q0, f1, f0;", "cvt.rn.satfinite.e4m3x2.f32 q1, f3, f2;", "mov.b32 $0, {q0, q1};"]
+    ptx, constraints, operands = "{\n\t" + "\n\t".join(ptx_lines) + "\n\t}", "=r," + ",".join(["r"] * num_words) + ",f", [Uint32(word) for word in words] + [Float32(rcp)]
+    return asm_u32(operands, ptx, constraints, loc, ip)
 
 
-def gptr(base: cute.Pointer, offset: Int64, esize: int, dtype: type, align: int) -> cute.Pointer:
+def global_ptr(base: cute.Pointer, offset: Int64, elem_bytes: int, dtype: type, align: int) -> cute.Pointer:
     """
-    Global pointer offset elements (of esize bytes) past base, as dtype,
+    Global pointer offset elements (of elem_bytes bytes) past base, as dtype,
     asserted align-byte aligned.
     """
-    addr = base.toint() + offset * esize
+    addr = base.toint() + offset * elem_bytes
     return cute.make_ptr(dtype, addr, cute.AddressSpace.gmem, assumed_align=align)
+
+
+class SubBlock:
+    """
+    Where one thread's rows x 16 register block sits in its CTA's tile and in x.
+    """
+
+    def __init__(self, tidx, m_tile_idx, k_tile_idx, M, K, rows: int) -> None:
+        self.tidx, self.m_tile_idx, self.k_tile_idx, self.M, self.K = tidx, m_tile_idx, k_tile_idx, M, K
+        self.warp, self.lane = tidx // 32, tidx % 32
+        # each warp covers 4 x rows rows and 8 x 16 columns; lane l takes row group l // 8, column group l % 8
+        self.row_group_idx, self.col_group_idx = self.lane // 8, self.lane % 8
+        self.row0, self.col0 = m_tile_idx * BLOCK + self.warp * (4 * rows) + self.row_group_idx * rows, k_tile_idx * BLOCK + self.col_group_idx * 8
 
 
 class RowwiseBlockwiseTranspose:
@@ -114,7 +128,10 @@ class RowwiseBlockwiseTranspose:
         self.dtype = dtype
         self.rows = rows
         self.threads = 1024 // rows
+        self.num_warps = 32 // rows
         self.kind = {cutlass.BFloat16: "bf16", cutlass.Float16: "f16", Float32: "f32"}[dtype]
+        self.elem_bytes = dtype.width // 8
+        self.elems_per_word = 32 // dtype.width
         self.vec_k = vec_k
         self.vec_m = vec_m
 
@@ -126,165 +143,201 @@ class RowwiseBlockwiseTranspose:
 
     @cute.kernel
     def kernel(self, mX: cute.Tensor, mQ: cute.Tensor, mS: cute.Tensor, mQT: cute.Tensor, mST: cute.Tensor) -> None:
-        VK, VM, R, NW = const_expr(self.vec_k), const_expr(self.vec_m), const_expr(self.rows), const_expr(32 // self.rows)
-        esize, EPW, KIND = const_expr(self.dtype.width // 8), const_expr(32 // self.dtype.width), const_expr(self.kind)
         tidx, _, _ = cute.arch.thread_idx()
-        bm, bk, _ = cute.arch.block_idx()
-        warp, lane = tidx // 32, tidx % 32
-        rg, cl = lane // 8, lane % 8
+        m_tile_idx, k_tile_idx, _ = cute.arch.block_idx()
+        sub_block = SubBlock(tidx, m_tile_idx, k_tile_idx, Int32(mX.shape[0]), Int32(mX.shape[1]), self.rows)
+        x_words = self.load_block(mX, sub_block)
+        row_amax = self.reduce_row_amax(x_words)
+        q_bytes = cute.make_rmem_tensor(cute.make_layout(8), Uint8)
+        self.store_rowwise(x_words, row_amax, q_bytes, mQ, mS, sub_block)
+        tile_rcp = self.reduce_tile_amax(row_amax, mST, sub_block)
+        self.store_transposed(x_words, tile_rcp, q_bytes, mQT, sub_block)
 
-        M, K = Int32(mX.shape[0]), Int32(mX.shape[1])
-        sx = Int64(mX.stride[0])
-        # mS is the MN-major tok_scale: scale[r, bk] at bk * s_ld + r.
-        s_ld = Int64(mS.stride[1])
-        nmb = Int32(mST.shape[1])
-
-        row0, col_base = bm * BLOCK + warp * (4 * R) + rg * R, bk * BLOCK + cl * 8
-
-        # Register block zero-filled outside (M, K): element (row row0 + i, column col_base + h * 64 + e) at n = i * 16 + h * 8 + e.
-        xr = cute.make_rmem_tensor(cute.make_layout(16 * R), self.dtype)
-        xr.fill(0.0)
-        for i in cutlass.range_constexpr(R):
-            r = row0 + i
-            for h in cutlass.range_constexpr(2):
-                for p in cutlass.range_constexpr(8 // VK):
-                    c = col_base + h * 64 + p * VK
-                    if r < M:
-                        if c < K:
-                            off = Int64(r) * sx + Int64(c)
-                            src = cute.make_tensor(gptr(mX.iterator, off, esize, self.dtype, VK * esize), cute.make_layout(VK))
-                            dst = cute.make_tensor(xr.iterator + (i * 16 + h * 8 + p * VK), cute.make_layout(VK))
+    @cute.jit
+    def load_block(self, mX: cute.Tensor, sub_block: SubBlock) -> cute.Tensor:
+        """
+        The thread's register block as packed words, zero outside (M, K): element (row0 + i, col0 +
+        half * 64 + e) at i * 16 + half * 8 + e.
+        """
+        row0, col0, M, K = sub_block.row0, sub_block.col0, sub_block.M, sub_block.K
+        VEC_K, elem_bytes = self.vec_k, self.elem_bytes
+        x_row_stride = Int64(mX.stride[0])
+        x_block = cute.make_rmem_tensor(cute.make_layout(16 * self.rows), self.dtype)
+        x_block.fill(0.0)
+        for i in cutlass.range_constexpr(self.rows):
+            row = row0 + i
+            for half in cutlass.range_constexpr(2):
+                for vec_idx in cutlass.range_constexpr(8 // VEC_K):
+                    col = col0 + half * 64 + vec_idx * VEC_K
+                    if row < M:
+                        if col < K:
+                            offset = Int64(row) * x_row_stride + Int64(col)
+                            src = cute.make_tensor(global_ptr(mX.iterator, offset, elem_bytes, self.dtype, VEC_K * elem_bytes), cute.make_layout(VEC_K))
+                            dst = cute.make_tensor(x_block.iterator + (i * 16 + half * 8 + vec_idx * VEC_K), cute.make_layout(VEC_K))
                             cute.autovec_copy(src, dst)
-        xw = cute.recast_tensor(xr, Uint32)
+        return cute.recast_tensor(x_block, Uint32)
 
+    @cute.jit
+    def reduce_row_amax(self, x_words: cute.Tensor) -> cute.Tensor:
+        """
+        Amax of each of the thread's rows over the whole 128-column tile row (all 8 column groups).
+        """
         row_amax = cute.make_rmem_tensor(cute.make_layout(8), Float32)
-        for i in cutlass.range_constexpr(R):
-            acc = Uint32(0)
-            for n in cutlass.range_constexpr(i * 16, i * 16 + 16, EPW):
-                acc = absmax_acc(acc, xw[n // EPW], KIND)
-            m = amax_f32(acc, KIND)
-            for off in cutlass.range_constexpr(3):
-                m = cute.arch.fmax(m, cute.arch.shuffle_sync_bfly(m, offset=1 << off))
-            row_amax[i] = m
+        for i in cutlass.range_constexpr(self.rows):
+            acc_amax = Uint32(0)
+            for elem_idx in cutlass.range_constexpr(i * 16, i * 16 + 16, self.elems_per_word):
+                acc_amax = accumulate_absmax(acc_amax, x_words[elem_idx // self.elems_per_word], self.kind)
+            amax = widen_amax(acc_amax, self.kind)
+            for step in cutlass.range_constexpr(3):
+                amax = cute.arch.fmax(amax, cute.arch.shuffle_sync_bfly(amax, offset=1 << step))
+            row_amax[i] = amax
+        return row_amax
 
-        qb = cute.make_rmem_tensor(cute.make_layout(8), Uint8)
-        qw = cute.recast_tensor(qb, Uint32)
-        for i in cutlass.range_constexpr(R):
-            r = row0 + i
+    @cute.jit
+    def store_rowwise(self, x_words: cute.Tensor, row_amax: cute.Tensor, q_bytes: cute.Tensor, mQ: cute.Tensor, mS: cute.Tensor, sub_block: SubBlock) -> None:
+        """
+        Quantize the register block by its row scales into tok and store the scales, lane
+        col_group_idx == i storing row i's.
+        """
+        row0, col0, col_group_idx, k_tile_idx, M, K = sub_block.row0, sub_block.col0, sub_block.col_group_idx, sub_block.k_tile_idx, sub_block.M, sub_block.K
+        VEC_K = self.vec_k
+        # mS is the MN-major tok_scale: scale[row, k_tile_idx] at k_tile_idx * tok_scale_stride + row.
+        tok_scale_stride = Int64(mS.stride[1])
+        q_words = cute.recast_tensor(q_bytes, Uint32)
+        for i in cutlass.range_constexpr(self.rows):
+            row = row0 + i
             scale = e8m0_scale(row_amax[i])
             rcp = exact_rcp(scale)
-            if r < M:
-                if cl == i:
-                    stile = cute.make_tensor(gptr(mS.iterator, Int64(bk) * s_ld + Int64(r), 4, Float32, 4), cute.make_layout(1))
-                    stile[0] = scale
-                for h in cutlass.range_constexpr(2):
-                    for g in cutlass.range_constexpr(2):
-                        elems = [i * 16 + h * 8 + 4 * g + k for k in range(4)]
-                        qw[g] = self.quant4(xw, elems, rcp)
-                    for p in cutlass.range_constexpr(8 // VK):
-                        c = col_base + h * 64 + p * VK
-                        if c < K:
-                            dst = cute.make_tensor(gptr(mQ.iterator, Int64(r) * Int64(K) + Int64(c), 1, Uint8, VK), cute.make_layout(VK))
-                            src = cute.make_tensor(qb.iterator + p * VK, cute.make_layout(VK))
+            if row < M:
+                if col_group_idx == i:
+                    scale_tile = cute.make_tensor(global_ptr(mS.iterator, Int64(k_tile_idx) * tok_scale_stride + Int64(row), 4, Float32, 4), cute.make_layout(1))
+                    scale_tile[0] = scale
+                for half in cutlass.range_constexpr(2):
+                    for quad in cutlass.range_constexpr(2):
+                        elems = [i * 16 + half * 8 + 4 * quad + k for k in range(4)]
+                        q_words[quad] = self.quantize4(x_words, elems, rcp)
+                    for vec_idx in cutlass.range_constexpr(8 // VEC_K):
+                        col = col0 + half * 64 + vec_idx * VEC_K
+                        if col < K:
+                            dst = cute.make_tensor(global_ptr(mQ.iterator, Int64(row) * Int64(K) + Int64(col), 1, Uint8, VEC_K), cute.make_layout(VEC_K))
+                            src = cute.make_tensor(q_bytes.iterator + vec_idx * VEC_K, cute.make_layout(VEC_K))
                             cute.autovec_copy(src, dst)
 
-        bmax = row_amax[0]
-        for i in cutlass.range_constexpr(1, R):
-            bmax = cute.arch.fmax(bmax, row_amax[i])
-        bmax = cute.arch.fmax(bmax, cute.arch.shuffle_sync_bfly(bmax, offset=8))
-        bmax = cute.arch.fmax(bmax, cute.arch.shuffle_sync_bfly(bmax, offset=16))
-
+    @cute.jit
+    def reduce_tile_amax(self, row_amax: cute.Tensor, mST: cute.Tensor, sub_block: SubBlock) -> Float32:
+        """
+        Reduce the row amaxes over the CTA's tile, store the tile's blk_t scale (thread 0) and
+        return its reciprocal.
+        """
+        tidx, warp, lane, m_tile_idx, k_tile_idx = sub_block.tidx, sub_block.warp, sub_block.lane, sub_block.m_tile_idx, sub_block.k_tile_idx
+        num_m_tiles = Int32(mST.shape[1])
+        tile_amax = row_amax[0]
+        for i in cutlass.range_constexpr(1, self.rows):
+            tile_amax = cute.arch.fmax(tile_amax, row_amax[i])
+        tile_amax = cute.arch.fmax(tile_amax, cute.arch.shuffle_sync_bfly(tile_amax, offset=8))
+        tile_amax = cute.arch.fmax(tile_amax, cute.arch.shuffle_sync_bfly(tile_amax, offset=16))
         smem = cutlass.memory.SmemAllocator()
-        red = smem.allocate_tensor(Float32, cute.make_layout(NW), byte_alignment=16)
+        s_amax = smem.allocate_tensor(Float32, cute.make_layout(self.num_warps), byte_alignment=16)
         if lane == 0:
-            red[warp] = bmax
+            s_amax[warp] = tile_amax
         cute.arch.barrier()
-        bmax = red[0]
-        for w in cutlass.range_constexpr(1, NW):
-            bmax = cute.arch.fmax(bmax, red[w])
-        bscale = e8m0_scale(bmax)
-        brcp = exact_rcp(bscale)
+        tile_amax = s_amax[0]
+        for warp_idx in cutlass.range_constexpr(1, self.num_warps):
+            tile_amax = cute.arch.fmax(tile_amax, s_amax[warp_idx])
+        tile_scale = e8m0_scale(tile_amax)
+        tile_rcp = exact_rcp(tile_scale)
         if tidx == 0:
-            st = cute.make_tensor(gptr(mST.iterator, Int64(bk) * Int64(nmb) + Int64(bm), 4, Float32, 4), cute.make_layout(1))
-            st[0] = bscale
+            scale_t_tile = cute.make_tensor(global_ptr(mST.iterator, Int64(k_tile_idx) * Int64(num_m_tiles) + Int64(m_tile_idx), 4, Float32, 4), cute.make_layout(1))
+            scale_t_tile[0] = tile_scale
+        return tile_rcp
 
+    @cute.jit
+    def store_transposed(self, x_words: cute.Tensor, tile_rcp: Float32, q_bytes: cute.Tensor, mQT: cute.Tensor, sub_block: SubBlock) -> None:
+        """
+        Quantize the register block by the tile scale into blk_t, each column's rows as one vector.
+        """
+        row0, col0, M, K = sub_block.row0, sub_block.col0, sub_block.M, sub_block.K
+        VEC_M = self.vec_m
+        q_words = cute.recast_tensor(q_bytes, Uint32)
         if row0 < M:
-            for h in cutlass.range_constexpr(2):
-                for e in cutlass.range_constexpr(8):
-                    c = col_base + h * 64 + e
-                    if c < K:
-                        for g in cutlass.range_constexpr(R // 4):
-                            qw[g] = self.quant4(xw, [(4 * g + k) * 16 + h * 8 + e for k in range(4)], brcp)
-                        for p in cutlass.range_constexpr(R // VM):
-                            r = row0 + p * VM
-                            if r < M:
-                                off = Int64(c) * Int64(M) + Int64(r)
-                                dst = cute.make_tensor(gptr(mQT.iterator, off, 1, Uint8, VM), cute.make_layout(VM))
-                                src = cute.make_tensor(qb.iterator + p * VM, cute.make_layout(VM))
+            for half in cutlass.range_constexpr(2):
+                for col_in_half in cutlass.range_constexpr(8):
+                    col = col0 + half * 64 + col_in_half
+                    if col < K:
+                        for quad in cutlass.range_constexpr(self.rows // 4):
+                            q_words[quad] = self.quantize4(x_words, [(4 * quad + k) * 16 + half * 8 + col_in_half for k in range(4)], tile_rcp)
+                        for vec_idx in cutlass.range_constexpr(self.rows // VEC_M):
+                            row = row0 + vec_idx * VEC_M
+                            if row < M:
+                                offset = Int64(col) * Int64(M) + Int64(row)
+                                dst = cute.make_tensor(global_ptr(mQT.iterator, offset, 1, Uint8, VEC_M), cute.make_layout(VEC_M))
+                                src = cute.make_tensor(q_bytes.iterator + vec_idx * VEC_M, cute.make_layout(VEC_M))
                                 cute.autovec_copy(src, dst)
 
-    def quant4(self, xw: cute.Tensor, elems: list, rcp: Float32) -> Uint32:
+    def quantize4(self, x_words: cute.Tensor, elems: list, rcp: Float32) -> Uint32:
         """
         Quantize the 4 register-block elements at flat indices elems.
         """
-        epw = 32 // self.dtype.width
-        words: list = []
-        sel: list = []
-        for n in elems:
-            w = n // epw
-            if w not in words:
-                words.append(w)
-            sel.append((words.index(w), n % epw))
-        return q4([xw[w] for w in words], sel, self.kind, rcp)
+        word_idxs: list = []
+        elem_picks: list = []
+        for elem_idx in elems:
+            word_idx = elem_idx // self.elems_per_word
+            if word_idx not in word_idxs:
+                word_idxs.append(word_idx)
+            elem_picks.append((word_idxs.index(word_idx), elem_idx % self.elems_per_word))
+        return quantize4_words([x_words[word_idx] for word_idx in word_idxs], elem_picks, self.kind, rcp)
 
 
 COMPILED: dict[tuple, Callable] = {}
 
 
-def vec(n: int, cap: int) -> int:
-    v = cap
-    while n % v:
-        v //= 2
-    return v
+def vector_width(size: int, max_width: int) -> int:
+    """
+    The largest power-of-2 width up to max_width (a power of 2) that divides size.
+    """
+    width = max_width
+    while size % width:
+        width //= 2
+    return width
 
 
 def compile_kernel(dtype: type, vec_k: int, vec_m: int, rows: int) -> Callable:
-    m_sym, k_sym, kb_sym, mb_sym = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
-    esize = dtype.width // 8
-    fake = cute.runtime.make_fake_tensor
-    x = fake(dtype, (m_sym, k_sym), stride=(cute.sym_int64(divisibility=vec_k), 1), assumed_align=vec_k * esize)
-    q = fake(cutlass.Float8E4M3FN, (m_sym, k_sym), stride=(k_sym, 1), assumed_align=16)
-    s = fake(Float32, (m_sym, kb_sym), stride=(1, cute.sym_int64()), assumed_align=16)
-    qt = fake(cutlass.Float8E4M3FN, (k_sym, m_sym), stride=(m_sym, 1), assumed_align=16)
-    st = fake(Float32, (kb_sym, mb_sym), stride=(mb_sym, 1), assumed_align=16)
-    return cute.compile(RowwiseBlockwiseTranspose(dtype, vec_k, vec_m, rows), x, q, s, qt, st, fake_stream(), options="--enable-tvm-ffi")
+    m_sym, k_sym, num_k_tiles_sym, num_m_tiles_sym = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
+    elem_bytes = dtype.width // 8
+    make_fake = cute.runtime.make_fake_tensor
+    x = make_fake(dtype, (m_sym, k_sym), stride=(cute.sym_int64(divisibility=vec_k), 1), assumed_align=vec_k * elem_bytes)
+    tok = make_fake(cutlass.Float8E4M3FN, (m_sym, k_sym), stride=(k_sym, 1), assumed_align=16)
+    tok_scale = make_fake(Float32, (m_sym, num_k_tiles_sym), stride=(1, cute.sym_int64()), assumed_align=16)
+    blk_t = make_fake(cutlass.Float8E4M3FN, (k_sym, m_sym), stride=(m_sym, 1), assumed_align=16)
+    blk_t_scale = make_fake(Float32, (num_k_tiles_sym, num_m_tiles_sym), stride=(num_m_tiles_sym, 1), assumed_align=16)
+    return cute.compile(RowwiseBlockwiseTranspose(dtype, vec_k, vec_m, rows), x, tok, tok_scale, blk_t, blk_t_scale, fake_stream(), options="--enable-tvm-ffi")
 
 
 DISPATCH: dict[tuple, tuple] = {}
 
 
-def resolve(dtype: torch.dtype, M: int, K: int, sx: int, ptr: int) -> tuple:
+def resolve(dtype: torch.dtype, M: int, K: int, x_row_stride: int, x_addr: int) -> tuple:
     """
     (compiled kernel or None for an empty input, ceil(K/128), ceil(M/128)).
     """
-    nkb, nmb = (K + BLOCK - 1) // BLOCK, (M + BLOCK - 1) // BLOCK
+    num_k_tiles, num_m_tiles = (K + BLOCK - 1) // BLOCK, (M + BLOCK - 1) // BLOCK
     if M == 0 or K == 0:
-        return None, nkb, nmb
-    esize = dtype.itemsize
-    vec_k = vec(K, min(16 // esize, 8))
-    vec_k = vec(sx, vec_k)
-    vec_k = vec(ptr // esize, vec_k)
+        return None, num_k_tiles, num_m_tiles
+    elem_bytes = dtype.itemsize
+    vec_k = vector_width(K, min(16 // elem_bytes, 8))
+    vec_k = vector_width(x_row_stride, vec_k)
+    vec_k = vector_width(x_addr // elem_bytes, vec_k)
     # 128 threads x 8 rows wins once the grid fills the GPU (fewer, fuller stores); a small grid
     # is latency-bound, so split each tile over 256 threads x 4 rows.
-    rows = 4 if nmb * nkb <= SMALL_GRID_TILES else 8
-    vec_m = vec(M, rows)
-    ckey = (dtype, vec_k, vec_m, rows)
-    fn = COMPILED.get(ckey)
+    rows = 4 if num_m_tiles * num_k_tiles <= SMALL_GRID_TILES else 8
+    vec_m = vector_width(M, rows)
+    key = (dtype, vec_k, vec_m, rows)
+    fn = COMPILED.get(key)
     if fn is None:
-        fn = COMPILED[ckey] = compile_kernel(TORCH2CUTE[dtype], vec_k, vec_m, rows)
+        fn = COMPILED[key] = compile_kernel(TORCH2CUTE[dtype], vec_k, vec_m, rows)
     if len(DISPATCH) > 4096:
         DISPATCH.clear()
-    return fn, nkb, nmb
+    return fn, num_k_tiles, num_m_tiles
 
 
 def fp8cast_rowwise_blockwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -293,22 +346,22 @@ def fp8cast_rowwise_blockwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Ten
     """
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     M, K = x.shape
-    sx, sk = x.stride()
-    if sk != 1:
+    x_row_stride, x_col_stride = x.stride()
+    if x_col_stride != 1:
         # as_strided pins the unit inner stride that torch leaves arbitrary when K == 1.
         x = x.contiguous().as_strided((M, K), (K, 1))
-        sx = K
+        x_row_stride = K
     dtype = x.dtype
     # Host cost matters (hundreds of calls per step): resolve once per (dtype, shape, row stride, pointer alignment).
-    key = (dtype, M, K, sx, x.data_ptr() & 15)
+    key = (dtype, M, K, x_row_stride, x.data_ptr() & 15)
     entry = DISPATCH.get(key)
     if entry is None:
-        entry = DISPATCH[key] = resolve(dtype, M, K, sx, x.data_ptr())
-    fn, nkb, nmb = entry
-    dev = x.device
-    out_tok = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=dev)
-    scale_tok = mn_major_scale(M, nkb, dev)
-    out_blk_t, scale_blk_t = torch.empty((K, M), dtype=torch.float8_e4m3fn, device=dev), torch.empty((nkb, nmb), dtype=torch.float32, device=dev)
+        entry = DISPATCH[key] = resolve(dtype, M, K, x_row_stride, x.data_ptr())
+    fn, num_k_tiles, num_m_tiles = entry
+    device = x.device
+    out_tok = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=device)
+    scale_tok = mn_major_scale(M, num_k_tiles, device)
+    out_blk_t, scale_blk_t = torch.empty((K, M), dtype=torch.float8_e4m3fn, device=device), torch.empty((num_k_tiles, num_m_tiles), dtype=torch.float32, device=device)
     if fn is not None:
         fn(x, out_tok, scale_tok, out_blk_t, scale_blk_t)
     return out_tok, scale_tok, out_blk_t, scale_blk_t

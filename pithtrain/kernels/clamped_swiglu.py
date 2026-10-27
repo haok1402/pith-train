@@ -1,7 +1,7 @@
 """
-gpt-oss's clamped SwiGLU, (uc + 1) * gc * sigmoid(alpha * gc) with gc = min(gate, limit) and uc =
-clamp(up, -limit, limit), forward and backward Triton kernels over an interleaved gate_up (M, 2N).
-Both architectures run them.
+gpt-oss's clamped SwiGLU, (up_clamped + 1) * gate_clamped * sigmoid(alpha * gate_clamped) with
+gate_clamped = min(gate, limit) and up_clamped = clamp(up, -limit, limit), forward and backward
+Triton kernels over an interleaved gate_up (M, 2N). Both architectures run them.
 """
 
 from __future__ import annotations
@@ -14,45 +14,45 @@ __all__ = ["BLOCK_SIZE", "clamped_swiglu_bwd", "clamped_swiglu_fwd"]
 
 
 @triton.jit
-def clamped_swiglu_fwd_kernel(gate_up_ptr, out_ptr, n_elements, alpha, limit, BLOCK_SIZE: tl.constexpr):
-    # offs indexes the flat (M, N) output; gate is at 2 * offs and up at 2 * offs + 1.
+def clamped_swiglu_fwd_kernel(gate_up_ptr, out_ptr, num_elements, alpha, limit, BLOCK_SIZE: tl.constexpr):
+    # elem_offs indexes the flat (M, N) output; gate is at 2 * elem_offs and up at 2 * elem_offs + 1.
     block_start = tl.program_id(0).to(tl.int64) * BLOCK_SIZE
-    offs = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offs < n_elements
+    elem_offs = block_start + tl.arange(0, BLOCK_SIZE)
+    elem_mask = elem_offs < num_elements
 
-    gate, up = tl.load(gate_up_ptr + 2 * offs, mask=mask), tl.load(gate_up_ptr + 2 * offs + 1, mask=mask)
-    g, u = gate.to(tl.float32), up.to(tl.float32)
-    gc, uc = tl.minimum(g, limit), tl.minimum(tl.maximum(u, -limit), limit)
+    gate, up = tl.load(gate_up_ptr + 2 * elem_offs, mask=elem_mask), tl.load(gate_up_ptr + 2 * elem_offs + 1, mask=elem_mask)
+    gate_f32, up_f32 = gate.to(tl.float32), up.to(tl.float32)
+    gate_clamped, up_clamped = tl.minimum(gate_f32, limit), tl.minimum(tl.maximum(up_f32, -limit), limit)
 
-    sig = tl.sigmoid(alpha * gc)
-    glu = gc * sig
-    out = (uc + 1.0) * glu
+    gate_sigmoid = tl.sigmoid(alpha * gate_clamped)
+    activated_gate = gate_clamped * gate_sigmoid
+    out = (up_clamped + 1.0) * activated_gate
 
-    tl.store(out_ptr + offs, out.to(gate.dtype), mask=mask)
+    tl.store(out_ptr + elem_offs, out.to(gate.dtype), mask=elem_mask)
 
 
 @triton.jit
-def clamped_swiglu_bwd_kernel(grad_out_ptr, gate_up_ptr, grad_gate_up_ptr, n_elements, alpha, limit, BLOCK_SIZE: tl.constexpr):
+def clamped_swiglu_bwd_kernel(grad_out_ptr, gate_up_ptr, grad_gate_up_ptr, num_elements, alpha, limit, BLOCK_SIZE: tl.constexpr):
     # A saturated clamp passes no gradient; the boundary itself does, as torch.clamp.
     block_start = tl.program_id(0).to(tl.int64) * BLOCK_SIZE
-    offs = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offs < n_elements
+    elem_offs = block_start + tl.arange(0, BLOCK_SIZE)
+    elem_mask = elem_offs < num_elements
 
-    do, gate, up = tl.load(grad_out_ptr + offs, mask=mask), tl.load(gate_up_ptr + 2 * offs, mask=mask), tl.load(gate_up_ptr + 2 * offs + 1, mask=mask)
-    do_f, g, u = do.to(tl.float32), gate.to(tl.float32), up.to(tl.float32)
-    gc, uc = tl.minimum(g, limit), tl.minimum(tl.maximum(u, -limit), limit)
+    grad_out, gate, up = tl.load(grad_out_ptr + elem_offs, mask=elem_mask), tl.load(gate_up_ptr + 2 * elem_offs, mask=elem_mask), tl.load(gate_up_ptr + 2 * elem_offs + 1, mask=elem_mask)
+    grad_out_f32, gate_f32, up_f32 = grad_out.to(tl.float32), gate.to(tl.float32), up.to(tl.float32)
+    gate_clamped, up_clamped = tl.minimum(gate_f32, limit), tl.minimum(tl.maximum(up_f32, -limit), limit)
 
-    sig = tl.sigmoid(alpha * gc)
-    glu = gc * sig
+    gate_sigmoid = tl.sigmoid(alpha * gate_clamped)
+    activated_gate = gate_clamped * gate_sigmoid
 
-    grad_uc, grad_gc = do_f * glu, do_f * (uc + 1.0) * sig * (1.0 + alpha * gc * (1.0 - sig))
+    grad_up_clamped, grad_gate_clamped = grad_out_f32 * activated_gate, grad_out_f32 * (up_clamped + 1.0) * gate_sigmoid * (1.0 + alpha * gate_clamped * (1.0 - gate_sigmoid))
 
-    g_active = g <= limit
-    u_active = (u >= -limit) & (u <= limit)
-    grad_g, grad_u = tl.where(g_active, grad_gc, 0.0), tl.where(u_active, grad_uc, 0.0)
+    is_gate_unclamped = gate_f32 <= limit
+    is_up_unclamped = (up_f32 >= -limit) & (up_f32 <= limit)
+    grad_gate, grad_up = tl.where(is_gate_unclamped, grad_gate_clamped, 0.0), tl.where(is_up_unclamped, grad_up_clamped, 0.0)
 
-    tl.store(grad_gate_up_ptr + 2 * offs, grad_g.to(gate.dtype), mask=mask)
-    tl.store(grad_gate_up_ptr + 2 * offs + 1, grad_u.to(up.dtype), mask=mask)
+    tl.store(grad_gate_up_ptr + 2 * elem_offs, grad_gate.to(gate.dtype), mask=elem_mask)
+    tl.store(grad_gate_up_ptr + 2 * elem_offs + 1, grad_up.to(up.dtype), mask=elem_mask)
 
 
 BLOCK_SIZE = 1024
@@ -60,9 +60,9 @@ BLOCK_SIZE = 1024
 
 def clamped_swiglu_fwd(gate_up: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
     """
-    Clamped SwiGLU of an interleaved gate_up: a new contiguous (M, N) tensor in gate_up's dtype, (uc
-    + 1) * gc * sigmoid(alpha * gc) with gate = gate_up[:, 0::2], up = gate_up[:, 1::2], gc =
-    min(gate, limit), uc = clamp(up, -limit, limit).
+    Clamped SwiGLU of an interleaved gate_up: a new contiguous (M, N) tensor in gate_up's dtype,
+    (up_clamped + 1) * gate_clamped * sigmoid(alpha * gate_clamped) with gate = gate_up[:, 0::2], up
+    = gate_up[:, 1::2], gate_clamped = min(gate, limit), up_clamped = clamp(up, -limit, limit).
 
     gate_up is contiguous (M, 2N), bf16 (any float dtype). alpha and limit are Python floats
     (gpt-oss: 1.702, 7.0). Computed in fp32 and rounded once to the input dtype. Deterministic.
@@ -75,12 +75,12 @@ def clamped_swiglu_fwd(gate_up: torch.Tensor, alpha: float, limit: float) -> tor
     N = two_n // 2
     out = torch.empty((M, N), device=gate_up.device, dtype=gate_up.dtype)
 
-    n = M * N
-    if n == 0:
+    num_elements = M * N
+    if num_elements == 0:
         return out
 
-    grid = (triton.cdiv(n, BLOCK_SIZE),)
-    clamped_swiglu_fwd_kernel[grid](gate_up, out, n, float(alpha), float(limit), BLOCK_SIZE=BLOCK_SIZE)
+    grid = (triton.cdiv(num_elements, BLOCK_SIZE),)
+    clamped_swiglu_fwd_kernel[grid](gate_up, out, num_elements, float(alpha), float(limit), BLOCK_SIZE=BLOCK_SIZE)
     return out
 
 
@@ -100,10 +100,10 @@ def clamped_swiglu_bwd(grad_output: torch.Tensor, gate_up: torch.Tensor, alpha: 
     assert grad_output.is_contiguous(), "grad_output must be contiguous"
 
     grad_gate_up = torch.empty_like(gate_up)
-    n = grad_output.numel()
-    if n == 0:
+    num_elements = grad_output.numel()
+    if num_elements == 0:
         return grad_gate_up
 
-    grid = (triton.cdiv(n, BLOCK_SIZE),)
-    clamped_swiglu_bwd_kernel[grid](grad_output, gate_up, grad_gate_up, n, float(alpha), float(limit), BLOCK_SIZE=BLOCK_SIZE)
+    grid = (triton.cdiv(num_elements, BLOCK_SIZE),)
+    clamped_swiglu_bwd_kernel[grid](grad_output, gate_up, grad_gate_up, num_elements, float(alpha), float(limit), BLOCK_SIZE=BLOCK_SIZE)
     return grad_gate_up

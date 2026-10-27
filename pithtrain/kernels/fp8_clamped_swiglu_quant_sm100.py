@@ -7,7 +7,7 @@ gradient). Scales are row-major; kmajor_channels is ignored.
 import torch
 
 from pithtrain.kernels.clamped_swiglu import clamped_swiglu_bwd, clamped_swiglu_fwd
-from pithtrain.kernels.fp8_rowwise_kmajor_sm100 import fp8cast_rowwise_kmajor_sm100
+from pithtrain.kernels.fp8_rowwise_kmajor_sm100 import fp8cast_rowwise_kmajor_sm100, kmajor_empty_outputs
 from pithtrain.kernels.segment_sum import block_segment_sum
 
 __all__ = ["biased_gate_up", "clamped_swiglu_bwd_biased", "clamped_swiglu_bwd_quant_sm100", "clamped_swiglu_quant_fwd_sm100", "clamped_swiglu_quant_kmajor_sm100", "clamped_swiglu_quant_rowwise_sm100"]
@@ -15,17 +15,21 @@ __all__ = ["biased_gate_up", "clamped_swiglu_bwd_biased", "clamped_swiglu_bwd_qu
 BLOCK = 128
 
 
-def group_ids(grouped_mm_offs: torch.Tensor, M: int) -> torch.Tensor:
-    ids = torch.arange(M, device=grouped_mm_offs.device, dtype=torch.int64)
-    offs = grouped_mm_offs.to(torch.int64)
-    return torch.searchsorted(offs, ids, right=True).clamp_(max=offs.shape[0] - 1)
+def find_row_groups(grouped_mm_offs: torch.Tensor, M: int) -> torch.Tensor:
+    """
+    The group of each of the M rows, int64 (M,); rows past the last group end count to
+    the last group.
+    """
+    row_idx = torch.arange(M, device=grouped_mm_offs.device, dtype=torch.int64)
+    group_ends = grouped_mm_offs.to(torch.int64)
+    return torch.searchsorted(group_ends, row_idx, right=True).clamp_(max=group_ends.shape[0] - 1)
 
 
 def biased_gate_up(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor) -> torch.Tensor:
     """
     gate_up + bias[group of each row].
     """
-    return gate_up + bias[group_ids(grouped_mm_offs, gate_up.shape[0])]
+    return gate_up + bias[find_row_groups(grouped_mm_offs, gate_up.shape[0])]
 
 
 def clamped_swiglu_bwd_biased(dh: torch.Tensor, gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
@@ -37,13 +41,6 @@ def clamped_swiglu_bwd_biased(dh: torch.Tensor, gate_up: torch.Tensor, bias: tor
     return clamped_swiglu_bwd(dh.to(x.dtype), x, alpha, limit)
 
 
-def empty(M: int, N: int, device: torch.device) -> tuple[torch.Tensor, ...]:
-    """
-    The four outputs of fp8cast_rowwise_kmajor_sm100 for an empty (M, N) input.
-    """
-    return (torch.empty((M, N), dtype=torch.float8_e4m3fn, device=device), torch.empty((M, (N + BLOCK - 1) // BLOCK), dtype=torch.float32, device=device), torch.empty(M * N, dtype=torch.float8_e4m3fn, device=device), torch.empty((N, M // BLOCK), dtype=torch.float32, device=device))
-
-
 def clamped_swiglu_quant_fwd_sm100(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     fp8cast_rowwise_kmajor_sm100(clamped_swiglu(gate_up + bias[group],
@@ -51,9 +48,9 @@ def clamped_swiglu_quant_fwd_sm100(gate_up: torch.Tensor, bias: torch.Tensor, gr
     """
     M, N = gate_up.shape[0], gate_up.shape[1] // 2
     if M == 0 or N == 0:
-        return empty(M, N, gate_up.device)
-    h = clamped_swiglu_fwd(biased_gate_up(gate_up, bias, grouped_mm_offs), alpha, limit)
-    return fp8cast_rowwise_kmajor_sm100(h, grouped_mm_offs)
+        return kmajor_empty_outputs(M, N, gate_up.device)
+    activation = clamped_swiglu_fwd(biased_gate_up(gate_up, bias, grouped_mm_offs), alpha, limit)
+    return fp8cast_rowwise_kmajor_sm100(activation, grouped_mm_offs)
 
 
 def clamped_swiglu_quant_rowwise_sm100(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -77,7 +74,7 @@ def clamped_swiglu_bwd_quant_sm100(dh: torch.Tensor, gate_up: torch.Tensor, bias
     """
     M, N = gate_up.shape[0], gate_up.shape[1] // 2
     if M == 0 or N == 0:
-        return empty(M, 2 * N, gate_up.device), bias.new_zeros(bias.shape)
-    dgu = clamped_swiglu_bwd_biased(dh, gate_up, bias, grouped_mm_offs, alpha, limit)
-    partials = dgu.float().view(M // BLOCK, BLOCK, 2 * N).sum(1)
-    return fp8cast_rowwise_kmajor_sm100(dgu, grouped_mm_offs), block_segment_sum(partials, grouped_mm_offs, bias.dtype)
+        return kmajor_empty_outputs(M, 2 * N, gate_up.device), bias.new_zeros(bias.shape)
+    grad_gate_up = clamped_swiglu_bwd_biased(dh, gate_up, bias, grouped_mm_offs, alpha, limit)
+    block_sums = grad_gate_up.float().view(M // BLOCK, BLOCK, 2 * N).sum(1)
+    return fp8cast_rowwise_kmajor_sm100(grad_gate_up, grouped_mm_offs), block_segment_sum(block_sums, grouped_mm_offs, bias.dtype)

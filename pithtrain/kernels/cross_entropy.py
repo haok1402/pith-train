@@ -11,51 +11,51 @@ import torch
 import triton
 import triton.language as tl
 
-__all__ = ["cross_entropy_fwd", "cross_entropy_fwd_inplace"]
+__all__ = ["cross_entropy_fwd_inplace"]
 
 
 @triton.jit
-def cross_entropy_fwd(X_ptr, X_stride, Y_ptr, Y_stride, loss_ptr, loss_stride, n_cols, n_non_ignore_ptr, ignore_idx, BLOCK_SIZE: tl.constexpr):
+def cross_entropy_fwd(logits_ptr, logits_row_stride, target_ptr, target_stride, loss_ptr, loss_stride, num_cols, num_non_ignored_ptr, ignore_index, BLOCK_SIZE: tl.constexpr):
     """
-    One program per row: an online softmax over the vocabulary (max m, sum of exp d), then the row
-    is overwritten with (softmax(x) - onehot(y)) / n_non_ignore and its loss stored. An ignored row
-    is zeroed with loss 0.
+    One program per row: an online softmax over the vocabulary (running max row_max, running sum of
+    exp exp_sum), then the row is overwritten with (softmax(x) - onehot(target)) / num_non_ignored
+    and its loss stored. An ignored row is zeroed with loss 0.
     """
-    row = tl.program_id(0).to(tl.int64)
-    X_ptr += row * X_stride
-    y = tl.load(Y_ptr + row * Y_stride)
+    row_idx = tl.program_id(0).to(tl.int64)
+    logits_ptr += row_idx * logits_row_stride
+    target_idx = tl.load(target_ptr + row_idx * target_stride)
 
-    if y == ignore_idx:
-        for i in range(0, n_cols, BLOCK_SIZE):
-            X_offsets = i + tl.arange(0, BLOCK_SIZE)
-            tl.store(X_ptr + X_offsets, 0.0, mask=X_offsets < n_cols)
-        tl.store(loss_ptr + row * loss_stride, 0.0)
+    if target_idx == ignore_index:
+        for col_start in range(0, num_cols, BLOCK_SIZE):
+            col_offs = col_start + tl.arange(0, BLOCK_SIZE)
+            tl.store(logits_ptr + col_offs, 0.0, mask=col_offs < num_cols)
+        tl.store(loss_ptr + row_idx * loss_stride, 0.0)
         return
 
-    n_non_ignore: tl.float32 = tl.load(n_non_ignore_ptr).to(tl.float32)
+    num_non_ignored: tl.float32 = tl.load(num_non_ignored_ptr).to(tl.float32)
 
-    m: tl.float32 = float("-inf")
-    d: tl.float32 = 0.0
-    for i in range(0, n_cols, BLOCK_SIZE):
-        X_offsets = i + tl.arange(0, BLOCK_SIZE)
-        X_block = tl.load(X_ptr + X_offsets, mask=X_offsets < n_cols, other=float("-inf")).to(tl.float32)
-        block_max = tl.max(X_block)
-        m_new = tl.maximum(m, block_max)
-        d = d * tl.exp(m - m_new) + tl.sum(tl.exp(X_block - m_new))
-        m = m_new
+    row_max: tl.float32 = float("-inf")
+    exp_sum: tl.float32 = 0.0
+    for col_start in range(0, num_cols, BLOCK_SIZE):
+        col_offs = col_start + tl.arange(0, BLOCK_SIZE)
+        logits = tl.load(logits_ptr + col_offs, mask=col_offs < num_cols, other=float("-inf")).to(tl.float32)
+        block_max = tl.max(logits)
+        new_row_max = tl.maximum(row_max, block_max)
+        exp_sum = exp_sum * tl.exp(row_max - new_row_max) + tl.sum(tl.exp(logits - new_row_max))
+        row_max = new_row_max
 
-    ori_X_y = tl.load(X_ptr + y).to(tl.float32)
+    target_logit = tl.load(logits_ptr + target_idx).to(tl.float32)
 
-    for i in range(0, n_cols, BLOCK_SIZE):
-        X_offsets = i + tl.arange(0, BLOCK_SIZE)
-        X_block = tl.load(X_ptr + X_offsets, mask=X_offsets < n_cols, other=float("-inf"))
-        grad_dtype = X_block.dtype
-        X_block = (tl.exp(X_block.to(tl.float32) - m) / d) / n_non_ignore
-        X_block = tl.where(X_offsets == y, X_block - 1.0 / n_non_ignore, X_block)
-        tl.store(X_ptr + X_offsets, X_block.to(grad_dtype), mask=X_offsets < n_cols)
+    for col_start in range(0, num_cols, BLOCK_SIZE):
+        col_offs = col_start + tl.arange(0, BLOCK_SIZE)
+        logits = tl.load(logits_ptr + col_offs, mask=col_offs < num_cols, other=float("-inf"))
+        grad_dtype = logits.dtype
+        grad_logits = (tl.exp(logits.to(tl.float32) - row_max) / exp_sum) / num_non_ignored
+        grad_logits = tl.where(col_offs == target_idx, grad_logits - 1.0 / num_non_ignored, grad_logits)
+        tl.store(logits_ptr + col_offs, grad_logits.to(grad_dtype), mask=col_offs < num_cols)
 
-    loss = -(ori_X_y - m - tl.log(d))
-    tl.store(loss_ptr + row * loss_stride, loss)
+    loss = -(target_logit - row_max - tl.log(exp_sum))
+    tl.store(loss_ptr + row_idx * loss_stride, loss)
 
 
 def cross_entropy_fwd_inplace(inp: torch.Tensor, target: torch.Tensor, ignore_index: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -73,20 +73,20 @@ def cross_entropy_fwd_inplace(inp: torch.Tensor, target: torch.Tensor, ignore_in
     Matches F.cross_entropy(inp.float(), target, ignore_index=ignore_index) and its gradient to
     fp32 rounding; deterministic.
     """
-    n_rows, n_cols = inp.shape
+    num_rows, num_cols = inp.shape
 
-    if inp.stride(-1) != 1 or inp.stride(-2) != n_cols:
+    if inp.stride(-1) != 1 or inp.stride(-2) != num_cols:
         inp = inp.contiguous()
     if target.stride(-1) != 1:
         target = target.contiguous()
 
-    n_non_ignore = (target != ignore_index).sum(dtype=torch.int64).view(1)
-    n_non_ignore.clamp_(min=1)
+    num_non_ignored = (target != ignore_index).sum(dtype=torch.int64).view(1)
+    num_non_ignored.clamp_(min=1)
 
-    loss_1d = torch.zeros(n_rows, dtype=torch.float32, device=inp.device)
-    BLOCK_SIZE = min(65536 // 2, triton.next_power_of_2(n_cols))
+    row_loss = torch.zeros(num_rows, dtype=torch.float32, device=inp.device)
+    BLOCK_SIZE = min(65536 // 2, triton.next_power_of_2(num_cols))
 
-    cross_entropy_fwd[(n_rows,)](X_ptr=inp, X_stride=inp.stride(-2), Y_ptr=target, Y_stride=target.stride(-1), loss_ptr=loss_1d, loss_stride=loss_1d.stride(-1), n_cols=n_cols, n_non_ignore_ptr=n_non_ignore, ignore_idx=ignore_index, BLOCK_SIZE=BLOCK_SIZE, num_warps=32)
+    cross_entropy_fwd[(num_rows,)](logits_ptr=inp, logits_row_stride=inp.stride(-2), target_ptr=target, target_stride=target.stride(-1), loss_ptr=row_loss, loss_stride=row_loss.stride(-1), num_cols=num_cols, num_non_ignored_ptr=num_non_ignored, ignore_index=ignore_index, BLOCK_SIZE=BLOCK_SIZE, num_warps=32)
 
-    loss = loss_1d.sum() / n_non_ignore.float().squeeze()
+    loss = row_loss.sum() / num_non_ignored.float().squeeze()
     return loss, inp

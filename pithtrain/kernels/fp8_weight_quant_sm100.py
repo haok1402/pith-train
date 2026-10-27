@@ -26,31 +26,31 @@ def fp8cast_blockwise_transpose_kernel(x_ptr, out_ptr, scale_ptr, out_t_ptr, sca
     row_start, col_start = pid_row * BLOCK, pid_col * BLOCK
     row_offs, col_offs = row_start + tl.arange(0, BLOCK), col_start + tl.arange(0, BLOCK)
 
-    ptrs = x_ptr + row_offs[:, None] * stride_x_row + col_offs[None, :] * stride_x_col
-    mask = (row_offs[:, None] < M) & (col_offs[None, :] < K)
-    x_bf16 = tl.load(ptrs, mask=mask, other=0.0)
+    x_ptrs = x_ptr + row_offs[:, None] * stride_x_row + col_offs[None, :] * stride_x_col
+    tile_mask = (row_offs[:, None] < M) & (col_offs[None, :] < K)
+    x_bf16 = tl.load(x_ptrs, mask=tile_mask, other=0.0)
 
-    abs_bf16 = tl.abs(x_bf16)
-    row_max = tl.max(abs_bf16, axis=1)
-    block_amax = tl.max(row_max, axis=0)
+    x_abs = tl.abs(x_bf16)
+    row_amax = tl.max(x_abs, axis=1)
+    block_amax = tl.max(row_amax, axis=0)
 
-    scale_val, rcp_val = compute_fp8_scale(block_amax, NATIVE_E8M0)
+    scale, rcp = compute_fp8_scale(block_amax, NATIVE_E8M0)
 
     x_f32 = x_bf16.to(tl.float32)
-    fp8_tile = (x_f32 * rcp_val).to(tl.float8e4nv)
+    fp8_tile = (x_f32 * rcp).to(tl.float8e4nv)
 
     out_ptrs = out_ptr + row_offs[:, None] * stride_out_row + col_offs[None, :]
-    tl.store(out_ptrs, fp8_tile, mask=mask)
+    tl.store(out_ptrs, fp8_tile, mask=tile_mask)
 
     # tl.trans miscompiles fp8 tiles: store the same tile to swapped-index addresses instead.
     out_t_ptrs = out_t_ptr + col_offs[None, :] * stride_out_t_row + row_offs[:, None]
-    tl.store(out_t_ptrs, fp8_tile, mask=mask)
+    tl.store(out_t_ptrs, fp8_tile, mask=tile_mask)
 
     scale_offset = pid_row * scale_cols + pid_col
-    tl.store(scale_ptr + scale_offset, scale_val)
+    tl.store(scale_ptr + scale_offset, scale)
 
     scale_t_offset = pid_col * scale_t_cols + pid_row
-    tl.store(scale_t_ptr + scale_t_offset, scale_val)
+    tl.store(scale_t_ptr + scale_t_offset, scale)
 
 
 def fp8cast_blockwise_transpose_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -85,34 +85,34 @@ def fp8cast_blockwise_transpose_batched_kernel(x_ptr, out_ptr, scale_ptr, out_t_
     row_start, col_start = pid_row * BLOCK, pid_col * BLOCK
     row_offs, col_offs = row_start + tl.arange(0, BLOCK), col_start + tl.arange(0, BLOCK)
 
-    base = x_ptr + pid_g * stride_x_g
-    ptrs = base + row_offs[:, None] * stride_x_row + col_offs[None, :] * stride_x_col
-    mask = (row_offs[:, None] < N) & (col_offs[None, :] < K)
-    x_bf16 = tl.load(ptrs, mask=mask, other=0.0)
+    x_base = x_ptr + pid_g * stride_x_g
+    x_ptrs = x_base + row_offs[:, None] * stride_x_row + col_offs[None, :] * stride_x_col
+    tile_mask = (row_offs[:, None] < N) & (col_offs[None, :] < K)
+    x_bf16 = tl.load(x_ptrs, mask=tile_mask, other=0.0)
 
-    abs_bf16 = tl.abs(x_bf16)
-    row_max = tl.max(abs_bf16, axis=1)
-    block_amax = tl.max(row_max, axis=0)
+    x_abs = tl.abs(x_bf16)
+    row_amax = tl.max(x_abs, axis=1)
+    block_amax = tl.max(row_amax, axis=0)
 
-    scale_val, rcp_val = compute_fp8_scale(block_amax, NATIVE_E8M0)
+    scale, rcp = compute_fp8_scale(block_amax, NATIVE_E8M0)
 
     x_f32 = x_bf16.to(tl.float32)
-    fp8_tile = (x_f32 * rcp_val).to(tl.float8e4nv)
+    fp8_tile = (x_f32 * rcp).to(tl.float8e4nv)
 
     out_base = out_ptr + pid_g * stride_out_g
     out_ptrs = out_base + row_offs[:, None] * stride_out_row + col_offs[None, :]
-    tl.store(out_ptrs, fp8_tile, mask=mask)
+    tl.store(out_ptrs, fp8_tile, mask=tile_mask)
 
     # tl.trans miscompiles fp8 tiles: store the same tile to swapped-index addresses instead.
     out_t_base = out_t_ptr + pid_g * stride_out_t_g
     out_t_ptrs = out_t_base + col_offs[None, :] * stride_out_t_row + row_offs[:, None]
-    tl.store(out_t_ptrs, fp8_tile, mask=mask)
+    tl.store(out_t_ptrs, fp8_tile, mask=tile_mask)
 
     scale_offset = pid_g * stride_scale_g + pid_row * scale_cols + pid_col
-    tl.store(scale_ptr + scale_offset, scale_val)
+    tl.store(scale_ptr + scale_offset, scale)
 
     scale_t_offset = pid_g * stride_scale_t_g + pid_col * scale_t_cols + pid_row
-    tl.store(scale_t_ptr + scale_t_offset, scale_val)
+    tl.store(scale_t_ptr + scale_t_offset, scale)
 
 
 def fp8cast_blockwise_transpose_batched_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -140,47 +140,49 @@ BLOCK = 128
 
 
 @triton.jit
-def fp8_shard_tile_kernel(x_ptr, amax_ptr, out_ptr, row_offset, local_rows, K, tile_row_start, amax_g_offset, amax_stride_g, amax_cols, CAST: tl.constexpr, NATIVE_E8M0: tl.constexpr):
+def fp8_shard_tile_kernel(x_ptr, amax_ptr, out_ptr, row_offset, local_rows, K, tile_row_start, amax_group_offset, amax_stride_g, amax_cols, CAST: tl.constexpr, NATIVE_E8M0: tl.constexpr):
     """
-    One 128x128 tile (global rows [tr * 128, tr * 128 + 128) of local expert pid(2)) of a row shard
-    holding global rows [row_offset, row_offset + local_rows). CAST False writes the amax of the
-    shard's rows in the tile to the grid; CAST True casts them with the reduced grid.
+    One 128x128 tile (global rows [tile_row_idx * 128, tile_row_idx * 128 + 128) of local
+    expert pid(2)) of a row shard holding global rows [row_offset, row_offset + local_rows).
+    CAST False writes the amax of the shard's rows in the tile to the grid; CAST True casts
+    them with the reduced grid.
     """
     BLOCK: tl.constexpr = 128
     pid_row, pid_col, pid_g = tl.program_id(0), tl.program_id(1), tl.program_id(2)
 
-    tr = tile_row_start + pid_row
-    rows = tr * BLOCK + tl.arange(0, BLOCK) - row_offset
-    cols = pid_col * BLOCK + tl.arange(0, BLOCK)
-    mask = (rows[:, None] >= 0) & (rows[:, None] < local_rows) & (cols[None, :] < K)
-    offs = pid_g.to(tl.int64) * local_rows * K + rows[:, None] * K + cols[None, :]
+    tile_row_idx = tile_row_start + pid_row
+    row_offs = tile_row_idx * BLOCK + tl.arange(0, BLOCK) - row_offset
+    col_offs = pid_col * BLOCK + tl.arange(0, BLOCK)
+    tile_mask = (row_offs[:, None] >= 0) & (row_offs[:, None] < local_rows) & (col_offs[None, :] < K)
+    x_offs = pid_g.to(tl.int64) * local_rows * K + row_offs[:, None] * K + col_offs[None, :]
     # Round to bf16 first, as FSDP's mixed-precision cast does.
-    x_bf16 = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.bfloat16)
+    x_bf16 = tl.load(x_ptr + x_offs, mask=tile_mask, other=0.0).to(tl.bfloat16)
 
-    amax_offs = (amax_g_offset + pid_g) * amax_stride_g + tr * amax_cols + pid_col
+    amax_offset = (amax_group_offset + pid_g) * amax_stride_g + tile_row_idx * amax_cols + pid_col
     if CAST:
-        amax = tl.load(amax_ptr + amax_offs)
+        amax = tl.load(amax_ptr + amax_offset)
         _, rcp = compute_fp8_scale(amax, NATIVE_E8M0)
-        fp8 = (x_bf16.to(tl.float32) * rcp).to(tl.float8e4nv)
-        tl.store(out_ptr + offs, fp8, mask=mask)
+        x_fp8 = (x_bf16.to(tl.float32) * rcp).to(tl.float8e4nv)
+        tl.store(out_ptr + x_offs, x_fp8, mask=tile_mask)
     else:
         amax = tl.max(tl.max(tl.abs(x_bf16), axis=1), axis=0)
-        tl.store(amax_ptr + amax_offs, amax.to(tl.float32))
+        tl.store(amax_ptr + amax_offset, amax.to(tl.float32))
 
 
 @triton.jit
-def fp8_scale_kernel(amax_ptr, scale_ptr, scale_t_ptr, R, C, NATIVE_E8M0: tl.constexpr):
+def fp8_scale_kernel(amax_ptr, scale_ptr, scale_t_ptr, num_rows, num_cols, NATIVE_E8M0: tl.constexpr):
     """
-    Scales of the (R, C) amax grid of group pid(1), written as (R, C) and transposed as (C, R).
+    Scales of the (num_rows, num_cols) amax grid of group pid(1), written as (num_rows, num_cols)
+    and transposed as (num_cols, num_rows).
     """
-    offs = tl.program_id(0) * 1024 + tl.arange(0, 1024)
-    g = tl.program_id(1)
-    mask = offs < R * C
-    amax = tl.load(amax_ptr + g * R * C + offs, mask=mask, other=0.0)
+    elem_offs = tl.program_id(0) * 1024 + tl.arange(0, 1024)
+    group_idx = tl.program_id(1)
+    elem_mask = elem_offs < num_rows * num_cols
+    amax = tl.load(amax_ptr + group_idx * num_rows * num_cols + elem_offs, mask=elem_mask, other=0.0)
     scale, _ = compute_fp8_scale(amax, NATIVE_E8M0)
-    tl.store(scale_ptr + g * R * C + offs, scale, mask=mask)
-    r, c = offs // C, offs % C
-    tl.store(scale_t_ptr + g * R * C + c * R + r, scale, mask=mask)
+    tl.store(scale_ptr + group_idx * num_rows * num_cols + elem_offs, scale, mask=elem_mask)
+    row_idx, col_idx = elem_offs // num_cols, elem_offs % num_cols
+    tl.store(scale_t_ptr + group_idx * num_rows * num_cols + col_idx * num_rows + row_idx, scale, mask=elem_mask)
 
 
 @triton.jit
@@ -190,21 +192,25 @@ def fp8_pack_transpose_kernel(x_ptr, out_ptr, out_t_ptr, N, K):
     """
     BLOCK: tl.constexpr = 128
     pid_row, pid_col, pid_g = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    rows, cols = pid_row * BLOCK + tl.arange(0, BLOCK), pid_col * BLOCK + tl.arange(0, BLOCK)
-    mask = (rows[:, None] < N) & (cols[None, :] < K)
-    base = pid_g.to(tl.int64) * N * K
-    tile = tl.load(x_ptr + base + rows[:, None] * K + cols[None, :], mask=mask)
-    tl.store(out_ptr + base + rows[:, None] * K + cols[None, :], tile, mask=mask)
+    row_offs, col_offs = pid_row * BLOCK + tl.arange(0, BLOCK), pid_col * BLOCK + tl.arange(0, BLOCK)
+    tile_mask = (row_offs[:, None] < N) & (col_offs[None, :] < K)
+    group_base = pid_g.to(tl.int64) * N * K
+    tile = tl.load(x_ptr + group_base + row_offs[:, None] * K + col_offs[None, :], mask=tile_mask)
+    tl.store(out_ptr + group_base + row_offs[:, None] * K + col_offs[None, :], tile, mask=tile_mask)
     # Swapped-index store, since tl.trans miscompiles fp8 tiles.
-    tl.store(out_t_ptr + base + cols[None, :] * N + rows[:, None], tile, mask=mask)
+    tl.store(out_t_ptr + group_base + col_offs[None, :] * N + row_offs[:, None], tile, mask=tile_mask)
 
 
 def shard_tiles(shard: torch.Tensor, amax: torch.Tensor, out: Optional[torch.Tensor], row_offset: int, group_offset: int) -> None:
-    g_local, local_rows, K = shard.shape
+    """
+    Launch fp8_shard_tile_kernel over the tiles the shard touches: the amax pass when out is None,
+    else the cast into out.
+    """
+    num_local_groups, local_rows, K = shard.shape
     if shard.numel() == 0:
         return
     tile_row_start, tile_row_end = row_offset // BLOCK, (row_offset + local_rows + BLOCK - 1) // BLOCK
-    grid = (tile_row_end - tile_row_start, triton.cdiv(K, BLOCK), g_local)
+    grid = (tile_row_end - tile_row_start, triton.cdiv(K, BLOCK), num_local_groups)
     fp8_shard_tile_kernel[grid](shard, amax, out if out is not None else shard, row_offset, local_rows, K, tile_row_start, group_offset, amax.stride(0), amax.shape[2], CAST=out is not None, NATIVE_E8M0=NATIVE_E8M0, num_warps=8)
 
 
@@ -226,9 +232,9 @@ def fp8_scales_sm100(amax: torch.Tensor, scale: torch.Tensor, scale_t: torch.Ten
     """
     Triton fp8_scales.
     """
-    G, R, C = amax.shape
-    grid = (triton.cdiv(R * C, 1024), G)
-    fp8_scale_kernel[grid](amax, scale, scale_t, R, C, NATIVE_E8M0=NATIVE_E8M0)
+    G, num_rows, num_cols = amax.shape
+    grid = (triton.cdiv(num_rows * num_cols, 1024), G)
+    fp8_scale_kernel[grid](amax, scale, scale_t, num_rows, num_cols, NATIVE_E8M0=NATIVE_E8M0)
 
 
 def fp8_pack_transpose_sm100(x: torch.Tensor, out: torch.Tensor) -> None:

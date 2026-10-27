@@ -11,13 +11,13 @@ __all__ = ["group_bias_add_"]
 
 
 @triton.jit
-def group_bias_add_kernel(y_ptr, bias_ptr, gi_ptr, H, BLOCK_M: tl.constexpr, BLOCK_H: tl.constexpr):
-    rows, cols = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M), tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
-    mask = cols[None, :] < H
-    g = tl.load(gi_ptr + rows).to(tl.int64)
-    offs = rows.to(tl.int64)[:, None] * H + cols[None, :]
-    y, b = tl.load(y_ptr + offs, mask=mask).to(tl.float32), tl.load(bias_ptr + g[:, None] * H + cols[None, :], mask=mask).to(tl.float32)
-    tl.store(y_ptr + offs, (y + b).to(y_ptr.dtype.element_ty), mask=mask)
+def group_bias_add_kernel(y_ptr, bias_ptr, group_idx_ptr, H, BLOCK_M: tl.constexpr, BLOCK_H: tl.constexpr):
+    row_offs, h_offs = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M), tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    h_mask = h_offs[None, :] < H
+    group_idx = tl.load(group_idx_ptr + row_offs).to(tl.int64)
+    y_offs = row_offs.to(tl.int64)[:, None] * H + h_offs[None, :]
+    y, bias = tl.load(y_ptr + y_offs, mask=h_mask).to(tl.float32), tl.load(bias_ptr + group_idx[:, None] * H + h_offs[None, :], mask=h_mask).to(tl.float32)
+    tl.store(y_ptr + y_offs, (y + bias).to(y_ptr.dtype.element_ty), mask=h_mask)
 
 
 def group_bias_add_(y: torch.Tensor, bias: torch.Tensor, group_indices: torch.Tensor) -> None:

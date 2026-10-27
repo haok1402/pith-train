@@ -20,14 +20,14 @@ def mn_pad(mn: int) -> int:
 
 def mn_major_scale(mn: int, sf_k: int, device: torch.device) -> torch.Tensor:
     """
-    Uninitialized fp32 (mn, sf_k) scale with strides (1, mn_pad(mn)).
+    Uninitialized fp32 scale of mn rows by sf_k K blocks, with strides (1, mn_pad(mn)).
     """
     return torch.empty_strided((mn, sf_k), (1, mn_pad(mn)), dtype=torch.float32, device=device)
 
 
 def is_mn_major(sf: torch.Tensor) -> bool:
     """
-    Whether DeepGEMM takes the 2D scale sf as it is.
+    Whether the scale sf is 2D and MN-major, so DeepGEMM takes it as it is.
     """
     return sf.dim() == 2 and sf.stride(0) == 1 and sf.stride(1) == mn_pad(sf.shape[0])
 

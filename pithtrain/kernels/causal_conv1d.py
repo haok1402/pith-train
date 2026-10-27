@@ -17,55 +17,71 @@ __all__ = ["BLOCK_C", "BLOCK_T", "BWD", "causal_conv1d_bwd", "causal_conv1d_fwd"
 
 
 @triton.jit
-def conv_fwd_kernel(x_ptr, w_ptr, y_ptr, L, S, C, offset, sy_b, sy_t, sy_c, K: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr):
-    pid_t, pid_c, b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    t, c = pid_t * BLOCK_T + tl.arange(0, BLOCK_T), pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
-    c_ok = c < C
-    x_base = x_ptr + b.to(tl.int64) * L * C
+def conv_fwd_kernel(x_ptr, w_ptr, y_ptr, L, S, C, offset, y_stride_b, y_stride_t, y_stride_c, K: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr):
+    pid_t, pid_c, batch_idx = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    out_offs, chan_offs = pid_t * BLOCK_T + tl.arange(0, BLOCK_T), pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    chan_mask = chan_offs < C
+    x_base = x_ptr + batch_idx.to(tl.int64) * L * C
     acc = tl.zeros((BLOCK_T, BLOCK_C), dtype=tl.float32)
     for k in tl.static_range(K):
-        w = tl.load(w_ptr + c * K + k, mask=c_ok, other=0.0).to(tl.float32)
-        src = t + offset - (K - 1) + k
-        ok = (src >= 0) & (t < S)
-        xv = tl.load(x_base + src[:, None] * C + c[None, :], mask=ok[:, None] & c_ok[None, :], other=0.0)
+        w_tap = tl.load(w_ptr + chan_offs * K + k, mask=chan_mask, other=0.0).to(tl.float32)
+        src_offs = out_offs + offset - (K - 1) + k
+        src_mask = (src_offs >= 0) & (out_offs < S)
+        x_tap = tl.load(x_base + src_offs[:, None] * C + chan_offs[None, :], mask=src_mask[:, None] & chan_mask[None, :], other=0.0)
         # Taps in order as fp32 fma, as ATen's depthwise kernel (nvcc contracts its acc += w * x;
         # a skipped padding tap equals fma(w, 0, acc)): bit-identical to conv1d.
-        acc = tl.fma(w[None, :], xv.to(tl.float32), acc)
-    y = y_ptr + b.to(tl.int64) * sy_b + t[:, None] * sy_t + c[None, :] * sy_c
-    tl.store(y, acc.to(tl.bfloat16), mask=(t < S)[:, None] & c_ok[None, :])
+        acc = tl.fma(w_tap[None, :], x_tap.to(tl.float32), acc)
+    y_ptrs = y_ptr + batch_idx.to(tl.int64) * y_stride_b + out_offs[:, None] * y_stride_t + chan_offs[None, :] * y_stride_c
+    tl.store(y_ptrs, acc.to(tl.bfloat16), mask=(out_offs < S)[:, None] & chan_mask[None, :])
 
 
 @triton.jit
-def conv_bwd_kernel(g_ptr, x_ptr, w_ptr, dx_ptr, dw_ptr, L, S, C, offset, n_t, sg_b, sg_t, sg_c, K: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr):
+def store_dx_block(g_base, w_ptr, dx_base, row_offs, chan_offs, chan_mask, L, S, C, offset, g_stride_t, g_stride_c, K: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr):
     """
-    dx of input rows [pid_t * BLOCK_T, +BLOCK_T), and the fp32 partial dw of the outputs in the same
-    row range (one partial per (b, t block)).
+    dx of the input rows row_offs: dx[s] = sum_k w[k] * g[s - offset + (K - 1) - k], over the
+    outputs that exist.
     """
-    pid_t, pid_c, b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    r = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)  # input row (dx) / output row (dw)
-    c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
-    c_ok = c < C
-    g_base, x_base = g_ptr + b.to(tl.int64) * sg_b, x_ptr + b.to(tl.int64) * L * C
-    # dx[s] = sum_k w[k] * g[s - offset + (K - 1) - k], in the order of ATen's backward kernel
-    # (taps k = 0 .. K - 1), over the outputs that exist.
+    # Taps k = 0 .. K - 1 in the order of ATen's backward kernel.
     acc = tl.zeros((BLOCK_T, BLOCK_C), dtype=tl.float32)
     for k in tl.static_range(K):
-        w = tl.load(w_ptr + c * K + k, mask=c_ok, other=0.0).to(tl.float32)
-        t = r - offset + (K - 1) - k
-        ok = (t >= 0) & (t < S)
-        gv = tl.load(g_base + t[:, None] * sg_t + c[None, :] * sg_c, mask=ok[:, None] & c_ok[None, :], other=0.0)
-        acc = tl.fma(w[None, :], gv.to(tl.float32), acc)
-    tl.store(dx_ptr + b.to(tl.int64) * L * C + r[:, None] * C + c[None, :], acc.to(tl.bfloat16), mask=(r < L)[:, None] & c_ok[None, :])
-    # dw[c, k] partial = sum over outputs t of this block of g[t] * x[t + offset - (K - 1) + k].
-    t_ok = r < S
-    gv = tl.load(g_base + r[:, None] * sg_t + c[None, :] * sg_c, mask=t_ok[:, None] & c_ok[None, :], other=0.0)
-    gv = gv.to(tl.float32)
-    part = dw_ptr + (b * n_t + pid_t).to(tl.int64) * C * K
+        w_tap = tl.load(w_ptr + chan_offs * K + k, mask=chan_mask, other=0.0).to(tl.float32)
+        out_offs = row_offs - offset + (K - 1) - k
+        out_mask = (out_offs >= 0) & (out_offs < S)
+        g_tap = tl.load(g_base + out_offs[:, None] * g_stride_t + chan_offs[None, :] * g_stride_c, mask=out_mask[:, None] & chan_mask[None, :], other=0.0)
+        acc = tl.fma(w_tap[None, :], g_tap.to(tl.float32), acc)
+    tl.store(dx_base + row_offs[:, None] * C + chan_offs[None, :], acc.to(tl.bfloat16), mask=(row_offs < L)[:, None] & chan_mask[None, :])
+
+
+@triton.jit
+def store_dw_partial(g_base, x_base, dw_part_base, row_offs, chan_offs, chan_mask, S, C, offset, g_stride_t, g_stride_c, K: tl.constexpr):
+    """
+    Partial dw[c, k] = sum over the outputs t in row_offs of g[t] * x[t + offset - (K - 1) + k].
+    """
+    out_mask = row_offs < S
+    g_rows = tl.load(g_base + row_offs[:, None] * g_stride_t + chan_offs[None, :] * g_stride_c, mask=out_mask[:, None] & chan_mask[None, :], other=0.0)
+    g_rows = g_rows.to(tl.float32)
     for k in tl.static_range(K):
-        src = r + offset - (K - 1) + k
-        ok = t_ok & (src >= 0)
-        xv = tl.load(x_base + src[:, None] * C + c[None, :], mask=ok[:, None] & c_ok[None, :], other=0.0)
-        tl.store(part + c * K + k, tl.sum(gv * xv.to(tl.float32), axis=0), mask=c_ok)
+        src_offs = row_offs + offset - (K - 1) + k
+        src_mask = out_mask & (src_offs >= 0)
+        x_tap = tl.load(x_base + src_offs[:, None] * C + chan_offs[None, :], mask=src_mask[:, None] & chan_mask[None, :], other=0.0)
+        tl.store(dw_part_base + chan_offs * K + k, tl.sum(g_rows * x_tap.to(tl.float32), axis=0), mask=chan_mask)
+
+
+@triton.jit
+def conv_bwd_kernel(g_ptr, x_ptr, w_ptr, dx_ptr, dw_part_ptr, L, S, C, offset, num_row_blocks, g_stride_b, g_stride_t, g_stride_c, K: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr):
+    """
+    dx of input rows [pid_t * BLOCK_T, +BLOCK_T), and the fp32 partial dw of the outputs in the same
+    row range (one partial per (batch, row block)).
+    """
+    pid_t, pid_c, batch_idx = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    row_offs = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)  # input row (dx) / output row (dw)
+    chan_offs = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    chan_mask = chan_offs < C
+    g_base, x_base = g_ptr + batch_idx.to(tl.int64) * g_stride_b, x_ptr + batch_idx.to(tl.int64) * L * C
+    dx_base = dx_ptr + batch_idx.to(tl.int64) * L * C
+    store_dx_block(g_base, w_ptr, dx_base, row_offs, chan_offs, chan_mask, L, S, C, offset, g_stride_t, g_stride_c, K, BLOCK_T, BLOCK_C)
+    dw_part_base = dw_part_ptr + (batch_idx * num_row_blocks + pid_t).to(tl.int64) * C * K
+    store_dw_partial(g_base, x_base, dw_part_base, row_offs, chan_offs, chan_mask, S, C, offset, g_stride_t, g_stride_c, K)
 
 
 BLOCK_T, BLOCK_C = 64, 128
@@ -113,10 +129,10 @@ def causal_conv1d_bwd(g: torch.Tensor, x: torch.Tensor, w: torch.Tensor, offset:
     B, L, C = x.shape
     K = w.shape[-1]
     S = L - offset
-    n_t = triton.cdiv(L, BWD["BLOCK_T"])
+    num_row_blocks = triton.cdiv(L, BWD["BLOCK_T"])
     dx = torch.empty_like(x)
-    part = torch.empty((B * n_t, C, K), dtype=torch.float32, device=x.device)
-    grid = (n_t, triton.cdiv(C, BWD["BLOCK_C"]), B)
-    conv_bwd_kernel[grid](g, x, w, dx, part, L, S, C, offset, n_t, *g.stride(), K=K, **BWD)
-    dw = part.sum(0).to(w.dtype).view(w.shape)
+    dw_part = torch.empty((B * num_row_blocks, C, K), dtype=torch.float32, device=x.device)
+    grid = (num_row_blocks, triton.cdiv(C, BWD["BLOCK_C"]), B)
+    conv_bwd_kernel[grid](g, x, w, dx, dw_part, L, S, C, offset, num_row_blocks, *g.stride(), K=K, **BWD)
+    dw = dw_part.sum(0).to(w.dtype).view(w.shape)
     return dx, dw

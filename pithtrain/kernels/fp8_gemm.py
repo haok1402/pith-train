@@ -19,7 +19,7 @@ from pithtrain.kernels.fp8_rowwise_colwise import fp8cast_rowwise_colwise
 from pithtrain.kernels.fp8_rowwise_kmajor import fp8cast_rowwise_kmajor
 from pithtrain.kernels.fp8_rowwise_transpose import fp8cast_rowwise_transpose
 
-__all__ = ["K_GROUPED_MAX_ROWS", "fp8_act_weight_gemm", "fp8_dgrad_wgrad", "fp8_fused_experts_supported", "fp8_gemm_nt", "fp8_grouped_wgrad_buffer", "fp8_m_grouped_gemm", "k_grouped_fp8_gemm", "k_grouped_fp8_gemm_nt", "k_grouped_runs_transposed", "k_grouped_safe_size", "m_grouped_fp8_gemm_nt", "m_grouped_group_indices", "pad_k_major_channels", "quantize_grouped_input"]
+__all__ = ["fp8_act_weight_gemm", "fp8_dgrad_wgrad", "fp8_fused_experts_supported", "fp8_gemm_nt", "fp8_grouped_wgrad_buffer", "fp8_m_grouped_gemm", "k_grouped_fp8_gemm", "k_grouped_safe_size", "m_grouped_group_indices", "quantize_grouped_input"]
 
 
 def fp8_gemm_nt(a_fp8: torch.Tensor, a_scale: torch.Tensor, b_fp8: torch.Tensor, b_scale: torch.Tensor, m: int, n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -47,9 +47,9 @@ def fp8_act_weight_gemm(input_2d: torch.Tensor, weight_fp8: torch.Tensor, scale_
     - input_t_fp8, scale_input_t: x.T (K, m) e4m3 quantized per 128x128 tile, scale fp32 (ceil(K /
       128), ceil(m / 128)) row-major; the activation operand of fp8_dgrad_wgrad.
     """
-    m, n = input_2d.shape[0], weight_fp8.shape[0]
+    M, N = input_2d.shape[0], weight_fp8.shape[0]
     input_fp8, scale_input, input_t_fp8, scale_input_t = fp8cast_rowwise_blockwise_transpose(input_2d)
-    output = fp8_gemm_nt(input_fp8, scale_input, weight_fp8, scale_weight, m, n, input_2d.device, input_2d.dtype)
+    output = fp8_gemm_nt(input_fp8, scale_input, weight_fp8, scale_weight, M, N, input_2d.device, input_2d.dtype)
     return output, input_t_fp8, scale_input_t
 
 
@@ -65,24 +65,24 @@ def fp8_dgrad_wgrad(grad_2d: torch.Tensor, weight_t_fp8: torch.Tensor, scale_wei
     - grad_input = grad @ W, fresh (m, k); weight_grad = grad.T @ x, fresh (n, k) (not accumulated);
       both in grad_2d's dtype.
     """
-    m, n = grad_2d.shape
+    M, N = grad_2d.shape
     grad_fp8, scale_grad, grad_t_fp8, scale_grad_t = fp8cast_rowwise_transpose(grad_2d)
-    grad_input = fp8_gemm_nt(grad_fp8, scale_grad, weight_t_fp8, scale_weight_t, m, k, grad_2d.device, grad_2d.dtype)
-    weight_grad = fp8_gemm_nt(grad_t_fp8, scale_grad_t, input_t_fp8, scale_input_t, n, k, grad_2d.device, grad_2d.dtype)
+    grad_input = fp8_gemm_nt(grad_fp8, scale_grad, weight_t_fp8, scale_weight_t, M, k, grad_2d.device, grad_2d.dtype)
+    weight_grad = fp8_gemm_nt(grad_t_fp8, scale_grad_t, input_t_fp8, scale_input_t, N, k, grad_2d.device, grad_2d.dtype)
     return grad_input, weight_grad
 
 
-def m_grouped_fp8_gemm_nt(a, b, d, grouped_mm_offs, M, group_indices=None):
+def m_grouped_fp8_gemm_nt(a, b, out, grouped_mm_offs, M, group_indices=None):
     """
-    m-grouped FP8 GEMM NT into d; on SM90 group_indices is computed when None.
+    m-grouped FP8 GEMM NT into out; on SM90 group_indices is computed when None.
     """
     match ARCH_MAJOR:
         case 9:
             if group_indices is None:
                 group_indices = m_grouped_group_indices(grouped_mm_offs, M)
-            deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a, b, d, group_indices)
+            deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a, b, out, group_indices)
         case 10:
-            deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, grouped_mm_offs, use_psum_layout=True, expected_m_for_psum_layout=M)
+            deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, out, grouped_mm_offs, use_psum_layout=True, expected_m_for_psum_layout=M)
         case _:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
@@ -94,32 +94,33 @@ once all groups' rows reach 116224, which imbalanced routing reaches, so larger 
 """
 
 
-def pad_k_major_channels(x: tuple[torch.Tensor, torch.Tensor], ks: list, channels: int) -> tuple[torch.Tensor, torch.Tensor]:
+def pad_k_major_channels(x: tuple[torch.Tensor, torch.Tensor], ks: list, num_padded_channels: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
     A K-major grouped operand (flat data of (n, k_g) row-major blocks, scales (n, rows / 128))
-    re-laid out with channels >= n; the extra channels are zero data with unit scales.
+    re-laid out with num_padded_channels >= n; the extra channels are zero data with unit scales.
     """
     data, scale = x
-    n, blocks = scale.shape
-    rows = sum(ks)
-    out = data.new_zeros(channels * rows)
-    row = 0
-    for k in ks:
-        if k:
-            dst = out[row * channels : (row + k) * channels].view(channels, k)
-            dst[:n].copy_(data[row * n : (row + k) * n].view(n, k))
-        row += k
-    out_scale = torch.ones((blocks, channels), device=scale.device, dtype=scale.dtype).T
-    out_scale[:n].copy_(scale)
+    num_channels, num_blocks = scale.shape
+    num_rows = sum(ks)
+    out = data.new_zeros(num_padded_channels * num_rows)
+    row_start = 0
+    for group_rows in ks:
+        if group_rows:
+            row_end = row_start + group_rows
+            out_block = out[row_start * num_padded_channels : row_end * num_padded_channels].view(num_padded_channels, group_rows)
+            out_block[:num_channels].copy_(data[row_start * num_channels : row_end * num_channels].view(num_channels, group_rows))
+        row_start += group_rows
+    out_scale = torch.ones((num_blocks, num_padded_channels), device=scale.device, dtype=scale.dtype).T
+    out_scale[:num_channels].copy_(scale)
     return out, out_scale
 
 
-def k_grouped_runs_transposed(m: int, n: int) -> bool:
+def k_grouped_runs_transposed(M: int, N: int) -> bool:
     """
-    Whether the SM90 k-grouped FP8 GEMM of an (m, n) output runs as the transposed product (see
-    k_grouped_call): an odd 128-block count on m and an even one on n.
+    Whether the SM90 k-grouped FP8 GEMM of an (M, N) output runs as the transposed product (see
+    k_grouped_call): an odd 128-block count on M and an even one on N.
     """
-    return -(-m // 128) % 2 == 1 and -(-n // 128) % 2 == 0
+    return -(-M // 128) % 2 == 1 and -(-N // 128) % 2 == 0
 
 
 def k_grouped_call(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tensor, torch.Tensor], d: torch.Tensor, ks: list, ks_tensor: torch.Tensor) -> None:
@@ -131,69 +132,74 @@ def k_grouped_call(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tensor, 
     always safe, so when a's is odd the call computes the transposed product b a^T if b's is even,
     and otherwise pads a's channels to a multiple of 256 with zeros.
     """
-    m, n = a[1].shape[0], b[1].shape[0]
-    if -(-m // 128) % 2 == 0:
+    M, N = a[1].shape[0], b[1].shape[0]
+    if -(-M // 128) % 2 == 0:
         deep_gemm.k_grouped_fp8_gemm_nt_contiguous(a, b, d, ks, ks_tensor, c=d)
-    elif k_grouped_runs_transposed(m, n):
+    elif k_grouped_runs_transposed(M, N):
         # fp8_grouped_wgrad_buffer stores d transposed for this case, so it accumulates in place.
-        dt = d.transpose(1, 2)
-        if dt.is_contiguous():
-            deep_gemm.k_grouped_fp8_gemm_nt_contiguous(b, a, dt, ks, ks_tensor, c=dt)
+        d_t = d.transpose(1, 2)
+        if d_t.is_contiguous():
+            deep_gemm.k_grouped_fp8_gemm_nt_contiguous(b, a, d_t, ks, ks_tensor, c=d_t)
             return
-        dt = dt.contiguous()
-        deep_gemm.k_grouped_fp8_gemm_nt_contiguous(b, a, dt, ks, ks_tensor, c=dt)
-        d.copy_(dt.transpose(1, 2))
+        d_t = d_t.contiguous()
+        deep_gemm.k_grouped_fp8_gemm_nt_contiguous(b, a, d_t, ks, ks_tensor, c=d_t)
+        d.copy_(d_t.transpose(1, 2))
     else:
-        mp = -(-m // 256) * 256
-        dp = d.new_zeros((d.shape[0], mp, d.shape[2]))
-        dp[:, :m].copy_(d)
-        ap = pad_k_major_channels(a, ks, mp)
-        deep_gemm.k_grouped_fp8_gemm_nt_contiguous(ap, b, dp, ks, ks_tensor, c=dp)
-        d.copy_(dp[:, :m])
+        M_padded = -(-M // 256) * 256
+        d_padded = d.new_zeros((d.shape[0], M_padded, d.shape[2]))
+        d_padded[:, :M].copy_(d)
+        a_padded = pad_k_major_channels(a, ks, M_padded)
+        deep_gemm.k_grouped_fp8_gemm_nt_contiguous(a_padded, b, d_padded, ks, ks_tensor, c=d_padded)
+        d.copy_(d_padded[:, :M])
 
 
-def k_grouped_fp8_gemm_nt(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tensor, torch.Tensor], d: torch.Tensor, ks: list, ks_tensor: torch.Tensor, c: torch.Tensor) -> None:
+def k_grouped_fp8_gemm_nt(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tensor, torch.Tensor], d: torch.Tensor, ks: list, ks_tensor: torch.Tensor) -> None:
     """
-    SM90 k-grouped FP8 GEMM NT accumulating into d (d is c), split into calls of at most
-    K_GROUPED_MAX_ROWS rows, each through k_grouped_call. Runs of whole groups are contiguous slices
-    of the K-major operands; a group longer than the limit is cut along k and accumulates chunk by
-    chunk. Scale slices keep the parent's MN-major strides, so DeepGEMM reads them as is.
+    SM90 k-grouped FP8 GEMM NT accumulating into d, split into calls of at most K_GROUPED_MAX_ROWS
+    rows, each through k_grouped_call. Runs of whole groups are contiguous slices of the K-major
+    operands; a group longer than the limit is cut along k and accumulates chunk by chunk. Scale
+    slices keep the parent's MN-major strides, so DeepGEMM reads them as is.
     """
-    assert d is c
     if sum(ks) <= K_GROUPED_MAX_ROWS:
         k_grouped_call(a, b, d, ks, ks_tensor)
         return
     channels = (a[1].shape[0], b[1].shape[0])
 
-    def call(g0: int, g1: int, row0: int, row1: int, chunk: tuple[int, int] | None) -> None:
-        ops = []
-        for (data, scale), n in zip((a, b), channels):
+    def call_run(group_start: int, group_end: int, row_start: int, row_end: int, chunk: tuple[int, int] | None) -> None:
+        """
+        One k_grouped_call over groups [group_start, group_end), which span rows [row_start,
+        row_end); with chunk = (chunk_start, chunk_end), only those rows of the single group.
+        """
+        operands = []
+        for (data, scale), num_channels in zip((a, b), channels):
             if chunk is None:
-                data, scale = data[row0 * n : row1 * n], scale[:, row0 // 128 : row1 // 128]
+                data, scale = data[row_start * num_channels : row_end * num_channels], scale[:, row_start // 128 : row_end // 128]
             else:
-                k, (r0, r1) = row1 - row0, chunk
-                data = data[row0 * n : row1 * n].view(n, k)[:, r0:r1].contiguous().view(-1)
-                scale = scale[:, (row0 + r0) // 128 : (row0 + r1) // 128]
-            ops.append((data, scale))
-        sub_ks = ks[g0:g1] if chunk is None else [chunk[1] - chunk[0]]
-        sub_t = ks_tensor[g0:g1] if chunk is None else torch.tensor(sub_ks, dtype=ks_tensor.dtype, device=ks_tensor.device)
-        out = d[g0:g1]
-        k_grouped_call(ops[0], ops[1], out, sub_ks, sub_t)
+                group_rows, (chunk_start, chunk_end) = row_end - row_start, chunk
+                data = data[row_start * num_channels : row_end * num_channels].view(num_channels, group_rows)[:, chunk_start:chunk_end].contiguous().view(-1)
+                scale = scale[:, (row_start + chunk_start) // 128 : (row_start + chunk_end) // 128]
+            operands.append((data, scale))
+        sub_ks = ks[group_start:group_end] if chunk is None else [chunk[1] - chunk[0]]
+        sub_ks_tensor = ks_tensor[group_start:group_end] if chunk is None else torch.tensor(sub_ks, dtype=ks_tensor.dtype, device=ks_tensor.device)
+        out = d[group_start:group_end]
+        k_grouped_call(operands[0], operands[1], out, sub_ks, sub_ks_tensor)
 
-    g0, row0, row = 0, 0, 0
-    for g, k in enumerate(ks):
-        if k > K_GROUPED_MAX_ROWS:
-            if g > g0:
-                call(g0, g, row0, row, None)
-            for r0 in range(0, k, K_GROUPED_MAX_ROWS):
-                call(g, g + 1, row, row + k, (r0, min(r0 + K_GROUPED_MAX_ROWS, k)))
-            g0, row0 = g + 1, row + k
-        elif row + k - row0 > K_GROUPED_MAX_ROWS:
-            call(g0, g, row0, row, None)
-            g0, row0 = g, row
-        row += k
-    if len(ks) > g0:
-        call(g0, len(ks), row0, row, None)
+    # A run is the groups since group_start (from row_start); group_row_start is group_idx's first row.
+    group_start, row_start, group_row_start = 0, 0, 0
+    for group_idx, group_rows in enumerate(ks):
+        group_row_end = group_row_start + group_rows
+        if group_rows > K_GROUPED_MAX_ROWS:
+            if group_idx > group_start:
+                call_run(group_start, group_idx, row_start, group_row_start, None)
+            for chunk_start in range(0, group_rows, K_GROUPED_MAX_ROWS):
+                call_run(group_idx, group_idx + 1, group_row_start, group_row_end, (chunk_start, min(chunk_start + K_GROUPED_MAX_ROWS, group_rows)))
+            group_start, row_start = group_idx + 1, group_row_end
+        elif group_row_end - row_start > K_GROUPED_MAX_ROWS:
+            call_run(group_start, group_idx, row_start, group_row_start, None)
+            group_start, row_start = group_idx, group_row_start
+        group_row_start = group_row_end
+    if len(ks) > group_start:
+        call_run(group_start, len(ks), row_start, group_row_start, None)
 
 
 def k_grouped_fp8_gemm(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tensor, torch.Tensor], d: torch.Tensor, ks: list, ks_tensor: torch.Tensor) -> None:
@@ -214,16 +220,16 @@ def k_grouped_fp8_gemm(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tens
             G, N, K = d.shape
             NA, KB = a[1].shape[0], b[1].shape[0]
             if (NA, KB) == (N, K):
-                k_grouped_fp8_gemm_nt(a, b, d, ks, ks_tensor, c=d)
+                k_grouped_fp8_gemm_nt(a, b, d, ks, ks_tensor)
                 return
             if NA % 256 != 0 and KB % 256 == 0:
-                c = torch.zeros((G, KB, NA), device=d.device, dtype=torch.float32)
-                k_grouped_fp8_gemm_nt(b, a, c, ks, ks_tensor, c=c)
-                d.add_(c[:, :K, :N].transpose(1, 2))
+                d_padded = torch.zeros((G, KB, NA), device=d.device, dtype=torch.float32)
+                k_grouped_fp8_gemm_nt(b, a, d_padded, ks, ks_tensor)
+                d.add_(d_padded[:, :K, :N].transpose(1, 2))
             else:
-                c = torch.zeros((G, NA, KB), device=d.device, dtype=torch.float32)
-                k_grouped_fp8_gemm_nt(a, b, c, ks, ks_tensor, c=c)
-                d.add_(c[:, :N, :K])
+                d_padded = torch.zeros((G, NA, KB), device=d.device, dtype=torch.float32)
+                k_grouped_fp8_gemm_nt(a, b, d_padded, ks, ks_tensor)
+                d.add_(d_padded[:, :N, :K])
         case 10:
             deep_gemm.k_grouped_fp8_gemm_tn_contiguous(a, b, d, ks, ks_tensor, c=d)
             return
@@ -238,9 +244,9 @@ def fp8_grouped_wgrad_buffer(size: torch.Size, device: torch.device) -> torch.Te
     SM90 computes the product transposed, otherwise contiguous.
     """
     if len(size) == 3 and ARCH_MAJOR == 9:
-        g, n, k = size
-        if k_grouped_runs_transposed(n, k):
-            return torch.empty((g, k, n), dtype=torch.float32, device=device).transpose(1, 2)
+        G, N, K = size
+        if k_grouped_runs_transposed(N, K):
+            return torch.empty((G, K, N), dtype=torch.float32, device=device).transpose(1, 2)
     return torch.empty(size, dtype=torch.float32, device=device)
 
 
@@ -312,10 +318,10 @@ def m_grouped_group_indices(grouped_mm_offs: torch.Tensor, M: int) -> torch.Tens
     """
     if ARCH_MAJOR != 9:
         return None
-    from pithtrain.kernels import group_indices_sm90 as cgi
-    if cgi.supports_group_indices(grouped_mm_offs, M):
-        return cgi.group_indices(grouped_mm_offs, M)
+    from pithtrain.kernels.group_indices_sm90 import group_indices, supports_group_indices
+    if supports_group_indices(grouped_mm_offs, M):
+        return group_indices(grouped_mm_offs, M)
     row_indices = torch.arange(M, device=grouped_mm_offs.device)
-    gi = torch.searchsorted(grouped_mm_offs, row_indices, right=True).to(torch.int32)
-    gi.clamp_(max=grouped_mm_offs.shape[0] - 1)
-    return gi
+    group_ids = torch.searchsorted(grouped_mm_offs, row_indices, right=True).to(torch.int32)
+    group_ids.clamp_(max=grouped_mm_offs.shape[0] - 1)
+    return group_ids

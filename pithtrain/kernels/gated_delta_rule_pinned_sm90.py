@@ -54,7 +54,7 @@ SIGNATURES = {
 }
 
 
-def jit_kernel(name: str) -> triton.JITFunction:
+def unwrap_kernel(name: str) -> triton.JITFunction:
     """
     The raw JITFunction under FLA's Heuristics(CachedAutotuner(...)) wrappers.
     """
@@ -62,35 +62,35 @@ def jit_kernel(name: str) -> triton.JITFunction:
 
 
 compiled: dict[tuple, object] = {}
-keyed: dict[str, tuple[list[int], list[int]]] = {}
+key_positions: dict[str, tuple[list[int], list[int]]] = {}
 
 
 def launch(name: str, grid: tuple, **kwargs) -> None:
     """
-    jit[grid](**kwargs), with the compiled kernel cached and launched straight through its C
+    jit_fn[grid](**kwargs), with the compiled kernel cached and launched straight through its C
     launcher on the device's current stream. The cache key is what Triton specializes these kernels
     on: each tensor's dtype and 16-byte alignment, the value of every other argument except T
     (do_not_specialize) and float scalars (never specialized), plus the device and launch config.
     """
-    jit = jit_kernel(name)
-    args = [kwargs[n] for n in jit.arg_names]
-    if name not in keyed:
-        tensors = [i for i, a in enumerate(args) if isinstance(a, torch.Tensor)]
-        values = [i for i, n in enumerate(jit.arg_names) if i not in tensors and n != "T"]
-        keyed[name] = tensors, values
-    tensors, values = keyed[name]
+    jit_fn = unwrap_kernel(name)
+    args = [kwargs[arg_name] for arg_name in jit_fn.arg_names]
+    if name not in key_positions:
+        tensor_positions = [i for i, arg in enumerate(args) if isinstance(arg, torch.Tensor)]
+        value_positions = [i for i, arg_name in enumerate(jit_fn.arg_names) if i not in tensor_positions and arg_name != "T"]
+        key_positions[name] = tensor_positions, value_positions
+    tensor_positions, value_positions = key_positions[name]
+    device = args[tensor_positions[0]].device.index
     # A float scalar keys on its type only (None, e.g. an absent scale, is a constexpr).
-    device = args[tensors[0]].device.index
-    key = (name, device, kwargs["num_warps"], kwargs["num_stages"], *(float if args[i].__class__ is float else args[i] for i in values), *((args[i].dtype, args[i].data_ptr() & 15) for i in tensors))
-    kernel = compiled.get(key)
-    if kernel is None:
-        compiled[key] = jit[grid](**kwargs)
+    key = (name, device, kwargs["num_warps"], kwargs["num_stages"], *(float if args[i].__class__ is float else args[i] for i in value_positions), *((args[i].dtype, args[i].data_ptr() & 15) for i in tensor_positions))
+    fn = compiled.get(key)
+    if fn is None:
+        compiled[key] = jit_fn[grid](**kwargs)
         return
     grid = (*grid, 1, 1)
     stream = torch._C._cuda_getCurrentRawStream(device)
-    enter, exit_ = knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook
-    metadata = None if enter is None else kernel.launch_metadata(grid, stream, *args)
-    kernel.run(grid[0], grid[1], grid[2], stream, kernel.function, kernel.packed_metadata, metadata, enter, exit_, *args)
+    enter_hook, exit_hook = knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook
+    metadata = None if enter_hook is None else fn.launch_metadata(grid, stream, *args)
+    fn.run(grid[0], grid[1], grid[2], stream, fn.function, fn.packed_metadata, metadata, enter_hook, exit_hook, *args)
 
 
 supported: list[bool] = []
@@ -109,6 +109,9 @@ def pinned_launch_supported() -> bool:
 
 
 def check_supported() -> bool:
+    """
+    The uncached check behind pinned_launch_supported.
+    """
     if fla.__version__ != VERSIONS["fla"] or triton.__version__ != VERSIONS["triton"]:
         return False
     if ARCH_MAJOR != 9:
@@ -120,18 +123,18 @@ def check_supported() -> bool:
     return True
 
 
-def cumsum(s: torch.Tensor, reverse: bool) -> torch.Tensor:
+def chunk_cumsum(x: torch.Tensor, reverse: bool) -> torch.Tensor:
     """
     chunk_local_cumsum (scalar, fp32 out): scaled by 1/ln 2 forward, unscaled in reverse.
     """
-    B, T, H = s.shape
-    o = torch.empty_like(s, dtype=torch.float)
+    B, T, H = x.shape
+    out = torch.empty_like(x, dtype=torch.float)
     config = CONFIGS["cumsum_rev" if reverse else "cumsum_fwd"]
-    launch("cumsum", (triton.cdiv(T, BT), B * H), s=s, o=o, scale=None if reverse else RCP_LN2, cu_seqlens=None, chunk_indices=None, T=T, B=B, H=H, BT=BT, REVERSE=reverse, HAS_SCALE=not reverse, IS_VARLEN=False, HEAD_FIRST=False, **config)
-    return o
+    launch("cumsum", (triton.cdiv(T, BT), B * H), s=x, o=out, scale=None if reverse else RCP_LN2, cu_seqlens=None, chunk_indices=None, T=T, B=B, H=H, BT=BT, REVERSE=reverse, HAS_SCALE=not reverse, IS_VARLEN=False, HEAD_FIRST=False, **config)
+    return out
 
 
-def w_u(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def recompute_w_u(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     recompute_w_u_fwd.
     """
@@ -141,7 +144,7 @@ def w_u(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, g
     return w, u
 
 
-def fwd_h(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def compute_chunk_states(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     chunk_gated_delta_rule_fwd_h: per-chunk states h and the transformed values.
     """
@@ -167,16 +170,16 @@ def chunk_gdr_fwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: t
     Only where gated_delta_rule_pinned_supported is True.
     """
     B, T, H, K, HV, V = *k.shape, *v.shape[2:]
-    NT = triton.cdiv(T, BT)
-    g_cum = cumsum(g, reverse=False)
+    num_chunks = triton.cdiv(T, BT)
+    g_cum = chunk_cumsum(g, reverse=False)
     # The fused kkt + solve stores only the triangular blocks: A must start zeroed.
     A = torch.zeros(B, T, HV, BT, device=k.device, dtype=k.dtype)
-    launch("kkt_solve", (NT, B * HV), k=k, g=g_cum, beta=beta, A=A, cu_seqlens=None, chunk_indices=None, T=T, H=H, HV=HV, K=K, BT=BT, BC=BC, USE_G=True, IS_VARLEN=False, **CONFIGS["kkt_solve"])
-    w, u = w_u(k, v, beta, A, g_cum)
-    h, v_new = fwd_h(k, w, u, g_cum)
+    launch("kkt_solve", (num_chunks, B * HV), k=k, g=g_cum, beta=beta, A=A, cu_seqlens=None, chunk_indices=None, T=T, H=H, HV=HV, K=K, BT=BT, BC=BC, USE_G=True, IS_VARLEN=False, **CONFIGS["kkt_solve"])
+    w, u = recompute_w_u(k, v, beta, A, g_cum)
+    h, v_new = compute_chunk_states(k, w, u, g_cum)
     o = torch.empty_like(v_new)
     config = CONFIGS["fwd_o"]
-    launch("fwd_o", (triton.cdiv(V, config["BV"]), NT, B * HV), q=q, k=k, v=v_new, h=h, g=g_cum, g_gamma=None, o=o, cu_seqlens=None, chunk_indices=None, scale=K**-0.5, T=T, H=H, HV=HV, K=K, V=V, BT=BT, USE_G=True, USE_G_GAMMA=False, STATE_V_FIRST=False, IS_VARLEN=False, **config)
+    launch("fwd_o", (triton.cdiv(V, config["BV"]), num_chunks, B * HV), q=q, k=k, v=v_new, h=h, g=g_cum, g_gamma=None, o=o, cu_seqlens=None, chunk_indices=None, scale=K**-0.5, T=T, H=H, HV=HV, K=K, V=V, BT=BT, USE_G=True, USE_G_GAMMA=False, STATE_V_FIRST=False, IS_VARLEN=False, **config)
     return o, g_cum, A
 
 
@@ -194,24 +197,24 @@ def chunk_gdr_bwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cu
     gated_delta_rule_pinned_supported is True.
     """
     B, T, H, K, HV, V = *k.shape, *v.shape[2:]
-    NT, scale = triton.cdiv(T, BT), K**-0.5
-    w, u = w_u(k, v, beta, A, g_cum)
-    h, v_new = fwd_h(k, w, u, g_cum)
+    num_chunks, scale = triton.cdiv(T, BT), K**-0.5
+    w, u = recompute_w_u(k, v, beta, A, g_cum)
+    h, v_new = compute_chunk_states(k, w, u, g_cum)
     dv_local = torch.empty_like(do)
-    launch("dv_local", (NT, B * HV), q=q, k=k, g=g_cum, g_gamma=None, A=None, do=do, dv=dv_local, cu_seqlens=None, chunk_indices=None, scale=scale, T=T, H=H, HV=HV, K=K, V=V, BT=BT, BK=128, BV=128, USE_G=True, USE_G_GAMMA=False, USE_A=False, IS_VARLEN=False, **CONFIGS["dv_local"])
-    dh, du = q.new_empty(B, NT, HV, K, V), torch.empty_like(dv_local)
+    launch("dv_local", (num_chunks, B * HV), q=q, k=k, g=g_cum, g_gamma=None, A=None, do=do, dv=dv_local, cu_seqlens=None, chunk_indices=None, scale=scale, T=T, H=H, HV=HV, K=K, V=V, BT=BT, BK=128, BV=128, USE_G=True, USE_G_GAMMA=False, USE_A=False, IS_VARLEN=False, **CONFIGS["dv_local"])
+    dh, du = q.new_empty(B, num_chunks, HV, K, V), torch.empty_like(dv_local)
     config = CONFIGS["bwd_dhu"]
     launch("bwd_dhu", (triton.cdiv(V, config["BV"]), B * HV), q=q, k=k, w=w, g=g_cum, gk=None, dht=None, dh0=None, do=do, dh=dh, dv=dv_local, dv2=du, cu_seqlens=None, chunk_offsets=None, scale=scale, T=T, H=H, HV=HV, K=K, V=V, BT=BT, USE_G=True, USE_GK=False, USE_INITIAL_STATE=False, USE_FINAL_STATE_GRADIENT=False, STATE_V_FIRST=False, IS_VARLEN=False, **config)
     dq, dk, dw = q.new_empty(B, T, HV, K), k.new_empty(B, T, HV, K), torch.empty_like(w)
     dg_parts = torch.empty(1, *g_cum.shape, dtype=torch.float32, device=g_cum.device)
-    launch("dqkwg", (1, NT, B * HV), q=q, k=k, v=v_new, g=g_cum, g_gamma=None, h=h, do=do, dh=dh, dq=dq, dk=dk, dw=dw, dv=du, dg=dg_parts, cu_seqlens=None, chunk_indices=None, scale=scale, B=B, T=T, H=H, HV=HV, K=K, V=V, BT=BT, BK=128, BV=128, USE_G=True, USE_G_GAMMA=False, USE_DW=True, STATE_V_FIRST=False, IS_VARLEN=False, **CONFIGS["dqkwg"])
+    launch("dqkwg", (1, num_chunks, B * HV), q=q, k=k, v=v_new, g=g_cum, g_gamma=None, h=h, do=do, dh=dh, dq=dq, dk=dk, dw=dw, dv=du, dg=dg_parts, cu_seqlens=None, chunk_indices=None, scale=scale, B=B, T=T, H=H, HV=HV, K=K, V=V, BT=BT, BK=128, BV=128, USE_G=True, USE_G_GAMMA=False, USE_DW=True, STATE_V_FIRST=False, IS_VARLEN=False, **CONFIGS["dqkwg"])
     dg = dg_parts.sum(0)
-    dk2, dv, db, dg2 = k.new_empty(B, T, HV, K), torch.empty_like(v), torch.empty_like(beta), torch.empty_like(g_cum)
-    launch("wy_bwd", (NT, B * HV), k=k, v=v, beta=beta, g=g_cum, A=A, dw=dw, du=du, dk=dk2, dv=dv, db=db, dg=dg2, cu_seqlens=None, chunk_indices=None, T=T, H=H, HV=HV, K=K, V=V, BT=BT, BK=64, BV=64, USE_G=True, IS_VARLEN=False, **CONFIGS["wy_bwd"])
-    dk.add_(dk2)
-    dg.add_(dg2)
-    dg = cumsum(dg, reverse=True)
-    return dq, dk, dv, dg, db
+    dk_wy, dv, dbeta, dg_wy = k.new_empty(B, T, HV, K), torch.empty_like(v), torch.empty_like(beta), torch.empty_like(g_cum)
+    launch("wy_bwd", (num_chunks, B * HV), k=k, v=v, beta=beta, g=g_cum, A=A, dw=dw, du=du, dk=dk_wy, dv=dv, db=dbeta, dg=dg_wy, cu_seqlens=None, chunk_indices=None, T=T, H=H, HV=HV, K=K, V=V, BT=BT, BK=64, BV=64, USE_G=True, IS_VARLEN=False, **CONFIGS["wy_bwd"])
+    dk.add_(dk_wy)
+    dg.add_(dg_wy)
+    dg = chunk_cumsum(dg, reverse=True)
+    return dq, dk, dv, dg, dbeta
 
 
 def pinned_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
@@ -222,8 +225,7 @@ def pinned_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Te
     """
     B, _, H, K = k.shape
     HV, V = v.shape[2:]
-    bf = torch.bfloat16
-    return B == 1 and HV == 32 and HV % H == 0 and K == 128 and V == 128 and q.shape == k.shape and q.dtype == k.dtype == v.dtype == beta.dtype == bf and g.dtype == torch.float32
+    return B == 1 and HV == 32 and HV % H == 0 and K == 128 and V == 128 and q.shape == k.shape and q.dtype == k.dtype == v.dtype == beta.dtype == torch.bfloat16 and g.dtype == torch.float32
 
 
 def gated_delta_rule_pinned_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:

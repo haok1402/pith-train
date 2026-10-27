@@ -12,35 +12,35 @@ __all__ = ["BLOCK_SIZE", "silu_mul_bwd", "silu_mul_fwd"]
 
 
 @triton.jit
-def silu_mul_fwd_kernel(gate_ptr, up_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+def silu_mul_fwd_kernel(gate_ptr, up_ptr, out_ptr, num_elements, BLOCK_SIZE: tl.constexpr):
     block_start = tl.program_id(0).to(tl.int64) * BLOCK_SIZE
-    offs = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offs < n_elements
+    elem_offs = block_start + tl.arange(0, BLOCK_SIZE)
+    elem_mask = elem_offs < num_elements
 
-    gate, up = tl.load(gate_ptr + offs, mask=mask), tl.load(up_ptr + offs, mask=mask)
-    gate_f, up_f = gate.to(tl.float32), up.to(tl.float32)
-    silu = gate_f * tl.sigmoid(gate_f)
-    out = silu * up_f
+    gate, up = tl.load(gate_ptr + elem_offs, mask=elem_mask), tl.load(up_ptr + elem_offs, mask=elem_mask)
+    gate_f32, up_f32 = gate.to(tl.float32), up.to(tl.float32)
+    gate_silu = gate_f32 * tl.sigmoid(gate_f32)
+    out = gate_silu * up_f32
 
-    tl.store(out_ptr + offs, out.to(up.dtype), mask=mask)
+    tl.store(out_ptr + elem_offs, out.to(up.dtype), mask=elem_mask)
 
 
 @triton.jit
-def silu_mul_bwd_kernel(grad_out_ptr, gate_ptr, up_ptr, grad_gate_ptr, grad_up_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+def silu_mul_bwd_kernel(grad_out_ptr, gate_ptr, up_ptr, grad_gate_ptr, grad_up_ptr, num_elements, BLOCK_SIZE: tl.constexpr):
     block_start = tl.program_id(0).to(tl.int64) * BLOCK_SIZE
-    offs = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offs < n_elements
+    elem_offs = block_start + tl.arange(0, BLOCK_SIZE)
+    elem_mask = elem_offs < num_elements
 
-    grad_out, gate, up = tl.load(grad_out_ptr + offs, mask=mask), tl.load(gate_ptr + offs, mask=mask), tl.load(up_ptr + offs, mask=mask)
-    grad_out_f, gate_f, up_f = grad_out.to(tl.float32), gate.to(tl.float32), up.to(tl.float32)
+    grad_out, gate, up = tl.load(grad_out_ptr + elem_offs, mask=elem_mask), tl.load(gate_ptr + elem_offs, mask=elem_mask), tl.load(up_ptr + elem_offs, mask=elem_mask)
+    grad_out_f32, gate_f32, up_f32 = grad_out.to(tl.float32), gate.to(tl.float32), up.to(tl.float32)
 
-    sig = tl.sigmoid(gate_f)
-    silu = gate_f * sig
+    gate_sigmoid = tl.sigmoid(gate_f32)
+    gate_silu = gate_f32 * gate_sigmoid
 
-    grad_up, grad_gate = grad_out_f * silu, grad_out_f * up_f * sig * (1.0 + gate_f - silu)
+    grad_up, grad_gate = grad_out_f32 * gate_silu, grad_out_f32 * up_f32 * gate_sigmoid * (1.0 + gate_f32 - gate_silu)
 
-    tl.store(grad_gate_ptr + offs, grad_gate.to(gate.dtype), mask=mask)
-    tl.store(grad_up_ptr + offs, grad_up.to(up.dtype), mask=mask)
+    tl.store(grad_gate_ptr + elem_offs, grad_gate.to(gate.dtype), mask=elem_mask)
+    tl.store(grad_up_ptr + elem_offs, grad_up.to(up.dtype), mask=elem_mask)
 
 
 BLOCK_SIZE = 1024
@@ -59,9 +59,9 @@ def silu_mul_fwd(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     assert gate.is_contiguous(), "gate must be contiguous"
     assert up.is_contiguous(), "up must be contiguous"
     out = torch.empty_like(gate)
-    n = gate.numel()
-    grid = (triton.cdiv(n, BLOCK_SIZE),)
-    silu_mul_fwd_kernel[grid](gate, up, out, n, BLOCK_SIZE=BLOCK_SIZE)
+    num_elements = gate.numel()
+    grid = (triton.cdiv(num_elements, BLOCK_SIZE),)
+    silu_mul_fwd_kernel[grid](gate, up, out, num_elements, BLOCK_SIZE=BLOCK_SIZE)
     return out
 
 
@@ -74,11 +74,11 @@ def silu_mul_bwd(grad_output: torch.Tensor, gate: torch.Tensor, up: torch.Tensor
     gate * s), each rounded once to the dtype. Deterministic; silu_mul_bwd_quant reproduces both
     bit for bit.
     """
-    assert grad_output.shape == gate.shape, (f"grad_output shape {grad_output.shape} != gate shape {gate.shape}")
-    assert grad_output.dtype == gate.dtype, (f"grad_output dtype {grad_output.dtype} != gate dtype {gate.dtype}")
+    assert grad_output.shape == gate.shape, f"grad_output shape {grad_output.shape} != gate shape {gate.shape}"
+    assert grad_output.dtype == gate.dtype, f"grad_output dtype {grad_output.dtype} != gate dtype {gate.dtype}"
     assert grad_output.is_contiguous(), "grad_output must be contiguous"
     grad_gate, grad_up = torch.empty_like(gate), torch.empty_like(up)
-    n = gate.numel()
-    grid = (triton.cdiv(n, BLOCK_SIZE),)
-    silu_mul_bwd_kernel[grid](grad_output, gate, up, grad_gate, grad_up, n, BLOCK_SIZE=BLOCK_SIZE)
+    num_elements = gate.numel()
+    grid = (triton.cdiv(num_elements, BLOCK_SIZE),)
+    silu_mul_bwd_kernel[grid](grad_output, gate, up, grad_gate, grad_up, num_elements, BLOCK_SIZE=BLOCK_SIZE)
     return grad_gate, grad_up
