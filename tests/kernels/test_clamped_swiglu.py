@@ -1,14 +1,11 @@
 """
-Verifier of ``clamped_swiglu_fwd`` / ``clamped_swiglu_bwd`` (gpt-oss) against plain PyTorch.
+Verifies clamped_swiglu_fwd and clamped_swiglu_bwd, the gpt-oss activation, against PyTorch.
 
-Contract: for the interleaved ``gate_up`` (M, 2N) (gate = even columns, up = odd columns),
-``out = (uc + 1) * gc * sigmoid(alpha * gc)`` with ``gc = min(gate, limit)`` and
-``uc = clamp(up, -limit, limit)``, computed in fp32 and rounded once to the input dtype; the
-backward returns the (M, 2N) interleaved gradient, zero where the clamp saturates
-(``gate > limit``, ``|up| > limit``). The fp32 reference uses the same formula; outputs must lie
-within one output-dtype ulp of it.
-
-    pytest tests/kernels/test_clamped_swiglu.py -v
+Contract: for the interleaved gate_up (M, 2N), gate the even columns and up the odd ones,
+out = (uc + 1) * gc * sigmoid(alpha * gc) with gc = min(gate, limit) and
+uc = clamp(up, -limit, limit), computed in fp32 and rounded once to the input dtype. The backward
+returns the (M, 2N) interleaved gradient, zero where the clamp saturates (gate > limit,
+|up| > limit). Outputs must lie within one output-dtype ulp of the fp32 reference.
 """
 
 import pytest
@@ -25,28 +22,34 @@ SHAPES = [(1, 2), (128, 768), (1023, 778), (37, 2050), (4096, 2 * 2880), (8192, 
 
 
 def ref_fwd(gate_up, alpha, limit):
-    g, u = gate_up.float()[:, ::2], gate_up.float()[:, 1::2]
-    gc = g.clamp(max=limit)
-    uc = u.clamp(min=-limit, max=limit)
+    gate, up = gate_up.float()[:, ::2], gate_up.float()[:, 1::2]
+    gc = gate.clamp(max=limit)
+    uc = up.clamp(min=-limit, max=limit)
     return (uc + 1.0) * (gc * torch.sigmoid(alpha * gc))
 
 
 def ref_bwd(grad_out, gate_up, alpha, limit):
-    do = grad_out.float()
-    g, u = gate_up.float()[:, ::2], gate_up.float()[:, 1::2]
-    gc = g.clamp(max=limit)
-    uc = u.clamp(min=-limit, max=limit)
+    """
+    The closed-form interleaved (M, 2N) gradient in fp32, zero where the clamp saturates.
+    """
+    grad_out_f32 = grad_out.float()
+    gate, up = gate_up.float()[:, ::2], gate_up.float()[:, 1::2]
+    gc = gate.clamp(max=limit)
+    uc = up.clamp(min=-limit, max=limit)
     sig = torch.sigmoid(alpha * gc)
-    grad_u = do * (gc * sig)
-    grad_g = do * (uc + 1.0) * sig * (1.0 + alpha * gc * (1.0 - sig))
-    grad_g = torch.where(g <= limit, grad_g, 0.0)
-    grad_u = torch.where((u >= -limit) & (u <= limit), grad_u, 0.0)
+    grad_up = grad_out_f32 * (gc * sig)
+    grad_gate = grad_out_f32 * (uc + 1.0) * sig * (1.0 + alpha * gc * (1.0 - sig))
+    grad_gate = torch.where(gate <= limit, grad_gate, 0.0)
+    grad_up = torch.where((up >= -limit) & (up <= limit), grad_up, 0.0)
     out = torch.empty(gate_up.shape, device=gate_up.device, dtype=torch.float32)
-    out[:, ::2], out[:, 1::2] = grad_g, grad_u
+    out[:, ::2], out[:, 1::2] = grad_gate, grad_up
     return out
 
 
 def assert_rounded(got, want32):
+    """
+    Assert got lies within one ulp of its dtype (1e-5 relative for fp32) of the fp32 want32.
+    """
     scale = want32.abs().max().item() if want32.numel() else 1.0
     if got.dtype == torch.float32:
         rtol, atol = 1e-5, 1e-6 * scale
@@ -79,13 +82,15 @@ def test_forward_backward(shape, dtype):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_matches_autograd(dtype):
-    """The closed-form gradient is autograd's gradient of the clamped formula (float64)."""
+    """
+    The closed-form gradient is autograd's float64 gradient of the clamped formula.
+    """
     gen = torch.Generator(device="cuda").manual_seed(1)
     gate_up = (torch.randn(256, 2 * 2880, generator=gen, device="cuda") * 4).to(dtype)
     grad_out = torch.randn(256, 2880, generator=gen, device="cuda").to(dtype)
     x = gate_up.double().requires_grad_()
-    g, u = x[:, ::2], x[:, 1::2]
-    gc, uc = g.clamp(max=LIMIT), u.clamp(min=-LIMIT, max=LIMIT)
+    gate, up = x[:, ::2], x[:, 1::2]
+    gc, uc = gate.clamp(max=LIMIT), up.clamp(min=-LIMIT, max=LIMIT)
     ((uc + 1) * gc * torch.sigmoid(ALPHA * gc)).backward(grad_out.double())
     grad = clamped_swiglu_bwd(grad_out, gate_up, ALPHA, LIMIT)
     scale = x.grad.abs().max().item()
@@ -94,8 +99,10 @@ def test_matches_autograd(dtype):
 
 
 def test_saturated_gradient_is_zero():
-    """Outside the clamp the gradient is exactly zero (gate one-sided, up both sides), and the
-    saturated forward equals the forward at the limit, bit for bit."""
+    """
+    Outside the clamp the gradient is exactly zero (gate one-sided, up both sides), and the
+    saturated forward equals the forward at the limit, bit for bit.
+    """
     M, N = 8, 16
     gate = torch.linspace(-LIMIT - 4.0, LIMIT + 4.0, M * N, device="cuda").view(M, N)
     up = torch.linspace(LIMIT + 3.0, LIMIT + 5.0, M * N, device="cuda").view(M, N)
@@ -105,8 +112,8 @@ def test_saturated_gradient_is_zero():
         gate_up[:, ::2], gate_up[:, 1::2] = gate.to(dtype), up.to(dtype)
         grad_out = torch.randn(M, N, device="cuda").to(dtype)
         _, grad = run(gate_up, grad_out)
-        g = gate_up[:, ::2].float()
-        assert torch.all(grad[:, ::2][g > LIMIT] == 0)
+        gate_f32 = gate_up[:, ::2].float()
+        assert torch.all(grad[:, ::2][gate_f32 > LIMIT] == 0)
         assert torch.all(grad[:, 1::2] == 0)  # every |up| > LIMIT
         # out(gate > L, up) == out(L, up) and out(gate, |up| > L) == out(gate, sign * L).
         clamped = gate_up.clone()
@@ -118,7 +125,9 @@ def test_saturated_gradient_is_zero():
 
 
 def test_limit_boundary_is_active():
-    """gate == limit and up == +/-limit are inside the clamp (gradient flows)."""
+    """
+    gate == limit and up == +/-limit are inside the clamp, so the gradient flows.
+    """
     gate_up = torch.tensor([[LIMIT, LIMIT, LIMIT, -LIMIT]], device="cuda", dtype=torch.float32)
     grad = clamped_swiglu_bwd(torch.ones(1, 2, device="cuda"), gate_up, ALPHA, LIMIT)
     assert torch.all(grad != 0)
@@ -155,10 +164,11 @@ def test_empty():
 def test_deterministic():
     gen = torch.Generator(device="cuda").manual_seed(4)
     gate_up = (torch.randn(4096, 2 * 2880, generator=gen, device="cuda") * 4).to(torch.bfloat16)
-    do = torch.randn(4096, 2880, generator=gen, device="cuda").to(torch.bfloat16)
+    grad_out = torch.randn(4096, 2880, generator=gen, device="cuda").to(torch.bfloat16)
     assert torch.equal(
         clamped_swiglu_fwd(gate_up, ALPHA, LIMIT), clamped_swiglu_fwd(gate_up, ALPHA, LIMIT)
     )
     assert torch.equal(
-        clamped_swiglu_bwd(do, gate_up, ALPHA, LIMIT), clamped_swiglu_bwd(do, gate_up, ALPHA, LIMIT)
+        clamped_swiglu_bwd(grad_out, gate_up, ALPHA, LIMIT),
+        clamped_swiglu_bwd(grad_out, gate_up, ALPHA, LIMIT),
     )

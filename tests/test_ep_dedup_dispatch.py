@@ -1,15 +1,13 @@
 """
-The dedup EP dispatch operator (prepare_dispatch) across ragged EP ranks. Its index kernels
-(fused_dedup_prepare_dispatch, expert_and_expand_idx) are verified in
-tests/kernels/test_ep_dispatch.py.
+Test of the dedup EP dispatch operator (prepare_dispatch) across EP ranks with ragged token
+counts. Its index kernels are verified in tests/kernels/test_ep_dispatch.py.
 """
 
 import pytest
 import torch
 
 
-def _ragged_dispatch_worker(rank, world_size, tokens_per_rank, out):
-    """One EP rank of test_prepare_dispatch_ragged_token_counts."""
+def ragged_dispatch_worker(rank, world_size, tokens_per_rank, out):
     import os
 
     import torch.distributed as dist
@@ -23,15 +21,15 @@ def _ragged_dispatch_worker(rank, world_size, tokens_per_rank, out):
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
-    ep_size, experts_per_rank, k, hidden = world_size, 4, 4, 64
+    ep_size, experts_per_rank, top_k, hidden = world_size, 4, 4, 64
     num_experts = ep_size * experts_per_rank
     device = torch.device("cuda", rank)
     torch.manual_seed(1234 + rank)
 
-    m = tokens_per_rank[rank]
-    hidden_states = torch.randn(1, m, hidden, device=device, dtype=torch.bfloat16)
-    topk_ids = torch.stack([torch.randperm(num_experts, device=device)[:k] for _ in range(m)])
-    topk_weight = torch.rand(m, k, device=device)
+    num_tokens = tokens_per_rank[rank]
+    hidden_states = torch.randn(1, num_tokens, hidden, device=device, dtype=torch.bfloat16)
+    topk_ids = torch.stack([torch.randperm(num_experts, device=device)[:top_k] for _ in range(num_tokens)])  # fmt: skip
+    topk_weight = torch.rand(num_tokens, top_k, device=device)
 
     dispatch_tokens, routing = prepare_dispatch(
         hidden_states,
@@ -59,7 +57,7 @@ def _ragged_dispatch_worker(rank, world_size, tokens_per_rank, out):
     out.append(
         (
             rank,
-            m,
+            num_tokens,
             expanded.shape[0],
             routing.expert_idxs.numel(),
             sum(routing.combine_splits.output_splits),
@@ -71,23 +69,17 @@ def _ragged_dispatch_worker(rank, world_size, tokens_per_rank, out):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
 def test_prepare_dispatch_ragged_token_counts():
-    """A rank holding a short packed micro-batch still receives every slot routed at it.
-
-    The received row count is decided by the *senders*, so it has nothing to do with this
-    rank's own token count: ``expert_idxs`` must have one entry per received row, the same
-    length as ``expand_idx``, which is what stage 3 gathers by.
-
-    The skew (8 tokens against 4096) is what packed / ragged micro-batching produces and
-    fixed-shape pretraining never does. Every other case in this file gives all senders the
-    same ``ms``, and with equal token counts the old local bound ``m * k * ep_size`` is
-    always large enough, so nothing goes wrong.
+    """
+    A rank holding a short micro-batch still receives every slot routed to it. The senders decide
+    the received row count, so expert_idxs must have one entry per received row, as many as
+    expand_idx, whatever this rank's own token count (8 here against 4096 on the other rank).
     """
     import torch.multiprocessing as mp
 
     world_size = 2
     manager = mp.Manager()
     out = manager.list()
-    mp.spawn(_ragged_dispatch_worker, args=(world_size, [8, 4096], out), nprocs=world_size)
+    mp.spawn(ragged_dispatch_worker, args=(world_size, [8, 4096], out), nprocs=world_size)
 
     assert len(out) == world_size
     for rank, m, rows, idxs, expected in sorted(out):

@@ -1,17 +1,17 @@
 """
-Slot maps and row reductions of the BF16 CuTe experts (SM90 only), against PyTorch, exactly.
+Verifies the slot maps and row reductions of the BF16 CuTe experts (SM90 only) against PyTorch
+bit for bit.
 
-- bf16_expert_group_slots: ``cu_seqlens`` the expert offsets, grouped rows expert-major and stable
-  (slot order within an expert), ``a_idx`` / ``row_of`` / ``slot_of`` consistent, deterministic; on
-  EP-dedup routings laid out as the dispatch delivers them (slots sender-major, expert-minor, a
-  token repeated once per local expert it chose), empty experts, ``expand_idx`` None or not,
+- bf16_expert_group_slots: cu_seqlens holds the expert offsets, grouped rows are expert-major and
+  stable (slot order within an expert), a_idx / row_of / slot_of agree, and repeated calls match.
+  Routings are laid out as the EP-dedup dispatch delivers them (slots sender-major, expert-minor,
+  a token repeated once per local expert it chose), with empty experts, expand_idx None or not,
   0 slots and 0 tokens, for 8 / 16 / 32 / 64 local experts.
-- bf16_expert_gather_sum: each token's grouped rows summed in fp32 in ascending expert order,
-  rounded once to bf16, compared bit for bit with the same sum in PyTorch.
-- bf16_expert_gather_rows: ``x[idx]`` bit for bit (the no-expand input gradient
-  ``dx[row_of]``).
-- expert_slot_segment_sum: per-segment fp32 row sums, compared bit for bit with PyTorch summing
-  256-row chunks in row order and the chunk partials in order (the order the contract fixes).
+- bf16_expert_gather_sum: each token's grouped rows summed in fp32 in ascending expert order and
+  rounded once to bf16, bit for bit.
+- bf16_expert_gather_rows: x[idx] bit for bit (the no-expand input gradient dx[row_of]).
+- expert_slot_segment_sum: per-segment fp32 row sums, bit for bit with PyTorch summing 256-row
+  chunks in row order and then the chunk partials in order, the order the contract fixes.
 """
 
 import pytest
@@ -34,42 +34,42 @@ pytestmark = pytest.mark.skipif(
 def ep_routing(G: int, ep: int, tokens_per_sender: int, k: int, empty=(), seed=0):
     """
     (expert_idxs, expand_idx, T): per sender, each token picks 1..k of the G local experts (none
-    of ``empty``); slots sender-major, expert-minor; expand_idx indexes the senders' concatenated
-    deduplicated tokens.
+    of empty), slots sender-major and expert-minor. expand_idx indexes the concatenated
+    deduplicated tokens of all senders.
     """
-    g = torch.Generator().manual_seed(seed)
-    allowed = torch.tensor([e for e in range(G) if e not in empty])
-    eids, exps, base = [], [], 0
+    gen = torch.Generator().manual_seed(seed)
+    allowed = torch.tensor([expert for expert in range(G) if expert not in empty])
+    expert_list, expand_list, token_base = [], [], 0
     for _ in range(ep):
-        n = torch.randint(1, k + 1, (tokens_per_sender,), generator=g)
+        num_chosen = torch.randint(1, k + 1, (tokens_per_sender,), generator=gen)
         choice = []
-        for t in range(tokens_per_sender):
-            perm = torch.randperm(len(allowed), generator=g)[: int(n[t])]
-            choice += [(e, t) for e in allowed[perm].tolist()]
+        for token in range(tokens_per_sender):
+            perm = torch.randperm(len(allowed), generator=gen)[: int(num_chosen[token])]
+            choice += [(expert, token) for expert in allowed[perm].tolist()]
         choice.sort()
-        eids += [e for e, _ in choice]
-        exps += [base + t for _, t in choice]
-        base += tokens_per_sender
+        expert_list += [expert for expert, _ in choice]
+        expand_list += [token_base + token for _, token in choice]
+        token_base += tokens_per_sender
     cuda = dict(device="cuda", dtype=torch.int64)
-    return torch.tensor(eids, **cuda), torch.tensor(exps, **cuda), base
+    return torch.tensor(expert_list, **cuda), torch.tensor(expand_list, **cuda), token_base
 
 
 def check_maps(maps, expert_idxs, expand_idx, G, T):
     S = expert_idxs.shape[0]
-    ar = torch.arange(S, device="cuda")
+    slot_range = torch.arange(S, device="cuda")
     counts = torch.bincount(expert_idxs, minlength=G)
     cu = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
     assert maps.cu_seqlens.dtype == torch.int32
     assert maps.cu_seqlens.tolist() == cu.tolist()
-    for t in (maps.a_idx, maps.row_of, maps.slot_of):
-        assert t.dtype == torch.int32 and t.shape == (S,)
+    for index_map in (maps.a_idx, maps.row_of, maps.slot_of):
+        assert index_map.dtype == torch.int32 and index_map.shape == (S,)
     # expert-major and stable: grouped row r holds the r-th slot of a stable sort by expert
     order = torch.argsort(expert_idxs, stable=True)
     assert torch.equal(maps.slot_of.long(), order)
     rows = maps.row_of.long()
-    assert torch.equal(torch.sort(rows).values, ar)
-    assert torch.equal(maps.slot_of.long()[rows], ar)
-    src = expand_idx if expand_idx is not None else ar
+    assert torch.equal(torch.sort(rows).values, slot_range)
+    assert torch.equal(maps.slot_of.long()[rows], slot_range)
+    src = expand_idx if expand_idx is not None else slot_range
     assert torch.equal(maps.a_idx.long()[rows], src)
     assert torch.equal(maps.a_idx.long(), src[order])
     if expand_idx is None:
@@ -104,8 +104,8 @@ def test_group_slots(G, ep, tps, k, empty):
 
 @pytest.mark.parametrize("G,S", [(16, 5000), (64, 70000), (8, 1), (32, 2047), (32, 2049)])
 def test_group_slots_without_expand(G, S):
-    g = torch.Generator().manual_seed(S)
-    expert_idxs = torch.randint(0, G, (S,), generator=g).cuda()
+    gen = torch.Generator().manual_seed(S)
+    expert_idxs = torch.randint(0, G, (S,), generator=gen).cuda()
     maps = bf16_expert_group_slots(expert_idxs, None, G, S)
     check_maps(maps, expert_idxs, None, G, S)
 
@@ -113,8 +113,8 @@ def test_group_slots_without_expand(G, S):
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize("T", [0, 5])
 def test_group_slots_no_slots(expand, T):
-    e = torch.empty(0, dtype=torch.int64, device="cuda")
-    maps = bf16_expert_group_slots(e, e if expand else None, 16, T)
+    no_slots = torch.empty(0, dtype=torch.int64, device="cuda")
+    maps = bf16_expert_group_slots(no_slots, no_slots if expand else None, 16, T)
     assert maps.cu_seqlens.tolist() == [0] * 17
     assert maps.a_idx.shape == maps.row_of.shape == maps.slot_of.shape == (0,)
     if expand:
@@ -130,11 +130,14 @@ BF16 = dict(device="cuda", dtype=torch.bfloat16)
 
 
 def gather_sum_reference(grad, expert_idxs, expand_idx, row_of, T):
-    """fp32 sum per token of its grouped rows in ascending expert order, rounded once."""
+    """
+    fp32 sum per token of its grouped rows in ascending expert order, rounded once.
+    """
     out = torch.zeros(T, grad.shape[1], dtype=torch.float32, device=grad.device)
-    for e in torch.unique(expert_idxs).tolist():  # ascending
-        sl = (expert_idxs == e).nonzero().squeeze(1)  # a token chose e at most once
-        out.index_add_(0, expand_idx[sl], grad[row_of[sl].long()].float())
+    for expert in torch.unique(expert_idxs).tolist():  # ascending
+        # a token chose each expert at most once, so index_add_ adds one row per token
+        slots = (expert_idxs == expert).nonzero().squeeze(1)
+        out.index_add_(0, expand_idx[slots], grad[row_of[slots].long()].float())
     return out.to(grad.dtype)
 
 
@@ -163,8 +166,8 @@ def test_gather_sum(G, ep, tps, k, H):
 
 
 def test_gather_sum_zero_tokens():
-    e = torch.empty(0, dtype=torch.int64, device="cuda")
-    maps = bf16_expert_group_slots(e, e, 16, 0)
+    no_slots = torch.empty(0, dtype=torch.int64, device="cuda")
+    maps = bf16_expert_group_slots(no_slots, no_slots, 16, 0)
     out = bf16_expert_gather_sum(torch.empty(0, 2048, **BF16), maps, 16, 8)
     assert out.shape == (0, 2048)
 
@@ -181,7 +184,9 @@ def test_gather_rows(N, rows):
 
 
 def test_gather_rows_no_expand_input_grad():
-    """Without expand_idx the input gradient is the grouped gradient read back by row_of."""
+    """
+    Without expand_idx the input gradient is the grouped gradient read back by row_of.
+    """
     G, S = 16, 4000
     expert_idxs = torch.randint(0, G, (S,), device="cuda")
     maps = bf16_expert_group_slots(expert_idxs, None, G, S)
@@ -193,27 +198,29 @@ def test_gather_rows_no_expand_input_grad():
 
 
 def segment_sum_reference(x, counts, idx=None):
-    """fp32 sums of 256-row chunks in row order, then of each segment's chunks in order."""
+    """
+    fp32 sums of 256-row chunks in row order, then of each segment's chunks in order.
+    """
     G, N = len(counts), x.shape[1]
     rows = x[idx.long()] if idx is not None else x
     out = torch.zeros(G, N, dtype=torch.float32, device=x.device)
-    start = 0
-    for g, c in enumerate(counts):
-        seg = rows[start : start + c].float()
-        start += c
-        nchunks = -(-c // 256)
-        if nchunks == 0:
+    row_start = 0
+    for group_idx, count in enumerate(counts):
+        segment = rows[row_start : row_start + count].float()
+        row_start += count
+        num_chunks = -(-count // 256)
+        if num_chunks == 0:
             continue
-        padded = seg.new_zeros(nchunks * 256, N)
-        padded[:c] = seg
-        padded = padded.view(nchunks, 256, N)
-        part = torch.zeros(nchunks, N, dtype=torch.float32, device=x.device)
-        for r in range(256):
-            part += padded[:, r]
-        acc = torch.zeros(N, dtype=torch.float32, device=x.device)
-        for q in range(nchunks):
-            acc += part[q]
-        out[g] = acc
+        padded = segment.new_zeros(num_chunks * 256, N)
+        padded[:count] = segment
+        padded = padded.view(num_chunks, 256, N)
+        acc_chunk = torch.zeros(num_chunks, N, dtype=torch.float32, device=x.device)
+        for row_idx in range(256):
+            acc_chunk += padded[:, row_idx]
+        acc_sum = torch.zeros(N, dtype=torch.float32, device=x.device)
+        for chunk_idx in range(num_chunks):
+            acc_sum += acc_chunk[chunk_idx]
+        out[group_idx] = acc_sum
     return out
 
 
@@ -237,8 +244,8 @@ def test_segment_sum(case, gather):
     x[::5] *= 300
     idx = torch.randperm(M + 17, device="cuda")[:M].to(torch.int32) if gather else None
     cu_host = [0]
-    for c in counts:
-        cu_host.append(cu_host[-1] + c)
+    for count in counts:
+        cu_host.append(cu_host[-1] + count)
     cu = torch.tensor(cu_host, dtype=torch.int32, device="cuda")
     out = expert_slot_segment_sum(x if gather else x[:M], cu_host, cu, idx)
     ref = segment_sum_reference(x if gather else x[:M], counts, idx)

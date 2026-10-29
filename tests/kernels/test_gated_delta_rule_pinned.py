@@ -1,27 +1,24 @@
 """
-Verifier of the pinned dense chunked gated delta rule (``gated_delta_rule_pinned_supported``,
-``chunk_gdr_fwd_pinned``, ``chunk_gdr_bwd_pinned``), the H200 path of Qwen3.5's Gated DeltaNet.
+Verifier of the pinned dense chunked gated delta rule (gated_delta_rule_pinned_supported,
+chunk_gdr_fwd_pinned, chunk_gdr_bwd_pinned), the H200 path of Qwen3.5's Gated DeltaNet.
 
-The recurrence (per value head, state S of shape (K, V), ``scale = K ** -0.5``):
+The recurrence, per value head with state S of shape (K, V) and scale = K ** -0.5:
 
     S = S * exp(g_t);  u = beta_t * (v_t - k_t @ S);  S = S + outer(k_t, u);  o_t = scale * q_t @ S
 
-with q / k L2-normalized per head (as the model passes them), H key heads serving groups of
-HV // H consecutive value heads, g the raw (natural-log) gate in fp32 and beta in bf16.
+q and k are L2-normalized per head, H key heads serve groups of HV // H consecutive value heads,
+g is the raw (natural-log) gate in fp32 and beta is bf16.
 
 Checked:
 
 - the capability query: True at the Qwen3.5 geometry on the H200 (batch 1, 32 value heads, 16 or
   32 key heads, dim 128, bf16 q / k / v / beta, fp32 gate), False off it;
-- the forward output against a naive token-by-token fp32 recurrence of the same bf16 inputs, and
-  the backward (dq, dk per value head, dv, dg w.r.t. the raw gate, dbeta) against torch.autograd
-  through that recurrence. The kernels compute in bf16 / fp32 chunks of 64 (the WY matrix A, the
-  chunk states and the transformed values are bf16), so the comparison is a normalized squared
-  error (``calc_diff``) below 1e-4 for the output and 1e-3 for every gradient, plus an absolute
-  error bound relative to the reference's largest magnitude (2e-2);
-- bit-exactness against FLA's own chunked gated delta rule (``chunk_gated_delta_rule_fwd`` /
-  ``_bwd``, third party) on q / k repeated to the value heads, with FLA's autotuners restricted
-  to the recorded launch configs: output, chunk-cumulated gate, A and every gradient identical.
+- the forward and backward (dq, dk per value head, dv, dg for the raw gate, dbeta) against a naive
+  token-by-token fp32 recurrence and its autograd. The kernels keep some chunk intermediates in
+  bf16, so the check is calc_diff below 1e-4 (output) and 1e-3 (gradients), plus a max absolute
+  error within 2e-2 of the reference's largest magnitude;
+- bit-exactness against FLA's chunked gated delta rule on q / k repeated to the value heads, with
+  FLA's autotuners restricted to the recorded launch configs.
 """
 
 import pytest
@@ -45,28 +42,30 @@ def make_inputs(
     seed: int = 0,
     resets: tuple[int, ...] = (),
 ) -> tuple[torch.Tensor, ...]:
-    """q / k (B, S, H, D) L2-normalized bf16, v (B, S, HV, D) bf16, g (B, S, HV) fp32, beta
-    (B, S, HV) bf16, do like v. ``gate="model"`` draws the gate as the model computes it
-    (``-exp(A_log) * softplus(a + dt_bias)``, A_log = log U(0, 16)); "mild" keeps a long memory.
-    ``resets`` are packed-document starts (g = -128, as the model sets them)."""
+    """
+    Return q / k (B, S, H, D) L2-normalized bf16, v (B, S, HV, D) bf16, g (B, S, HV) fp32, beta
+    (B, S, HV) bf16 and do like v. gate="model" draws the gate as the model computes it,
+    -exp(A_log) * softplus(a + dt_bias) with A_log = log U(0, 16); "mild" keeps a long memory.
+    resets are packed-document starts, where g = -128 as the model sets it.
+    """
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    dev, bf = "cuda", torch.bfloat16
+    device, bf16 = "cuda", torch.bfloat16
 
     def randn(*shape: int) -> torch.Tensor:
-        return torch.randn(*shape, device=dev, generator=gen)
+        return torch.randn(*shape, device=device, generator=gen)
 
-    q = F.normalize(randn(B, S, H, D).to(bf), dim=-1)
-    k = F.normalize(randn(B, S, H, D).to(bf), dim=-1)
-    v = randn(B, S, HV, D).to(bf)
+    q = F.normalize(randn(B, S, H, D).to(bf16), dim=-1)
+    k = F.normalize(randn(B, S, H, D).to(bf16), dim=-1)
+    v = randn(B, S, HV, D).to(bf16)
     if gate == "model":
-        a_log = torch.log(torch.rand(HV, device=dev, generator=gen) * 16)
+        a_log = torch.log(torch.rand(HV, device=device, generator=gen) * 16)
         g = -a_log.exp() * F.softplus(randn(B, S, HV) + 1.0)
     else:
-        g = -torch.rand(B, S, HV, device=dev, generator=gen) * 0.1
+        g = -torch.rand(B, S, HV, device=device, generator=gen) * 0.1
     if resets:
         g[:, list(resets)] = -128.0
-    beta = randn(B, S, HV).to(bf).sigmoid()
-    do = randn(B, S, HV, D).to(bf)
+    beta = randn(B, S, HV).to(bf16).sigmoid()
+    do = randn(B, S, HV, D).to(bf16)
     return q, k, v, g, beta, do
 
 
@@ -87,37 +86,34 @@ def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
 
 
 def naive_gdr(q, k, v, g, beta):
-    """Token-by-token recurrence in fp32; q / k per value head (B, T, HV, D)."""
-    B, T, Hv, K = q.shape
+    """
+    Run the recurrence token by token in fp32; q / k are per value head (B, T, HV, D).
+    """
+    B, T, num_heads, K = q.shape
     scale = K**-0.5
-    state = q.new_zeros(B, Hv, K, v.shape[-1])
+    state = q.new_zeros(B, num_heads, K, v.shape[-1])
     out = []
     for t in range(T):
         state = state * g[:, t].exp()[..., None, None]
-        kt = k[:, t]
-        u = beta[:, t, :, None] * (v[:, t] - torch.einsum("bhk,bhkv->bhv", kt, state))
-        state = state + kt[..., :, None] * u[..., None, :]
+        k_t = k[:, t]
+        u = beta[:, t, :, None] * (v[:, t] - torch.einsum("bhk,bhkv->bhv", k_t, state))
+        state = state + k_t[..., :, None] * u[..., None, :]
         out.append(torch.einsum("bhk,bhkv->bhv", q[:, t] * scale, state))
     return torch.stack(out, 1)
 
 
-def per_value_head(t: torch.Tensor) -> torch.Tensor:
-    return t.repeat_interleave(HV // t.shape[2], dim=2)
+def per_value_head(x: torch.Tensor) -> torch.Tensor:
+    return x.repeat_interleave(HV // x.shape[2], dim=2)
 
 
 def assert_close_to(got: torch.Tensor, ref: torch.Tensor, name: str, diff: float) -> None:
     assert got.shape == ref.shape, name
     assert torch.isfinite(got).all(), name
-    d = calc_diff(got, ref)
-    assert d < diff, f"{name}: calc_diff {d:.2e}"
+    diff_value = calc_diff(got, ref)
+    assert diff_value < diff, f"{name}: calc_diff {diff_value:.2e}"
     err = float((got.float() - ref).abs().max())
     bound = 2e-2 * float(ref.abs().max())
     assert err <= bound, f"{name}: max abs err {err:.3e} > {bound:.3e}"
-
-
-# ---------------------------------------------------------------------------
-# Capability query
-# ---------------------------------------------------------------------------
 
 
 def test_supported_at_the_qwen35_geometry() -> None:
@@ -129,25 +125,20 @@ def test_supported_at_the_qwen35_geometry() -> None:
 
 def test_not_supported_off_the_geometry() -> None:
     q, k, v, g, beta, _ = make_inputs(256)
-    bf = torch.bfloat16
+    bf16 = torch.bfloat16
     off = {
         "batch 2": make_inputs(256, B=2)[:5],
         "16 value heads": (q, k, v[:, :, :16], g[:, :, :16], beta[:, :, :16]),
         "key heads not dividing value heads": (q[:, :, :12], k[:, :, :12], v, g, beta),
         "key dim 64": (q[..., :64].contiguous(), k[..., :64].contiguous(), v, g, beta),
         "value dim 64": (q, k, v[..., :64].contiguous(), g, beta),
-        "bf16 gate": (q, k, v, g.to(bf), beta),
+        "bf16 gate": (q, k, v, g.to(bf16), beta),
         "fp32 q / k / v": (q.float(), k.float(), v.float(), g, beta),
         "fp32 beta": (q, k, v, g, beta.float()),
         "q and k differ": (q[:, :, :8], k, v, g, beta),
     }
     for name, args in off.items():
         assert not gated_delta_rule_pinned_supported(*args), name
-
-
-# ---------------------------------------------------------------------------
-# Forward and backward against the naive recurrence
-# ---------------------------------------------------------------------------
 
 
 CASES = [
@@ -170,23 +161,25 @@ def test_against_naive_recurrence(S: int, H: int, gate: str, resets: tuple[int, 
     assert o.shape == v.shape and o.dtype == torch.bfloat16
     assert g_cum.shape == g.shape and g_cum.dtype == torch.float32
     assert A.shape == (1, S, HV, 64)
-    dq, dk, dv, dg, db = chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)
+    dq, dk, dv, dg, dbeta = chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)
     assert dq.shape == dk.shape == (1, S, HV, D)  # per value head
-    assert dv.shape == v.shape and dg.shape == g.shape and db.shape == beta.shape
-    assert dg.dtype == torch.float32 and db.dtype == dv.dtype == torch.bfloat16
+    assert dv.shape == v.shape and dg.shape == g.shape and dbeta.shape == beta.shape
+    assert dg.dtype == torch.float32 and dbeta.dtype == dv.dtype == torch.bfloat16
 
     leaves = [per_value_head(q).float(), per_value_head(k).float(), v.float(), g, beta.float()]
-    leaves = [t.detach().clone().requires_grad_() for t in leaves]
+    leaves = [leaf_value.detach().clone().requires_grad_() for leaf_value in leaves]
     ref = naive_gdr(*leaves)
     ref.backward(do.float())
 
     assert_close_to(o, ref.detach(), "o", 1e-4)
-    for name, got, leaf in zip(("dq", "dk", "dv", "dg", "dbeta"), (dq, dk, dv, dg, db), leaves):
+    for name, got, leaf in zip(("dq", "dk", "dv", "dg", "dbeta"), (dq, dk, dv, dg, dbeta), leaves):
         assert_close_to(got, leaf.grad, name, 1e-3)
 
 
 def test_comparison_is_sensitive() -> None:
-    """A wrong gate (decay a tenth weaker) fails the forward comparison."""
+    """
+    A wrong gate (decay a tenth weaker) fails the forward comparison.
+    """
     q, k, v, g, beta, _ = make_inputs(256, gate="model", seed=3)
     o, _, _ = chunk_gdr_fwd_pinned(q, k, v, g * 0.9, beta)
     ref = naive_gdr(
@@ -195,12 +188,8 @@ def test_comparison_is_sensitive() -> None:
     assert calc_diff(o, ref) > 1e-4
 
 
-# ---------------------------------------------------------------------------
-# Bit-exactness against FLA's own chunked gated delta rule
-# ---------------------------------------------------------------------------
-
 # The launch configs FLA's autotuner picks on H200 at this geometry (FLA 0.5.2, Triton 3.7.1),
-# which the pinned launches use; FLA is restricted to them so that both sides run the same kernels.
+# which the pinned launches use. FLA is restricted to them so both sides run the same kernels.
 RECORDED = {
     "cumsum": dict(num_warps=1, num_stages=3),
     "kkt_solve": dict(BK=64, num_warps=1, num_stages=3),
@@ -246,7 +235,9 @@ def fla_kernels() -> dict:
 
 
 def pin_fla(monkeypatch: pytest.MonkeyPatch, configs: dict) -> None:
-    """Give each FLA autotuner the single config of ``configs``."""
+    """
+    Give each FLA autotuner the single config of configs.
+    """
     import triton
 
     for name, kernel in fla_kernels().items():
@@ -258,7 +249,9 @@ def pin_fla(monkeypatch: pytest.MonkeyPatch, configs: dict) -> None:
 
 
 def fla_reference(q, k, v, g, beta, do):
-    """FLA's dense chunked forward and backward on q / k repeated to the value heads."""
+    """
+    Run FLA's dense chunked forward and backward on q / k repeated to the value heads.
+    """
     from fla.ops.gated_delta_rule.chunk import (
         chunk_gated_delta_rule_bwd,
         chunk_gated_delta_rule_fwd,
@@ -269,16 +262,16 @@ def fla_reference(q, k, v, g, beta, do):
     g_cum, o, A, *_ = chunk_gated_delta_rule_fwd(
         q=q, k=k, v=v, g=g, beta=beta, scale=scale, initial_state=None, output_final_state=False
     )
-    dq, dk, dv, db, dg, *_ = chunk_gated_delta_rule_bwd(
+    dq, dk, dv, dbeta, dg, *_ = chunk_gated_delta_rule_bwd(
         q=q, k=k, v=v, g=g_cum, beta=beta, A=A, scale=scale, initial_state=None, do=do, dht=None
     )
-    return o, g_cum, A, dq, dk, dv, dg, db
+    return o, g_cum, A, dq, dk, dv, dg, dbeta
 
 
 def pinned_path(q, k, v, g, beta, do):
     o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
-    dq, dk, dv, dg, db = chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)
-    return o, g_cum, A, dq, dk, dv, dg, db
+    dq, dk, dv, dg, dbeta = chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)
+    return o, g_cum, A, dq, dk, dv, dg, dbeta
 
 
 NAMES = ("o", "g_cum", "A", "dq", "dk", "dv", "dg", "dbeta")
@@ -289,18 +282,22 @@ NAMES = ("o", "g_cum", "A", "dq", "dk", "dv", "dg", "dbeta")
     "S,resets", [(4096, ()), (1000, ()), (4096, (0, 300, 1777, 2048, 4091)), (8192, ())]
 )
 def test_bit_exact_against_fla(monkeypatch: pytest.MonkeyPatch, S: int, resets, H: int) -> None:
-    """H = 16 runs grouped value heads on unrepeated q / k; FLA gets them repeated."""
+    """
+    H = 16 runs grouped value heads on unrepeated q / k; FLA gets them repeated.
+    """
     pin_fla(monkeypatch, RECORDED)
     q, k, v, g, beta, do = make_inputs(S, H=H, gate="mild", seed=S, resets=resets)
     got, ref = pinned_path(q, k, v, g, beta, do), fla_reference(q, k, v, g, beta, do)
-    for name, a, b in zip(NAMES, got, ref):
-        assert a.dtype == b.dtype and a.shape == b.shape, name
-        assert torch.equal(a, b), name
+    for name, got_part, ref_part in zip(NAMES, got, ref):
+        assert got_part.dtype == ref_part.dtype and got_part.shape == ref_part.shape, name
+        assert torch.equal(got_part, ref_part), name
 
 
 def test_fla_config_drift_detected(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Another launch config on FLA's side breaks the bitwise match (dqkwg's num_warps changes
-    the gate gradient): the exact comparison is sensitive to config drift."""
+    """
+    Another launch config on FLA's side (dqkwg's num_warps) changes the gate gradient, so the
+    exact comparison detects config drift.
+    """
     configs = dict(RECORDED, dqkwg=dict(RECORDED["dqkwg"], num_warps=2))
     pin_fla(monkeypatch, configs)
     q, k, v, g, beta, do = make_inputs(4096, H=32, gate="mild")

@@ -1,12 +1,11 @@
 """
-Verifier of ``fp8cast_rowwise_blockwise_transpose`` against a pure-PyTorch implementation of the
-E8M0 FP8 recipe.
+Verifies fp8cast_rowwise_blockwise_transpose against a PyTorch implementation of
+the E8M0 FP8 recipe.
 
-``(x_fp8, x_scale, xt_fp8, xt_scale) = fp8cast_rowwise_blockwise_transpose(x)`` is the rowwise
-1x128 quantization of x ((M, K) e4m3, scale (M, ceil(K/128))) plus the 128x128 blockwise
-quantization of x.T ((K, M) e4m3, scale (ceil(K/128), ceil(M/128))). FP8 bytes and scale values
-must be identical to the reference; the rowwise scale's strides are unspecified by contract, so
-scales are compared by logical value.
+(x_fp8, x_scale, xt_fp8, xt_scale) = fp8cast_rowwise_blockwise_transpose(x) is the rowwise 1x128
+quantization of x ((M, K) e4m3, scale (M, ceil(K / 128))) plus the 128x128 blockwise quantization
+of x.T ((K, M) e4m3, scale (ceil(K / 128), ceil(M / 128))). FP8 bytes and scale values must equal
+the reference; the rowwise scale's strides are unspecified, so scales are compared by value.
 """
 
 import pytest
@@ -18,17 +17,15 @@ from pithtrain.kernels import fp8cast_rowwise_blockwise_transpose
 BLOCK = 128
 
 
-# ---------------------------------------------------------------------------
-# PyTorch reference of the recipe
-# ---------------------------------------------------------------------------
-
-
 def e8m0_scale(amax: torch.Tensor) -> torch.Tensor:
-    """2 ** ceil(log2(max(amax, 1e-4) / 448)), exact (frexp, no float log2)."""
-    v = amax.float().clamp(min=1e-4) / 448.0
-    m, e = torch.frexp(v)  # v = m * 2**e, m in [0.5, 1)
-    e = torch.where(m == 0.5, e - 1, e)
-    return ((e + 127) << 23).to(torch.int32).view(torch.float32)
+    """
+    2 ** ceil(log2(max(amax, 1e-4) / 448)), exact (frexp, no float log2).
+    """
+    raw_scale = amax.float().clamp(min=1e-4) / 448.0
+    mantissa, exponent = torch.frexp(raw_scale)  # raw_scale = mantissa * 2**exponent
+    # mantissa is in [0.5, 1): exactly 0.5 is already a power of two, so no round-up
+    exponent = torch.where(mantissa == 0.5, exponent - 1, exponent)
+    return ((exponent + 127) << 23).to(torch.int32).view(torch.float32)
 
 
 def to_e4m3(x: torch.Tensor) -> torch.Tensor:
@@ -36,33 +33,38 @@ def to_e4m3(x: torch.Tensor) -> torch.Tensor:
 
 
 def ref_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """1x128 rowwise quantization of a 2D tensor: (q (M, K), scale (M, ceil(K/128)))."""
+    """
+    1x128 rowwise quantization of a 2D tensor: (q (M, K), scale (M, ceil(K / 128))).
+    """
     M, K = x.shape
-    kb = (K + BLOCK - 1) // BLOCK
-    xb = F.pad(x.float(), (0, kb * BLOCK - K)).view(M, kb, BLOCK)
-    s = e8m0_scale(xb.abs().amax(dim=-1)) if M * kb else torch.empty(M, kb, device=x.device)
-    q = to_e4m3(xb / s[..., None]).view(M, kb * BLOCK)[:, :K]
-    return q.contiguous(), s
+    num_kblocks = (K + BLOCK - 1) // BLOCK
+    x_blocks = F.pad(x.float(), (0, num_kblocks * BLOCK - K)).view(M, num_kblocks, BLOCK)
+    scale = e8m0_scale(x_blocks.abs().amax(dim=-1)) if M * num_kblocks else torch.empty(M, num_kblocks, device=x.device)  # fmt: skip
+    q = to_e4m3(x_blocks / scale[..., None]).view(M, num_kblocks * BLOCK)[:, :K]
+    return q.contiguous(), scale
 
 
 def ref_blockwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """128x128 blockwise quantization of a 2D tensor: (q (N, K), scale (ceil(N/128), ceil(K/128)))."""
+    """
+    128x128 blockwise quantization of a 2D tensor: (q (N, K), scale (ceil(N / 128),
+    ceil(K / 128))).
+    """
     N, K = x.shape
-    nb, kb = (N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
-    xb = F.pad(x.float(), (0, kb * BLOCK - K, 0, nb * BLOCK - N)).view(nb, BLOCK, kb, BLOCK)
-    if nb * kb:
-        s = e8m0_scale(xb.abs().amax(dim=(1, 3)))
+    num_nblocks, num_kblocks = (N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
+    x_blocks = F.pad(x.float(), (0, num_kblocks * BLOCK - K, 0, num_nblocks * BLOCK - N)).view(num_nblocks, BLOCK, num_kblocks, BLOCK)  # fmt: skip
+    if num_nblocks * num_kblocks:
+        scale = e8m0_scale(x_blocks.abs().amax(dim=(1, 3)))
     else:
-        s = torch.empty(nb, kb, device=x.device)
-    q = to_e4m3(xb / s[:, None, :, None]).view(nb * BLOCK, kb * BLOCK)[:N, :K]
-    return q.contiguous(), s
+        scale = torch.empty(num_nblocks, num_kblocks, device=x.device)
+    q = to_e4m3(x_blocks / scale[:, None, :, None]).view(num_nblocks * BLOCK, num_kblocks * BLOCK)[:N, :K]  # fmt: skip
+    return q.contiguous(), scale
 
 
 def assert_fp8_equal(name: str, out: torch.Tensor, ref: torch.Tensor) -> None:
     assert out.dtype == torch.float8_e4m3fn, (name, out.dtype)
     assert out.shape == ref.shape, (name, out.shape, ref.shape)
-    a, b = out.view(torch.uint8), ref.view(torch.uint8)
-    assert torch.equal(a, b), f"{name}: {(a != b).sum().item()} mismatching bytes"
+    out_bytes, ref_bytes = out.view(torch.uint8), ref.view(torch.uint8)
+    assert torch.equal(out_bytes, ref_bytes), f"{name}: {(out_bytes != ref_bytes).sum().item()} mismatching bytes"  # fmt: skip
 
 
 def assert_scale_equal(name: str, out: torch.Tensor, ref: torch.Tensor) -> None:
@@ -73,18 +75,14 @@ def assert_scale_equal(name: str, out: torch.Tensor, ref: torch.Tensor) -> None:
 
 def check(x: torch.Tensor) -> None:
     x_fp8, x_scale, xt_fp8, xt_scale = fp8cast_rowwise_blockwise_transpose(x)
-    q, s = ref_rowwise(x)
-    qt, st = ref_blockwise(x.T)
+    q, scale = ref_rowwise(x)
+    q_t, scale_t = ref_blockwise(x.T)
     assert_fp8_equal("x_fp8", x_fp8, q)
-    assert_scale_equal("x_scale", x_scale, s)
-    assert_fp8_equal("xt_fp8", xt_fp8, qt)
-    assert_scale_equal("xt_scale", xt_scale, st)
+    assert_scale_equal("x_scale", x_scale, scale)
+    assert_fp8_equal("xt_fp8", xt_fp8, q_t)
+    assert_scale_equal("xt_scale", xt_scale, scale_t)
     assert xt_scale.is_contiguous(), xt_scale.stride()  # 128x128 scales are row-major
 
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
 
 # (M, K): the model hidden / intermediate / dense sizes plus tile edges and odd sizes.
 SHAPES = [
@@ -113,10 +111,10 @@ SHAPES = [
 
 def with_outliers(x: torch.Tensor) -> torch.Tensor:
     flat = x.view(-1)
-    n = flat.numel()
-    flat[:: max(1, n // 97)] *= 1000.0
-    flat[5 :: max(1, n // 61)] = 0.0
-    flat[3 :: max(1, n // 13)] *= -1e-3
+    numel = flat.numel()
+    flat[:: max(1, numel // 97)] *= 1000.0
+    flat[5 :: max(1, numel // 61)] = 0.0
+    flat[3 :: max(1, numel // 13)] *= -1e-3
     return x
 
 
@@ -137,15 +135,16 @@ def test_special_values(M: int, K: int) -> None:
     # Huge values: large-exponent scales, |q| up to 448 (saturation boundary).
     check(torch.randn(M, K, device="cuda", dtype=bf16) * 1e30)
     # Exact powers of two: amax = 448 * 2**k hits the no-round-up branch of the E8M0 ceil.
-    p2 = torch.exp2(torch.randint(-20, 20, (M, K), device="cuda").float()).to(bf16)
-    check(p2 * 448.0)
-    check(-p2)
-    # All negative.
+    pow2 = torch.exp2(torch.randint(-20, 20, (M, K), device="cuda").float()).to(bf16)
+    check(pow2 * 448.0)
+    check(-pow2)
     check(-torch.rand(M, K, device="cuda", dtype=bf16) * 3.0)
 
 
 def test_strided_rows() -> None:
-    """A row-strided view (a slice of a wider buffer)."""
+    """
+    A row-strided view (a slice of a wider buffer).
+    """
     torch.manual_seed(1)
     base = torch.randn(1000, 2304, device="cuda", dtype=torch.bfloat16)
     check(base[:, :2048])
@@ -154,7 +153,9 @@ def test_strided_rows() -> None:
 
 
 def test_transposed_input() -> None:
-    """A non-unit inner stride."""
+    """
+    A non-unit inner stride.
+    """
     torch.manual_seed(2)
     check(torch.randn(576, 1000, device="cuda", dtype=torch.bfloat16).T)
 

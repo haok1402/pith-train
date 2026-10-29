@@ -10,10 +10,13 @@ micro-batches and overlap the compute of one with the communication of another.
 - Stage 4: combine all-to-all.
 - Stage 5: post-combine compute.
 
+Each stage has a forward (_f) and a backward (_b) function; stage 3 also has a weight-gradient
+function (_w). The layer_forward / layer_backward and model_forward / model_backward functions run
+the same stages in order without overlap.
+
 run_backward is derived from dualpipe/utils.py in DeepSeek's DualPipe project
-(https://github.com/deepseek-ai/DualPipe), licensed under the MIT License, as is WeightGradStore
-(pithtrain/contexts/weight_grad_store.py). Copyright (c) 2025 DeepSeek. See pithtrain/pipeline/LICENSE
-for the full license text. The five-stage decomposition is an original addition.
+(https://github.com/deepseek-ai/DualPipe), licensed under the MIT License. Copyright (c) 2025
+DeepSeek. See pithtrain/pipeline/LICENSE for the full license text.
 """
 
 from dataclasses import dataclass, field, fields
@@ -29,15 +32,41 @@ from pithtrain.contexts.weight_grad_store import WeightGradStore
 from pithtrain.models.interface import AllToAllSplits, LayerProtocol, ModelProtocol, RoutingInfo
 from pithtrain.operators.all_to_all import all_to_all_async, direct_all_to_all
 
-# fmt: off
-
-# ------------------------------------------------------------
-# DEFERRED WEIGHT GRADIENTS / MANUAL BACKWARD
-# ------------------------------------------------------------
+__all__ = [
+    "ChunkRecord",
+    "ExecutionCtx",
+    "clear_layer_records",
+    "create_chunk_record",
+    "epilog_f",
+    "layer_backward",
+    "layer_forward",
+    "model_backward",
+    "model_forward",
+    "prolog_b",
+    "prolog_f",
+    "run_backward",
+    "stage1_b",
+    "stage1_f",
+    "stage1_stage5_b",
+    "stage2_b",
+    "stage2_f",
+    "stage3_b",
+    "stage3_f",
+    "stage3_w",
+    "stage4_b",
+    "stage4_f",
+    "stage5_b",
+    "stage5_f",
+    "stage5_stage1_f",
+]
 
 
 def run_backward(tensors: List[torch.Tensor], grad_tensors: List[torch.Tensor]) -> None:
-    pairs = [(t, g) for t, g in zip(tensors, grad_tensors) if t is not None]
+    """
+    Backpropagate grad_tensors from tensors, skipping None tensors, and accumulate into .grad. The
+    graph is freed and the engine runs on the calling thread.
+    """
+    pairs = [(tensor, grad) for tensor, grad in zip(tensors, grad_tensors) if tensor is not None]
     if not pairs:
         return
     tensors, grad_tensors = map(tuple, zip(*pairs))
@@ -58,50 +87,56 @@ class ExecutionCtx:
     """
 
     comm_stream: torch.cuda.Stream
-    """Separate stream for asynchronous all-to-all communication."""
+
     comp_stream: torch.cuda.Stream = field(default_factory=torch.cuda.default_stream)
-    """Main compute stream for forward/backward kernels."""
+
     fwd_event: torch.cuda.Event = field(default_factory=torch.cuda.Event)
-    """Event recorded after forward compute; comm_stream waits on it before dispatch."""
+    """
+    Recorded after forward compute; comm_stream waits on it before a forward all-to-all.
+    """
+
     bwd_event: torch.cuda.Event = field(default_factory=torch.cuda.Event)
-    """Event recorded after backward compute; comm_stream waits on it before combine."""
+    """
+    Recorded after backward compute; comm_stream waits on it before a backward all-to-all.
+    """
+
     fwd_comm_work: Optional[torch.distributed.Work] = None
-    """Async work handle for the in-flight forward all-to-all (dispatch or combine)."""
+    """
+    Work handle of the in-flight forward all-to-all (dispatch or combine), if any.
+    """
+
     bwd_comm_work: Optional[torch.distributed.Work] = None
-    """Async work handle for the in-flight backward all-to-all."""
+    """
+    Work handle of the in-flight backward all-to-all, if any.
+    """
+
     fwd_comm_deferred_free: List[torch.Tensor] = field(default_factory=list)
     """
-    Tensors whose storage should be freed after the next fwd_comm_work.wait().
-
-    Callers append tensors here after launching async forward comms (e.g. all-to-all in
-    Stage 2 / Stage 4). The subsequent stage that waits on fwd_comm_work drains and frees
-    this list automatically.
+    Tensors whose storage is freed by the next stage that waits on fwd_comm_work. Callers append
+    the inputs of an asynchronous forward all-to-all here.
     """
 
 
-def comm_all_to_all(ctx: ExecutionCtx, input: torch.Tensor, output_splits: List[int], input_splits: List[int]):
+def comm_all_to_all(ctx: ExecutionCtx, send_tensor: torch.Tensor, output_splits: List[int], input_splits: List[int]):  # fmt: skip
     """
-    Asynchronous all-to-all over the EP group issued from the comm stream: (output, work).
-
-    Equivalent to running direct_all_to_all under `with torch.cuda.stream(ctx.comm_stream)` (the
-    output is allocated from the comm stream's pool and NCCL orders itself after the comm
-    stream), with the stream switched by two direct calls instead of a StreamContext.
+    Start an all-to-all over the EP group on ctx.comm_stream and return (output, work), as
+    direct_all_to_all under torch.cuda.stream(ctx.comm_stream) would.
     """
     stream = ctx.comm_stream
+    # Two direct stream switches instead of a torch.cuda.stream context, which costs more host time.
     prev = torch._C._cuda_getCurrentStream(stream.device_index)
     torch._C._cuda_setStream(stream.stream_id, stream.device_index, stream.device_type)
     try:
-        return all_to_all_async(input, output_splits, input_splits, distributed.ep_group)
+        return all_to_all_async(send_tensor, output_splits, input_splits, distributed.ep_group)
     finally:
         torch._C._cuda_setStream(*prev)
 
 
-# ------------------------------------------------------------
-# STAGE1(F/B)
-# ------------------------------------------------------------
-
-
 class Stage1Args(NamedTuple):
+    """
+    The layer input, and the detached copy stage 1 reads (its grad is the input gradient).
+    """
+
     prev_hidden_states: torch.Tensor
     next_hidden_states: torch.Tensor
 
@@ -118,9 +153,9 @@ class Stage1Record:
     outs: Optional[Stage1Outs] = None
 
 
-def stage1_f(ctx: ExecutionCtx, layer: LayerProtocol, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor], cu_seqlens: Optional[torch.Tensor] = None):
+def stage1_f(ctx: ExecutionCtx, layer: LayerProtocol, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor], cu_seqlens: Optional[torch.Tensor] = None):  # fmt: skip
     """
-    Stage1 forward.
+    Run the layer's stage 1 and return (record, dispatch_tokens, residual, routing).
     """
     nvtx.range_push("layer%02d.stage1_f" % layer.idx)
     record = Stage1Record()
@@ -129,7 +164,7 @@ def stage1_f(ctx: ExecutionCtx, layer: LayerProtocol, hidden_states: torch.Tenso
     next_hidden_states = hidden_states.detach().requires_grad_()
     record.args = Stage1Args(prev_hidden_states, next_hidden_states)
 
-    dispatch_tokens, residual, routing = layer.forward_stage1(next_hidden_states, rotary_posemb, cu_seqlens)
+    dispatch_tokens, residual, routing = layer.forward_stage1(next_hidden_states, rotary_posemb, cu_seqlens)  # fmt: skip
     ctx.comp_stream.record_event(ctx.fwd_event)
 
     topk_weight = routing.topk_weight if routing is not None else None
@@ -140,9 +175,6 @@ def stage1_f(ctx: ExecutionCtx, layer: LayerProtocol, hidden_states: torch.Tenso
 
 
 def stage1_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage1Record, grad_tensors: tuple):
-    """
-    Stage1 backward.
-    """
     nvtx.range_push("layer%02d.stage1_b" % layer.idx)
 
     if ctx.bwd_comm_work is not None:
@@ -157,19 +189,15 @@ def stage1_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage1Record, grad
     return hidden_states_grad
 
 
-# ------------------------------------------------------------
-# STAGE2(F/B)
-# ------------------------------------------------------------
-
-
 @dataclass(slots=True)
 class Stage2Record:
     splits: Optional[AllToAllSplits] = None
 
 
-def stage2_f(ctx: ExecutionCtx, layer: LayerProtocol, dispatch_tokens: torch.Tensor, dispatch_splits: Optional[AllToAllSplits]):
+def stage2_f(ctx: ExecutionCtx, layer: LayerProtocol, dispatch_tokens: torch.Tensor, dispatch_splits: Optional[AllToAllSplits]):  # fmt: skip
     """
-    Stage2 forward: all-to-all dispatch for expert parallelism.
+    Start the dispatch all-to-all on the comm stream and return (record, gathered_tokens). Without
+    splits the tokens pass through.
     """
     nvtx.range_push("layer%02d.stage2_f" % layer.idx)
     record = Stage2Record()
@@ -179,7 +207,7 @@ def stage2_f(ctx: ExecutionCtx, layer: LayerProtocol, dispatch_tokens: torch.Ten
     dispatch_tokens = dispatch_tokens.detach()
     record.splits = dispatch_splits
     if dispatch_splits is not None:
-        gathered_tokens, ctx.fwd_comm_work = comm_all_to_all(ctx, dispatch_tokens, dispatch_splits.output_splits, dispatch_splits.input_splits)
+        gathered_tokens, ctx.fwd_comm_work = comm_all_to_all(ctx, dispatch_tokens, dispatch_splits.output_splits, dispatch_splits.input_splits)  # fmt: skip
     else:
         gathered_tokens, ctx.fwd_comm_work = dispatch_tokens, None
 
@@ -189,25 +217,20 @@ def stage2_f(ctx: ExecutionCtx, layer: LayerProtocol, dispatch_tokens: torch.Ten
 
 def stage2_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage2Record, grad_tensors: tuple):
     """
-    Stage2 backward: reverse all-to-all.
+    Start the reverse dispatch all-to-all of the gradient and return it.
     """
     nvtx.range_push("layer%02d.stage2_b" % layer.idx)
 
     ctx.comm_stream.wait_event(ctx.bwd_event)
 
     if record.splits is not None:
-        dispatch_tokens_grad, ctx.bwd_comm_work = comm_all_to_all(ctx, grad_tensors[0], record.splits.input_splits, record.splits.output_splits)
+        dispatch_tokens_grad, ctx.bwd_comm_work = comm_all_to_all(ctx, grad_tensors[0], record.splits.input_splits, record.splits.output_splits)  # fmt: skip
     else:
         dispatch_tokens_grad = grad_tensors[0]
         ctx.bwd_comm_work = None
 
     nvtx.range_pop()
     return dispatch_tokens_grad
-
-
-# ------------------------------------------------------------
-# STAGE3(F/B/W)
-# ------------------------------------------------------------
 
 
 class Stage3Args(NamedTuple):
@@ -224,24 +247,20 @@ class Stage3Record:
     outs: Optional[Stage3Outs] = None
 
 
-def _drain_deferred_free(ctx: ExecutionCtx) -> None:
-    """
-    Free tensor storage that was deferred until after the comm wait.
-    """
-    for t in ctx.fwd_comm_deferred_free:
-        t.untyped_storage().resize_(0)
+def drain_deferred_free(ctx: ExecutionCtx) -> None:
+    for tensor in ctx.fwd_comm_deferred_free:
+        tensor.untyped_storage().resize_(0)
     ctx.fwd_comm_deferred_free.clear()
 
 
-def _keeps_stage3_input(layer: LayerProtocol) -> bool:
-    """Whether the layer's stage 3 saves its input for the backward (see keeps_stage3_input)."""
+def layer_keeps_stage3_input(layer: LayerProtocol) -> bool:
     keeps = getattr(layer, "keeps_stage3_input", None)
     return keeps is not None and keeps()
 
 
-def stage3_f(ctx: ExecutionCtx, layer: LayerProtocol, gathered_tokens: torch.Tensor, expert_idxs: Optional[torch.Tensor], expand_idx: Optional[torch.Tensor] = None, expert_counts: Optional[list[int]] = None):
+def stage3_f(ctx: ExecutionCtx, layer: LayerProtocol, gathered_tokens: torch.Tensor, expert_idxs: Optional[torch.Tensor], expand_idx: Optional[torch.Tensor] = None, expert_counts: Optional[list[int]] = None):  # fmt: skip
     """
-    Stage3 forward.
+    Wait for the dispatch, run the layer's stage 3 and return (record, moe_outs).
     """
     nvtx.range_push("layer%02d.stage3_f" % layer.idx)
     record = Stage3Record()
@@ -251,15 +270,13 @@ def stage3_f(ctx: ExecutionCtx, layer: LayerProtocol, gathered_tokens: torch.Ten
 
     if ctx.fwd_comm_work is not None:
         ctx.fwd_comm_work.wait()
-    _drain_deferred_free(ctx)
+    drain_deferred_free(ctx)
 
     moe_outs = layer.forward_stage3(gathered_tokens, expert_idxs, expand_idx, expert_counts)
     record.outs = Stage3Outs(moe_outs)
-    # Free the args storage - only safe for MoE layers with EP where
-    # padded_index_gather is the first consumer and doesn't save the input.
-    # When ep_size==1, gathered_tokens shares storage with dispatch_tokens.
-    # Layers whose experts read the tokens again in backward keep them (keeps_stage3_input).
-    if expert_idxs is not None and ctx.fwd_comm_work is not None and not _keeps_stage3_input(layer):
+    # The backward needs only the grad of gathered_tokens, so free its values: only with EP, where
+    # it does not share storage with dispatch_tokens, and when stage 3 did not save it.
+    if expert_idxs is not None and ctx.fwd_comm_work is not None and not layer_keeps_stage3_input(layer):  # fmt: skip
         gathered_tokens.untyped_storage().resize_(0)
 
     ctx.comp_stream.record_event(ctx.fwd_event)
@@ -270,7 +287,8 @@ def stage3_f(ctx: ExecutionCtx, layer: LayerProtocol, gathered_tokens: torch.Ten
 
 def stage3_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage3Record, grad_tensors: tuple):
     """
-    Stage3 backward for input.
+    Backpropagate stage 3 to its input, deferring weight gradients to WeightGradStore, and return
+    the input gradient.
     """
     nvtx.range_push("layer%02d.stage3_b" % layer.idx)
 
@@ -291,7 +309,7 @@ def stage3_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage3Record, grad
 
 def stage3_w(layer: LayerProtocol):
     """
-    Stage3 backward for weight.
+    Queue the weight gradients deferred since the last flush, then run the oldest queued group.
     """
     nvtx.range_push("layer%02d.stage3_w" % layer.idx)
 
@@ -301,19 +319,15 @@ def stage3_w(layer: LayerProtocol):
     nvtx.range_pop()
 
 
-# ------------------------------------------------------------
-# STAGE4(F/B)
-# ------------------------------------------------------------
-
-
 @dataclass(slots=True)
 class Stage4Record:
     splits: Optional[AllToAllSplits] = None
 
 
-def stage4_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, combine_splits: Optional[AllToAllSplits]):
+def stage4_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, combine_splits: Optional[AllToAllSplits]):  # fmt: skip
     """
-    Stage4 forward: all-to-all combine for expert parallelism.
+    Start the combine all-to-all on the comm stream and return (record, moe_outs). Without splits
+    the outputs pass through.
     """
     nvtx.range_push("layer%02d.stage4_f" % layer.idx)
     record = Stage4Record()
@@ -323,7 +337,7 @@ def stage4_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, co
 
     record.splits = combine_splits
     if combine_splits is not None:
-        moe_outs, ctx.fwd_comm_work = comm_all_to_all(ctx, moe_outs, combine_splits.input_splits, combine_splits.output_splits)
+        moe_outs, ctx.fwd_comm_work = comm_all_to_all(ctx, moe_outs, combine_splits.input_splits, combine_splits.output_splits)  # fmt: skip
     else:
         ctx.fwd_comm_work = None
 
@@ -333,25 +347,20 @@ def stage4_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, co
 
 def stage4_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage4Record, grad_tensors: tuple):
     """
-    Stage4 backward: reverse all-to-all.
+    Start the reverse combine all-to-all of the gradient and return it.
     """
     nvtx.range_push("layer%02d.stage4_b" % layer.idx)
 
     ctx.comm_stream.wait_event(ctx.bwd_event)
 
     if record.splits is not None:
-        moe_outs_grad, ctx.bwd_comm_work = comm_all_to_all(ctx, grad_tensors[0], record.splits.output_splits, record.splits.input_splits)
+        moe_outs_grad, ctx.bwd_comm_work = comm_all_to_all(ctx, grad_tensors[0], record.splits.output_splits, record.splits.input_splits)  # fmt: skip
     else:
         moe_outs_grad = grad_tensors[0]
         ctx.bwd_comm_work = None
 
     nvtx.range_pop()
     return moe_outs_grad
-
-
-# ------------------------------------------------------------
-# STAGE5(F/B)
-# ------------------------------------------------------------
 
 
 class Stage5Args(NamedTuple):
@@ -370,9 +379,9 @@ class Stage5Record:
     outs: Optional[Stage5Outs] = None
 
 
-def stage5_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, routing: Optional[RoutingInfo], residual: torch.Tensor):
+def stage5_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, routing: Optional[RoutingInfo], residual: torch.Tensor):  # fmt: skip
     """
-    Stage5 forward.
+    Wait for the combine, run the layer's stage 5 and return (record, hidden_states).
     """
     nvtx.range_push("layer%02d.stage5_f" % layer.idx)
     record = Stage5Record()
@@ -385,7 +394,7 @@ def stage5_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, ro
 
     if ctx.fwd_comm_work is not None:
         ctx.fwd_comm_work.wait()
-    _drain_deferred_free(ctx)
+    drain_deferred_free(ctx)
 
     moe_local_idxs = routing.moe_local_idxs if routing is not None else None
     hidden_states = layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
@@ -397,7 +406,7 @@ def stage5_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, ro
 
 def stage5_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage5Record, grad_tensors: tuple):
     """
-    Stage5 backward.
+    Backpropagate stage 5 and return the gradients of (moe_outs, topk_weight, residual).
     """
     nvtx.range_push("layer%02d.stage5_b" % layer.idx)
 
@@ -405,22 +414,16 @@ def stage5_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage5Record, grad
 
     ctx.comp_stream.record_event(ctx.bwd_event)
 
-    moe_outs_grad, topk_weight_grad, residual_grad = [t.grad if t is not None else None for t in record.args]
+    moe_outs_grad, topk_weight_grad, residual_grad = [arg.grad if arg is not None else None for arg in record.args]  # fmt: skip
 
     nvtx.range_pop()
     return moe_outs_grad, topk_weight_grad, residual_grad
 
 
-# ------------------------------------------------------------
-# STAGE5_STAGE1(F) / STAGE1_STAGE5(B) - the fused pair across a layer boundary
-# ------------------------------------------------------------
-
-
-def stage5_stage1_f(ctx: ExecutionCtx, prev_layer: LayerProtocol, next_layer: LayerProtocol, moe_outs: torch.Tensor, routing: Optional[RoutingInfo], residual: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor], cu_seqlens: Optional[torch.Tensor] = None):
+def stage5_stage1_f(ctx: ExecutionCtx, prev_layer: LayerProtocol, next_layer: LayerProtocol, moe_outs: torch.Tensor, routing: Optional[RoutingInfo], residual: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor], cu_seqlens: Optional[torch.Tensor] = None):  # fmt: skip
     """
-    Fused forward: prev_layer stage5, then next_layer stage1.
-
-    Returns (stage5_args, stage1_outs, dispatch_tokens, residual, routing) for the next layer.
+    Run prev_layer's stage 5, then next_layer's stage 1. Returns (stage5_args, stage1_outs,
+    dispatch_tokens, residual, routing), the last three for next_layer.
     """
     nvtx.range_push("layer%02d_stage5_f_layer%02d_stage1_f" % (prev_layer.idx, next_layer.idx))
 
@@ -432,16 +435,16 @@ def stage5_stage1_f(ctx: ExecutionCtx, prev_layer: LayerProtocol, next_layer: La
 
     if ctx.fwd_comm_work is not None:
         ctx.fwd_comm_work.wait()
-    _drain_deferred_free(ctx)
+    drain_deferred_free(ctx)
 
     moe_local_idxs = routing.moe_local_idxs if routing is not None else None
     fused = getattr(next_layer, "forward_stage5_stage1", None)
     if fused is not None:
         # One compiled region for prev_layer's stage 5 and next_layer's stage 1 (model opt-in).
-        dispatch_tokens, next_residual, next_routing = fused(prev_layer, moe_outs, moe_local_idxs, topk_weight, residual, rotary_posemb, cu_seqlens)
+        dispatch_tokens, next_residual, next_routing = fused(prev_layer, moe_outs, moe_local_idxs, topk_weight, residual, rotary_posemb, cu_seqlens)  # fmt: skip
     else:
         hidden_states = prev_layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
-        dispatch_tokens, next_residual, next_routing = next_layer.forward_stage1(hidden_states, rotary_posemb, cu_seqlens)
+        dispatch_tokens, next_residual, next_routing = next_layer.forward_stage1(hidden_states, rotary_posemb, cu_seqlens)  # fmt: skip
     ctx.comp_stream.record_event(ctx.fwd_event)
 
     next_topk_weight = next_routing.topk_weight if next_routing is not None else None
@@ -451,11 +454,10 @@ def stage5_stage1_f(ctx: ExecutionCtx, prev_layer: LayerProtocol, next_layer: La
     return stage5_args, stage1_outs, dispatch_tokens, next_residual, next_routing
 
 
-def stage1_stage5_b(ctx: ExecutionCtx, next_layer: LayerProtocol, prev_layer: LayerProtocol, stage1_outs: Stage1Outs, stage5_args: Stage5Args, grad_tensors: tuple):
+def stage1_stage5_b(ctx: ExecutionCtx, next_layer: LayerProtocol, prev_layer: LayerProtocol, stage1_outs: Stage1Outs, stage5_args: Stage5Args, grad_tensors: tuple):  # fmt: skip
     """
-    Fused backward: next_layer stage1, then prev_layer stage5.
-
-    Takes stage1_outs (from the next layer) and stage5_args (from the previous layer) separately.
+    Backpropagate next_layer's stage 1 through prev_layer's stage 5 and return the gradients of
+    prev_layer's (moe_outs, topk_weight, residual).
     """
     nvtx.range_push("layer%02d_stage5_b_layer%02d_stage1_b" % (prev_layer.idx, next_layer.idx))
 
@@ -466,15 +468,10 @@ def stage1_stage5_b(ctx: ExecutionCtx, next_layer: LayerProtocol, prev_layer: La
 
     ctx.comp_stream.record_event(ctx.bwd_event)
 
-    moe_outs_grad, topk_weight_grad, residual_grad = [t.grad if t is not None else None for t in stage5_args]
+    moe_outs_grad, topk_weight_grad, residual_grad = [arg.grad if arg is not None else None for arg in stage5_args]  # fmt: skip
 
     nvtx.range_pop()
     return moe_outs_grad, topk_weight_grad, residual_grad
-
-
-# ------------------------------------------------------------
-# PROLOG(F/B)
-# ------------------------------------------------------------
 
 
 class PrologOuts(NamedTuple):
@@ -486,9 +483,9 @@ class PrologRecord:
     outs: Optional[PrologOuts] = None
 
 
-def prolog_f(module: ModelProtocol, hidden_states: torch.Tensor, record: PrologRecord) -> torch.Tensor:
+def prolog_f(module: ModelProtocol, hidden_states: torch.Tensor, record: PrologRecord) -> torch.Tensor:  # fmt: skip
     """
-    Prolog forward: embed the input tokens, recording into record for the backward.
+    Embed the input tokens, saving the output in record for the backward.
     """
     nvtx.range_push("prolog_f")
     hidden_states = module.forward_prolog(hidden_states)
@@ -498,19 +495,11 @@ def prolog_f(module: ModelProtocol, hidden_states: torch.Tensor, record: PrologR
 
 
 def prolog_b(module: ModelProtocol, record: PrologRecord, grad_tensors: tuple):
-    """
-    Prolog backward.
-    """
     nvtx.range_push("prolog_b")
 
     run_backward(record.outs, grad_tensors)
 
     nvtx.range_pop()
-
-
-# ------------------------------------------------------------
-# EPILOG(F/B)
-# ------------------------------------------------------------
 
 
 class EpilogArgs(NamedTuple):
@@ -522,13 +511,10 @@ class EpilogRecord:
     args: Optional[EpilogArgs] = None
 
 
-def epilog_f(module: ModelProtocol, hidden_states: torch.Tensor, record: EpilogRecord) -> torch.Tensor:
+def epilog_f(module: ModelProtocol, hidden_states: torch.Tensor, record: EpilogRecord) -> torch.Tensor:  # fmt: skip
     """
-    Epilog forward: norm + lm_head, recording its input activation into record.
-
-    The backward is handled by loss.backward() which traverses the autograd
-    graph through norm -> lm_head -> objective.  The only thing the caller needs
-    from the record is args.hidden_states.grad (populated by autograd).
+    Apply the final norm and lm_head. The detached input is saved in record; the loss backward
+    fills its grad, the gradient handed to the decoder layers.
     """
     nvtx.range_push("epilog_f")
     hidden_states = hidden_states.detach().requires_grad_()
@@ -536,11 +522,6 @@ def epilog_f(module: ModelProtocol, hidden_states: torch.Tensor, record: EpilogR
     logits = module.forward_epilog(hidden_states)
     nvtx.range_pop()
     return logits
-
-
-# ------------------------------------------------------------
-# INTERMEDIATE TENSORS
-# ------------------------------------------------------------
 
 
 @dataclass(init=False, slots=True)
@@ -560,9 +541,6 @@ class ChunkRecord:
 
 
 def create_layer_record() -> LayerRecord:
-    """
-    Create a pre-allocated LayerRecord with all records.
-    """
     layer = LayerRecord()
     layer.stage1 = Stage1Record()
     layer.stage2 = Stage2Record()
@@ -573,9 +551,6 @@ def create_layer_record() -> LayerRecord:
 
 
 def create_chunk_record(num_layers: int, has_prolog: bool, has_epilog: bool) -> ChunkRecord:
-    """
-    Create a pre-allocated ChunkRecord structure for reuse across iterations.
-    """
     record = ChunkRecord()
     record.prolog = PrologRecord() if has_prolog else None
     record.epilog = EpilogRecord() if has_epilog else None
@@ -585,35 +560,24 @@ def create_chunk_record(num_layers: int, has_prolog: bool, has_epilog: bool) -> 
 
 def clear_layer_records(layer: LayerRecord) -> None:
     """
-    Clear tensor references from a layer's records while keeping records pre-allocated.
+    Drop the tensor references of a layer's records, keeping the records themselves.
     """
-    for f in fields(layer):
-        record = getattr(layer, f.name)
-        for rf in fields(record):
-            setattr(record, rf.name, None)
+    for stage_field in fields(layer):
+        record = getattr(layer, stage_field.name)
+        for record_field in fields(record):
+            setattr(record, record_field.name, None)
 
 
-# ------------------------------------------------------------
-# SEQUENTIAL (NON-OVERLAPPED) LAYER + CHUNK PASSES
-# ------------------------------------------------------------
-
-
-def layer_forward_dispatch(dispatch_tokens: torch.Tensor, dispatch_splits: Optional[AllToAllSplits]):
-    """
-    All-to-all dispatch.
-    """
+def layer_forward_dispatch(dispatch_tokens: torch.Tensor, dispatch_splits: Optional[AllToAllSplits]):  # fmt: skip
     if dispatch_splits is None:
         return dispatch_tokens
-    return direct_all_to_all(dispatch_tokens, dispatch_splits.output_splits, dispatch_splits.input_splits, distributed.ep_group)
+    return direct_all_to_all(dispatch_tokens, dispatch_splits.output_splits, dispatch_splits.input_splits, distributed.ep_group)  # fmt: skip
 
 
 def layer_forward_combine(outs: torch.Tensor, combine_splits: Optional[AllToAllSplits]):
-    """
-    All-to-all combine.
-    """
     if combine_splits is None:
         return outs
-    return direct_all_to_all(outs, combine_splits.input_splits, combine_splits.output_splits, distributed.ep_group)
+    return direct_all_to_all(outs, combine_splits.input_splits, combine_splits.output_splits, distributed.ep_group)  # fmt: skip
 
 
 def layer_forward(
@@ -624,27 +588,23 @@ def layer_forward(
     cu_seqlens: Optional[torch.Tensor] = None,
 ):
     """
-    Forward pass for a DualPipeV decoder layer.
-
-    Records each stage's tensors into layer_record for the pipeline backward.
+    Run a decoder layer's five stages in order, saving each stage's tensors in layer_record for the
+    backward in layer_backward.
     """
-
-    # Stage 1.
     nvtx.range_push("layer%02d.stage1_f" % layer.idx)
     record = Stage1Record()
     prev_hidden_states = hidden_states
     next_hidden_states = hidden_states.detach().requires_grad_()
     record.args = Stage1Args(prev_hidden_states, next_hidden_states)
 
-    dispatch_tokens, residual, routing = layer.forward_stage1(next_hidden_states, rotary_posemb, cu_seqlens)
+    dispatch_tokens, residual, routing = layer.forward_stage1(next_hidden_states, rotary_posemb, cu_seqlens)  # fmt: skip
 
     has_experts = routing is not None
 
-    record.outs = Stage1Outs(dispatch_tokens, residual, routing.topk_weight if has_experts else None)
+    record.outs = Stage1Outs(dispatch_tokens, residual, routing.topk_weight if has_experts else None)  # fmt: skip
     layer_record.stage1 = record
     nvtx.range_pop()
 
-    # Stage 2.
     nvtx.range_push("layer%02d.stage2_f" % layer.idx)
     record = Stage2Record()
     record.splits = routing.dispatch_splits if has_experts else None
@@ -654,7 +614,6 @@ def layer_forward(
     layer_record.stage2 = record
     nvtx.range_pop()
 
-    # Stage 3.
     nvtx.range_push("layer%02d.stage3_f" % layer.idx)
     record = Stage3Record()
     gathered_tokens = gathered_tokens.detach().requires_grad_()
@@ -662,26 +621,21 @@ def layer_forward(
 
     if fwd_comm_work is not None:
         fwd_comm_work.wait()
-    # Stage 2 all-to-all has completed - dispatch_tokens storage is no longer read.
-    # Free it now; run_backward only needs the grad_fn chain, not the values.
-    # Guard: only when a2a actually occurred (ep_size > 1); otherwise dispatch_tokens
-    # and gathered_tokens share storage.
+    # The dispatch has completed, so free dispatch_tokens: the backward needs its grad_fn, not its
+    # values. Only with EP; otherwise it shares storage with gathered_tokens.
     if has_experts and fwd_comm_work is not None:
         dispatch_tokens.untyped_storage().resize_(0)
 
-    moe_outs = layer.forward_stage3(gathered_tokens, routing.expert_idxs if has_experts else None, routing.expand_idx if has_experts else None, routing.expert_counts if has_experts else None)
+    moe_outs = layer.forward_stage3(gathered_tokens, routing.expert_idxs if has_experts else None, routing.expand_idx if has_experts else None, routing.expert_counts if has_experts else None)  # fmt: skip
 
     record.outs = Stage3Outs(moe_outs)
-    # Free args storage - values no longer needed, only .grad is read after backward.
-    # Only safe for MoE layers with EP: padded_index_gather is the first consumer and
-    # doesn't save the input.  For dense layers or ep_size==1, gate_proj/up_proj may
-    # save gathered_tokens directly, or it shares storage with dispatch_tokens.
-    if has_experts and fwd_comm_work is not None and not _keeps_stage3_input(layer):
+    # The backward needs only the grad of gathered_tokens, so free its values: only with EP, where
+    # it does not share storage with dispatch_tokens, and when stage 3 did not save it.
+    if has_experts and fwd_comm_work is not None and not layer_keeps_stage3_input(layer):
         gathered_tokens.untyped_storage().resize_(0)
     layer_record.stage3 = record
     nvtx.range_pop()
 
-    # Stage 4.
     nvtx.range_push("layer%02d.stage4_f" % layer.idx)
     record = Stage4Record()
     record.splits = routing.combine_splits if has_experts else None
@@ -691,7 +645,6 @@ def layer_forward(
     layer_record.stage4 = record
     nvtx.range_pop()
 
-    # Stage 5.
     nvtx.range_push("layer%02d.stage5_f" % layer.idx)
     record = Stage5Record()
     moe_outs = moe_outs.detach().requires_grad_()
@@ -702,7 +655,7 @@ def layer_forward(
 
     if fwd_comm_work is not None:
         fwd_comm_work.wait()
-    # Stage 4 all-to-all has completed - Stage 3 output is no longer read.
+    # The combine has completed, so the stage 3 output is no longer read.
     if has_experts and fwd_comm_work is not None:
         layer_record.stage3.outs.moe_outs.untyped_storage().resize_(0)
     moe_local_idxs = routing.moe_local_idxs if has_experts else None
@@ -721,42 +674,36 @@ def layer_backward(
     layer_record: LayerRecord,
 ):
     """
-    Backward pass for a DualPipeV decoder layer.
+    Backpropagate a decoder layer from the records layer_forward saved, clear the records and
+    return the input gradient.
 
-    Handles both normal and merged cases using asymmetric None pattern:
-    - Merged stage1: stage1.outs is set, stage1.args is None
-      -> Run backward on stage1.outs, grads flow to prev layer's stage5.args
-      -> Return None to signal prev layer to get grads from stage5.args
-    - Merged stage5: stage5.args is set, stage5.outs is None
-      -> Get grads from stage5.args.*.grad (already computed by next layer)
+    A stage 1 fused with the previous layer's stage 5 (stage1.args None) leaves its gradients on
+    that layer's stage5.args and returns None. A stage 5 fused that way (stage5.outs None) reads
+    its gradients from its own stage5.args, which the next layer already filled.
     """
-
     stage1_record = layer_record.stage1
     stage5_record = layer_record.stage5
     stage5_was_merged = stage5_record.args is not None and stage5_record.outs is None
     stage1_is_merged = stage1_record.outs is not None and stage1_record.args is None
 
-    # Stage 5.
     if stage5_was_merged:
         nvtx.range_push("layer%02d.stage5_merged_skip" % layer.idx)
     else:
         nvtx.range_push("layer%02d.stage5_b" % layer.idx)
         run_backward(stage5_record.outs, output_grads)
-    moe_outs_grad, topk_weight_grad, residual_grad = [t.grad if t is not None else None for t in stage5_record.args]
+    moe_outs_grad, topk_weight_grad, residual_grad = [arg.grad if arg is not None else None for arg in stage5_record.args]  # fmt: skip
     nvtx.range_pop()
 
-    # Stage 4.
     nvtx.range_push("layer%02d.stage4_b" % layer.idx)
     record = layer_record.stage4
     if record.splits is not None:
-        moe_outs_grad = direct_all_to_all(moe_outs_grad, record.splits.output_splits, record.splits.input_splits, distributed.ep_group)
+        moe_outs_grad = direct_all_to_all(moe_outs_grad, record.splits.output_splits, record.splits.input_splits, distributed.ep_group)  # fmt: skip
         bwd_comm_work = moe_outs_grad.comm_work
         moe_outs_grad.comm_work = None
     else:
         bwd_comm_work = None
     nvtx.range_pop()
 
-    # Stage 3.
     nvtx.range_push("layer%02d.stage3_b" % layer.idx)
     record = layer_record.stage3
 
@@ -767,11 +714,10 @@ def layer_backward(
     gathered_tokens_grad = record.args.gathered_tokens.grad
     nvtx.range_pop()
 
-    # Stage 2.
     nvtx.range_push("layer%02d.stage2_b" % layer.idx)
     record = layer_record.stage2
     if record.splits is not None:
-        dispatch_tokens_grad = direct_all_to_all(gathered_tokens_grad, record.splits.input_splits, record.splits.output_splits, distributed.ep_group)
+        dispatch_tokens_grad = direct_all_to_all(gathered_tokens_grad, record.splits.input_splits, record.splits.output_splits, distributed.ep_group)  # fmt: skip
         bwd_comm_work = dispatch_tokens_grad.comm_work
         dispatch_tokens_grad.comm_work = None
     else:
@@ -779,7 +725,6 @@ def layer_backward(
         bwd_comm_work = None
     nvtx.range_pop()
 
-    # Stage 1.
     nvtx.range_push("layer%02d.stage1_b" % layer.idx)
     if bwd_comm_work is not None:
         bwd_comm_work.wait()
@@ -804,10 +749,8 @@ def model_forward(
     cu_seqlens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Sequential (non-overlapped) forward for one pipeline chunk: prolog -> layers -> epilog.
-
-    Without grad, clear records after each layer to bound activation memory and leave the
-    empty records required by the next training step's merged stage-5/stage-1 path.
+    Run one pipeline chunk without overlap: prolog, layers, epilog. Without grad the records are
+    cleared after each layer, bounding activation memory and leaving them empty for the next step.
     """
     forward_only = not torch.is_grad_enabled()
     if module.stage_index == 0:
@@ -836,10 +779,8 @@ def model_backward(
     chunk_record: ChunkRecord,
 ):
     """
-    Sequential (non-overlapped) backward for one pipeline chunk: epilog -> layers -> prolog.
-
-    Backprops through the tensors model_forward saved in chunk_record and
-    returns the input gradients to hand back to the previous pipeline stage.
+    Backpropagate one pipeline chunk from the records model_forward saved: epilog, layers, prolog.
+    Returns the input gradients for the previous pipeline stage.
     """
     if loss is not None:
         loss.backward()

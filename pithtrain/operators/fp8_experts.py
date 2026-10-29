@@ -1,27 +1,18 @@
 """
-FP8 routed experts on Hopper as single autograd nodes, with the activation fused into the FP8
-quantization of its neighbours, and the fused stage-3 input path that feeds them.
+FP8 routed experts as single autograd nodes, with the activation fused into the FP8 quantization
+of its neighbours, and the fused expert input that feeds them.
 
-- FP8SwiGLUExpertsFunc (fp8_swiglu_experts): separate gate / up / down FP8GroupedLinear weights
-  (DeepSeek-V2-Lite, Qwen3), SwiGLU fused through the kernel library's silu_mul_quant_*.
-- FP8SwiGLUGateUpExpertsFunc (fp8_swiglu_gate_up_experts): one fused (G, 2I, H) gate_up weight
-  (Qwen3.5).
-- FP8ClampedSwiGLUExpertsFunc (fp8_clamped_swiglu_experts): gpt-oss's raw biased interleaved
-  gate_up and down parameters and its clamped SwiGLU, fused through clamped_swiglu_quant_*.
-- FP8ScatterQuantFunc (fp8_scatter_quant): received tokens -> quantized grouped input in one pass
-  (scatter_quant), with scatter_quant_backward.
+- fp8_swiglu_experts: separate gate, up and down FP8GroupedLinear weights (DeepSeek-V2-Lite,
+  Qwen3).
+- fp8_swiglu_gate_up_experts: one fused (G, 2I, H) gate_up weight (Qwen3.5).
+- fp8_clamped_swiglu_experts: gpt-oss's raw biased, interleaved gate_up and down parameters and
+  its clamped SwiGLU.
+- fp8_scatter_quant: received tokens to the quantized grouped expert input in one pass.
 
-Only where fp8_fused_experts_supported() (the models check it); elsewhere FP8 training takes the
-unfused FP8GroupedLinear path.
-
-Every FP8 operand is bit-identical to the unfused path (FP8GroupedLinear -> activation ->
-FP8GroupedLinear), so the outputs and gradients are too, except where noted (gpt-oss's gate_up
-bias gradient sums the same bf16 values in a different fp32 order).
-
-The gpt-oss experts: the down bias is added in place into the down GEMM's output (one fp32 add
-rounded to bf16, as indexed_bias_add does, without materializing bias[group_ids]); its gradient is
-indexed_bias_add's segment sum. Their wgrads go through fp8_padded_wgrad, whose operands are laid
-out padded to the channel counts the k-grouped GEMM takes without a copy.
+Use these only where fp8_fused_experts_supported() is true; elsewhere FP8 experts take the
+unfused FP8GroupedLinear path. Every FP8 operand is bit-identical to that path, so the outputs
+and gradients are too, except gpt-oss's gate_up bias gradient, which sums the same bf16 values in
+a different fp32 order.
 """
 
 import torch
@@ -60,18 +51,9 @@ __all__ = [
 
 class FP8SwiGLUExpertsFunc(torch.autograd.Function):
     """
-    gate_proj, up_proj -> SwiGLU -> down_proj for FP8 routed experts on Hopper, as one autograd
-    node.
-
-    SwiGLU is fused into the quantization of its neighbours (silu_mul_quant_fwd and co.): forward
-    quantizes h for down_proj straight from gate and up, and backward quantizes dg and du for the
-    gate/up GEMMs straight from dh, so h, dg and du never reach HBM in bf16. The x quantization is
-    shared by gate_proj and up_proj. Every kernel is bit-identical to the unfused path, so the
-    result equals FP8GroupedLinear(gate/up) -> silu_mul -> FP8GroupedLinear(down).
-
-    The K-major FP8 h that down_proj's wgrad reads is not kept from the forward but quantized
-    again from the saved gate and up in backward (one more silu_mul_quant pass, deterministic, so
-    the bytes are the same), which drops it from the saved activations.
+    down_proj(silu(gate_proj(x)) * up_proj(x)) for FP8 experts with separate gate, up and down
+    weights, as one autograd node. The SwiGLU output h and its gradients are produced directly in
+    FP8, never in bf16. Equal to FP8GroupedLinear, silu_mul and FP8GroupedLinear run in turn.
     """
 
     @staticmethod
@@ -105,6 +87,8 @@ class FP8SwiGLUExpertsFunc(torch.autograd.Function):
             (h_fp8, h_scale), quantized_down[:2], hidden, grouped_mm_offs, group_indices
         )
         del h_fp8, h_scale
+        # The K-major h for down_proj's wgrad is not saved: the backward quantizes it again from
+        # gate and up, the same bytes.
         ctx.save_for_backward(
             gate, up, x_kmajor, x_kmajor_scale,
             grouped_mm_offs, ks_tensor,
@@ -127,8 +111,8 @@ class FP8SwiGLUExpertsFunc(torch.autograd.Function):
         inter, hidden = w_gate.shape[1], w_down.shape[1]
         x_kmajor_pair = (x_kmajor, x_kmajor_scale)
 
-        # Locals are dropped as soon as their last reader is queued, to keep the transient peak of
-        # the backward low; the deferred wgrads keep only the K-major operands they need.
+        # Each local is deleted once its last reader is queued, to keep the backward's peak memory
+        # low; the deferred wgrads hold only the K-major operands they need.
         _, _, h_kmajor, h_kmajor_scale = silu_mul_quant_fwd(gate, up, grouped_mm_offs)
         dy_fp8, dy_scale, dy_kmajor, dy_kmajor_scale = quantize_grouped_input(dy, grouped_mm_offs)
         del dy
@@ -172,13 +156,13 @@ def fp8_swiglu_experts(
     quantized_input: tuple[torch.Tensor, ...] | None = None,
 ) -> torch.Tensor:
     """
-    down_proj(silu(gate_proj(x)) * up_proj(x)) through FP8SwiGLUExpertsFunc. With quantized_input
+    down_proj(silu(gate_proj(x)) * up_proj(x)), all three FP8GroupedLinear. With quantized_input
     (from fp8_scatter_quant) x is only a gradient carrier and is never read.
     """
     return FP8SwiGLUExpertsFunc.apply(
         x, gate_proj.weight, up_proj.weight, down_proj.weight, grouped_mm_offs, ks, ks_tensor,
-        group_indices, gate_proj._get_quantized_weight(), up_proj._get_quantized_weight(),
-        down_proj._get_quantized_weight(), quantized_input,
+        group_indices, gate_proj.get_quantized_weight(), up_proj.get_quantized_weight(),
+        down_proj.get_quantized_weight(), quantized_input,
     )  # fmt: skip
 
 
@@ -189,30 +173,27 @@ def scatter_quant_backward(
     num_src_rows: int,
 ) -> torch.Tensor:
     """
-    Gradient with respect to gathered given the gradient of the (never materialized) bf16 grouped
-    input x (M, N): the backward of scatter_for_grouped_gemm (gather by reverse_shuffle_idxs)
-    composed with that of padded_index_gather (scatter-add by expand_idx). Padding rows of grad_x
-    are ignored. Needs no forward activations.
+    Gradient of fp8_scatter_quant's gathered input from grad_x (M, N), the gradient of the grouped
+    expert input: rows gathered by reverse_shuffle_idxs, then, with expand_idx, scatter-added into
+    num_src_rows rows. Padding rows of grad_x are ignored.
     """
     grad_expanded = grad_x[reverse_shuffle_idxs]
     if expand_idx is None:
         return grad_expanded
     out = grad_x.new_zeros(num_src_rows, grad_x.shape[1])
-    # scatter_add_ (as _PaddedIndexGather.backward uses) rather than index_add_: several times
-    # faster for bf16 rows at these shapes.
+    # scatter_add_ rather than index_add_: several times faster for bf16 rows at these shapes.
     out.scatter_add_(0, expand_idx.unsqueeze(-1).expand_as(grad_expanded), grad_expanded)
     return out
 
 
 class FP8ScatterQuantFunc(torch.autograd.Function):
     """
-    Received tokens -> quantized grouped expert input in one pass (scatter_quant): the dedup
-    expansion (padded_index_gather), the scatter by expert (scatter_for_grouped_gemm) and the FP8
-    quantization (quantize_grouped_input) fused, so the bf16 expert input is never written.
+    Received tokens to the quantized grouped expert input in one pass: the dedup expansion, the
+    scatter by expert and the FP8 quantization, without writing the bf16 expert input.
 
     Returns a zero-storage (M, N) stand-in for that bf16 input, which only carries its gradient
     back to the received tokens, followed by scatter_for_grouped_gemm's outputs with the bf16
-    tokens replaced by the quantized tuple. Rows are placed in token order within each expert.
+    tokens replaced by the quantized tuple. Rows are in token order within each expert.
     """
 
     @staticmethod
@@ -255,8 +236,8 @@ def fp8_scatter_quant(
     group_counts: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list, torch.Tensor, tuple[torch.Tensor, ...]]:
     """
-    (x, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor, quantized_x) for FP8 experts on
-    Hopper; see FP8ScatterQuantFunc. x is the gradient carrier to hand the experts with quantized_x.
+    Returns (x, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor, quantized_x); see
+    FP8ScatterQuantFunc. Hand the experts x, the gradient carrier, together with quantized_x.
     """
     x, reverse_shuffle_idxs, grouped_mm_offs, ks_tensor, ks, quantized_x = (
         FP8ScatterQuantFunc.apply(gathered, expert_idxs, num_groups, expand_idx, group_counts)
@@ -266,10 +247,8 @@ def fp8_scatter_quant(
 
 class FP8SwiGLUGateUpExpertsFunc(torch.autograd.Function):
     """
-    gate_up_proj -> SwiGLU -> down_proj for FP8 routed experts with a fused gate_up weight
-    (G, 2I, H), on Hopper, as one autograd node. The GEMMs are those of the unfused path (one
-    gate_up GEMM, one down GEMM; in backward one dgrad and one wgrad each); SwiGLU lives inside the
-    quantization kernels.
+    down_proj(silu(g) * u) with [g | u] = gate_up_proj(x) for FP8 experts with a fused (G, 2I, H)
+    gate_up weight, as one autograd node, SwiGLU fused into the FP8 quantizations.
     """
 
     @staticmethod
@@ -297,8 +276,8 @@ class FP8SwiGLUGateUpExpertsFunc(torch.autograd.Function):
         y = fp8_m_grouped_gemm(
             (h_fp8, h_scale), quantized_down[:2], hidden, grouped_mm_offs, group_indices
         )
-        # The K-major h for down_proj's wgrad is a pure function of gate_up, which is saved anyway:
-        # backward quantizes it again (bit-identical) instead of keeping it alive meanwhile.
+        # The K-major h for down_proj's wgrad is not saved: the backward quantizes it again from
+        # gate_up, the same bytes.
         ctx.save_for_backward(
             gate_up, x_kmajor, x_kmajor_scale, grouped_mm_offs, ks_tensor,
             quantized_gate_up[2], quantized_gate_up[3], quantized_down[2], quantized_down[3],
@@ -357,13 +336,12 @@ def fp8_swiglu_gate_up_experts(
     quantized_input: tuple[torch.Tensor, ...] | None = None,
 ) -> torch.Tensor:
     """
-    down_proj(silu(g) * u) with [g | u] = gate_up_proj(x), both FP8GroupedLinear, through
-    FP8SwiGLUGateUpExpertsFunc. With quantized_input (from fp8_scatter_quant) x is only a gradient
-    carrier and is never read.
+    down_proj(silu(g) * u) with [g | u] = gate_up_proj(x), both FP8GroupedLinear. With
+    quantized_input (from fp8_scatter_quant) x is only a gradient carrier and is never read.
     """
     return FP8SwiGLUGateUpExpertsFunc.apply(
         x, gate_up_proj.weight, down_proj.weight, grouped_mm_offs, ks, ks_tensor, group_indices,
-        gate_up_proj._get_quantized_weight(), down_proj._get_quantized_weight(), quantized_input,
+        gate_up_proj.get_quantized_weight(), down_proj.get_quantized_weight(), quantized_input,
     )  # fmt: skip
 
 
@@ -376,11 +354,10 @@ def fp8_padded_wgrad(
     main_grad: torch.Tensor | None = None,
 ) -> None:
     """
-    weight.grad += a^T b per expert (into main_grad in fp32 instead when it holds storage, see
-    modules/wgrad_accumulation.install_raw_main_grad) (k-grouped FP8 GEMM, deferred to DualPipeV's
-    W phase like grouped_linear.fp8_grouped_wgrad), for weight (G, N, K), a's per-channel FP8 with
-    NA >= N channels and b's with KB >= K (either may be laid out padded: the fused ops'
-    padded=True); k_grouped_fp8_gemm drops the padding.
+    weight.grad += a.T @ b per expert for weight (G, N, K), or into main_grad in fp32 when it has
+    storage. a and b are per-channel FP8 (data, scale) pairs with at least N and K channels (the
+    fused ops' padded=True layout); channels past N and K are ignored. Deferred to DualPipeV's W
+    phase when WeightGradStore is enabled.
     """
     G, N, K = weight.shape
 
@@ -406,8 +383,8 @@ def fp8_padded_wgrad(
 
 class FP8ClampedSwiGLUExpertsFunc(torch.autograd.Function):
     """
-    gate_up (+bias) -> clamped SwiGLU -> down (+bias) for gpt-oss FP8 experts on Hopper. See the
-    module docstring. With quantized_input (from fp8_scatter_quant), x is only a gradient carrier.
+    down(clamped_swiglu(gate_up(x) + b_gate_up)) + b_down for gpt-oss FP8 experts, as one autograd
+    node. With quantized_input (from fp8_scatter_quant), x is only a gradient carrier.
     """
 
     @staticmethod
@@ -436,8 +413,7 @@ class FP8ClampedSwiGLUExpertsFunc(torch.autograd.Function):
         gate_up = fp8_m_grouped_gemm(
             (x_fp8, x_scale), quantized_gate_up[:2], two_inter, grouped_mm_offs, group_indices
         )
-        # Only the rowwise h for the down GEMM: its K-major copy (down_proj's wgrad operand) is
-        # recomputed from gate_up in backward rather than kept, the same bytes.
+        # Only the rowwise h: the backward quantizes its K-major copy again from gate_up.
         h_fp8, h_scale = clamped_swiglu_quant_rowwise(
             gate_up, b_gate_up, grouped_mm_offs, alpha, limit
         )

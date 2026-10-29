@@ -1,48 +1,40 @@
 """
-Import layering, kernel naming and the kernel library's interface, checked statically (CPU only,
-nothing is imported).
+Static checks (CPU only, nothing imported) of the import layering, kernel naming and the kernel
+library's interface, over pithtrain/, tests/, benchmarks/, tools/ and examples/:
 
-An AST walk over ``pithtrain/``, ``tests/``, ``benchmarks/``, ``tools/`` and ``examples/`` that
-enforces the package layering (AGENTS.md, "Kernels"), the ``_sm90`` / ``_sm100`` naming convention
-of ``pithtrain/kernels/`` and its black-box interface:
+- kernels/ is flat; its __init__.py holds only "from pithtrain.kernels.<module> import <names>"
+  lines and __all__ (built by __all__.append calls), which lists exactly the imported names, each
+  defined at the top level of its module (no _sm100 module, no private name); operators/__init__.py
+  is empty;
+- outside kernels/ the only import of the kernel library is "from pithtrain.kernels import
+  <name>" with the name in __all__ (no submodule, no "import pithtrain.kernels");
+- outside kernels/ nothing in pithtrain/ or tests/kernels/ branches on the architecture: no
+  get_device_capability, ARCH_MAJOR, NATIVE_E8M0, is_sm90 or is_sm90_device (capability queries
+  named for a feature are exported instead);
+- every name in __all__ is imported and used by tests/kernels/test_<feature>.py, where feature is
+  its module's stem without _sm90 / _sm100, and tests/kernels/ imports nothing from pithtrain but
+  pithtrain.kernels;
+- inside kernels/ every module lists its exports in a literal __all__, defines no name with a
+  leading underscore at any level (functions, classes, methods, attributes, locals, parameters,
+  import aliases), and imports from a sibling only names in that sibling's __all__ (directly or as
+  attributes of a module alias);
+- importing pithtrain.kernels loads neither cutlass, QuACK nor FA4: no module it imports at module
+  level, transitively, imports them at module level;
+- kernels/ imports only third-party code and other kernels/ modules; contexts/ imports nothing
+  from pithtrain at runtime; operators/ imports only kernels/, contexts/ and sibling operators;
+  pipeline/, models/ and tasks/ import only what the layering allows (models import pipeline/ for
+  layer_partition and model_forward, a package-level 2-cycle that is acyclic per module because
+  pipeline/ imports only models/interface.py);
+- _sm90 / _sm100 files exist only in kernels/, and every _sm90 file has its _sm100 sibling unless
+  it is SM90-only or a shared SM90 helper;
+- no _sm100 file imports an _sm90 file or a picker, an _sm90 file imports another feature's _smXX
+  file only along the named cross-feature edges, and no picker imports another picker;
+- get_device_capability appears in pithtrain/ only in kernels/arch.py;
+- no test file is named for an architecture (test_*_sm90.py / test_*_sm100.py);
+- the modules/ files the models import do not import the models back;
+- the module import graph of pithtrain/ has no cycle.
 
-- ``kernels/`` is flat; its ``__init__.py`` holds only ``from pithtrain.kernels.<module> import
-  <names>`` lines and ``__all__`` (a list built by ``__all__.append`` calls), which lists exactly
-  the imported names, each defined at the top
-  level of its module (no ``_sm100`` module, no private name); ``operators/__init__.py`` is empty;
-- outside ``kernels/`` the only import of the kernel library is ``from pithtrain.kernels import
-  <name>`` with ``<name>`` in ``__all__`` (no submodule, no ``import pithtrain.kernels``);
-- outside ``kernels/`` nothing in ``pithtrain/`` branches on the architecture: no
-  ``get_device_capability``, ``ARCH_MAJOR``, ``NATIVE_E8M0``, ``is_sm90`` or ``is_sm90_device``
-  (capability queries named for a feature are exported instead), and neither does
-  ``tests/kernels/``;
-- every name in ``__all__`` is exercised (imported and used) by ``tests/kernels/test_<feature>.py``,
-  ``<feature>`` its module's stem without ``_sm90`` / ``_sm100``, and ``tests/kernels/`` imports
-  nothing from pithtrain but ``pithtrain.kernels``;
-- inside ``kernels/`` every module lists what it exports in a literal ``__all__``, defines no
-  ``_name`` at any level (functions, classes, methods, attributes, locals, parameters, import
-  aliases; ``__all__`` marks what is internal, not an underscore), and imports from a
-  sibling only names in that sibling's ``__all__`` (``from pithtrain.kernels.x import n`` or ``x.n``
-  through a module alias);
-- importing ``pithtrain.kernels`` loads neither cutlass, QuACK nor FA4: no module it imports at
-  module level, transitively, imports them at module level (the ``_sm90`` CuTe kernels and FA4
-  are imported inside the functions that run them);
-- ``kernels/`` imports only third-party code and other ``kernels/`` modules; ``contexts/`` imports
-  nothing from pithtrain at runtime; ``operators/`` imports only ``kernels/``, ``contexts/`` and
-  sibling operators; ``pipeline/``, ``models/`` and ``tasks/`` import only what the layering allows
-  (models import ``pipeline/`` for ``layer_partition`` / ``model_forward``, a package-level 2-cycle
-  that is acyclic per module because ``pipeline/`` imports only ``models/interface.py``);
-- ``_sm90`` / ``_sm100`` files exist only in ``kernels/``, and every ``_sm90`` file has its
-  ``_sm100`` sibling unless it is SM90-only or a shared SM90 helper;
-- no ``_sm100`` file imports an ``_sm90`` file or a picker, an ``_sm90`` file imports another
-  feature's ``_smXX`` file only along the named cross-feature edges, and no picker imports another
-  picker;
-- ``get_device_capability`` appears in ``pithtrain/`` only in ``kernels/arch.py``;
-- no test file is named for an architecture (``test_*_sm90.py`` / ``test_*_sm100.py``);
-- the ``modules/`` files the models import do not import the models back;
-- the module import graph of ``pithtrain/`` has no cycle.
-
-Imports inside functions count; imports under ``if TYPE_CHECKING:`` do not.
+Imports inside functions count; imports under "if TYPE_CHECKING:" do not.
 """
 
 from __future__ import annotations
@@ -63,23 +55,22 @@ SM90_ONLY = {
 }
 # Shared CuTe helpers that only SM90 code uses (rule 6).
 SM90_HELPERS = {"cute_ptx_sm90", "cute_compile_sm90", "fp8_e8m0_scale_sm90"}
-# Cross-feature edges from an _sm90 file into another feature's _smXX file (F4-F6), plus the
-# SM90-only features' internal edges.
+# Cross-feature edges from an _sm90 file into another feature's _smXX file.
 SM90_CROSS_EDGES = {
     ("fp8_silu_mul_quant_sm90", "fp8_rowwise_kmajor_sm90"),
     ("fp8_clamped_swiglu_quant_sm90", "fp8_rowwise_kmajor_sm90"),
     ("fp8_scatter_quant_sm90", "fp8_rowwise_kmajor_sm90"),
 }
-# What models/ may import from modules/ (from kernels/: only the package, like everyone else).
+# What models/ may import from modules/ (from kernels/ only the package, like everyone else).
 MODELS_MODULES = {"load_balance", "recompute", "fp8_param_gather"}
 PIPELINE_OPERATORS = {"all_to_all"}
 
-# Violations of the current tree, as (rule, module, detail). Shrinks as the restructure lands; the
-# test also fails on an entry that no longer occurs, so the list stays exact.
+# Known violations, as (rule, module, detail). The test also fails on an entry that no longer
+# occurs, so the list stays exact.
 ALLOWED: set[tuple[str, str, str]] = set()
 
 
-def _module_name(path: Path) -> str:
+def module_name_of(path: Path) -> str:
     rel = path.relative_to(ROOT).with_suffix("")
     parts = list(rel.parts)
     if parts[-1] == "__init__":
@@ -87,12 +78,12 @@ def _module_name(path: Path) -> str:
     return ".".join(parts)
 
 
-def _modules(base: Path) -> dict[str, Path]:
-    return {_module_name(p): p for p in sorted(base.rglob("*.py")) if "__pycache__" not in p.parts}
+def collect_modules(base: Path) -> dict[str, Path]:
+    return {module_name_of(p): p for p in sorted(base.rglob("*.py")) if "__pycache__" not in p.parts}  # fmt: skip
 
 
-MODULES = _modules(PKG)
-TEST_MODULES = _modules(ROOT / "tests")
+MODULES = collect_modules(PKG)
+TEST_MODULES = collect_modules(ROOT / "tests")
 # Every Python file outside pithtrain/kernels/ that may import the kernel library.
 OUTSIDE_FILES = [
     p
@@ -104,10 +95,10 @@ OUTSIDE_FILES = [
 ARCH_NAMES = {"get_device_capability", "ARCH_MAJOR", "NATIVE_E8M0", "is_sm90", "is_sm90_device"}
 
 
-def _exports() -> tuple[dict[str, list[str]], list[str], list[str]]:
+def read_exports() -> tuple[dict[str, list[str]], list[str], list[str]]:
     """
-    From kernels/__init__.py: the imported names by defining module stem, ``__all__``, and every
-    statement that is neither such an import nor ``__all__`` (the docstring aside).
+    Return, from kernels/__init__.py, the imported names by defining module stem, __all__, and
+    every statement that is neither such an import nor __all__ (the docstring aside).
     """
     tree = ast.parse((KERNELS / "__init__.py").read_text())
     exports: dict[str, list[str]] = {}
@@ -133,7 +124,7 @@ def _exports() -> tuple[dict[str, list[str]], list[str], list[str]]:
     return exports, all_names, other
 
 
-EXPORTS, ALL_LIST, INIT_OTHER = _exports()
+EXPORTS, ALL_LIST, INIT_OTHER = read_exports()
 ALL = {name for names in EXPORTS.values() for name in names}
 
 
@@ -142,25 +133,29 @@ ALL = {name for names in EXPORTS.values() for name in names}
 HEAVY = {"cutlass", "quack", "flash_attn"}
 
 
-def _top_level_imports(path: Path) -> list[str]:
-    """Modules ``path`` imports at module level (not inside a function), resolved to pithtrain
-    modules where they are one."""
+def top_level_imports(path: Path) -> list[str]:
+    """
+    Return the modules path imports at module level (not inside a function), resolved to
+    pithtrain modules where they are one.
+    """
     out: list[str] = []
     for node in ast.parse(path.read_text()).body:
         if isinstance(node, ast.Import):
-            out.extend(_resolve(a.name) for a in node.names)
+            out.extend(resolve_module(a.name) for a in node.names)
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             for a in node.names:
                 full = f"{node.module}.{a.name}"
-                out.append(full if full in MODULES else _resolve(node.module))
+                out.append(full if full in MODULES else resolve_module(node.module))
     return out
 
 
-def _eager_closure(root: str) -> set[str]:
-    """The pithtrain modules importing ``root`` loads: module-level imports, transitively."""
+def eager_closure(root: str) -> set[str]:
+    """
+    Return the pithtrain modules that importing root loads: module-level imports, transitively.
+    """
     seen, stack = {root}, [root]
     while stack:
-        for t in _top_level_imports(MODULES[stack.pop()]):
+        for t in top_level_imports(MODULES[stack.pop()]):
             if t in MODULES and t not in seen:
                 seen.add(t)
                 stack.append(t)
@@ -173,7 +168,7 @@ Modules verified through another feature's verifier: launch-config tuning by the
 """
 
 
-def _feature(stem: str) -> str:
+def feature_of(stem: str) -> str:
     if stem in VERIFIER_OF:
         return VERIFIER_OF[stem]
     for suffix in ("_sm90", "_sm100"):
@@ -182,7 +177,7 @@ def _feature(stem: str) -> str:
     return stem
 
 
-def _top_level_names(path: Path) -> set[str]:
+def top_level_names(path: Path) -> set[str]:
     names: set[str] = set()
     for node in ast.parse(path.read_text()).body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -194,10 +189,12 @@ def _top_level_names(path: Path) -> set[str]:
     return names
 
 
-def _defined_names(tree: ast.Module) -> set[str]:
-    """Every name a module defines at any level: functions, classes, methods, assignment targets
-    (attributes such as self.x included), parameters and import aliases. Reads of other code's
-    attributes (a library's _hooks) are not definitions."""
+def defined_names(tree: ast.Module) -> set[str]:
+    """
+    Return every name a module defines at any level: functions, classes, methods, assignment
+    targets (attributes such as self.x included), parameters and import aliases. Reads of other
+    code's attributes (a library's hooks) are not definitions.
+    """
     names: set[str] = set()
     for n in ast.walk(tree):
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -213,8 +210,10 @@ def _defined_names(tree: ast.Module) -> set[str]:
     return names
 
 
-def _kernel_imports(path: Path) -> list[tuple[int, str, str]]:
-    """(line, form, detail) of every import of pithtrain.kernels in ``path``, TYPE_CHECKING too."""
+def kernel_imports(path: Path) -> list[tuple[int, str, str]]:
+    """
+    Return (line, form, detail) of every import of pithtrain.kernels in path, TYPE_CHECKING too.
+    """
     out: list[tuple[int, str, str]] = []
     for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
         if isinstance(node, ast.Import):
@@ -232,14 +231,16 @@ def _kernel_imports(path: Path) -> list[tuple[int, str, str]]:
     return out
 
 
-def _is_type_checking(test: ast.expr) -> bool:
+def is_type_checking(test: ast.expr) -> bool:
     if isinstance(test, ast.Name):
         return test.id == "TYPE_CHECKING"
     return isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
 
 
-def _resolve(name: str) -> str:
-    """The longest prefix of ``name`` that is a pithtrain module, else ``name`` itself."""
+def resolve_module(name: str) -> str:
+    """
+    Return the longest prefix of name that is a pithtrain module, else name itself.
+    """
     parts = name.split(".")
     for i in range(len(parts), 0, -1):
         cand = ".".join(parts[:i])
@@ -248,20 +249,22 @@ def _resolve(name: str) -> str:
     return name
 
 
-def _imports(path: Path) -> list[str]:
-    """Every module ``path`` imports at runtime (lazy imports included, TYPE_CHECKING excluded)."""
+def runtime_imports(path: Path) -> list[str]:
+    """
+    Return every module path imports at runtime (lazy imports included, TYPE_CHECKING excluded).
+    """
     tree = ast.parse(path.read_text(), filename=str(path))
-    mod = _module_name(path)
+    mod = module_name_of(path)
     pkg = mod if path.name == "__init__.py" else mod.rpartition(".")[0]
     out: list[str] = []
 
     def visit(node: ast.AST) -> None:
-        if isinstance(node, ast.If) and _is_type_checking(node.test):
+        if isinstance(node, ast.If) and is_type_checking(node.test):
             for child in node.orelse:
                 visit(child)
             return
         if isinstance(node, ast.Import):
-            out.extend(_resolve(a.name) for a in node.names)
+            out.extend(resolve_module(a.name) for a in node.names)
         elif isinstance(node, ast.ImportFrom):
             base = node.module or ""
             if node.level:
@@ -269,7 +272,7 @@ def _imports(path: Path) -> list[str]:
                 base = ".".join(anchor + ([base] if base else []))
             for a in node.names:
                 full = f"{base}.{a.name}"
-                out.append(full if full in MODULES else _resolve(base))
+                out.append(full if full in MODULES else resolve_module(base))
         for child in ast.iter_child_nodes(node):
             visit(child)
 
@@ -277,43 +280,42 @@ def _imports(path: Path) -> list[str]:
     return out
 
 
-IMPORTS = {m: [t for t in _imports(p) if t.startswith("pithtrain")] for m, p in MODULES.items()}
+IMPORTS = {m: [t for t in runtime_imports(p) if t.startswith("pithtrain")] for m, p in MODULES.items()}  # fmt: skip
 
 
-def _layer(mod: str) -> str:
+def layer_of(mod: str) -> str:
     parts = mod.split(".")
     return parts[1] if len(parts) > 1 else ""
 
 
-def _stem(mod: str) -> str:
+def stem_of(mod: str) -> str:
     return mod.rpartition(".")[2]
 
 
-def _smxx(mod: str) -> bool:
-    return _stem(mod).endswith(("_sm90", "_sm100"))
+def is_smxx(mod: str) -> bool:
+    return stem_of(mod).endswith(("_sm90", "_sm100"))
 
 
-def _pickers() -> set[str]:
-    stems = {_stem(m) for m in MODULES if _layer(m) == "kernels"}
+def find_pickers() -> set[str]:
+    stems = {stem_of(m) for m in MODULES if layer_of(m) == "kernels"}
     return {
         f"pithtrain.kernels.{s}" for s in stems if f"{s}_sm90" in stems and f"{s}_sm100" in stems
     }
 
 
-PICKERS = _pickers()
+PICKERS = find_pickers()
 
 
-def _violations() -> set[tuple[str, str, str]]:
+def find_violations() -> set[tuple[str, str, str]]:
     found: set[tuple[str, str, str]] = set()
 
-    # Package shape.
     if KERNELS.exists():
         for p in KERNELS.iterdir():
             if p.is_dir() and p.name != "__pycache__":
                 found.add(("kernels-flat", "pithtrain.kernels", p.name))
     init = PKG / "operators" / "__init__.py"
     if init.exists() and init.read_text().strip():
-        found.add(("empty-init", _module_name(init), ""))
+        found.add(("empty-init", module_name_of(init), ""))
 
     # The kernel library's interface: __all__ is exactly the imported names, each defined in the
     # module it is imported from, nothing private, nothing else in __init__.py.
@@ -331,7 +333,7 @@ def _violations() -> set[tuple[str, str, str]]:
             continue
         if module.endswith("_sm100"):
             found.add(("exports-sm100", "pithtrain.kernels", module))
-        defined = _top_level_names(path)
+        defined = top_level_names(path)
         for name in names:
             if name not in defined:
                 found.add(("exports-undefined", f"pithtrain.kernels.{module}", name))
@@ -340,10 +342,10 @@ def _violations() -> set[tuple[str, str, str]]:
     if len(ALL) != sum(len(v) for v in EXPORTS.values()):
         found.add(("exports-duplicate", "pithtrain.kernels", ""))
 
-    # Outside kernels/: only `from pithtrain.kernels import <name in __all__>`, no arch branches.
+    # Outside kernels/: only "from pithtrain.kernels import <name in __all__>", no arch branches.
     for path in OUTSIDE_FILES:
         rel = str(path.relative_to(ROOT))
-        for line, form, detail in _kernel_imports(path):
+        for line, form, detail in kernel_imports(path):
             if form != "name" or detail not in ALL:
                 found.add(("kernels-interface", rel, f"{line}: {form} {detail}"))
         in_pkg = PKG in path.parents
@@ -357,12 +359,12 @@ def _violations() -> set[tuple[str, str, str]]:
     # Every exported name is exercised by its feature's verifier, which imports only the library.
     kernel_tests = ROOT / "tests" / "kernels"
     for module, names in EXPORTS.items():
-        test = kernel_tests / f"test_{_feature(module)}.py"
+        test = kernel_tests / f"test_{feature_of(module)}.py"
         if not test.exists():
             found.add(("verifier-missing", str(test.relative_to(ROOT)), module))
             continue
         tree = ast.parse(test.read_text())
-        imported = {d for _, form, d in _kernel_imports(test) if form == "name"}
+        imported = {d for _, form, d in kernel_imports(test) if form == "name"}
         used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
         for name in names:
             if name not in imported or name not in used:
@@ -383,11 +385,11 @@ def _violations() -> set[tuple[str, str, str]]:
                         found.add(("verifier-imports", str(path.relative_to(ROOT)), m))
 
     for mod, path in MODULES.items():
-        layer, stem = _layer(mod), _stem(mod)
+        layer, stem = layer_of(mod), stem_of(mod)
         targets = IMPORTS[mod]
 
         # Naming: _smXX files live only in kernels/, and an _sm90 file has its _sm100 sibling.
-        if _smxx(mod) and layer != "kernels":
+        if is_smxx(mod) and layer != "kernels":
             found.add(("smxx-outside-kernels", mod, ""))
         if layer == "kernels" and stem.endswith("_sm90"):
             sibling = stem[: -len("_sm90")] + "_sm100"
@@ -397,13 +399,11 @@ def _violations() -> set[tuple[str, str, str]]:
             ):
                 found.add(("sm90-without-sm100", mod, sibling))
 
-        # Capability checks only in kernels/arch.py.
         if mod != "pithtrain.kernels.arch" and "get_device_capability" in path.read_text():
             found.add(("capability-outside-arch", mod, ""))
 
         for t in targets:
-            tl = _layer(t)
-            # Package layering.
+            tl = layer_of(t)
             if layer == "kernels" and tl != "kernels":
                 found.add(("kernels-imports", mod, t))
             elif layer == "contexts" and t != mod:
@@ -415,13 +415,13 @@ def _violations() -> set[tuple[str, str, str]]:
             elif layer == "pipeline" and not (
                 tl in ("contexts", "pipeline")
                 or t == "pithtrain.models.interface"
-                or (tl == "operators" and _stem(t) in PIPELINE_OPERATORS)
+                or (tl == "operators" and stem_of(t) in PIPELINE_OPERATORS)
             ):
                 found.add(("pipeline-imports", mod, t))
             elif layer == "models" and (
                 tl == "tasks"
                 or (tl == "kernels" and t != "pithtrain.kernels")
-                or (tl == "modules" and _stem(t) not in MODELS_MODULES)
+                or (tl == "modules" and stem_of(t) not in MODELS_MODULES)
             ):
                 found.add(("models-imports", mod, t))
             elif layer == "modules" and tl in ("models", "pipeline", "tasks"):
@@ -433,15 +433,14 @@ def _violations() -> set[tuple[str, str, str]]:
             ):
                 found.add(("models-modules-cycle", mod, t))
 
-            # _smXX edges.
-            if _smxx(t):
+            if is_smxx(t):
                 if layer != "kernels":
                     found.add(("smxx-importer", mod, t))
-                if stem.endswith("_sm100") and _stem(t).endswith("_sm90"):
+                if stem.endswith("_sm100") and stem_of(t).endswith("_sm90"):
                     found.add(("sm100-imports-sm90", mod, t))
                 if stem.endswith("_sm90") and stem not in SM90_HELPERS:
                     own = stem[: -len("_sm90")]
-                    ts = _stem(t)
+                    ts = stem_of(t)
                     ok = (
                         ts == own + "_sm100" or ts in SM90_HELPERS or (stem, ts) in SM90_CROSS_EDGES
                     )
@@ -455,8 +454,8 @@ def _violations() -> set[tuple[str, str, str]]:
 
     # Importing pithtrain.kernels never loads cutlass, QuACK or FA4 (which loads both): no module
     # the package imports at module level, transitively, imports them at module level.
-    for mod in sorted(_eager_closure("pithtrain.kernels")):
-        heavy = [t for t in _top_level_imports(MODULES[mod]) if t.split(".")[0] in HEAVY]
+    for mod in sorted(eager_closure("pithtrain.kernels")):
+        heavy = [t for t in top_level_imports(MODULES[mod]) if t.split(".")[0] in HEAVY]
         if heavy:
             found.add(("kernels-eager-heavy", mod, heavy[0]))
 
@@ -479,7 +478,7 @@ def _violations() -> set[tuple[str, str, str]]:
             module_all[path.stem] = set()
         if not decl:
             found.add(("kernels-module-all", f"pithtrain.kernels.{path.stem}", "missing __all__"))
-        for name in sorted(_defined_names(tree)):
+        for name in sorted(defined_names(tree)):
             if (
                 name.startswith("_")
                 and name != "_"
@@ -522,19 +521,19 @@ def _violations() -> set[tuple[str, str, str]]:
                         )
                     )
 
-    # Tests are named for the feature, never for an architecture.
     for mod in TEST_MODULES:
-        if _stem(mod).startswith("test_") and _smxx(mod):
+        if stem_of(mod).startswith("test_") and is_smxx(mod):
             found.add(("arch-named-test", mod, ""))
 
-    # The module import graph has no cycle.
-    for cycle in _cycles():
+    for cycle in find_cycles():
         found.add(("cycle", cycle[0], " -> ".join(cycle)))
     return found
 
 
-def _cycles() -> list[list[str]]:
-    """One representative per strongly connected component of more than one module."""
+def find_cycles() -> list[list[str]]:
+    """
+    Return one representative per strongly connected component of more than one module.
+    """
     index: dict[str, int] = {}
     low: dict[str, int] = {}
     stack: list[str] = []
@@ -572,7 +571,7 @@ def _cycles() -> list[list[str]]:
     return sccs
 
 
-VIOLATIONS = _violations()
+VIOLATIONS = find_violations()
 
 
 def test_no_new_violations() -> None:

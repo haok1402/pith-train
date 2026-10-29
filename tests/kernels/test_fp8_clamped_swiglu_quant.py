@@ -1,32 +1,28 @@
 """
-Verifier of the ``fp8_clamped_swiglu_quant`` feature (``clamped_swiglu_quant_rowwise``,
-``clamped_swiglu_quant_kmajor``, ``clamped_swiglu_bwd_quant``) against plain PyTorch.
+Verifies the fp8_clamped_swiglu_quant feature (clamped_swiglu_quant_rowwise,
+clamped_swiglu_quant_kmajor, clamped_swiglu_bwd_quant) against PyTorch.
 
-Contract: gpt-oss's clamped SwiGLU of ``gate_up + bias[group]`` (the bias added in fp32 and rounded
-to bf16; gate_up interleaved, gate at even / up at odd columns), rounded to bf16 as the plain
-kernels ``clamped_swiglu_fwd`` / ``clamped_swiglu_bwd`` round it, then quantized as
-``quantize_grouped_input`` does on SM90 (rowwise 1x128 plus the per-channel FP8 K-major per
-group). ``padded=True`` lays the K-major pair out with ``ceil(C / 256) * 256`` channels (C = N in
-forward, 2N in backward) where the fused kernel runs, C where the input takes the unfused fallback;
-the extra channels are unwritten, and ``k_grouped_fp8_gemm`` gives the same product with either
-layout (it drops the outputs of extra channels). The bias is bf16. The backward also
-returns the per-group bias gradient: fp32 sums of each 128-row block of the bf16 gradient, added in
-block order, rounded once to the bias dtype.
+Contract: gpt-oss's clamped SwiGLU of gate_up + bias[group], the bias added in fp32 and rounded to
+bf16 (gate_up interleaved, gate at even and up at odd columns), rounded to bf16 as the plain
+clamped_swiglu_fwd / clamped_swiglu_bwd round it, then quantized as quantize_grouped_input does on
+SM90: rowwise 1x128, plus per-channel FP8 K-major per group. padded=True lays the K-major pair out
+with ceil(C / 256) * 256 channels (C = N forward, 2N backward) where the fused kernel runs, and C
+where the input takes the unfused fallback. The extra channels are unwritten, and
+k_grouped_fp8_gemm gives the same product with either layout. The bias is bf16. The backward also
+returns the per-group bias gradient: fp32 sums of each 128-row block of the bf16 gradient, added
+in block order and rounded once to the bias dtype.
 
-Reference. The kernels' sigmoid (Triton's ``1 / (1 + ex2.approx(...))`` lowering) cannot be
-reproduced bit for bit in PyTorch, so exact equality with a PyTorch activation is impossible.
-Instead the FP8 bytes and scale values must equal, exactly, a PyTorch quantization (the recipe,
-below) of the exported plain kernels' bf16 output on the PyTorch-biased input, and those bf16
-activations must be within one bf16 rounding of a float64 PyTorch evaluation of the formula (plus
-fp32-level noise). The bias add itself is compared exactly (it is PyTorch's). The bias gradient is
-compared to the fp32 block sums within the bf16 rounding plus fp32 reassociation inside a block
-(the in-block summation order is the kernel's).
+Reference: the kernels' sigmoid (Triton's 1 / (1 + ex2.approx(...))) cannot be reproduced bit for
+bit in PyTorch. So the FP8 bytes and scale values must equal exactly a PyTorch quantization of the
+plain kernels' bf16 output on the PyTorch-biased input, and those bf16 activations must lie within
+one bf16 rounding (plus fp32 noise) of a float64 evaluation of the formula. The bias add is
+compared exactly. The bias gradient must lie within one bf16 rounding of the fp32 block sums, plus
+fp32 reassociation inside a block, whose summation order is the kernel's.
 
-Recipe: per 128-element block ``amax = max |x|`` (NaN ignored), ``scale = 2^ceil(log2(max(amax,
-1e-4) / 448))`` computed as the kernels do (fp32 product with 1/448, then a power-of-two ceil by
-bit arithmetic; the same value), ``q = e4m3_satfinite(x * (1 / scale))`` (round to nearest even).
-
-    pytest tests/kernels/test_fp8_clamped_swiglu_quant.py -v
+Recipe: per 128-element block amax = max |x| (NaN ignored),
+scale = 2^ceil(log2(max(amax, 1e-4) / 448)) computed as the kernels do (an fp32 product with
+1 / 448, then a power-of-two ceil by bit arithmetic), and q = e4m3_satfinite(x * (1 / scale))
+rounding to nearest even.
 """
 
 import pytest
@@ -51,41 +47,44 @@ pytestmark = pytest.mark.skipif(
 BLOCK = 128
 ALPHA, LIMIT = 1.702, 7.0
 
-# ---------------------------------------------------------------- PyTorch quantization reference
 
-
-def _e8m0(amax: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """The recipe's power-of-two scale of an fp32 amax, and its exact reciprocal."""
-    a = torch.maximum(amax, torch.full_like(amax, 1e-4))
-    s = a * torch.full_like(a, 1.0 / 448.0)
-    bits = s.view(torch.int32)
+def e8m0_scale(amax: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    The recipe's power-of-two scale of an fp32 amax, and its exact reciprocal.
+    """
+    amax_floor = torch.maximum(amax, torch.full_like(amax, 1e-4))
+    raw_scale = amax_floor * torch.full_like(amax_floor, 1.0 / 448.0)
+    bits = raw_scale.view(torch.int32)
+    # round up to a power of two: keep the exponent, bump it when any mantissa bit is set
     bits = (bits & 0x7F800000) + ((bits & 0x007FFFFF) != 0).to(torch.int32) * 0x00800000
-    scale = torch.maximum(bits.view(torch.float32), torch.full_like(a, 2.0**-126))
+    scale = torch.maximum(bits.view(torch.float32), torch.full_like(amax_floor, 2.0**-126))
     rcp = ((254 << 23) - scale.view(torch.int32)).view(torch.float32)
     return scale, rcp
 
 
-def _absmax_input(x: torch.Tensor) -> torch.Tensor:
-    a = x.abs()
-    return torch.where(torch.isnan(a), torch.zeros_like(a), a)
+def nan_free_abs(x: torch.Tensor) -> torch.Tensor:
+    x_abs = x.abs()
+    return torch.where(torch.isnan(x_abs), torch.zeros_like(x_abs), x_abs)
 
 
-def _q(x: torch.Tensor, rcp: torch.Tensor) -> torch.Tensor:
+def quantize_e4m3(x: torch.Tensor, rcp: torch.Tensor) -> torch.Tensor:
     return (x * rcp).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
 
 
 def quantize_grouped_ref(x: torch.Tensor, offs: torch.Tensor) -> tuple[torch.Tensor, ...]:
-    """``quantize_grouped_input`` on SM90 in PyTorch: ``(x_fp8 (M, K) as uint8, x_scale (M,
-    ceil(K/128)), x_ch flat (M*K,) uint8 K-major per group, x_ch_scale (K, M/128))``."""
+    """
+    quantize_grouped_input on SM90 in PyTorch: (x_fp8 (M, K) as uint8, x_scale (M, ceil(K / 128)),
+    x_ch flat (M * K,) uint8 K-major per group, x_ch_scale (K, M / 128)).
+    """
     M, K = x.shape
     nb = -(-K // BLOCK)
     xf = torch.zeros(M, nb * BLOCK, dtype=torch.float32, device=x.device)
     xf[:, :K] = x.float()
-    s_row, r_row = _e8m0(_absmax_input(xf).view(M, nb, BLOCK).amax(-1))
-    q_row = _q(xf.view(M, nb, BLOCK), r_row[..., None]).view(M, nb * BLOCK)[:, :K]
+    s_row, r_row = e8m0_scale(nan_free_abs(xf).view(M, nb, BLOCK).amax(-1))
+    q_row = quantize_e4m3(xf.view(M, nb, BLOCK), r_row[..., None]).view(M, nb * BLOCK)[:, :K]
     xc = xf[:, :K].reshape(M // BLOCK, BLOCK, K)
-    s_ch, r_ch = _e8m0(_absmax_input(xc).amax(1))
-    q_ch = _q(xc, r_ch[:, None, :]).view(M, K)
+    s_ch, r_ch = e8m0_scale(nan_free_abs(xc).amax(1))
+    q_ch = quantize_e4m3(xc, r_ch[:, None, :]).view(M, K)
     flat = torch.zeros(M * K, dtype=torch.uint8, device=x.device)
     start = 0
     for end in offs.tolist():
@@ -94,8 +93,10 @@ def quantize_grouped_ref(x: torch.Tensor, offs: torch.Tensor) -> tuple[torch.Ten
     return q_row.contiguous(), s_row, flat, s_ch.T.contiguous()
 
 
-def _assert_bytes(got: torch.Tensor, ref: torch.Tensor, name: str) -> None:
-    """Same e4m3 bytes; a NaN may carry either sign."""
+def assert_bytes(got: torch.Tensor, ref: torch.Tensor, name: str) -> None:
+    """
+    Same e4m3 bytes; a NaN may carry either sign.
+    """
     got = got.view(torch.uint8)
     nan = (ref & 0x7F) == 0x7F
     ok = (got == ref) | (nan & ((got & 0x7F) == 0x7F))
@@ -110,7 +111,7 @@ def assert_quant_equal(got: tuple, ref: tuple, names: tuple[str, ...]) -> None:
         assert a.shape == b.shape, (name, a.shape, b.shape)
         if name.endswith("fp8"):
             assert a.dtype == torch.float8_e4m3fn, name
-            _assert_bytes(a, b, name)
+            assert_bytes(a, b, name)
         else:
             assert a.dtype == torch.float32, name
             if not torch.equal(a, b):
@@ -123,17 +124,19 @@ KMAJOR = ("x_ch_fp8", "x_ch_scale")
 ALL = ROW + KMAJOR
 
 
-def _padded(c: int) -> int:
+def padded_channels(c: int) -> int:
     return -(-c // 256) * 256
 
 
 def assert_kmajor(got: tuple, ref: tuple, offs: torch.Tensor, K: int, padded: bool = False) -> None:
-    """The K-major pair ``got``: laid out with ``K`` channels, or with ``padded`` with ``K`` or
-    ``_padded(K)`` (the returned scale's row count says which); its first ``K`` channels equal the
-    unpadded reference ``ref`` exactly. Extra channels are unspecified."""
+    """
+    Assert the K-major pair got, laid out with K channels (or, when padded, K or
+    padded_channels(K) as the scale's row count says), equals the unpadded ref exactly in its
+    first K channels. Extra channels are unspecified.
+    """
     fp8, scale = got
     KP = scale.shape[0] if scale.ndim == 2 else K
-    assert KP in ((K, _padded(K)) if padded else (K,)), (scale.shape, K, padded)
+    assert KP in ((K, padded_channels(K)) if padded else (K,)), (scale.shape, K, padded)
     M = scale.shape[1] * BLOCK if scale.ndim == 2 else 0
     assert fp8.dtype == torch.float8_e4m3fn and scale.dtype == torch.float32
     assert fp8.numel() == M * KP, (fp8.shape, scale.shape, KP)
@@ -147,98 +150,106 @@ def assert_kmajor(got: tuple, ref: tuple, offs: torch.Tensor, K: int, padded: bo
     assert_quant_equal((real.view(torch.float8_e4m3fn), scale[:K]), ref, KMAJOR)
 
 
-# ---------------------------------------------------------------------- activation references
-
-
-def _group_ids(offs: torch.Tensor, M: int) -> torch.Tensor:
+def group_ids(offs: torch.Tensor, M: int) -> torch.Tensor:
     ids = torch.arange(M, device=offs.device)
     return torch.searchsorted(offs.long(), ids, right=True).clamp_(max=offs.shape[0] - 1)
 
 
 def biased_ref(gate_up: torch.Tensor, bias: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
-    """gate_up + bias[group of each row], one fp32 add rounded to bf16."""
-    return (gate_up.float() + bias.float()[_group_ids(offs, gate_up.shape[0])]).to(torch.bfloat16)
+    """
+    gate_up + bias[group of each row], one fp32 add rounded to bf16.
+    """
+    return (gate_up.float() + bias.float()[group_ids(offs, gate_up.shape[0])]).to(torch.bfloat16)
 
 
-def _assert_bf16_close(got: torch.Tensor, ref64: torch.Tensor, mag: torch.Tensor) -> None:
-    """``got`` (bf16) is the bf16 rounding of a value fp32-close to the float64 ``ref64``."""
-    g = got.double()
-    assert bool(torch.isfinite(ref64).all()) and bool(torch.isfinite(g).all())
-    err = (g - ref64).abs()
+def assert_bf16_close(got: torch.Tensor, ref64: torch.Tensor, mag: torch.Tensor) -> None:
+    """
+    Assert the bf16 got is the bf16 rounding of a value fp32-close to the float64 ref64.
+    """
+    got64 = got.double()
+    assert bool(torch.isfinite(ref64).all()) and bool(torch.isfinite(got64).all())
+    err = (got64 - ref64).abs()
     tol = 2.0**-8 * ref64.abs() + 2.0**-20 * mag + 1e-30
     if not bool((err <= tol).all()):
-        i = (err - tol).argmax()
-        raise AssertionError(f"activation off: got {g.flatten()[i]}, want {ref64.flatten()[i]}")
+        worst = (err - tol).argmax()
+        raise AssertionError(f"activation off: got {got64.flatten()[worst]}, want {ref64.flatten()[worst]}")  # fmt: skip
 
 
-def _f32(v: float) -> float:
+def to_f32(v: float) -> float:
     return torch.tensor(v, dtype=torch.float32).item()
 
 
 def check_fwd_activation(x: torch.Tensor, h: torch.Tensor) -> None:
-    """Plain ``clamped_swiglu_fwd`` output ``h`` of the biased ``x`` against float64."""
-    a, lim = _f32(ALPHA), _f32(LIMIT)
-    g, u = x[:, 0::2].double(), x[:, 1::2].double()
-    gc, uc = g.clamp(max=lim), u.clamp(-lim, lim)
-    glu = gc * torch.sigmoid(a * gc)
-    _assert_bf16_close(h, (uc + 1) * glu, (uc.abs() + 1) * glu.abs())
+    """
+    Assert the plain clamped_swiglu_fwd output h of the biased x against float64.
+    """
+    alpha, limit = to_f32(ALPHA), to_f32(LIMIT)
+    gate, up = x[:, 0::2].double(), x[:, 1::2].double()
+    gc, uc = gate.clamp(max=limit), up.clamp(-limit, limit)
+    glu = gc * torch.sigmoid(alpha * gc)
+    assert_bf16_close(h, (uc + 1) * glu, (uc.abs() + 1) * glu.abs())
 
 
 def check_bwd_activation(dh: torch.Tensor, x: torch.Tensor, dx: torch.Tensor) -> None:
-    """Plain ``clamped_swiglu_bwd`` output ``dx`` (interleaved) against float64."""
-    a, lim = _f32(ALPHA), _f32(LIMIT)
-    d, g, u = dh.double(), x[:, 0::2].double(), x[:, 1::2].double()
-    gc, uc = g.clamp(max=lim), u.clamp(-lim, lim)
-    sig = torch.sigmoid(a * gc)
+    """
+    Assert the plain clamped_swiglu_bwd output dx (interleaved) against float64.
+    """
+    alpha, limit = to_f32(ALPHA), to_f32(LIMIT)
+    dh64, gate, up = dh.double(), x[:, 0::2].double(), x[:, 1::2].double()
+    gc, uc = gate.clamp(max=limit), up.clamp(-limit, limit)
+    sig = torch.sigmoid(alpha * gc)
     glu = gc * sig
-    front = d * (uc + 1) * sig
-    dg = torch.where(g <= lim, front * (1 + a * gc * (1 - sig)), 0.0)
-    du = torch.where((u >= -lim) & (u <= lim), d * glu, 0.0)
-    _assert_bf16_close(dx[:, 0::2], dg, (d * (uc.abs() + 1) * sig).abs() * (1 + abs(a) * gc.abs()))
-    _assert_bf16_close(dx[:, 1::2], du, (d * glu).abs())
+    front = dh64 * (uc + 1) * sig
+    dg = torch.where(gate <= limit, front * (1 + alpha * gc * (1 - sig)), 0.0)
+    du = torch.where((up >= -limit) & (up <= limit), dh64 * glu, 0.0)
+    assert_bf16_close(dx[:, 0::2], dg, (dh64 * (uc.abs() + 1) * sig).abs() * (1 + abs(alpha) * gc.abs()))  # fmt: skip
+    assert_bf16_close(dx[:, 1::2], du, (dh64 * glu).abs())
 
 
 def bias_grad_blocks(dgu: torch.Tensor, offs: torch.Tensor, G: int) -> tuple:
-    """fp32 per-group sums of the 128-row block sums, in block order, and the per-group sums of
-    |dgu| (the reassociation bound)."""
+    """
+    fp32 per-group sums of the 128-row block sums in block order, and the per-group sums of |dgu|
+    (the reassociation bound).
+    """
     M, C = dgu.shape
     blocks = dgu.float().view(M // BLOCK, BLOCK, C).sum(1)
-    ablocks = dgu.float().abs().view(M // BLOCK, BLOCK, C).sum(1)
-    exp = torch.zeros(G, C, device=dgu.device)
-    absum = torch.zeros(G, C, device=dgu.device)
+    abs_blocks = dgu.float().abs().view(M // BLOCK, BLOCK, C).sum(1)
+    expected = torch.zeros(G, C, device=dgu.device)
+    abs_sum = torch.zeros(G, C, device=dgu.device)
     start = 0
-    for g, end in enumerate((offs // BLOCK).tolist()):
-        for b in range(start, end):
-            exp[g] += blocks[b]
-        absum[g] = ablocks[start:end].sum(0)
+    for group_idx, end in enumerate((offs // BLOCK).tolist()):
+        for block_idx in range(start, end):
+            expected[group_idx] += blocks[block_idx]
+        abs_sum[group_idx] = abs_blocks[start:end].sum(0)
         start = end
-    return exp, absum
+    return expected, abs_sum
 
 
 def check_bias_grad(got: torch.Tensor, dgu: torch.Tensor, offs: torch.Tensor, bias) -> None:
-    """bf16 bias gradient: within one bf16 rounding of the fp32 block-order sums, plus fp32
-    reassociation inside a block; exactly zero for empty groups."""
+    """
+    Assert the bf16 bias gradient lies within one bf16 rounding of the fp32 block-order sums, plus
+    fp32 reassociation inside a block, and is exactly zero for empty groups.
+    """
     assert got.dtype == bias.dtype and got.shape == bias.shape
-    exp, absum = bias_grad_blocks(dgu, offs, bias.shape[0])
-    err = (got.double() - exp.double()).abs()
-    tol = 2.0**-8 * exp.double().abs() + 2.0**-16 * absum.double()
+    expected, abs_sum = bias_grad_blocks(dgu, offs, bias.shape[0])
+    err = (got.double() - expected.double()).abs()
+    tol = 2.0**-8 * expected.double().abs() + 2.0**-16 * abs_sum.double()
     assert bool((err <= tol).all()), f"bias grad off by {(err - tol).max().item()}"
-    empty = absum == 0
+    empty = abs_sum == 0
     assert bool((got[empty] == 0).all())
 
 
-# --------------------------------------------------------------------------------- inputs
-
-
-def _offs(M: int, G: int, gen: torch.Generator) -> torch.Tensor:
-    """Random 128-aligned cumulative group ends (some groups empty), last entry M."""
+def make_offs(M: int, G: int, gen: torch.Generator) -> torch.Tensor:
+    """
+    Random 128-aligned cumulative group ends (some groups empty), the last one M.
+    """
     blocks = M // BLOCK
     cuts = torch.sort(torch.randint(0, blocks + 1, (G - 1,), generator=gen)).values
     ends = torch.cat([cuts, torch.tensor([blocks])]) * BLOCK
     return ends.to(torch.int32).cuda()
 
 
-def _inputs(M: int, N: int, G: int, seed: int):
+def make_inputs(M: int, N: int, G: int, seed: int):
     gen = torch.Generator().manual_seed(seed)
     gu = torch.randn(M, 2 * N, generator=gen) * 4
     gu[torch.rand(M, 2 * N, generator=gen) < 0.01] *= 100  # outliers past the clamp
@@ -250,7 +261,7 @@ def _inputs(M: int, N: int, G: int, seed: int):
     dh = torch.randn(M, N, generator=gen)
     dh[torch.rand(M, N, generator=gen) < 0.01] *= 1000
     bf = dict(dtype=torch.bfloat16, device="cuda")
-    return gu.to(**bf), bias.to(**bf), dh.to(**bf), _offs(M, G, gen)
+    return gu.to(**bf), bias.to(**bf), dh.to(**bf), make_offs(M, G, gen)
 
 
 # (M, N, G): gpt-oss-20b's 2880 (hidden = intermediate), small / ragged N, 32 experts.
@@ -266,12 +277,9 @@ SHAPES = [
 ]
 
 
-# ----------------------------------------------------------------------------------- tests
-
-
 @pytest.mark.parametrize("M,N,G", SHAPES)
 def test_quant_rowwise(M: int, N: int, G: int) -> None:
-    gu, bias, _, offs = _inputs(M, N, G, seed=M + N + G)
+    gu, bias, _, offs = make_inputs(M, N, G, seed=M + N + G)
     x = biased_ref(gu, bias, offs)
     h = clamped_swiglu_fwd(x, ALPHA, LIMIT)
     check_fwd_activation(x, h)
@@ -285,7 +293,7 @@ KMAJOR_CASES = [pytest.param(*shape, padded) for shape in SHAPES for padded in (
 
 @pytest.mark.parametrize("M,N,G,padded", KMAJOR_CASES)
 def test_quant_kmajor(M: int, N: int, G: int, padded: bool) -> None:
-    gu, bias, _, offs = _inputs(M, N, G, seed=3 * M + N + G)
+    gu, bias, _, offs = make_inputs(M, N, G, seed=3 * M + N + G)
     h = clamped_swiglu_fwd(biased_ref(gu, bias, offs), ALPHA, LIMIT)
     ref = quantize_grouped_ref(h, offs)
     got = clamped_swiglu_quant_kmajor(gu, bias, offs, ALPHA, LIMIT, padded=padded)
@@ -294,7 +302,7 @@ def test_quant_kmajor(M: int, N: int, G: int, padded: bool) -> None:
 
 @pytest.mark.parametrize("M,N,G,padded", KMAJOR_CASES)
 def test_bwd_quant(M: int, N: int, G: int, padded: bool) -> None:
-    gu, bias, dh, offs = _inputs(M, N, G, seed=7 * M + N + G)
+    gu, bias, dh, offs = make_inputs(M, N, G, seed=7 * M + N + G)
     x = biased_ref(gu, bias, offs)
     dgu = clamped_swiglu_bwd(dh, x, ALPHA, LIMIT)
     check_bwd_activation(dh, x, dgu)
@@ -307,11 +315,13 @@ def test_bwd_quant(M: int, N: int, G: int, padded: bool) -> None:
 
 @pytest.mark.parametrize("backward", [False, True])
 def test_padded_layout_feeds_k_grouped_gemm(backward: bool) -> None:
-    """With ``padded=True`` the fused kernels lay out ``_padded(C)`` channels, the extra ones
-    unwritten (the allocator is dirtied first); ``k_grouped_fp8_gemm`` drops them, so the weight
-    gradient equals the one from the unpadded layout."""
+    """
+    With padded=True the fused kernels lay out padded_channels(C) channels, the extra ones
+    unwritten (the allocator is dirtied first); k_grouped_fp8_gemm drops them, so the weight
+    gradient equals the one from the unpadded layout.
+    """
     M, N, G = 1024, 2880, 4
-    gu, bias, dh, offs = _inputs(M, N, G, seed=17)
+    gu, bias, dh, offs = make_inputs(M, N, G, seed=17)
     torch.cuda.empty_cache()
     torch.empty(64 << 20, dtype=torch.uint8, device="cuda").fill_(0x7F)  # FP8 NaN bytes
     if backward:
@@ -322,10 +332,10 @@ def test_padded_layout_feeds_k_grouped_gemm(backward: bool) -> None:
         C = N
         pad = clamped_swiglu_quant_kmajor(gu, bias, offs, ALPHA, LIMIT, padded=True)
         flat = clamped_swiglu_quant_kmajor(gu, bias, offs, ALPHA, LIMIT)
-    assert pad[1].shape[0] == _padded(C) and flat[1].shape[0] == C
+    assert pad[1].shape[0] == padded_channels(C) and flat[1].shape[0] == C
     other = torch.randn(M, 2048, device="cuda").to(torch.bfloat16)
     b = quantize_grouped_input(other, offs)[2:]
-    ks = [int(v) for v in torch.diff(offs, prepend=offs.new_zeros(1)).tolist()]
+    ks = [int(size) for size in torch.diff(offs, prepend=offs.new_zeros(1)).tolist()]
     kt = torch.tensor(ks, dtype=torch.int32, device="cuda")
     got = torch.zeros(G, C, 2048, device="cuda")
     want = torch.zeros(G, C, 2048, device="cuda")
@@ -337,8 +347,10 @@ def test_padded_layout_feeds_k_grouped_gemm(backward: bool) -> None:
 
 @pytest.mark.parametrize("backward", [False, True])
 def test_every_bf16_gate_and_up(backward: bool) -> None:
-    """Every BF16 bit pattern (inf and NaN included) as gate and, shuffled, as up, with a random
-    bias; NaN-ignoring block amax."""
+    """
+    Every BF16 bit pattern (inf and NaN included) as gate and, shuffled, as up, with a random bias;
+    the block amax ignores NaN.
+    """
     M, N, G = 512, 128, 2
     gen = torch.Generator().manual_seed(3)
     bits = torch.arange(65536, dtype=torch.int32).to(torch.int16)
@@ -362,14 +374,16 @@ def test_every_bf16_gate_and_up(backward: bool) -> None:
 
 
 def test_zeros() -> None:
-    """Zero inputs and a zero bias: zero bytes, the scale floor 2^ceil(log2(1e-4 / 448)) and a
-    zero bias gradient, from every entry point."""
+    """
+    Zero inputs and a zero bias give zero bytes, the scale floor 2^ceil(log2(1e-4 / 448)) and a
+    zero bias gradient, from every entry point.
+    """
     M, N, G = 384, 2880, 3
     gu = torch.zeros(M, 2 * N, dtype=torch.bfloat16, device="cuda")
     bias = torch.zeros(G, 2 * N, dtype=torch.bfloat16, device="cuda")
     dh = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
     offs = torch.tensor([128, 128, 384], dtype=torch.int32, device="cuda")
-    floor = _e8m0(torch.zeros(1, device="cuda"))[0].item()
+    floor = e8m0_scale(torch.zeros(1, device="cuda"))[0].item()
     row = clamped_swiglu_quant_rowwise(gu, bias, offs, ALPHA, LIMIT)
     km = clamped_swiglu_quant_kmajor(gu, bias, offs, ALPHA, LIMIT)
     (q, d_bias) = clamped_swiglu_bwd_quant(dh, gu, bias, offs, ALPHA, LIMIT)
@@ -380,7 +394,9 @@ def test_zeros() -> None:
 
 
 def test_empty_input() -> None:
-    """M == 0 (no tokens routed to this rank): correctly shaped empty outputs, zero bias grad."""
+    """
+    M == 0 (no tokens routed to this rank): correctly shaped empty outputs, zero bias grad.
+    """
     N, G = 2880, 4
     gu = torch.empty(0, 2 * N, dtype=torch.bfloat16, device="cuda")
     bias = torch.randn(G, 2 * N, device="cuda").to(torch.bfloat16)

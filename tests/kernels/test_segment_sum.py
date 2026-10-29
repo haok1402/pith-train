@@ -1,18 +1,14 @@
 """
-Verifier of ``segment_sum_along_rows`` against plain PyTorch.
+Verifier of segment_sum_along_rows against plain PyTorch.
 
-Contract: rows of ``x`` (M, H) are sorted by group; group g spans rows
-``[offs[g-1], offs[g])`` (``offs[-1] := 0``, offsets past M clamped to M); the result (G, H) holds
-each group's column sums accumulated in fp32 (cast to ``out_dtype``). The summation order is fixed
-(128-row tiles from the group's own start, tile sums added in row order) whatever the number of
-groups, so the result is deterministic and a group's sum does not depend on the other groups:
-checked run to run and against the same group summed alone, plus closeness to a float64 sum.
+Contract: the rows of x (M, H) are sorted by group; group g spans rows [offs[g-1], offs[g]), with
+offs[-1] = 0 and offsets past M clamped to M. The result (G, H) holds each group's column sums,
+accumulated in fp32 and cast to out_dtype. The summation order is fixed (128-row tiles from the
+group's start, tile sums added in row order) whatever the number of groups, so the result is
+deterministic and a group's sum does not depend on the other groups.
 
-The kernel's two internal paths (many groups: one block per group; few groups: tile partials then
-an ordered pass) are compared against each other through the public call (the same group summed
-among many groups and alone).
-
-    pytest tests/kernels/test_segment_sum.py -v
+The tests check run-to-run equality, equality with the same group summed alone (which exercises
+the kernel's other internal path), and closeness to a float64 sum.
 """
 
 import pytest
@@ -26,19 +22,23 @@ def offsets(counts):
 
 
 def reference(x, offs):
-    """float64 per-group column sums (offsets clamped to M)."""
+    """
+    Return float64 per-group column sums, with offsets clamped to M.
+    """
     M, H = x.shape
     ends = offs.long().clamp(max=M).tolist()
     out, start = torch.zeros(len(ends), H, dtype=torch.float64, device=x.device), 0
-    for g, end in enumerate(ends):
+    for group_idx, end in enumerate(ends):
         if end > start:
-            out[g] = x[start:end].double().sum(0)
+            out[group_idx] = x[start:end].double().sum(0)
         start = max(start, end)
     return out
 
 
 def tolerance(x, offs):
-    """fp32 accumulation error bound: a few eps32 of each group's sum of |x|."""
+    """
+    Return the fp32 accumulation error bound: a few eps32 of each group's sum of |x|.
+    """
     return 4 * torch.finfo(torch.float32).eps * reference(x.abs(), offs) + 1e-30
 
 
@@ -49,7 +49,7 @@ def check(counts, H, dtype, out_dtype, seed=0):
     offs = offsets(counts)
     got = segment_sum_along_rows(x, offs, out_dtype)
     assert got.dtype == out_dtype and got.shape == (len(counts), H)
-    # Deterministic: run to run.
+    # Deterministic run to run.
     assert torch.equal(got, segment_sum_along_rows(x, offs, out_dtype))
     # Close to the exact sum (fp32 accumulation, then one rounding to out_dtype).
     got32 = segment_sum_along_rows(x, offs, torch.float32)
@@ -58,11 +58,11 @@ def check(counts, H, dtype, out_dtype, seed=0):
     assert torch.equal(got, got32.to(out_dtype))
     # Same bits as each group summed alone (the other internal path when there are many groups).
     start = 0
-    for g, c in enumerate(counts):
-        # (a fresh copy: a sliced base pointer can change Triton's specialization)
-        alone = segment_sum_along_rows(x[start : start + c].clone(), offsets([c]), torch.float32)
-        assert torch.equal(alone[0], got32[g]), f"group {g} differs when summed alone"
-        start += c
+    for group_idx, count in enumerate(counts):
+        # A fresh copy, since a sliced base pointer can change Triton's specialization.
+        alone = segment_sum_along_rows(x[start : start + count].clone(), offsets([count]), torch.float32)  # fmt: skip
+        assert torch.equal(alone[0], got32[group_idx]), f"group {group_idx} differs when summed alone"  # fmt: skip
+        start += count
     return got32
 
 
@@ -135,17 +135,18 @@ def check_tensor(x, counts):
 
 
 def test_order_is_tile_order():
-    """The documented order (128-row tiles from the group start, tile sums added in row order)
-    is what the kernel does: summing the halves of a group separately changes the bits, and a
-    group split at a tile boundary into its tiles' sums added in order reproduces them."""
+    """
+    The kernel sums in the documented order: a group's tile sums added in row order reproduce its
+    bits, and summing its halves separately does not.
+    """
     counts = [8192] * 4
     gen = torch.Generator(device="cuda").manual_seed(9)
     x = (torch.randn(sum(counts), 2880, generator=gen, device="cuda") * 3).to(torch.bfloat16)
     got = segment_sum_along_rows(x, offsets(counts), torch.float32)
     tiles = segment_sum_along_rows(x[:8192].clone(), offsets([128] * 64), torch.float32)
     acc = torch.zeros(2880, device="cuda")
-    for t in tiles:
-        acc = acc + t
+    for tile_sum in tiles:
+        acc = acc + tile_sum
     assert torch.equal(acc, got[0])
     halves = torch.stack(
         [

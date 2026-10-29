@@ -38,5 +38,5 @@ class FP8WeightCacheControl:
         """
         for module in modules:
             for m in module.modules():
-                if hasattr(m, "_wq_cache"):
-                    m._wq_cache = None
+                if hasattr(m, "quantized_weight_cache"):
+                    m.quantized_weight_cache = None

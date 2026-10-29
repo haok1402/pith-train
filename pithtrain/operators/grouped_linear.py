@@ -15,17 +15,20 @@ from pithtrain.kernels import (
     quantize_grouped_input,
 )
 
+__all__ = [
+    "FP8GroupedLinear",
+    "FP8GroupedLinearFunc",
+    "GroupedLinear",
+    "GroupedLinearFunc",
+    "fp8_grouped_wgrad",
+]
+
 
 class GroupedLinearFunc(torch.autograd.Function):
     """
-    Custom autograd Function for BF16 grouped linear layer (MoE experts).
-
-    Forward: output      = grouped_mm(input, weight.T)      [2D-3D, jagged on M]
-    Dgrad:   grad_input  = grouped_mm(grad_output, weight)  [2D-3D, jagged on M]
-    Wgrad:   weight_grad = grouped_mm(grad_output.T, input) [2D-2D, jagged on K]
-
-    The wgrad is split from dgrad so DualPipeV's zero-bubble W-phase can defer
-    it via WeightGradStore, freeing the critical path during stage3_b.
+    BF16 grouped linear, output = input @ weight[g].T for the rows of each group g. The weight
+    gradient is deferred to DualPipeV's W phase when WeightGradStore is enabled, and accumulates
+    into main_grad in fp32 when one is given (ks and ks_tensor are then required).
     """
 
     @staticmethod
@@ -67,9 +70,8 @@ class GroupedLinearFunc(torch.autograd.Function):
 
 class GroupedLinear(nn.Module):
     """
-    Grouped linear layer that partitions input data and applies a distinct
-    linear transformation per group. This is useful for the MLP layers in
-    the mixture-of-experts models.
+    BF16 grouped linear layer with weight (num_groups, out_features, in_features). The input rows
+    are sorted by group, with group boundaries given by grouped_mm_offs.
     """
 
     main_grad: Optional[torch.Tensor] = None
@@ -91,9 +93,8 @@ class GroupedLinear(nn.Module):
         quantized_input: Optional[tuple[torch.Tensor, ...]] = None,
     ) -> torch.Tensor:
         if input.shape[0] == 0:
-            # Use a matmul instead of new_empty to preserve the autograd graph.
-            # With 0 tokens the result is (0, out_features) and gradients are zero,
-            # but the grad_fn must exist so that run_backward does not crash.
+            # A matmul rather than new_empty, so the (0, out_features) result has a grad_fn and
+            # the backward does not fail.
             weight = self.weight[0] if self.main_grad is None else self.weight[0].detach()
             return input @ weight.T
         if self.main_grad is not None and torch.is_grad_enabled():
@@ -111,13 +112,11 @@ def fp8_grouped_wgrad(
     shape: tuple[int, int, int],
 ) -> None:
     """
-    Weight gradient of an FP8 grouped linear from the per-channel FP8 (data, scale) pairs of
-    grad_output (grad_ch) and input (input_ch), deferred to DualPipeV's W phase when
-    WeightGradStore is on. With an fp32 main_grad on the weight (FP8GroupedLinear sets
-    weight.main_grad when wgrad_accumulation installed one), the GEMM accumulates straight into
-    it, so no bf16 .grad and no fp32 temporary exist; otherwise the (G, N, K) result of the given
-    shape is added into weight.grad in bf16. The operands are the per-channel FP8 of
-    quantize_grouped_input, in whatever layout the kernel library's k-grouped GEMM reads.
+    Weight gradient of an FP8 grouped linear from the per-channel FP8 (data, scale) pairs that
+    quantize_grouped_input gives for grad_output (grad_ch) and input (input_ch). With an fp32
+    weight.main_grad the GEMM accumulates into it; otherwise the (G, N, K) result of the given
+    shape is added into weight.grad in bf16. Deferred to DualPipeV's W phase when
+    WeightGradStore is enabled.
     """
     main_grad = getattr(weight, "main_grad", None)
 
@@ -143,11 +142,9 @@ def fp8_grouped_wgrad(
 
 class FP8GroupedLinearFunc(torch.autograd.Function):
     """
-    Custom autograd Function for FP8 grouped linear layer (MoE experts).
-
-    Forward:  output = grouped_mm(input, weight.T)  via m_grouped FP8 GEMM NT
-    Dgrad:    grad_input = grouped_mm(grad_output, weight_t.T)  via m_grouped FP8 GEMM NT
-    Wgrad:    weight_grad = grouped_mm(grad_output.T, input)  via k_grouped FP8 GEMM
+    FP8 grouped linear, output = input @ weight[g].T for the rows of each group g, from the
+    quantized weight that FP8GroupedLinear.get_quantized_weight returns. quantized_input, when
+    given, is quantize_grouped_input(input) computed once for several projections.
     """
 
     @staticmethod
@@ -166,14 +163,10 @@ class FP8GroupedLinearFunc(torch.autograd.Function):
         K = input.shape[1]
         num_groups, N, _ = weight.shape
 
-        # Quantize input to FP8 (fused: single read for both forward and wgrad), unless the caller
-        # already did so for several projections of the same input (see quantize_grouped_input).
         if quantized_input is None:
             quantized_input = quantize_grouped_input(input, grouped_mm_offs)
         input_fp8, scale_input, input_ch_fp8, scale_input_ch = quantized_input
 
-        # Forward: m_grouped GEMM NT contiguous. group_indices is an optional hint the caller
-        # computes once (precompute_group_indices) and passes to all grouped projections.
         output = fp8_m_grouped_gemm(
             (input_fp8, scale_input), (weight_fp8, scale_weight), N, grouped_mm_offs, group_indices
         )
@@ -200,14 +193,10 @@ class FP8GroupedLinearFunc(torch.autograd.Function):
         group_indices = ctx.group_indices
         K, N, num_groups = ctx.K, ctx.N, ctx.num_groups
 
-        # Quantize grad_output (fused: single read).
-        # Produces both per-token (for dgrad) and per-channel (for wgrad)
-        # FP8 tensors in one pass, eliminating a redundant BF16 read.
         grad_fp8, scale_grad, grad_ch_fp8, scale_grad_ch = quantize_grouped_input(
             grad_output, grouped_mm_offs
         )
 
-        # Dgrad: m_grouped GEMM NT contiguous with pre-transposed weight
         grad_input = fp8_m_grouped_gemm(
             (grad_fp8, scale_grad),
             (weight_t_fp8, scale_weight_t),
@@ -216,7 +205,6 @@ class FP8GroupedLinearFunc(torch.autograd.Function):
             group_indices,
         )
 
-        # Wgrad: k_grouped GEMM on the per-channel FP8 of grad_output and input.
         a_wgrad = (grad_ch_fp8, scale_grad_ch)
         b_wgrad = (input_ch_fp8, scale_input_ch)
 
@@ -227,13 +215,9 @@ class FP8GroupedLinearFunc(torch.autograd.Function):
 
 class FP8GroupedLinear(nn.Module):
     """
-    FP8 grouped linear layer for MoE experts.
-
-    Drop-in replacement for ``GroupedLinear`` using FP8 GEMM via DeepGEMM.
-    Weight shape: ``(num_groups, out_features, in_features)``.
-    Quantized weights are cached and reused across micro-batches within a single pipeline step.
-    With fp8_param_gather set (see pithtrain/modules/fp8_param_gather.py), the weight arrives
-    already quantized.
+    Drop-in GroupedLinear replacement with FP8 GEMMs, weight (num_groups, out_features,
+    in_features). The bf16 weight is quantized once per pipeline step and reused by every
+    micro-batch of it; with fp8_param_gather set, the weight arrives already quantized.
     """
 
     fp8_param_gather: bool = False
@@ -248,14 +232,14 @@ class FP8GroupedLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.weight = nn.Parameter(torch.empty((num_groups, out_features, in_features)))
-        self._wq_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
-        self._wq_version: int = -1
+        self.quantized_weight_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None  # fmt: skip
+        self.quantized_weight_version: int = -1
 
-    def _get_quantized_weight(
+    def get_quantized_weight(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Every FP8 expert path reads the weight through here, so this is where the weight that
-        # the backward sees learns its main_grad (the unsharded parameter outlives the step).
+        # Every FP8 expert path reads the weight through here, so the weight the backward sees
+        # gets its main_grad here (the unsharded parameter outlives the step).
         if self.main_grad is not None:
             self.weight.main_grad = self.main_grad
         if self.fp8_param_gather:
@@ -263,11 +247,11 @@ class FP8GroupedLinear(nn.Module):
         if torch.compiler.is_compiling():
             return fp8cast_blockwise_transpose_batched(self.weight)
         ver = FP8WeightCacheControl.version
-        if self._wq_version == ver:
-            return self._wq_cache
+        if self.quantized_weight_version == ver:
+            return self.quantized_weight_cache
         result = fp8cast_blockwise_transpose_batched(self.weight)
-        self._wq_cache = result
-        self._wq_version = ver
+        self.quantized_weight_cache = result
+        self.quantized_weight_version = ver
         return result
 
     def forward(
@@ -280,10 +264,10 @@ class FP8GroupedLinear(nn.Module):
         quantized_input: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
         if input.shape[0] == 0:
-            # Preserve autograd graph with 0 tokens (same pattern as GroupedLinear).
+            # A matmul rather than new_empty, as in GroupedLinear, to keep a grad_fn.
             weight = self.weight[0] if self.main_grad is None else self.weight[0].detach()
             return input @ weight.T
-        quantized_weight = self._get_quantized_weight()
+        quantized_weight = self.get_quantized_weight()
         return FP8GroupedLinearFunc.apply(
             input,
             self.weight,

@@ -1,4 +1,6 @@
-"""openai/gpt-oss-20b and openai/gpt-oss-120b."""
+"""
+openai/gpt-oss-20b and openai/gpt-oss-120b.
+"""
 
 import math
 
@@ -37,11 +39,12 @@ from pithtrain.operators.token_scatter import (
 from pithtrain.pipeline.dualpipev import layer_partition
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
 
+__all__ = ["GptOssExperts", "GptOssModel", "GptOssTopKRouter"]
+
 EDGE_LAYER_COST = 3.5
 """
-Step time of the stage-edge work (embedding, final norm, BF16 lm_head and cross-entropy) in units
-of one FP8 decoder layer, both edges together. Measured with torch.profiler on gpt-oss-20b (seq
-4096, FP8 experts): the edges cost ~195 ms of compute per step against ~55 ms per layer.
+Step time of the stage-edge work (embedding, final norm, BF16 lm_head and cross-entropy), both
+edges together, in units of one FP8 decoder layer.
 """
 
 
@@ -63,10 +66,10 @@ def gpt_oss_layer_partition(
     base, extra = divmod(num_layers - first, pp_size - 1)
     if base < 2:
         return layer_partition(num_layers, stage_count, stage_index)
-    per_rank = [first] + [base + (r <= extra) for r in range(1, pp_size)]
+    per_rank = [first] + [base + (rank <= extra) for rank in range(1, pp_size)]
     layers = [0] * stage_count
-    for r, n in enumerate(per_rank):
-        layers[r], layers[stage_count - 1 - r] = (n + 1) // 2, n // 2
+    for rank, num_held in enumerate(per_rank):
+        layers[rank], layers[stage_count - 1 - rank] = (num_held + 1) // 2, num_held // 2
     begin = sum(layers[:stage_index])
     return range(begin, begin + layers[stage_index])
 
@@ -125,8 +128,8 @@ class GptOssRotaryEmbedding(nn.Module):
                 raise ValueError(f"unsupported rope_type: {other!r}")
 
     def set_cos_sin(self, config: GptOssConfig, inv_freq: torch.Tensor, attn_scale: float) -> None:
-        t = torch.arange(config.max_position_embeddings, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)
+        positions = torch.arange(config.max_position_embeddings, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         cos = (emb.cos() * attn_scale).to(torch.bfloat16)
         sin = (emb.sin() * attn_scale).to(torch.bfloat16)
@@ -139,7 +142,9 @@ class GptOssRotaryEmbedding(nn.Module):
 
 class GptOssExperts(nn.Module):
     fp8_raw_params = ("gate_up_proj", "down_proj")
-    """Raw expert weights modules/fp8_param_gather.py may all-gather in FP8 (with fp8_param_gather)."""
+    """
+    Raw expert weights that the FP8 parameter all-gather and the fp32 main_grad accumulation handle.
+    """
 
     def __init__(self, config: GptOssConfig, num_experts: int):
         super().__init__()
@@ -152,26 +157,26 @@ class GptOssExperts(nn.Module):
         self.gate_up_proj_bias = nn.Parameter(torch.zeros(num_experts, 2 * intermediate_size))
         self.down_proj = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
         self.down_proj_bias = nn.Parameter(torch.zeros(num_experts, hidden_size))
-        # Raw nn.Parameter (fused gate_up) so training.GroupedLinear can't wrap it; the fp8
-        # quantized-weight cache lives here, keyed by projection name + version (clear() nulls it).
-        self._wq_cache: dict[str, tuple] | None = None
-        self._wq_version: int = -1
+        # The weights are raw Parameters (gate_up is fused), so no GroupedLinear caches their FP8
+        # copies: the cache lives here, keyed by projection name and reset on a new version.
+        self.quantized_weight_cache: dict[str, tuple] | None = None
+        self.quantized_weight_version: int = -1
 
-    def _quantized_weight(self, name: str, weight: torch.Tensor) -> tuple:
+    def quantize_weight(self, name: str, weight: torch.Tensor) -> tuple:
         if (gathered := fp8_param_operands(self, name)) is not None:
             return gathered
         if torch.compiler.is_compiling():
             return fp8cast_blockwise_transpose_batched(weight)
-        ver = FP8WeightCacheControl.version
-        cache = self._wq_cache
-        if self._wq_version != ver or cache is None:
-            cache = self._wq_cache = {}
-            self._wq_version = ver
+        version = FP8WeightCacheControl.version
+        cache = self.quantized_weight_cache
+        if self.quantized_weight_version != version or cache is None:
+            cache = self.quantized_weight_cache = {}
+            self.quantized_weight_version = version
         if name not in cache:
             cache[name] = fp8cast_blockwise_transpose_batched(weight)
         return cache[name]
 
-    def _group_linear(
+    def apply_grouped_linear(
         self,
         x: torch.Tensor,
         weight: nn.Parameter,
@@ -184,7 +189,7 @@ class GptOssExperts(nn.Module):
         if x.shape[0] == 0:
             return x @ weight[0].transpose(-2, -1)
         if training.fp8:
-            return FP8GroupedLinearFunc.apply(x, weight, offs, ks, ks_tensor, self._quantized_weight(name, weight), group_indices)  # fmt: skip
+            return FP8GroupedLinearFunc.apply(x, weight, offs, ks, ks_tensor, self.quantize_weight(name, weight), group_indices)  # fmt: skip
         return GroupedLinearFunc.apply(x, weight, offs)
 
     def forward(
@@ -196,33 +201,32 @@ class GptOssExperts(nn.Module):
         quantized_input: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
         if training.fp8 and fp8_fused_experts_supported() and x.shape[0]:
-            gi = precompute_group_indices(grouped_mm_offs, x.shape[0])
-            q_gu = self._quantized_weight("gate_up_proj", self.gate_up_proj)
-            q_down = self._quantized_weight("down_proj", self.down_proj)
-            args = (grouped_mm_offs, ks, ks_tensor, gi, q_gu, q_down, 1.702, self.swiglu_limit)
+            group_indices = precompute_group_indices(grouped_mm_offs, x.shape[0])
+            gate_up_quant = self.quantize_weight("gate_up_proj", self.gate_up_proj)
+            down_quant = self.quantize_weight("down_proj", self.down_proj)
+            args = (grouped_mm_offs, ks, ks_tensor, group_indices, gate_up_quant, down_quant, 1.702, self.swiglu_limit)  # fmt: skip
             weights = (
                 self.gate_up_proj,
                 self.gate_up_proj_bias,
                 self.down_proj,
                 self.down_proj_bias,
             )
-            mgs = (raw_main_grad(self, "gate_up_proj"), raw_main_grad(self, "down_proj"))
-            return fp8_clamped_swiglu_experts(x, *weights, *args, quantized_input, mgs)
+            main_grads = (raw_main_grad(self, "gate_up_proj"), raw_main_grad(self, "down_proj"))
+            return fp8_clamped_swiglu_experts(x, *weights, *args, quantized_input, main_grads)
         group_ids = torch.searchsorted(
             grouped_mm_offs.to(torch.int64),
             torch.arange(x.shape[0], device=x.device, dtype=torch.int64),
             right=True,
         ).clamp_(max=self.num_experts - 1)
-        gi = precompute_group_indices(grouped_mm_offs, x.shape[0]) if training.fp8 else None
-        gate_up = self._group_linear(x, self.gate_up_proj, "gate_up_proj", grouped_mm_offs, ks, ks_tensor, gi)  # fmt: skip
+        group_indices = precompute_group_indices(grouped_mm_offs, x.shape[0]) if training.fp8 else None  # fmt: skip
+        gate_up = self.apply_grouped_linear(x, self.gate_up_proj, "gate_up_proj", grouped_mm_offs, ks, ks_tensor, group_indices)  # fmt: skip
         gate_up = indexed_bias_add(gate_up, self.gate_up_proj_bias, group_ids, grouped_mm_offs)
         activated = clamped_swiglu(gate_up, 1.702, self.swiglu_limit)
-        out = self._group_linear(activated, self.down_proj, "down_proj", grouped_mm_offs, ks, ks_tensor, gi)  # fmt: skip
+        out = self.apply_grouped_linear(activated, self.down_proj, "down_proj", grouped_mm_offs, ks, ks_tensor, group_indices)  # fmt: skip
         out = indexed_bias_add(out, self.down_proj_bias, group_ids, grouped_mm_offs)
         return out
 
     def uses_bf16_cute(self) -> bool:
-        """Whether BF16 stage 3 runs as the fused CuTe experts (operators/bf16_experts.py) in this process."""
         return not training.fp8 and bf16_experts_supported(self.num_experts)
 
     def forward_from_tokens(
@@ -243,9 +247,9 @@ class GptOssExperts(nn.Module):
             args = (gathered, expert_idxs, expand_idx, expert_counts, self.top_k)
             out = bf16_clamped_swiglu_experts(self, *args, 1.702, self.swiglu_limit)
             return out, None
-        x, rsi, offs, ks, ks_tensor, xq = fp8_scatter_quant(gathered, expert_idxs, self.num_experts, expand_idx, expert_counts)  # fmt: skip
+        x, reverse_shuffle_idxs, offs, ks, ks_tensor, quantized_input = fp8_scatter_quant(gathered, expert_idxs, self.num_experts, expand_idx, expert_counts)  # fmt: skip
         # self.forward, not self(...): calling the module re-enters FSDP's input cast.
-        return self.forward(x, offs, ks=ks, ks_tensor=ks_tensor, quantized_input=xq), rsi
+        return self.forward(x, offs, ks=ks, ks_tensor=ks_tensor, quantized_input=quantized_input), reverse_shuffle_idxs  # fmt: skip
 
 
 class GptOssTopKRouter(nn.Module):
@@ -346,11 +350,11 @@ class GptOssAttention(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, S, _ = hidden_states.size()
-        xq = training.Linear.quantize_input(hidden_states)
-        query_states = self.q_proj(hidden_states, xq).view(B, S, self.num_heads, self.head_dim)
-        key_states = self.k_proj(hidden_states, xq).view(B, S, self.num_kv_heads, self.head_dim)
-        value_states = self.v_proj(hidden_states, xq).view(B, S, self.num_kv_heads, self.head_dim)
-        query_states, key_states = self.apply_rotary_posemb(query_states, key_states, rotary_posemb)
+        quantized_hidden = training.Linear.quantize_input(hidden_states)
+        query_states = self.q_proj(hidden_states, quantized_hidden).view(B, S, self.num_heads, self.head_dim)  # fmt: skip
+        key_states = self.k_proj(hidden_states, quantized_hidden).view(B, S, self.num_kv_heads, self.head_dim)  # fmt: skip
+        value_states = self.v_proj(hidden_states, quantized_hidden).view(B, S, self.num_kv_heads, self.head_dim)  # fmt: skip
+        query_states, key_states = self.apply_rotary_posemb(query_states, key_states, rotary_posemb)  # fmt: skip
         window_size = (self.sliding_window - 1, 0) if self.is_sliding else (None, None)
         sinks = self.sinks.to(query_states.dtype)
         if cu_seqlens is not None:
@@ -417,9 +421,9 @@ class GptOssDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         if training.fp8 and fp8_fused_experts_supported():
             expand = expand_idx if distributed.ep_size > 1 else None
-            outs, rsi = self.mlp.experts.forward_from_tokens(gathered_tokens, expert_idxs, expand, expert_counts)  # fmt: skip
+            outs, reverse_shuffle_idxs = self.mlp.experts.forward_from_tokens(gathered_tokens, expert_idxs, expand, expert_counts)  # fmt: skip
             del gathered_tokens
-            return padded_index_gather(outs, rsi)
+            return padded_index_gather(outs, reverse_shuffle_idxs)
         if self.keeps_stage3_input():
             expand = expand_idx if distributed.ep_size > 1 else None
             return self.mlp.experts.forward_from_tokens(gathered_tokens, expert_idxs, expand, expert_counts)[0]  # fmt: skip
@@ -481,7 +485,6 @@ class GptOssModel(nn.Module):
                 stage_count = distributed.pp_size * 2
                 stage_index = stage_count - 1 - distributed.pp_rank
             case -1:
-                # non-pipelined reference: a single stage owns the whole model
                 stage_count = 1
                 stage_index = 0
             case _:

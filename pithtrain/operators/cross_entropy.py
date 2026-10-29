@@ -11,13 +11,10 @@ import torch
 
 from pithtrain.kernels import cross_entropy_fwd_inplace
 
+__all__ = ["cross_entropy"]
+
 
 class CrossEntropy(torch.autograd.Function):
-    """
-    Fused cross-entropy that overwrites the logit tensor with gradients
-    during the forward pass so no extra activation memory is needed.
-    """
-
     @staticmethod
     def forward(ctx, inp, target, ignore_index):
         loss, inp = cross_entropy_fwd_inplace(inp, target, ignore_index)
@@ -37,26 +34,8 @@ def cross_entropy(
     ignore_index: int = -100,
 ) -> torch.Tensor:
     """
-    In-place fused cross-entropy loss with mean reduction.
-
-    Overwrites ``inp`` with pre-computed gradients during the forward pass,
-    eliminating the need for a separate activation tensor.  All arithmetic
-    is performed in FP32; gradients are stored in the original dtype of
-    ``inp``.
-
-    Parameters
-    ----------
-    inp : torch.Tensor
-        Logits of shape ``(N, V)`` where N is the number of tokens and V is
-        the vocabulary size.  Modified in-place.
-    target : torch.Tensor
-        Target indices of shape ``(N,)`` with values in ``[0, V-1]``.
-    ignore_index : int
-        Target value that is ignored in loss and gradient computation.
-
-    Returns
-    -------
-    torch.Tensor
-        Scalar mean cross-entropy loss (float32).
+    Mean cross-entropy of logits inp (N, V) against target (N,), as a float32 scalar; targets equal
+    to ignore_index are left out. Computes in fp32 and overwrites inp in place with its gradient,
+    in inp's dtype.
     """
     return CrossEntropy.apply(inp, target, ignore_index)

@@ -1,34 +1,17 @@
 """
-FP8 parameter all-gather for FSDP2: gather FP8 weight bytes instead of bf16.
+FP8 parameter all-gather for FSDP2: gather the FP8 bytes of 128x128 block-scaled weights instead
+of bf16, so no bf16 copy of an FP8 weight exists and the all-gather moves one byte per element.
 
-Port of Megatron-LM's ``--fp8-param-gather`` to PithTrain's 128x128 block-scaled FP8 weights. With
-it on, no bf16 copy of an FP8 weight exists and the parameter all-gather moves one byte per element:
+precompute_fp8_param_scales computes the per-tile amax of each rank's fp32 shard, reduces it with
+one packed all-reduce MAX per FSDP shard group, derives the scales and casts the shard to FP8. It
+must run after every change to the fp32 weights (init, checkpoint load, optimizer step). FSDP
+then all-gathers that FP8 shard, and the post-all-gather hook packs the gathered weight and its
+transpose into one buffer of the bf16 weight's size. The unsharded parameter is a bf16 view of
+that buffer, so autograd and FSDP's gradient path are unchanged, and the module reads the operands
+through the weight_fp8 and weight_t_fp8 buffers that view the same storage.
 
-1. ``precompute_fp8_param_scales`` runs after every change to the fp32 master (weight init,
-   checkpoint load, ``optimizer.step()``). Each rank computes the per-tile amax of its own shard,
-   and one packed all-reduce MAX per FSDP shard group leaves every rank with the full grid, from
-   which the scales follow. Tiles may straddle shards, so the grid is reduced, never gathered. The
-   shard is then cast to FP8 into a persistent buffer, as Megatron's distributed optimizer does
-   right after its step, so the forward pass does no quantization work at all.
-2. FSDP2 calls ``fsdp_pre_all_gather`` on the sharded parameter, which hands it that FP8 shard,
-   and all-gathers the FP8 bytes.
-3. ``fsdp_post_all_gather`` lays the gathered bytes and their transpose out back to back in one
-   buffer of exactly the bf16 weight's size, and the unsharded parameter is a bf16 view of it. The
-   parameter keeps its usual shape and dtype, so autograd and FSDP's gradient path are unchanged,
-   but its bytes are the FP8 operands. The module reads them through two FP8 buffers viewing the
-   same storage, built once: FSDP frees and reallocates the storage in place on every reshard and
-   unshard, so the views stay valid and no per-call work is needed to recover the operands.
-
-Every step rounds fp32 to bf16 before taking an amax or casting, so the FP8 bytes and scales are
-bit-identical to ``fp8cast_blockwise_transpose[_batched]`` of the bf16 weight that FSDP gathers
-with the flag off. The flag changes memory and communication, not numerics.
-
-The hooks are plain functions set as attributes of the sharded local tensor, which FSDP2 picks up
-at lazy init; no tensor subclass is involved, so optimizers, checkpointing and ``torch.compile``
-only ever see plain tensors.
-
-The kernels (amax, cast, scales, pack + transpose) come from the kernel library:
-``fp8_shard_amax[_multi]``, ``fp8_shard_cast``, ``fp8_scales[_multi]``, ``fp8_pack_transpose``.
+The FP8 bytes and scales are bit-identical to fp8cast_blockwise_transpose of the bf16 weight. The
+hooks are plain functions set on the sharded local tensor, so no tensor subclass is involved.
 """
 
 from dataclasses import dataclass
@@ -59,36 +42,47 @@ __all__ = [
 BLOCK = 128
 
 
-# ---------------------------------------------------------------------------
-# FSDP2 wiring
-# ---------------------------------------------------------------------------
-
-
 @dataclass
-class _FP8ParamState:
+class FP8ParamState:
     """
-    Everything one wrapped weight needs, shared by its two FSDP hooks and the precompute.
+    The state of one weight gathered in FP8, shared by its two FSDP hooks and the precompute.
     """
 
     module: nn.Module
     fsdp_param: FSDPParam
     shape: torch.Size
-    """Global shape, (N, K) or (G, N, K)."""
+    """
+    Global shape, (N, K) or (G, N, K).
+    """
     row_offset: int
-    """First global row of N this rank holds; 0 for a 3-D weight, sharded over G."""
+    """
+    First global row of N this rank holds; 0 for a 3-D weight, which is sharded over G.
+    """
     group_offset: int
-    """First global group of G this rank holds; 0 for a 2-D weight."""
+    """
+    First global group of G this rank holds; 0 for a 2-D weight.
+    """
     amax: torch.Tensor
-    """(G, ceil(N/128), ceil(K/128)) view into the packed buffer of the shard group."""
+    """
+    The (G, ceil(N / 128), ceil(K / 128)) amax grid, a view into its shard group's packed buffer.
+    """
     version: int = -1
-    """Version counter of the local shard when amax was last computed."""
+    """
+    Version counter of the local shard when amax was last computed.
+    """
     packed: Optional[torch.Tensor] = None
-    """Flat byte buffer [fp8 | fp8_t] behind the unsharded parameter."""
+    """
+    Flat byte buffer [fp8 | fp8_t] behind the unsharded parameter.
+    """
     fp8_shard: Optional[torch.Tensor] = None
-    """This rank's shard cast to FP8, of FSDP's padded shard size; the all-gather input."""
+    """
+    This rank's shard cast to FP8 at FSDP's padded shard size: the all-gather input.
+    """
 
     def local_shard(self) -> torch.Tensor:
-        """The local fp32 shard as (g_local, local_rows, K)."""
+        """
+        The local fp32 shard as (local groups, local rows, K).
+        """
         local = self.fsdp_param._sharded_local_tensor
         return local.view(1, *local.shape) if len(self.shape) == 2 else local
 
@@ -100,24 +94,32 @@ class _FP8ParamState:
         module: nn.Module,
         mp_policy: Any,
     ) -> tuple[tuple[torch.Tensor, ...], None]:
-        if self._shard_freed():
+        """
+        FSDP's fsdp_pre_all_gather hook: hand FSDP the FP8 shard to gather.
+        """
+        if self.shard_freed():
             self.cast_shard()
         assert self.fsdp_param._sharded_local_tensor._version == self.version, (
             "FP8 shard is stale: call precompute_fp8_param_scales after changing the weights"
         )
         return (self.fp8_shard,), None
 
-    def _shard_freed(self) -> bool:
+    def shard_freed(self) -> bool:
+        """
+        Whether post_all_gather released the FP8 shard's storage.
+        """
         return self.fp8_shard is not None and self.fp8_shard.untyped_storage().size() == 0
 
     def cast_shard(self) -> None:
-        """Cast the local fp32 shard into fp8_shard with the current amax grid."""
+        """
+        Cast the local fp32 shard into fp8_shard with the current amax grid.
+        """
         padded = self.fsdp_param.padded_sharded_param_size
-        if self._shard_freed():
+        if self.shard_freed():
             self.fp8_shard.untyped_storage().resize_(self.fp8_shard.numel())
         if self.fp8_shard is None:
-            # Uneven shards must still hand FSDP the padded size; the padding rows are dropped
-            # after the gather, so they are left uninitialised.
+            # FSDP needs the padded size even for an uneven shard; the padding rows are dropped
+            # after the gather, so they stay uninitialised.
             device = self.fsdp_param.sharded_param.device
             self.fp8_shard = torch.empty(padded, dtype=torch.uint8, device=device)
         out = self.fp8_shard.view(torch.float8_e4m3fn)
@@ -136,6 +138,12 @@ class _FP8ParamState:
         *,
         out: Optional[torch.Tensor] = None,
     ) -> Optional[tuple[torch.Tensor, tuple[torch.Tensor, ...]]]:
+        """
+        FSDP's fsdp_post_all_gather hook: pack the gathered FP8 weight and its transpose into the
+        packed buffer and return the bf16 view of it as the unsharded parameter. On the first call
+        (out is None) it allocates the buffer and registers weight_fp8 and weight_t_fp8 on the
+        module; later calls refill it in place and return None.
+        """
         assert param_dtype == torch.bfloat16, param_dtype
         (gathered,) = all_gather_outputs
         gathered = gathered[: self.shape[0]].view(torch.float8_e4m3fn).view(self.shape)
@@ -149,32 +157,32 @@ class _FP8ParamState:
             self.module.register_buffer("weight_fp8", fp8, persistent=False)
             self.module.register_buffer("weight_t_fp8", fp8_t, persistent=False)
         fp8_pack_transpose(gathered, self.packed)
-        # The bytes now live in the packed buffer; drop the gather output until the next unshard,
-        # which reallocates it. Both run on the current stream, so the free is ordered.
-        for t in self.fsdp_param.all_gather_outputs:
-            free_storage(t)
+        # The bytes now live in the packed buffer; the next unshard reallocates the gather output.
+        # Both run on the current stream, so the free is ordered.
+        for output in self.fsdp_param.all_gather_outputs:
+            free_storage(output)
         # FSDP copied the FP8 shard into its all-gather buffer, so it is dead until the next
-        # precompute recasts it: release it rather than hold 1 B/param through the step.
+        # precompute recasts it.
         free_storage(self.fp8_shard)
         if out is not None:
             return None
         return self.packed.view(torch.bfloat16).view(self.shape), (self.packed,)
 
 
-_states: list[_FP8ParamState] = []
-_groups: list[tuple[dist.ProcessGroup, torch.Tensor, list[_FP8ParamState]]] = []
+fp8_states: list[FP8ParamState] = []
+fp8_groups: list[tuple[dist.ProcessGroup, torch.Tensor, list[FP8ParamState]]] = []
 
 
 def install_fp8_param_gather(model: nn.Module, fp8_classes: tuple[type, ...]) -> None:
     """
-    Make FSDP2 all-gather the weight of every module of fp8_classes in FP8.
+    Make FSDP2 all-gather the weight of every module of fp8_classes in FP8, registering the
+    weight_scale and weight_scale_t buffers on each module and computing the scales once.
 
-    Call after fully_shard and before the first forward. The scales are computed here once; call
-    precompute_fp8_param_scales again after every later change to the weights.
+    Call after fully_shard and before the first forward. Collective over each shard group.
     """
-    _states.clear()
-    _groups.clear()
-    by_group: dict[int, tuple[dist.ProcessGroup, list[tuple[_FP8ParamState, int]]]] = {}
+    fp8_states.clear()
+    fp8_groups.clear()
+    by_group: dict[int, tuple[dist.ProcessGroup, list[tuple[FP8ParamState, int]]]] = {}
     for fsdp_module in model.modules():
         if not isinstance(fsdp_module, FSDPModule):
             continue
@@ -203,7 +211,7 @@ def install_fp8_param_gather(model: nn.Module, fp8_classes: tuple[type, ...]) ->
             module.register_buffer("weight_scale_t", scale_t, persistent=False)
             module.fp8_param_gather = True
             row_offset, group_offset = (offset, 0) if len(shape) == 2 else (0, offset)
-            state = _FP8ParamState(module, fsdp_param, shape, row_offset, group_offset, torch.empty(0))  # fmt: skip
+            state = FP8ParamState(module, fsdp_param, shape, row_offset, group_offset, torch.empty(0))  # fmt: skip
             group = mesh_info.shard_process_group
             entry = by_group.setdefault(id(group), (group, []))
             entry[1].append((state, G * grid[1] * grid[2]))
@@ -211,18 +219,18 @@ def install_fp8_param_gather(model: nn.Module, fp8_classes: tuple[type, ...]) ->
             local.fsdp_pre_all_gather = state.pre_all_gather
             local.fsdp_post_all_gather = state.post_all_gather
             fsdp_param._init_extensions()
-            _states.append(state)
+            fp8_states.append(state)
 
     # One packed amax buffer per shard group, so each group reduces in a single collective.
     for group, entries in by_group.values():
         device = entries[0][0].fsdp_param.sharded_param.device
-        buffer = torch.zeros(sum(n for _, n in entries), dtype=torch.float32, device=device)
+        buffer = torch.zeros(sum(num_tiles for _, num_tiles in entries), dtype=torch.float32, device=device)  # fmt: skip
         start = 0
-        for state, n in entries:
+        for state, num_tiles in entries:
             G, N, K = (1, *state.shape) if len(state.shape) == 2 else state.shape
-            state.amax = buffer[start : start + n].view(G, (N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK)  # fmt: skip
-            start += n
-        _groups.append((group, buffer, [s for s, _ in entries]))
+            state.amax = buffer[start : start + num_tiles].view(G, (N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK)  # fmt: skip
+            start += num_tiles
+        fp8_groups.append((group, buffer, [state for state, _ in entries]))
 
     precompute_fp8_param_scales()
 
@@ -231,12 +239,11 @@ def install_fp8_param_gather(model: nn.Module, fp8_classes: tuple[type, ...]) ->
 def precompute_fp8_param_scales() -> None:
     """
     Recompute the FP8 scales and the FP8 shard of every installed weight from its fp32 shard.
-
     Collective over each FSDP shard group, so every rank must call it at the same point.
     """
-    for group, buffer, states in _groups:
+    for group, buffer, states in fp8_groups:
         buffer.zero_()
-        launches = _multi_launches(states)
+        launches = multi_launches(states)
         if launches is not None:
             launches[0]()
         else:
@@ -249,78 +256,71 @@ def precompute_fp8_param_scales() -> None:
             launches[1]()
         for state in states:
             if launches is None:
-                fp8_scales(state.amax, *_scale_grids(state.module))
+                fp8_scales(state.amax, *scale_grids(state.module))
             state.cast_shard()
             state.version = state.fsdp_param._sharded_local_tensor._version
 
 
-def _scale_grids(module: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
-    """The module's scale buffers as (G, R, C) and (G, C, R)."""
+def scale_grids(module: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    The module's scale buffers as 3-D grids (G, R, C) and (G, C, R).
+    """
     scale, scale_t = module.weight_scale, module.weight_scale_t
     if scale.dim() == 2:
         scale, scale_t = scale.unsqueeze(0), scale_t.unsqueeze(0)
     return scale, scale_t
 
 
-_multi_cache: dict[int, tuple[tuple[int, ...], tuple[Any, Any]]] = {}
+multi_launch_cache: dict[int, tuple[tuple[int, ...], tuple[Any, Any]]] = {}
 
 
-def _multi_launches(states: list[_FP8ParamState]) -> Optional[tuple[Any, Any]]:
+def multi_launches(states: list[FP8ParamState]) -> Optional[tuple[Any, Any]]:
     """
-    One amax launch and one scales launch covering every weight of a shard group (CuTe-DSL, with a
-    device table of pointers built once), or None where the kernels have no such launch (off SM90),
-    so the caller loops over the weights. Rebuilt if any shard moved, e.g. after an RL offload.
+    One amax launch and one scales launch covering every weight of a shard group, or None where
+    the kernel library has no such launch, in which case the caller loops over the weights. Cached
+    per group and rebuilt when any shard moves.
     """
-    shards = [s.local_shard() for s in states]
-    key = tuple(t.data_ptr() for t in shards)
-    cached = _multi_cache.get(id(states))
+    shards = [state.local_shard() for state in states]
+    key = tuple(shard.data_ptr() for shard in shards)
+    cached = multi_launch_cache.get(id(states))
     if cached is None or cached[0] != key:
-        amaxes = [s.amax for s in states]
-        grids = [_scale_grids(s.module) for s in states]
+        amaxes = [state.amax for state in states]
+        grids = [scale_grids(state.module) for state in states]
         amax_launch = fp8_shard_amax_multi(
-            shards, amaxes, [s.row_offset for s in states], [s.group_offset for s in states]
+            shards,
+            amaxes,
+            [state.row_offset for state in states],
+            [state.group_offset for state in states],
         )
         if amax_launch is None:
             return None
-        scales_launch = fp8_scales_multi(amaxes, [g[0] for g in grids], [g[1] for g in grids])
+        scales_launch = fp8_scales_multi(amaxes, [grid[0] for grid in grids], [grid[1] for grid in grids])  # fmt: skip
         cached = (key, (amax_launch, scales_launch))
-        _multi_cache[id(states)] = cached
+        multi_launch_cache[id(states)] = cached
     return cached[1]
 
 
-# ---------------------------------------------------------------------------
-# Raw expert parameters (gpt-oss's gate_up_proj / down_proj)
-# ---------------------------------------------------------------------------
-#
-# The FP8 parameter all-gather above for expert weights kept as raw
-# parameters, such as gpt-oss's ``gate_up_proj`` / ``down_proj``.
-#
-# ``install_fp8_param_gather`` wraps the ``weight`` of FP8Linear / FP8GroupedLinear modules and hangs
-# the gathered FP8 operands off that module as ``weight_fp8``, ``weight_scale`` and so on. A module
-# holding several raw 3-D expert weights cannot take that naming, and turning the weights into
-# submodules would rename them in every checkpoint (``experts.gate_up_proj`` ->
-# ``experts.gate_up_proj.weight``). Instead, a module lists its raw FP8 weights in a class attribute
-# ``fp8_raw_params``, and each gets a small holder module (kept outside the module tree, so neither
-# ``state_dict`` nor ``named_modules`` sees it) that plays the part of the FP8 module for
-# the gather above: the same ``_FP8ParamState`` hooks, the same packed per-shard-group amax reduction,
-# recomputed by the same ``precompute_fp8_param_scales``. FQNs, checkpoints and the optimizer are
-# unchanged.
-#
-# The module reads the operands with :func:`fp8_param_operands`, which returns ``None`` when the
+# Raw expert parameters (gpt-oss's gate_up_proj and down_proj): a module lists them in its
+# fp8_raw_params class attribute, and each gets a holder module that plays the part of the FP8
+# module for the gather. The holder sits in a plain dict in the module's __dict__, outside the
+# module tree, so parameter names and checkpoints are unchanged.
+HOLDERS_KEY = "_fp8_param_holders"
 
 
-_HOLDERS = "_fp8_param_holders"
-
-
-class _Holder(nn.Module):
-    """Stands in for an FP8 module: the gather registers the operand buffers on it."""
+class RawParamHolder(nn.Module):
+    """
+    Stands in for an FP8 module: the gather registers the operand buffers on it.
+    """
 
     fp8_param_gather: bool = True
 
 
 def fp8_param_operands(module: nn.Module, name: str) -> Optional[tuple[torch.Tensor, ...]]:
-    """(fp8, scale, fp8_t, scale_t) of the raw weight ``name`` when it is gathered in FP8."""
-    holder = module.__dict__.get(_HOLDERS, {}).get(name)
+    """
+    The FP8 operands (fp8, scale, fp8_t, scale_t) of the raw weight name, or None when it is not
+    gathered in FP8.
+    """
+    holder = module.__dict__.get(HOLDERS_KEY, {}).get(name)
     if holder is None:
         return None
     return holder.weight_fp8, holder.weight_scale, holder.weight_t_fp8, holder.weight_scale_t
@@ -328,12 +328,12 @@ def fp8_param_operands(module: nn.Module, name: str) -> Optional[tuple[torch.Ten
 
 def install_raw_fp8_param_gather(model: nn.Module) -> None:
     """
-    Gather in FP8 every raw parameter named in a module's ``fp8_raw_params``.
+    Make FSDP2 all-gather in FP8 every raw parameter named in a module's fp8_raw_params.
 
-    Call after ``install_fp8_param_gather`` (which resets the registry and must therefore
-    run first), after fully_shard and before the first forward. Collective over each shard group.
+    Call after install_fp8_param_gather, which resets the registry, and before the first forward.
+    Collective over each shard group.
     """
-    by_group: dict[int, tuple[dist.ProcessGroup, list[tuple[_FP8ParamState, int]]]] = {}
+    by_group: dict[int, tuple[dist.ProcessGroup, list[tuple[FP8ParamState, int]]]] = {}
     for fsdp_module in model.modules():
         if not isinstance(fsdp_module, FSDPModule):
             continue
@@ -355,15 +355,12 @@ def install_raw_fp8_param_gather(model: nn.Module) -> None:
             G, N, K = shape
             grid = (G, (N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK)
             device = fsdp_param.sharded_param.device
-            holder = _Holder()
+            holder = RawParamHolder()
             holder.register_buffer("weight_scale", torch.empty(grid, dtype=torch.float32, device=device), persistent=False)  # fmt: skip
             holder.register_buffer("weight_scale_t", torch.empty(G, grid[2], grid[1], dtype=torch.float32, device=device), persistent=False)  # fmt: skip
             # Plain dict in __dict__: not a submodule, so invisible to state_dict and FSDP.
-            module.__dict__.setdefault(_HOLDERS, {})[name] = holder
-            # A raw parameter's FP8 shard is released after each gather, as for every FP8 weight;
-            # that matters most for expert weights that the expert-dp axis does not shard (EP8 on
-            # one node: the shard is the whole local weight, 2.4 GB of gpt-oss-20b).
-            state = _FP8ParamState(holder, fsdp_param, shape, 0, offset, torch.empty(0))
+            module.__dict__.setdefault(HOLDERS_KEY, {})[name] = holder
+            state = FP8ParamState(holder, fsdp_param, shape, 0, offset, torch.empty(0))
             group = mesh_info.shard_process_group
             entry = by_group.setdefault(id(group), (group, []))
             entry[1].append((state, G * grid[1] * grid[2]))
@@ -371,17 +368,17 @@ def install_raw_fp8_param_gather(model: nn.Module) -> None:
             local.fsdp_pre_all_gather = state.pre_all_gather
             local.fsdp_post_all_gather = state.post_all_gather
             fsdp_param._init_extensions()
-            _states.append(state)
+            fp8_states.append(state)
 
     for group, entries in by_group.values():
         device = entries[0][0].fsdp_param.sharded_param.device
-        buffer = torch.zeros(sum(n for _, n in entries), dtype=torch.float32, device=device)
+        buffer = torch.zeros(sum(num_tiles for _, num_tiles in entries), dtype=torch.float32, device=device)  # fmt: skip
         start = 0
-        for state, n in entries:
+        for state, num_tiles in entries:
             G, N, K = state.shape
-            state.amax = buffer[start : start + n].view(G, (N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK)  # fmt: skip
-            start += n
-        _groups.append((group, buffer, [s for s, _ in entries]))
+            state.amax = buffer[start : start + num_tiles].view(G, (N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK)  # fmt: skip
+            start += num_tiles
+        fp8_groups.append((group, buffer, [state for state, _ in entries]))
 
     if by_group:
         precompute_fp8_param_scales()

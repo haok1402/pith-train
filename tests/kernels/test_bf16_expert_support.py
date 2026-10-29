@@ -1,11 +1,11 @@
 """
-bf16_experts_supported: the fused BF16 CuTe experts run only on SM90, with the exact quack-kernels
-version they were validated against, and for at most 64 local experts; otherwise False, warning at
-most once per device. The query never imports QuACK or cutlass.
+Verifies bf16_experts_supported: true only on SM90, with the exact quack-kernels version the fused
+BF16 CuTe experts were validated against, and for at most 64 local experts; otherwise false, with
+at most one warning per device. The query never imports QuACK or cutlass.
 
-The version / architecture cases run in a subprocess that patches the probes the query reads
-(``importlib.metadata.version`` and ``torch.cuda.get_device_capability``) before importing the
-library, so each starts from an empty per-device cache.
+The version and architecture cases run in a subprocess that patches the probes the query reads
+(importlib.metadata.version and torch.cuda.get_device_capability) before importing the library,
+so each starts from an empty per-device cache.
 """
 
 import importlib.metadata
@@ -28,7 +28,9 @@ def quack_version() -> str | None:
 
 
 def h200() -> bool:
-    """The H200 (SM90) path, told by a capability query rather than an architecture probe."""
+    """
+    The H200 (SM90) path, told by a capability query rather than an architecture probe.
+    """
     return fp8_fused_experts_supported()
 
 
@@ -41,8 +43,8 @@ def test_supported_on_h200():
     if quack_version() != VALIDATED_QUACK:
         pytest.skip(f"venv quack-kernels is {quack_version()}, not {VALIDATED_QUACK}")
     assert bf16_experts_supported()
-    for g in (1, 8, 16, 32, 64):
-        assert bf16_experts_supported(g)
+    for num_groups in (1, 8, 16, 32, 64):
+        assert bf16_experts_supported(num_groups)
 
 
 @pytest.mark.skipif(not h200(), reason="needs SM90")

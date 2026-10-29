@@ -107,7 +107,7 @@ class HFPrefixRotaryEmbedding(nn.Module):  # TODO_HF rename to match HF class
 #       metadata.
 #
 #   (b) Fused gate+up or per-expert bias -> raw `nn.Parameter` of shape
-#       `[E, out, in]` plus a private `_group_linear` helper that dispatches
+#       `[E, out, in]` plus an `apply_grouped_linear` helper that dispatches
 #       on `training.fp8` (GPT-OSS-style; see gpt_oss.py `GptOssExperts`).
 #       If HF stores `[E, in, out]`, the transpose lives ONLY in dcp2hf,
 #       never here.

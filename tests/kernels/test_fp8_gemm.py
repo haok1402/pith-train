@@ -1,15 +1,15 @@
 """
-Verifier of the ``fp8_gemm`` feature of ``pithtrain.kernels`` against plain PyTorch.
+Verifies the fp8_gemm feature of pithtrain.kernels against PyTorch.
 
-- ``quantize_grouped_input``: exact FP8 bytes and E8M0 scale values of both outputs (rowwise 1x128
-  per row; per-channel 128x1 within each group in the K-major per-group layout of SM90).
-- ``m_grouped_group_indices``: exact ids against ``searchsorted``, for offsets the one-launch
-  kernel covers and offsets it does not.
-- ``fp8_m_grouped_gemm`` (with and without the hint), ``k_grouped_fp8_gemm`` (in place, row-limit
-  split, the SM90 deadlock guard's direct / transposed / padded branches, padded operands, the
-  ``fp8_grouped_wgrad_buffer`` layouts), and the dense ``fp8_gemm_nt`` / ``fp8_act_weight_gemm``
-  / ``fp8_dgrad_wgrad``: against fp32 PyTorch matmuls of the dequantized FP8 operands.
-- ``fp8_grouped_wgrad_buffer`` layout and ``fp8_fused_experts_supported``.
+- quantize_grouped_input: exact FP8 bytes and E8M0 scale values of both outputs (rowwise 1x128
+  per row, and per-channel 128x1 within each group in SM90's K-major per-group layout).
+- m_grouped_group_indices: exact ids against searchsorted, for offsets the one-launch kernel
+  covers and offsets it does not.
+- fp8_m_grouped_gemm (with and without the hint), k_grouped_fp8_gemm (in place, the row-limit
+  split, the SM90 deadlock guard's direct, transposed and padded branches, padded operands, both
+  fp8_grouped_wgrad_buffer layouts), and the dense fp8_gemm_nt, fp8_act_weight_gemm and
+  fp8_dgrad_wgrad: against fp32 PyTorch matmuls of the dequantized FP8 operands.
+- The fp8_grouped_wgrad_buffer layout and fp8_fused_experts_supported.
 
 The deadlock-guard shapes of k_grouped_fp8_gemm run in a subprocess under a timeout, so a hang
 fails the test instead of the session.
@@ -47,13 +47,10 @@ DEV = "cuda"
 BLOCK = 128
 
 
-# ---------------------------------------------------------------------------
-# PyTorch reference of the FP8 recipe
-# ---------------------------------------------------------------------------
-
-
 def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
-    """Normalized squared error ``1 - 2 sum(xy) / sum(x^2 + y^2)`` in float64."""
+    """
+    Normalized squared error 1 - 2 sum(xy) / sum(x^2 + y^2) in float64.
+    """
     x, y = x.double(), y.double()
     den = (x * x + y * y).sum()
     if den == 0:
@@ -62,12 +59,14 @@ def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
 
 
 def e8m0_scale(amax: torch.Tensor) -> torch.Tensor:
-    """``2 ** ceil(log2(max(amax, 1e-4) / 448))`` as an exact fp32 power of two. ``/ 448`` is the
-    kernels' multiply by fp32(1 / 448); the power-of-two ceil is done on the bits."""
-    a = amax.float().clamp(min=1e-4) * torch.tensor(1.0 / 448.0, dtype=torch.float32)
-    bits = a.view(torch.int32)
-    up = torch.where((bits & 0x007FFFFF) != 0, 0x00800000, 0).to(torch.int32)
-    return ((bits & 0x7F800000) + up).view(torch.float32)
+    """
+    2 ** ceil(log2(max(amax, 1e-4) / 448)) as an exact fp32 power of two, dividing by 448 as the
+    kernels do (a multiply by fp32(1 / 448)) and taking the power-of-two ceil on the bits.
+    """
+    raw_scale = amax.float().clamp(min=1e-4) * torch.tensor(1.0 / 448.0, dtype=torch.float32)
+    bits = raw_scale.view(torch.int32)
+    exponent_bump = torch.where((bits & 0x007FFFFF) != 0, 0x00800000, 0).to(torch.int32)
+    return ((bits & 0x7F800000) + exponent_bump).view(torch.float32)
 
 
 def cast(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -75,40 +74,48 @@ def cast(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 
 def ref_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """1x128 along each row: fp8 (M, K), scale (M, ceil(K / 128))."""
+    """
+    1x128 along each row: fp8 (M, K), scale (M, ceil(K / 128)).
+    """
     M, K = x.shape
-    kb = -(-K // BLOCK)
-    xp = torch.zeros(M, kb * BLOCK, dtype=torch.float32, device=x.device)
-    xp[:, :K] = x.float()
-    xb = xp.view(M, kb, BLOCK)
-    s = e8m0_scale(xb.abs().amax(-1))
-    q = cast(xb, s[..., None]).view(M, kb * BLOCK)[:, :K].contiguous()
-    return q, s
+    num_kblocks = -(-K // BLOCK)
+    x_padded = torch.zeros(M, num_kblocks * BLOCK, dtype=torch.float32, device=x.device)
+    x_padded[:, :K] = x.float()
+    x_blocks = x_padded.view(M, num_kblocks, BLOCK)
+    scale = e8m0_scale(x_blocks.abs().amax(-1))
+    q = cast(x_blocks, scale[..., None]).view(M, num_kblocks * BLOCK)[:, :K].contiguous()
+    return q, scale
 
 
 def ref_channelwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """128x1 along the rows (M a multiple of 128): fp8 (M, K), scale (K, M / 128)."""
+    """
+    128x1 along the rows (M a multiple of 128): fp8 (M, K), scale (K, M / 128).
+    """
     M, K = x.shape
-    xb = x.float().view(M // BLOCK, BLOCK, K)
-    s = e8m0_scale(xb.abs().amax(1))
-    q = cast(xb, s[:, None, :]).view(M, K)
-    return q, s.T
+    x_blocks = x.float().view(M // BLOCK, BLOCK, K)
+    scale = e8m0_scale(x_blocks.abs().amax(1))
+    q = cast(x_blocks, scale[:, None, :]).view(M, K)
+    return q, scale.T
 
 
 def ref_blockwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """128x128 tiles of a 2D x: fp8 (R, C), scale (ceil(R / 128), ceil(C / 128))."""
+    """
+    128x128 tiles of a 2D x: fp8 (R, C), scale (ceil(R / 128), ceil(C / 128)).
+    """
     R, C = x.shape
-    rb, cb = -(-R // BLOCK), -(-C // BLOCK)
-    xp = torch.zeros(rb * BLOCK, cb * BLOCK, dtype=torch.float32, device=x.device)
-    xp[:R, :C] = x.float()
-    xb = xp.view(rb, BLOCK, cb, BLOCK)
-    s = e8m0_scale(xb.abs().amax(dim=(1, 3)))
-    q = cast(xb, s[:, None, :, None]).view(rb * BLOCK, cb * BLOCK)[:R, :C].contiguous()
-    return q, s
+    num_rblocks, num_cblocks = -(-R // BLOCK), -(-C // BLOCK)
+    x_padded = torch.zeros(num_rblocks * BLOCK, num_cblocks * BLOCK, dtype=torch.float32, device=x.device)  # fmt: skip
+    x_padded[:R, :C] = x.float()
+    x_blocks = x_padded.view(num_rblocks, BLOCK, num_cblocks, BLOCK)
+    scale = e8m0_scale(x_blocks.abs().amax(dim=(1, 3)))
+    q = cast(x_blocks, scale[:, None, :, None]).view(num_rblocks * BLOCK, num_cblocks * BLOCK)[:R, :C].contiguous()  # fmt: skip
+    return q, scale
 
 
 def to_kmajor(q: torch.Tensor, ks: list[int]) -> torch.Tensor:
-    """(M, K) per-channel FP8 -> flat K-major per group: group g's (K, ks[g]) block row-major."""
+    """
+    (M, K) per-channel FP8 to flat K-major per group: group g's (K, ks[g]) block row-major.
+    """
     parts, row = [], 0
     for k in ks:
         parts.append(q[row : row + k].T.contiguous().view(-1))
@@ -116,23 +123,25 @@ def to_kmajor(q: torch.Tensor, ks: list[int]) -> torch.Tensor:
     return torch.cat(parts) if parts else q.new_empty(0)
 
 
-def dq_rowwise(q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-    return q.float() * s.repeat_interleave(BLOCK, dim=1)[:, : q.shape[1]]
+def dq_rowwise(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return q.float() * scale.repeat_interleave(BLOCK, dim=1)[:, : q.shape[1]]
 
 
-def dq_blockwise(q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+def dq_blockwise(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     R, C = q.shape[-2:]
-    full = s.repeat_interleave(BLOCK, dim=-2).repeat_interleave(BLOCK, dim=-1)
+    full = scale.repeat_interleave(BLOCK, dim=-2).repeat_interleave(BLOCK, dim=-1)
     return q.float() * full[..., :R, :C]
 
 
 def dq_kmajor(data: torch.Tensor, scale: torch.Tensor, ks: list[int], ch: int) -> list:
-    """Per group (ch, ks[g]) fp32 from the K-major flat data and (ch, M / 128) scales."""
+    """
+    Per group (ch, ks[g]) fp32 from the K-major flat data and (ch, M / 128) scales.
+    """
     out, row = [], 0
     for k in ks:
         block = data[row * ch : (row + k) * ch].view(ch, k).float()
-        s = scale[:, row // BLOCK : (row + k) // BLOCK].repeat_interleave(BLOCK, dim=1)
-        out.append(block * s)
+        block_scale = scale[:, row // BLOCK : (row + k) // BLOCK].repeat_interleave(BLOCK, dim=1)
+        out.append(block * block_scale)
         row += k
     return out
 
@@ -142,14 +151,14 @@ def offsets(ks: list[int]) -> torch.Tensor:
 
 
 def make_input(M: int, K: int, kind: str = "randn", seed: int = 0) -> torch.Tensor:
-    g = torch.Generator(device=DEV).manual_seed(seed)
-    x = torch.randn(M, K, device=DEV, generator=g)
+    gen = torch.Generator(device=DEV).manual_seed(seed)
+    x = torch.randn(M, K, device=DEV, generator=gen)
     if kind == "scaled":  # per-row and per-column dynamic range over many binades
-        rs = torch.exp2(torch.randint(-20, 20, (M, 1), device=DEV, generator=g).float())
-        cs = torch.exp2(torch.randint(-6, 6, (1, K), device=DEV, generator=g).float())
-        x = x * rs * cs
+        row_scale = torch.exp2(torch.randint(-20, 20, (M, 1), device=DEV, generator=gen).float())
+        col_scale = torch.exp2(torch.randint(-6, 6, (1, K), device=DEV, generator=gen).float())
+        x = x * row_scale * col_scale
     elif kind == "outliers":
-        mask = torch.rand(M, K, device=DEV, generator=g) < 1e-3
+        mask = torch.rand(M, K, device=DEV, generator=gen) < 1e-3
         x = torch.where(mask, x * 1e4, x)
         x[:, : min(K, 3)] = 0.0  # all-zero columns
         x[5::97] = 0.0  # all-zero rows
@@ -167,18 +176,13 @@ def make_input(M: int, K: int, kind: str = "randn", seed: int = 0) -> torch.Tens
 
 def assert_fp8_equal(got: torch.Tensor, ref: torch.Tensor, name: str) -> None:
     assert got.dtype == torch.float8_e4m3fn and got.shape == ref.shape, (name, got.shape)
-    a, b = got.view(torch.uint8), ref.view(torch.uint8)
-    assert torch.equal(a, b), f"{name}: {(a != b).sum().item()} bytes differ"
+    got_bytes, ref_bytes = got.view(torch.uint8), ref.view(torch.uint8)
+    assert torch.equal(got_bytes, ref_bytes), f"{name}: {(got_bytes != ref_bytes).sum().item()} bytes differ"  # fmt: skip
 
 
 def assert_scale_equal(got: torch.Tensor, ref: torch.Tensor, name: str) -> None:
     assert got.dtype == torch.float32 and got.shape == ref.shape, (name, got.shape, ref.shape)
     assert torch.equal(got, ref), f"{name}: {(got != ref).sum().item()} scales differ"
-
-
-# ---------------------------------------------------------------------------
-# fp8_fused_experts_supported / fp8_grouped_wgrad_buffer
-# ---------------------------------------------------------------------------
 
 
 def test_fused_experts_supported() -> None:
@@ -214,28 +218,23 @@ def test_wgrad_buffer_layout(size: tuple) -> None:
     assert buf.shape == size and buf.contiguous().shape == size
     transposed = len(size) == 3 and blocks(size[1]) % 2 == 1 and blocks(size[2]) % 2 == 0
     if transposed:
-        g, n, k = size
+        _, n, k = size
         assert not buf.is_contiguous() and buf.stride() == (n * k, 1, n)
         assert buf.transpose(1, 2).is_contiguous()
     else:
         assert buf.is_contiguous()
 
 
-# ---------------------------------------------------------------------------
-# quantize_grouped_input
-# ---------------------------------------------------------------------------
-
-
 def check_grouped_input(x: torch.Tensor, ks: list[int]) -> None:
     M, K = x.shape
     x_fp8, x_scale, ch_fp8, ch_scale = quantize_grouped_input(x, offsets(ks))
-    rq, rs = ref_rowwise(x)
-    assert_fp8_equal(x_fp8, rq, "x_fp8")
-    assert_scale_equal(x_scale, rs, "x_scale")
-    cq, cs = ref_channelwise(x)
+    row_q, row_scale = ref_rowwise(x)
+    assert_fp8_equal(x_fp8, row_q, "x_fp8")
+    assert_scale_equal(x_scale, row_scale, "x_scale")
+    ch_q, ch_ref_scale = ref_channelwise(x)
     assert ch_fp8.shape == (M * K,)
-    assert_fp8_equal(ch_fp8, to_kmajor(cq, ks), "x_ch_fp8")
-    assert_scale_equal(ch_scale, cs, "x_ch_scale")
+    assert_fp8_equal(ch_fp8, to_kmajor(ch_q, ks), "x_ch_fp8")
+    assert_scale_equal(ch_scale, ch_ref_scale, "x_ch_scale")
 
 
 BALANCED = [2048] * 16
@@ -281,8 +280,8 @@ def test_quantize_grouped_input_zeros() -> None:
 
 
 def test_quantize_grouped_input_many_groups() -> None:
-    g = torch.Generator().manual_seed(1)
-    ks = (torch.randint(0, 6, (100,), generator=g) * 128).tolist()
+    gen = torch.Generator().manual_seed(1)
+    ks = (torch.randint(0, 6, (100,), generator=gen) * 128).tolist()
     check_grouped_input(make_input(sum(ks), 512, "scaled"), ks)
 
 
@@ -292,30 +291,25 @@ def test_quantize_grouped_input_empty() -> None:
     assert [tuple(t.shape) for t in out] == [(0, 2048), (0, 16), (0,), (2048, 0)]
 
 
-# ---------------------------------------------------------------------------
-# m_grouped_group_indices
-# ---------------------------------------------------------------------------
-
-
 def ref_group_indices(offs: torch.Tensor, M: int) -> torch.Tensor:
     rows = torch.arange(M, device=offs.device)
-    gi = torch.searchsorted(offs.contiguous(), rows, right=True).to(torch.int32)
-    return gi.clamp_(max=offs.shape[0] - 1)
+    group_idx = torch.searchsorted(offs.contiguous(), rows, right=True).to(torch.int32)
+    return group_idx.clamp_(max=offs.shape[0] - 1)
 
 
 def check_group_indices(offs: torch.Tensor, M: int) -> None:
-    gi = m_grouped_group_indices(offs, M)
-    assert gi is not None and gi.dtype == torch.int32 and gi.shape == (M,)
-    assert torch.equal(gi, ref_group_indices(offs, M))
+    group_idx = m_grouped_group_indices(offs, M)
+    assert group_idx is not None and group_idx.dtype == torch.int32 and group_idx.shape == (M,)
+    assert torch.equal(group_idx, ref_group_indices(offs, M))
 
 
 @pytest.mark.parametrize("G", [1, 3, 8, 16, 32, 64, 128, 1024, 1025, 1500])
 @pytest.mark.parametrize("seed", [0, 1])
 def test_group_indices(G: int, seed: int) -> None:
     # G <= 1024 int32 contiguous runs the one-launch kernel, G > 1024 the searchsorted fallback.
-    g = torch.Generator().manual_seed(seed)
-    counts = torch.randint(0, 3000, (G,), generator=g)
-    counts[torch.rand(G, generator=g) < 0.3] = 0  # empty groups
+    gen = torch.Generator().manual_seed(seed)
+    counts = torch.randint(0, 3000, (G,), generator=gen)
+    counts[torch.rand(G, generator=gen) < 0.3] = 0  # empty groups
     ks = (counts + 127) // 128 * 128
     offs = ks.cumsum(0).to(torch.int32).to(DEV)
     M = int(offs[-1])
@@ -344,11 +338,6 @@ def test_group_indices_example() -> None:
     assert torch.equal(m_grouped_group_indices(offs, 512), ref)
 
 
-# ---------------------------------------------------------------------------
-# fp8_m_grouped_gemm
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize(
     "ks,n,K",
     [
@@ -372,27 +361,24 @@ def test_m_grouped_gemm(ks: list[int], n: int, K: int) -> None:
     x_fp8, x_scale, _, _ = quantize_grouped_input(x, offs)
     w_fp8, w_scale, _, _ = fp8cast_blockwise_transpose_batched(w)
     out = fp8_m_grouped_gemm((x_fp8, x_scale), (w_fp8, w_scale), n, offs)
-    gi = m_grouped_group_indices(offs, M)
-    hinted = fp8_m_grouped_gemm((x_fp8, x_scale), (w_fp8, w_scale), n, offs, group_indices=gi)
+    group_idx = m_grouped_group_indices(offs, M)
+    hinted = fp8_m_grouped_gemm((x_fp8, x_scale), (w_fp8, w_scale), n, offs, group_indices=group_idx)  # fmt: skip
     assert out.shape == (M, n) and out.dtype == torch.bfloat16
     assert torch.equal(out, hinted)
-    xd, wd = dq_rowwise(x_fp8, x_scale), dq_blockwise(w_fp8, w_scale)
+    x_dq, w_dq = dq_rowwise(x_fp8, x_scale), dq_blockwise(w_fp8, w_scale)
     row = 0
-    for g, k in enumerate(ks):
+    for group, k in enumerate(ks):
         if k:
-            ref = xd[row : row + k] @ wd[g].T
-            assert calc_diff(out[row : row + k], ref) < 1e-3, g
+            ref = x_dq[row : row + k] @ w_dq[group].T
+            assert calc_diff(out[row : row + k], ref) < 1e-3, group
         row += k
 
 
-# ---------------------------------------------------------------------------
-# k_grouped_fp8_gemm
-# ---------------------------------------------------------------------------
-
-
 def kgrouped_case(ks: list[int], N: int, K: int, NA: int | None = None, KB: int | None = None):
-    """grad_output (M, N) and input (M, K) per-channel FP8 from quantize_grouped_input, optionally
-    zero-padded to NA / KB channels, plus their dequantized per-group (N, k) / (K, k) fp32."""
+    """
+    grad_output (M, N) and input (M, K) per-channel FP8 from quantize_grouped_input, optionally
+    zero-padded to NA / KB channels, plus their dequantized per-group (N, k) / (K, k) fp32.
+    """
     M = sum(ks)
     offs = offsets(ks)
     ops, refs = [], []
@@ -401,31 +387,33 @@ def kgrouped_case(ks: list[int], N: int, K: int, NA: int | None = None, KB: int 
         x[:, :ch] = make_input(M, ch, seed=seed)
         _, _, data, scale = quantize_grouped_input(x, offs)
         ops.append((data, scale))
-        refs.append([t[:ch] for t in dq_kmajor(data, scale, ks, padded)])
+        refs.append([group_ref[:ch] for group_ref in dq_kmajor(data, scale, ks, padded)])
     ks_t = torch.tensor(ks, dtype=torch.int32, device=DEV)
     return ops[0], ops[1], ks_t, refs[0], refs[1]
 
 
 def check_kgrouped(d: torch.Tensor, ks: list[int], N: int, K: int, **pad) -> None:
-    a, b, ks_t, ra, rb = kgrouped_case(ks, N, K, **pad)
+    a, b, ks_t, ref_a, ref_b = kgrouped_case(ks, N, K, **pad)
     # large enough that overwriting d instead of accumulating into it fails the check below
     d.copy_(100 * torch.randn(d.shape, device=DEV, generator=torch.Generator(DEV).manual_seed(5)))
     d0 = d.clone()
     ptr, stride = d.data_ptr(), d.stride()
     k_grouped_fp8_gemm(a, b, d, ks, ks_t)
     assert d.data_ptr() == ptr and d.stride() == stride
-    for g, k in enumerate(ks):
+    for group, k in enumerate(ks):
         if k == 0:  # d0 has no subnormals, so even a reduce-add of zeros leaves it bit-identical
-            assert torch.equal(d[g], d0[g]), f"empty group {g} changed"
+            assert torch.equal(d[group], d0[group]), f"empty group {group} changed"
             continue
-        prod = ra[g] @ rb[g].T
+        prod = ref_a[group] @ ref_b[group].T
         # tolerance, not bit equality: DeepGEMM's reduce-add into fp32 d accumulates at its own
-        # precision (the FP8 GEMM alone is ~1e-4 relative)
-        assert calc_diff(d[g] - d0[g], prod) < 1e-3, g
+        # precision
+        assert calc_diff(d[group] - d0[group], prod) < 1e-3, group
 
 
 def run_kgrouped_case(ks: list[int], N: int, K: int, NA: int | None, KB: int | None) -> None:
-    """Both main_grad layouts: the fp8_grouped_wgrad_buffer one and a plain contiguous tensor."""
+    """
+    Check both main_grad layouts: fp8_grouped_wgrad_buffer's and a plain contiguous tensor.
+    """
     size = torch.Size((len(ks), N, K))
     for d in (
         fp8_grouped_wgrad_buffer(size, torch.device(DEV)),
@@ -435,10 +423,9 @@ def run_kgrouped_case(ks: list[int], N: int, K: int, NA: int | None, KB: int | N
     torch.cuda.synchronize()
 
 
-# A case whose first operand has an odd 128-block count would deadlock DeepGEMM's SM90 2-CTA
-# k-grouped GEMM if made directly; k_grouped_fp8_gemm must guard it. Those cases run in a
-# subprocess under a timeout, so a regression fails instead of hanging the session (a hung kernel
-# cannot be interrupted from Python).
+# A first operand with an odd 128-block count deadlocks DeepGEMM's SM90 2-CTA k-grouped GEMM unless
+# k_grouped_fp8_gemm guards it. Those cases run in a subprocess under a timeout, because a hung
+# kernel cannot be interrupted from Python.
 SUBPROCESS = r"""
 import importlib.util, json, sys
 spec = importlib.util.spec_from_file_location("fp8_gemm_verifier", sys.argv[1])
@@ -495,7 +482,7 @@ def test_k_grouped_gemm(ks: list[int], N: int, K: int, NA: int | None, KB: int |
         return
     args = json.dumps([ks, N, K, NA, KB])
     try:
-        r = subprocess.run(
+        result = subprocess.run(
             [sys.executable, "-c", SUBPROCESS, os.path.abspath(__file__), args],
             capture_output=True,
             text=True,
@@ -503,12 +490,8 @@ def test_k_grouped_gemm(ks: list[int], N: int, K: int, NA: int | None, KB: int |
         )
     except subprocess.TimeoutExpired:
         pytest.fail(f"k_grouped_fp8_gemm hung for (N, K, NA, KB) = ({N}, {K}, {NA}, {KB}), {ks}")
-    assert r.returncode == 0 and "OK" in r.stdout, r.stdout[-2000:] + r.stderr[-4000:]
+    assert result.returncode == 0 and "OK" in result.stdout, result.stdout[-2000:] + result.stderr[-4000:]  # fmt: skip
 
-
-# ---------------------------------------------------------------------------
-# Dense: fp8_gemm_nt, fp8_act_weight_gemm, fp8_dgrad_wgrad
-# ---------------------------------------------------------------------------
 
 # (M, K, N): the dense projections of the models plus M not a multiple of 128 (all multiples of 16)
 DENSE_SHAPES = [
@@ -550,22 +533,22 @@ def test_act_weight_gemm_and_dgrad_wgrad(M: int, K: int, N: int) -> None:
 
     out, xt_fp8, xt_scale = fp8_act_weight_gemm(x, w_fp8, w_scale)
     assert out.shape == (M, N) and out.dtype == torch.bfloat16
-    xq, xs = ref_rowwise(x)
-    ref = dq_rowwise(xq, xs) @ dq_blockwise(w_fp8, w_scale).T
+    x_q, x_ref_scale = ref_rowwise(x)
+    ref = dq_rowwise(x_q, x_ref_scale) @ dq_blockwise(w_fp8, w_scale).T
     assert calc_diff(out, ref) < 1e-3
     # the transposed activation is the 128x128 blockwise FP8 of x.T
-    rq, rs = ref_blockwise(x.T)
-    assert_fp8_equal(xt_fp8, rq, "input_t_fp8")
-    assert_scale_equal(xt_scale, rs, "scale_input_t")
+    xt_q, xt_ref_scale = ref_blockwise(x.T)
+    assert_fp8_equal(xt_fp8, xt_q, "input_t_fp8")
+    assert_scale_equal(xt_scale, xt_ref_scale, "scale_input_t")
 
     grad_input, weight_grad = fp8_dgrad_wgrad(dy, wt_fp8, wt_scale, xt_fp8, xt_scale, K)
     assert grad_input.shape == (M, K) and grad_input.dtype == torch.bfloat16
     assert weight_grad.shape == (N, K) and weight_grad.dtype == torch.bfloat16
-    gq, gs = ref_rowwise(dy)
-    ref_gi = dq_rowwise(gq, gs) @ dq_blockwise(wt_fp8, wt_scale).T
+    dy_q, dy_scale = ref_rowwise(dy)
+    ref_gi = dq_rowwise(dy_q, dy_scale) @ dq_blockwise(wt_fp8, wt_scale).T
     assert calc_diff(grad_input, ref_gi) < 1e-3
-    gtq, gts = ref_rowwise(dy.T.contiguous())
-    ref_wg = dq_rowwise(gtq, gts) @ dq_blockwise(xt_fp8, xt_scale).T
+    dyt_q, dyt_scale = ref_rowwise(dy.T.contiguous())
+    ref_wg = dq_rowwise(dyt_q, dyt_scale) @ dq_blockwise(xt_fp8, xt_scale).T
     assert calc_diff(weight_grad, ref_wg) < 1e-3
     # and close to the unquantized products
     assert calc_diff(grad_input, dy.float() @ w.float()) < 1e-2

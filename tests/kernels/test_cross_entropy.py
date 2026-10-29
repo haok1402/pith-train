@@ -1,13 +1,11 @@
 """
-Verifier of ``cross_entropy_fwd_inplace`` against plain PyTorch.
+Verifies cross_entropy_fwd_inplace against PyTorch.
 
-Contract: the mean cross-entropy of the (N, V) logits against ``target`` over the rows whose
-target is not ``ignore_index`` (at least one counted, so all-ignored gives 0), computed in fp32;
-the logits are overwritten with the gradient of that mean, ``(softmax(x) - onehot(y)) / n`` per
-counted row and zero on ignored rows, rounded once to the logits' dtype. ``grad`` is ``inp``
-itself when ``inp`` is row-contiguous, otherwise a contiguous copy.
-
-    pytest tests/kernels/test_cross_entropy.py -v
+Contract: the fp32 mean cross-entropy of the (N, V) logits against target over the rows whose
+target is not ignore_index (dividing by at least one, so all-ignored gives 0). The logits are
+overwritten with the gradient of that mean, (softmax(x) - onehot(y)) / n on the n counted rows and
+zero on ignored rows, rounded once to the logits' dtype. grad is inp itself when inp is
+row-contiguous, otherwise a contiguous copy.
 """
 
 import pytest
@@ -20,20 +18,22 @@ IGNORE = -100
 
 
 def reference(logits, target, ignore_index):
-    """(loss, grad) in fp32: F.cross_entropy and the closed-form gradient of the mean."""
+    """
+    (loss, grad, num_counted) in fp32: F.cross_entropy and the closed-form gradient of the mean.
+    """
     x = logits.float()
     keep = target != ignore_index
-    n = max(int(keep.sum()), 1)
-    loss = F.cross_entropy(x, target, ignore_index=ignore_index, reduction="sum") / n
-    grad = torch.softmax(x, dim=-1) / n
+    num_counted = max(int(keep.sum()), 1)
+    loss = F.cross_entropy(x, target, ignore_index=ignore_index, reduction="sum") / num_counted
+    grad = torch.softmax(x, dim=-1) / num_counted
     rows = torch.nonzero(keep).squeeze(1)
-    grad[rows, target[rows]] -= 1.0 / n
+    grad[rows, target[rows]] -= 1.0 / num_counted
     grad[~keep] = 0
-    return loss, grad, n
+    return loss, grad, num_counted
 
 
 def check(logits, target, ignore_index=IGNORE):
-    want_loss, want_grad, n = reference(logits, target, ignore_index)
+    want_loss, want_grad, num_counted = reference(logits, target, ignore_index)
     inp = logits.clone()
     loss, grad = cross_entropy_fwd_inplace(inp, target, ignore_index)
     assert loss.dtype == torch.float32 and loss.dim() == 0
@@ -43,14 +43,14 @@ def check(logits, target, ignore_index=IGNORE):
     rtol = 1e-5 if logits.dtype == torch.float32 else torch.finfo(logits.dtype).eps
     # (p_y - 1) / n cancels when p_y ~ 1: fp32 noise is absolute there, of order eps32 / n.
     # fp16 gradients of large vocabularies are subnormal: their spacing is absolute.
-    atol = 1e-6 / n + torch.finfo(logits.dtype).smallest_normal * torch.finfo(logits.dtype).eps
+    atol = 1e-6 / num_counted + torch.finfo(logits.dtype).smallest_normal * torch.finfo(logits.dtype).eps  # fmt: skip
     torch.testing.assert_close(grad.float(), want_grad, rtol=rtol, atol=atol)
     # The target entry must hold (p_y - 1) / n, never a stale logit, and ignored rows are zero.
     keep = target != ignore_index
     rows = torch.nonzero(keep).squeeze(1)
-    tgt = grad.float()[rows, target[rows]]
-    torch.testing.assert_close(tgt, want_grad[rows, target[rows]], rtol=rtol, atol=atol)
-    assert torch.all(tgt <= 0)
+    grad_at_target = grad.float()[rows, target[rows]]
+    torch.testing.assert_close(grad_at_target, want_grad[rows, target[rows]], rtol=rtol, atol=atol)
+    assert torch.all(grad_at_target <= 0)
     assert torch.all(grad[~keep] == 0)
     return loss, grad
 
@@ -77,7 +77,9 @@ def test_dtypes(dtype):
 
 
 def test_large_logits_stable():
-    """Online softmax stays finite for large and very negative logits."""
+    """
+    Online softmax stays finite for large and very negative logits.
+    """
     gen = torch.Generator(device="cuda").manual_seed(2)
     logits = (torch.randn(512, 151936, generator=gen, device="cuda") * 50).to(torch.bfloat16)
     logits[:8, :1000] = -1e4
@@ -94,8 +96,8 @@ def test_target_at_edges_and_one_column():
     logits = torch.randn(64, V, generator=gen, device="cuda").to(torch.bfloat16)
     target = torch.tensor([0, V - 1, 32767, 32768, 65535, 65536] * 10 + [1, 2, 3, 4], device="cuda")
     check(logits, target)
-    one = torch.randn(16, 1, device="cuda")
-    loss, grad = check(one, torch.zeros(16, dtype=torch.long, device="cuda"))
+    one_column = torch.randn(16, 1, device="cuda")
+    loss, grad = check(one_column, torch.zeros(16, dtype=torch.long, device="cuda"))
     assert loss.item() == 0 and torch.all(grad == 0)
 
 
@@ -127,20 +129,22 @@ def test_single_row_and_mean_over_counted_rows():
 
 
 def test_non_contiguous_logits_return_a_copy():
-    """A column slice of a wider buffer is not row-contiguous: the gradient comes back in a
-    contiguous copy, still correct."""
+    """
+    A column slice of a wider buffer is not row-contiguous: the gradient comes back, still
+    correct, in a contiguous copy.
+    """
     gen = torch.Generator(device="cuda").manual_seed(5)
     wide = torch.randn(300, 5000, generator=gen, device="cuda").to(torch.bfloat16)
     logits = wide[:, :4000]
     target = torch.randint(0, 4000, (300,), generator=gen, device="cuda")
     target[::4] = IGNORE
-    want_loss, want_grad, n = reference(logits, target, IGNORE)
+    want_loss, want_grad, num_counted = reference(logits, target, IGNORE)
     loss, grad = cross_entropy_fwd_inplace(logits, target, IGNORE)
     assert grad.is_contiguous() and grad.data_ptr() != wide.data_ptr()
     torch.testing.assert_close(loss, want_loss, rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(grad.float(), want_grad, rtol=2**-8, atol=1e-6 / n)
+    torch.testing.assert_close(grad.float(), want_grad, rtol=2**-8, atol=1e-6 / num_counted)
     # Strided target (every other element of a longer tensor).
-    t2 = torch.stack([target, torch.zeros_like(target)], 1).reshape(-1)[::2]
-    assert not t2.is_contiguous() or t2.stride(-1) != 1
-    loss2, _ = cross_entropy_fwd_inplace(logits.contiguous(), t2, IGNORE)
+    strided_target = torch.stack([target, torch.zeros_like(target)], 1).reshape(-1)[::2]
+    assert not strided_target.is_contiguous() or strided_target.stride(-1) != 1
+    loss2, _ = cross_entropy_fwd_inplace(logits.contiguous(), strided_target, IGNORE)
     torch.testing.assert_close(loss2, want_loss, rtol=1e-5, atol=1e-5)

@@ -1,4 +1,6 @@
-"""Qwen/Qwen3.5-35B-A3B, Qwen/Qwen3.5-122B-A10B, and Qwen/Qwen3.5-397B-A17B (text tower)."""
+"""
+Qwen/Qwen3.5-35B-A3B, Qwen/Qwen3.5-122B-A10B, and Qwen/Qwen3.5-397B-A17B (text tower).
+"""
 
 import torch
 import torch.nn.functional as F
@@ -40,6 +42,8 @@ from pithtrain.operators.token_scatter import (
 from pithtrain.pipeline.dualpipev import layer_partition, layer_sizes
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
 
+__all__ = ["Qwen35MoeGatedDeltaNet", "Qwen35MoeModel", "Qwen35MoeTopKRouter"]
+
 
 def pipeline_layer_sizes(num_layers: int, stage_count: int) -> list[int]:
     """
@@ -58,7 +62,7 @@ def pipeline_layer_sizes(num_layers: int, stage_count: int) -> list[int]:
     return moved if balanced else sizes
 
 
-def _recompute_policy(ctx, func, *args, **kwargs) -> CheckpointPolicy:
+def recompute_policy(ctx, func, *args, **kwargs) -> CheckpointPolicy:
     ops = torch.ops.pithtrain
     if func in (
         ops.qwen35_causal_conv1d.default,
@@ -75,23 +79,22 @@ def _recompute_policy(ctx, func, *args, **kwargs) -> CheckpointPolicy:
     return CheckpointPolicy.PREFER_SAVE
 
 
-def _recompute():
+def selective_recompute_contexts():
     """
-    Selective checkpoint of the token-mixing blocks (Gated DeltaNet, attention): in backward,
-    recompute the GDN conv (a 4-tap stencil) and the FP8 input projections that read a shared
-    quantized input (in_proj_qkv / in_proj_z, q / k / v_proj) from that saved FP8 input, instead
-    of keeping their bf16 outputs alive between forward and backward. The recurrence, attention,
-    the CP exchanges and the input quantization are kept, never recomputed. Forward unchanged.
+    Selective checkpoint contexts for the token-mixing blocks (Gated DeltaNet, attention). The
+    backward recomputes the GDN conv and the FP8 input projections (in_proj_qkv / in_proj_z,
+    q / k / v_proj) from their saved FP8 input instead of keeping their bf16 outputs. The
+    recurrence, attention, the CP exchanges and the input quantization are saved.
     """
-    return create_selective_checkpoint_contexts(_recompute_policy)
+    return create_selective_checkpoint_contexts(recompute_policy)
 
 
 def document_positions(cu_seqlens: torch.Tensor, S: int) -> torch.Tensor:
     """
     Per-document token positions without a host sync or data-dependent output shape.
     """
-    idx = torch.arange(S, device=cu_seqlens.device, dtype=cu_seqlens.dtype)
-    return idx - cu_seqlens[torch.searchsorted(cu_seqlens, idx, right=True) - 1]
+    token_idx = torch.arange(S, device=cu_seqlens.device, dtype=cu_seqlens.dtype)
+    return token_idx - cu_seqlens[torch.searchsorted(cu_seqlens, token_idx, right=True) - 1]
 
 
 class Qwen35MoeRMSNorm(nn.Module):
@@ -127,8 +130,8 @@ class Qwen35MoeRotaryEmbedding(nn.Module):
         rotary_dim = int(config.head_dim * rope_params.get("partial_rotary_factor", 1.0))
         base = rope_params["rope_theta"]
         inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim))  # fmt: skip
-        t = torch.arange(config.max_position_embeddings, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)
+        positions = torch.arange(config.max_position_embeddings, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("cos", emb.cos().to(torch.bfloat16), persistent=False)
         self.register_buffer("sin", emb.sin().to(torch.bfloat16), persistent=False)
@@ -153,7 +156,7 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         self.conv1d = nn.Conv1d(in_channels=self.conv_dim, out_channels=self.conv_dim, bias=False, kernel_size=self.conv_kernel_size, groups=self.conv_dim, padding=self.conv_kernel_size - 1)  # fmt: skip
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
         self.A_log = nn.Parameter(torch.log(torch.empty(self.num_v_heads).uniform_(0, 16)))
-        self.norm = Qwen35MoeRMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
+        self.norm = Qwen35MoeRMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)  # fmt: skip
         self.in_proj_qkv = training.Linear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)  # fmt: skip
         self.in_proj_z = training.Linear(self.hidden_size, self.value_dim, bias=False)
         self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
@@ -161,7 +164,9 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         self.out_proj = training.Linear(self.value_dim, self.hidden_size, bias=False)
 
     def split_qkv(self, mixed_qkv: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """The activated conv output -> L2-normalized query and key, and value, per head."""
+        """
+        Split the activated conv output into L2-normalized query and key, and value, per head.
+        """
         B, S, _ = mixed_qkv.shape
         query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)  # fmt: skip
         query = F.normalize(query.reshape(B, S, -1, self.head_k_dim), dim=-1)
@@ -173,8 +178,8 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
 
     def conv_qkv(self, mixed_qkv: torch.Tensor, offset: int) -> tuple[torch.Tensor, ...]:
         """
-        Causal conv + SiLU + split_qkv for unpacked rows. The channels-last conv (operators/causal_conv1d)
-        is bit-identical to self.conv1d on the transposed input sliced to [offset, offset + S).
+        Causal conv, SiLU and split_qkv for unpacked rows. The channels-last conv is bit-identical
+        to self.conv1d on the transposed input sliced to [offset, offset + S).
         """
         conv_out = causal_conv1d(mixed_qkv, self.conv1d.weight, offset)
         return self.split_qkv(F.silu(conv_out))
@@ -184,18 +189,18 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
     ) -> torch.Tensor:
         if cu_seqlens is not None or not torch.is_grad_enabled():
             return self.block(hidden_states, cu_seqlens)
-        return checkpoint(self.block, hidden_states, None, use_reentrant=False, context_fn=_recompute)  # fmt: skip
+        return checkpoint(self.block, hidden_states, None, use_reentrant=False, context_fn=selective_recompute_contexts)  # fmt: skip
 
     def block(
         self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None
     ) -> torch.Tensor:
         B, S, _ = hidden_states.shape
-        xq = training.Linear.quantize_input(hidden_states)
-        mixed_qkv = self.in_proj_qkv(hidden_states, xq)
-        z = self.in_proj_z(hidden_states, xq).reshape(B, S, -1, self.head_v_dim)
+        quantized_hidden = training.Linear.quantize_input(hidden_states)
+        mixed_qkv = self.in_proj_qkv(hidden_states, quantized_hidden)
+        z = self.in_proj_z(hidden_states, quantized_hidden).reshape(B, S, -1, self.head_v_dim)
         b, a = self.in_proj_b(hidden_states), self.in_proj_a(hidden_states)
-        # Causal depthwise conv + SiLU, truncated back to S (padding=k-1). The prepended state
-        # displaces the zeros conv1d would pad with, shifting the valid window right by offset.
+        # Causal depthwise conv + SiLU, truncated back to S (padding=kernel_size-1). The prepended
+        # state displaces the zeros conv1d would pad with, shifting the valid window by offset.
         offset = 0
         if distributed.cp_size > 1:
             offset = self.conv_kernel_size - 1
@@ -205,9 +210,9 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         else:
             # Mask taps crossing document boundaries. Round after SiLU to match Inductor's
             # fused conv/SiLU; an intermediate bf16 cast makes eager and compiled results differ.
-            k, pos = self.conv_kernel_size, document_positions(cu_seqlens, S)
-            x, w = F.pad(mixed_qkv.transpose(1, 2).float(), (k - 1, 0)), self.conv1d.weight.float()
-            conv_out = sum(x[..., i : i + S] * w[..., i] * (pos >= k - 1 - i) for i in range(k))
+            kernel_size, positions = self.conv_kernel_size, document_positions(cu_seqlens, S)
+            padded, conv_weight = F.pad(mixed_qkv.transpose(1, 2).float(), (kernel_size - 1, 0)), self.conv1d.weight.float()  # fmt: skip
+            conv_out = sum(padded[..., i : i + S] * conv_weight[..., i] * (positions >= kernel_size - 1 - i) for i in range(kernel_size))  # fmt: skip
             query, key, value = self.split_qkv(F.silu(conv_out).to(mixed_qkv.dtype).transpose(1, 2))
         beta = b.sigmoid()
         # .float() on A_log guards against -inf when loaded in low precision.
@@ -215,7 +220,7 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         if cu_seqlens is not None:
             # exp(-128) underflows fp32 to zero, resetting state at document boundaries.
             # A finite gate avoids FLA's inf-inf; its magnitude preserves chunk-cumsum precision.
-            g = torch.where(pos[:, None] == 0, -128.0, g)
+            g = torch.where(positions[:, None] == 0, -128.0, g)
         if distributed.cp_size > 1:
             core_attn_out = gated_delta_rule(query, key, value, g, beta, distributed.cp_group)
         else:
@@ -269,7 +274,7 @@ class Qwen35MoeAttention(nn.Module):
     ) -> torch.Tensor:
         if not (training.fp8 and torch.is_grad_enabled()):
             return self.block(hidden_states, rotary_posemb, cu_seqlens)
-        return checkpoint(self.block, hidden_states, rotary_posemb, cu_seqlens, use_reentrant=False, context_fn=_recompute)  # fmt: skip
+        return checkpoint(self.block, hidden_states, rotary_posemb, cu_seqlens, use_reentrant=False, context_fn=selective_recompute_contexts)  # fmt: skip
 
     def block(
         self,
@@ -278,12 +283,12 @@ class Qwen35MoeAttention(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, S, _ = hidden_states.size()
-        xq = training.Linear.quantize_input(hidden_states)
-        query_states, gate = torch.chunk(self.q_proj(hidden_states, xq).view(B, S, -1, self.head_dim * 2), 2, dim=-1)  # fmt: skip
+        quantized_hidden = training.Linear.quantize_input(hidden_states)
+        query_states, gate = torch.chunk(self.q_proj(hidden_states, quantized_hidden).view(B, S, -1, self.head_dim * 2), 2, dim=-1)  # fmt: skip
         gate = gate.reshape(B, S, -1)
         query_states = self.q_norm(query_states)
-        key_states = self.k_norm(self.k_proj(hidden_states, xq).view(B, S, self.num_kv_heads, self.head_dim))  # fmt: skip
-        value_states = self.v_proj(hidden_states, xq).view(B, S, self.num_kv_heads, self.head_dim)
+        key_states = self.k_norm(self.k_proj(hidden_states, quantized_hidden).view(B, S, self.num_kv_heads, self.head_dim))  # fmt: skip
+        value_states = self.v_proj(hidden_states, quantized_hidden).view(B, S, self.num_kv_heads, self.head_dim)  # fmt: skip
         query_states, key_states = self.apply_rotary_posemb(query_states, key_states, rotary_posemb)
         if distributed.cp_size > 1:
             attn_output = ring_attention_func(query_states, key_states, value_states, sm_scale=self.scaling, cp_group=distributed.cp_group)  # fmt: skip
@@ -306,8 +311,8 @@ class Qwen35MoeMLP(nn.Module):
         self.down_proj = training.Linear(intermediate_size, hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        xq = training.Linear.quantize_input(x)
-        return self.down_proj(silu_mul(self.gate_proj(x, xq), self.up_proj(x, xq)))
+        quantized_x = training.Linear.quantize_input(x)
+        return self.down_proj(silu_mul(self.gate_proj(x, quantized_x), self.up_proj(x, quantized_x)))  # fmt: skip
 
 
 class Qwen35MoeExperts(nn.Module):
@@ -328,18 +333,17 @@ class Qwen35MoeExperts(nn.Module):
         ks_tensor: torch.Tensor | None = None,
         quantized_input: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
-        gi = precompute_group_indices(grouped_mm_offs, x.shape[0])
+        group_indices = precompute_group_indices(grouped_mm_offs, x.shape[0])
         if training.fp8 and fp8_fused_experts_supported() and x.shape[0]:
-            args = (x, grouped_mm_offs, ks, ks_tensor, gi, quantized_input)
+            args = (x, grouped_mm_offs, ks, ks_tensor, group_indices, quantized_input)
             return fp8_swiglu_gate_up_experts(self.gate_up_proj, self.down_proj, *args)
-        kwargs = dict(grouped_mm_offs=grouped_mm_offs, ks=ks, ks_tensor=ks_tensor, group_indices=gi)
+        kwargs = dict(grouped_mm_offs=grouped_mm_offs, ks=ks, ks_tensor=ks_tensor, group_indices=group_indices)  # fmt: skip
         gate_up = self.gate_up_proj(x, **kwargs)
         gate = gate_up[:, : self.moe_intermediate_size].contiguous()
         up = gate_up[:, self.moe_intermediate_size :].contiguous()
         return self.down_proj(silu_mul(gate, up), **kwargs)
 
     def uses_bf16_cute(self) -> bool:
-        """Whether BF16 stage 3 runs as the fused CuTe experts (operators/bf16_experts.py) in this process."""
         return not training.fp8 and bf16_experts_supported(self.gate_up_proj.num_groups)
 
     def forward_from_tokens(
@@ -359,9 +363,9 @@ class Qwen35MoeExperts(nn.Module):
 
             args = (gathered, expert_idxs, expand_idx, self.top_k)
             return bf16_swiglu_experts(self.gate_up_proj, None, self.down_proj, *args), None
-        x, rsi, offs, ks, ks_tensor, xq = fp8_scatter_quant(gathered, expert_idxs, self.num_experts, expand_idx, expert_counts)  # fmt: skip
+        x, reverse_shuffle_idxs, offs, ks, ks_tensor, quantized_input = fp8_scatter_quant(gathered, expert_idxs, self.num_experts, expand_idx, expert_counts)  # fmt: skip
         # self.forward, not self(...): calling the module re-enters FSDP's input cast.
-        return self.forward(x, offs, ks=ks, ks_tensor=ks_tensor, quantized_input=xq), rsi
+        return self.forward(x, offs, ks=ks, ks_tensor=ks_tensor, quantized_input=quantized_input), reverse_shuffle_idxs  # fmt: skip
 
 
 class Qwen35MoeTopKRouter(nn.Module):
@@ -501,9 +505,9 @@ class Qwen35MoeDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         if training.fp8 and fp8_fused_experts_supported():
             expand = expand_idx if distributed.ep_size > 1 else None
-            outs, rsi = self.mlp.experts.forward_from_tokens(gathered_tokens, expert_idxs, expand, expert_counts)  # fmt: skip
+            outs, reverse_shuffle_idxs = self.mlp.experts.forward_from_tokens(gathered_tokens, expert_idxs, expand, expert_counts)  # fmt: skip
             del gathered_tokens
-            return padded_index_gather(outs, rsi)
+            return padded_index_gather(outs, reverse_shuffle_idxs)
         if self.keeps_stage3_input():
             expand = expand_idx if distributed.ep_size > 1 else None
             return self.mlp.experts.forward_from_tokens(gathered_tokens, expert_idxs, expand, None)[0]  # fmt: skip
@@ -572,7 +576,6 @@ class Qwen35MoeModel(nn.Module):
                 stage_count = distributed.pp_size * 2
                 stage_index = stage_count - 1 - distributed.pp_rank
             case -1:
-                # non-pipelined reference: a single stage owns the whole model
                 stage_count = 1
                 stage_index = 0
             case _:
@@ -607,7 +610,7 @@ class Qwen35MoeModel(nn.Module):
             return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
         cp_size = distributed.cp_size
         spans = zigzag_spans(distributed.cp_rank, cp_size, S * cp_size)
-        position_ids = torch.cat([torch.arange(s.start, s.stop, device=device) for s in spans])
+        position_ids = torch.cat([torch.arange(span.start, span.stop, device=device) for span in spans])  # fmt: skip
         cos, sin = self.rotary_emb(S * cp_size)
         return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
 

@@ -408,7 +408,7 @@ def record_mla_fp8(req: MLARequest):
     # Implementation: zigzag-local latent rotated around the ring, FP8 in-ring decompress.
     imp_lin = FP8Linear(R, out_features, bias=False).to(device).to(torch.bfloat16)
     imp_lin.weight.data.copy_(w_full)
-    kv_b_quant = imp_lin._get_quantized_weight()
+    kv_b_quant = imp_lin.get_quantized_weight()
     q_nope_i = extract_zigzag(q_nope_full, cp_rank, cp_size).clone().requires_grad_(True)
     q_pe_i = extract_zigzag(q_pe_full, cp_rank, cp_size).clone().requires_grad_(True)
     normed_kv_i = extract_zigzag(normed_kv_full, cp_rank, cp_size).clone().requires_grad_(True)

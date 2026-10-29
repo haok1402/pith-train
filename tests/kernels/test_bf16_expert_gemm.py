@@ -1,8 +1,8 @@
 """
-The six grouped GEMMs of the BF16 CuTe experts (SM90 only) against a float64 PyTorch reference of
-the same math.
+Verifies the six grouped GEMMs of the BF16 CuTe experts (SM90 only) against a float64 PyTorch
+reference of the same math.
 
-Forward, per expert e over its grouped rows ``[cu[e], cu[e + 1])``:
+Forward, per expert e over its grouped rows [cu[e], cu[e + 1]):
 
     preact = round(x[a_idx] @ [W_gate | W_up]^T (+ bias))     interleaved (gate, up) pairs
     h      = round(act(preact))                              SwiGLU, or gpt-oss clamped SwiGLU
@@ -10,19 +10,20 @@ Forward, per expert e over its grouped rows ``[cu[e], cu[e + 1])``:
 
 Backward:
 
-    dh = dy[slot_of] @ W_down;  dpre = round(dact(preact) * dh), h re-emitted bit for bit
-    dx = round(dg @ W_gate + du @ W_up)                       dpre lanes in the weights' address order
+    dh   = dy[slot_of] @ W_down
+    dpre = round(dact(preact) * dh)                           h re-emitted bit for bit
+    dx   = round(dg @ W_gate + du @ W_up)                     dpre in the weights' address order
     mg_gate, mg_up += dg^T x[a_idx], du^T x[a_idx]            fp32, in place
     mg_down        += dy[slot_of]^T h                          fp32, in place
 
 Every bf16 output is the fp32 accumulation rounded once: it must lie within half a bf16 ulp of the
-float64 reference plus a fp32-accumulation slack of 1e-5 of the sum of absolute products. A main
-grad accumulation (nonzero start) must lie within 1e-5 of the sum of absolute products plus 2 fp32
-ulps of the result. Gate and up are exercised as two separate weights in both address orders, as
-the two halves of one fused [gate; up] weight, and (gpt-oss) as the interleaved rows of one weight;
-their main grads likewise. Shapes are those of qwen3-30b-a3b (2048 / 768; 16, 32, 64 local
-experts), deepseek-v2-lite (2048 / 1408), qwen3.5 (2048 / 512) and gpt-oss-20b (2880 / 2880,
-32 experts), with ragged and empty groups, more than 65536 rows, and 0 rows.
+float64 reference plus 1e-5 of the sum of absolute products. A main grad accumulation from a
+nonzero start must lie within 1e-5 of the sum of absolute products plus 2 fp32 ulps of the result.
+Gate and up are tested as two weights in both address orders, as the two halves of one fused
+[gate; up] weight, and (gpt-oss) as the interleaved rows of one weight; their main grads likewise.
+Shapes are those of qwen3-30b-a3b (2048 / 768; 16, 32, 64 local experts), deepseek-v2-lite
+(2048 / 1408), qwen3.5 (2048 / 512) and gpt-oss-20b (2880 / 2880, 32 experts), with ragged and
+empty groups, more than 65536 rows, and 0 rows.
 """
 
 import pytest
@@ -49,15 +50,10 @@ BF16 = dict(device="cuda", dtype=torch.bfloat16)
 F64 = torch.float64
 
 
-# ---------------------------------------------------------------------------
-# Reference helpers
-# ---------------------------------------------------------------------------
-
-
 def assert_within(out, ref, absref, what, bf16=True):
     """
-    |out - ref| <= rel * |ref| + 1e-5 * absref, rel half a bf16 ulp (2^-8) for a bf16 output or
-    2 fp32 ulps for an fp32 one; absref bounds the accumulation-order error.
+    Assert |out - ref| <= rel * |ref| + 1e-5 * absref, with rel half a bf16 ulp (2^-8) for a bf16
+    output or 2 fp32 ulps for an fp32 one; absref bounds the accumulation-order error.
     """
     rel = 2.0**-8 if bf16 else 2.0**-22
     err = (out.to(F64) - ref).abs()
@@ -67,31 +63,35 @@ def assert_within(out, ref, absref, what, bf16=True):
 
 
 def gmm(a, w, counts, trans=True):
-    """Per group ``a_g @ w[g]^T`` (or ``@ w[g]`` with trans=False) in float64, and |a| @ |w|."""
-    outs, abss, s = [], [], 0
-    for g, c in enumerate(counts):
-        ag = a[s : s + c].to(F64)
-        wg = w[g].to(F64)
-        wg = wg.T if trans else wg
-        outs.append(ag @ wg)
-        abss.append(ag.abs() @ wg.abs())
-        s += c
-    return torch.cat(outs), torch.cat(abss)
+    """
+    Per group a_g @ w[g]^T (or a_g @ w[g] with trans=False) in float64, and |a_g| @ |w[g]|.
+    """
+    outs, abs_outs, row_start = [], [], 0
+    for group_idx, count in enumerate(counts):
+        a_group = a[row_start : row_start + count].to(F64)
+        w_group = w[group_idx].to(F64)
+        w_group = w_group.T if trans else w_group
+        outs.append(a_group @ w_group)
+        abs_outs.append(a_group.abs() @ w_group.abs())
+        row_start += count
+    return torch.cat(outs), torch.cat(abs_outs)
 
 
 def per_row_bias(bias, counts):
-    return torch.cat([bias[g].to(F64).expand(c, -1) for g, c in enumerate(counts)])
+    return torch.cat([bias[group_idx].to(F64).expand(count, -1) for group_idx, count in enumerate(counts)])  # fmt: skip
 
 
 def kgrouped(a, b, counts):
-    """Per group ``a_g^T @ b_g`` in float64, and |a_g|^T @ |b_g|: (G, a cols, b cols)."""
-    outs, abss, s = [], [], 0
-    for c in counts:
-        ag, bg = a[s : s + c].to(F64), b[s : s + c].to(F64)
-        outs.append(ag.T @ bg)
-        abss.append(ag.abs().T @ bg.abs())
-        s += c
-    return torch.stack(outs), torch.stack(abss)
+    """
+    Per group a_g^T @ b_g in float64, and |a_g|^T @ |b_g|, each (G, a cols, b cols).
+    """
+    outs, abs_outs, row_start = [], [], 0
+    for count in counts:
+        a_group, b_group = a[row_start : row_start + count].to(F64), b[row_start : row_start + count].to(F64)  # fmt: skip
+        outs.append(a_group.T @ b_group)
+        abs_outs.append(a_group.abs().T @ b_group.abs())
+        row_start += count
+    return torch.stack(outs), torch.stack(abs_outs)
 
 
 def swiglu_ref(g, u):
@@ -99,8 +99,8 @@ def swiglu_ref(g, u):
 
 
 def dswiglu_ref(g, u, dh):
-    s = torch.sigmoid(g)
-    return dh * u * s * (1 + g * (1 - s)), dh * g * s
+    sig = torch.sigmoid(g)
+    return dh * u * sig * (1 + g * (1 - sig)), dh * g * sig
 
 
 def oai_ref(g, u, alpha, limit):
@@ -110,9 +110,9 @@ def oai_ref(g, u, alpha, limit):
 
 def doai_ref(g, u, dh, alpha, limit):
     gc, uc = g.clamp(max=limit), u.clamp(-limit, limit)
-    s = torch.sigmoid(alpha * gc)
-    dg = dh * (uc + 1) * (s + alpha * gc * s * (1 - s)) * (g <= limit)
-    du = dh * gc * s * (u.abs() <= limit)
+    sig = torch.sigmoid(alpha * gc)
+    dg = dh * (uc + 1) * (sig + alpha * gc * sig * (1 - sig)) * (g <= limit)
+    du = dh * gc * sig * (u.abs() <= limit)
     return dg, du
 
 
@@ -121,19 +121,21 @@ def cu_of(counts):
 
 
 def ragged(G, total, seed, empty=0.0):
-    """G group sizes summing to about ``total``, some empty, the rest uneven."""
-    g = torch.Generator().manual_seed(seed)
-    w = torch.rand(G, generator=g) ** 2
-    w[torch.rand(G, generator=g) < empty] = 0
-    w[0] = max(w[0].item(), 1e-3)
-    return [int(v) for v in (w / w.sum() * total).round().long()]
+    """
+    G group sizes summing to about total, some empty, the rest uneven.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    weights = torch.rand(G, generator=gen) ** 2
+    weights[torch.rand(G, generator=gen) < empty] = 0
+    weights[0] = max(weights[0].item(), 1e-3)
+    return [int(size) for size in (weights / weights.sum() * total).round().long()]
 
 
 def pair(G, n, k, layout, dtype=torch.bfloat16, scale=1.0):
     """
-    (gate, up), each (G, n, k), laid out as ``layout``: ``separate`` (two weights, gate lower),
-    ``swapped`` (two weights, up lower), ``halves`` (one fused (G, 2n, k) weight [gate; up]),
-    ``interleaved`` (one (G, 2n, k) weight with gate / up rows alternating, gpt-oss).
+    (gate, up), each (G, n, k), laid out as layout: separate (two weights, gate lower), swapped
+    (two weights, up lower), halves (one fused (G, 2n, k) weight [gate; up]) or interleaved (one
+    (G, 2n, k) weight with gate / up rows alternating, gpt-oss).
     """
     if layout in ("separate", "swapped"):
         buf = (torch.randn(2, G, n, k, device="cuda") * scale).to(dtype)
@@ -156,13 +158,11 @@ def inputs(counts, H, seed):
 
 
 def lanes(dpre, swapped):
-    """(dg, du) from dpre, whose pairs are in the weights' address order."""
+    """
+    (dg, du) from dpre, whose pairs are in the weights' address order.
+    """
     return (dpre[:, 1::2], dpre[:, 0::2]) if swapped else (dpre[:, 0::2], dpre[:, 1::2])
 
-
-# ---------------------------------------------------------------------------
-# Cases
-# ---------------------------------------------------------------------------
 
 # name: (H, I, counts)
 CASES = {
@@ -291,7 +291,9 @@ def test_swiglu_wgrads(case, w_layout, mg_layout):
 
 @pytest.mark.parametrize("case", ["qwen3-edges", "qwen3-imbalanced", "q35-g32", "dsv2-g16"])
 def test_down_scattered(case):
-    """Bias in fp32 before the rounding; the scattered rows equal the grouped rows reordered."""
+    """
+    Bias in fp32 before the rounding; the scattered rows equal the grouped rows reordered.
+    """
     H, inter, counts = CASES[case]
     G, M = len(counts), sum(counts)
     torch.manual_seed(4)
@@ -398,7 +400,9 @@ def test_gptoss(counts_case, limit):
     ],
 )
 def test_zero_rows(H, inter, G, gptoss):
-    """0 rows (every group empty): empty outputs, main grads untouched."""
+    """
+    0 rows (every group empty): empty outputs, main grads untouched.
+    """
     cu = torch.zeros(G + 1, dtype=torch.int32, device="cuda")
     idx = torch.empty(0, dtype=torch.int32, device="cuda")
     x = torch.randn(3, H, **BF16)
@@ -427,7 +431,9 @@ def test_zero_rows(H, inter, G, gptoss):
 
 
 def test_wrong_group_offsets_fail():
-    """The reference check is sharp: a GEMM run with shifted group offsets fails it."""
+    """
+    The reference check is sharp: a GEMM run with shifted group offsets fails it.
+    """
     H, inter, counts = CASES["qwen3-edges"]
     G = len(counts)
     x, a_idx, _, cu = inputs(counts, H, seed=0)

@@ -1,12 +1,9 @@
 """
-Verifier of ``silu_mul_fwd`` / ``silu_mul_bwd`` against plain PyTorch.
+Verifier of silu_mul_fwd and silu_mul_bwd against plain PyTorch.
 
-Contract: elementwise ``silu(gate) * up`` and its gradient for contiguous same-shape, same-dtype
-tensors, computed in fp32 and rounded once to the input dtype. The reference evaluates the same
-fp32 formula; the kernel's sigmoid may differ from torch's by fp32 ulps, so outputs must lie
-within one output-dtype ulp of the fp32 reference (round to nearest of a value fp32-close to it).
-
-    pytest tests/kernels/test_silu_mul.py -v
+Contract: elementwise silu(gate) * up and its gradient for contiguous same-shape, same-dtype
+tensors, computed in fp32 and rounded once to the input dtype. The kernel's sigmoid may differ
+from torch's by fp32 ulps, so outputs must lie within one output-dtype ulp of the fp32 reference.
 """
 
 import pytest
@@ -41,12 +38,14 @@ def ref_fwd(gate, up):
 def ref_bwd(grad_out, gate, up):
     do, g, u = grad_out.float(), gate.float(), up.float()
     sig = torch.sigmoid(g)
-    s = g * sig
-    return do * u * sig * (1.0 + g - s), do * s
+    silu = g * sig
+    return do * u * sig * (1.0 + g - silu), do * silu
 
 
 def assert_rounded(got, want32, scale):
-    """got (in its dtype) is within one ulp of the fp32 reference, plus fp32 noise."""
+    """
+    Check that got (in its dtype) is within one ulp of the fp32 reference, plus fp32 noise.
+    """
     eps = torch.finfo(got.dtype).eps
     atol = 1e-5 * scale if got.dtype == torch.float32 else 1e-6 * scale + 1e-30
     rtol = 1e-5 if got.dtype == torch.float32 else eps
@@ -62,12 +61,12 @@ def run(gate, up, grad_out):
     assert dg.shape == gate.shape and du.shape == up.shape
     assert dg.dtype == gate.dtype and du.dtype == up.dtype
     want_g, want_u = ref_bwd(grad_out, gate, up)
-    # The gate term (1 + g - silu(g)) cancels near g ~ -1.28: absolute fp32 noise there scales
-    # with the size of the factors, not of the result.
+    # The gate term (1 + g - silu(g)) cancels near g = -1.28, so absolute fp32 noise there
+    # scales with the size of the factors, not of the result.
     scale_g = (grad_out.float() * up.float()).abs().max().item() if dg.numel() else 1.0
     assert_rounded(dg, want_g, max(scale_g, 1e-30))
     assert_rounded(du, want_u, want_u.abs().max().item() if du.numel() else 1.0)
-    # And the closed form matches autograd of torch's own silu (float64).
+    # The closed form also matches float64 autograd of torch's own silu.
     if gate.numel() and gate.dtype != torch.float16:
         g64 = gate.double().requires_grad_()
         u64 = up.double().requires_grad_()
@@ -88,7 +87,9 @@ def test_forward_backward(shape, dtype):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_three_dims(dtype):
-    """Any contiguous shape: the kernels are flat elementwise."""
+    """
+    Any contiguous shape works: the kernels are flat elementwise.
+    """
     gen = torch.Generator(device="cuda").manual_seed(1)
     shape = (2, 3, 1000)
     gate, up, do = (torch.randn(shape, generator=gen, device="cuda").to(dtype) for _ in range(3))
@@ -97,16 +98,18 @@ def test_three_dims(dtype):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_zeros(dtype):
-    z = torch.zeros(300, 129, device="cuda", dtype=dtype)
-    out = silu_mul_fwd(z, z)
-    assert torch.equal(out, z)
-    dg, du = silu_mul_bwd(torch.ones_like(z), z, z)
-    assert torch.equal(dg, z) and torch.equal(du, z)  # silu(0) = 0, d/dg = u * 1/2 = 0
+    zeros = torch.zeros(300, 129, device="cuda", dtype=dtype)
+    out = silu_mul_fwd(zeros, zeros)
+    assert torch.equal(out, zeros)
+    dg, du = silu_mul_bwd(torch.ones_like(zeros), zeros, zeros)
+    assert torch.equal(dg, zeros) and torch.equal(du, zeros)  # silu(0) = 0, d/dg = u * 1/2 = 0
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_large_and_negative(dtype):
-    """Sigmoid saturation at both ends: silu(g) -> g for g >> 0, -> 0 (signed) for g << 0."""
+    """
+    Sigmoid saturates at both ends: silu(g) -> g for g >> 0, and -> 0 (signed) for g << 0.
+    """
     gen = torch.Generator(device="cuda").manual_seed(2)
     gate = torch.cat(
         [
@@ -129,7 +132,9 @@ def test_large_and_negative(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_float16_moderate_range(dtype):
-    """fp16 keeps its range: values that stay finite in fp16."""
+    """
+    Values that stay finite in fp16.
+    """
     gen = torch.Generator(device="cuda").manual_seed(3)
     gate = (torch.randn(1000, 1000, generator=gen, device="cuda") * 8).to(dtype)
     up = (torch.randn(1000, 1000, generator=gen, device="cuda") * 50).to(dtype)
@@ -138,9 +143,9 @@ def test_float16_moderate_range(dtype):
 
 
 def test_empty():
-    e = torch.empty(0, 768, device="cuda", dtype=torch.bfloat16)
-    assert silu_mul_fwd(e, e).shape == (0, 768)
-    dg, du = silu_mul_bwd(e, e, e)
+    empty = torch.empty(0, 768, device="cuda", dtype=torch.bfloat16)
+    assert silu_mul_fwd(empty, empty).shape == (0, 768)
+    dg, du = silu_mul_bwd(empty, empty, empty)
     assert dg.shape == (0, 768) and du.shape == (0, 768)
 
 
@@ -150,5 +155,5 @@ def test_deterministic():
         torch.randn(4096, 1408, generator=gen, device="cuda").to(torch.bfloat16) for _ in range(3)
     )
     assert torch.equal(silu_mul_fwd(gate, up), silu_mul_fwd(gate, up))
-    a, b = silu_mul_bwd(do, gate, up), silu_mul_bwd(do, gate, up)
-    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+    first, second = silu_mul_bwd(do, gate, up), silu_mul_bwd(do, gate, up)
+    assert torch.equal(first[0], second[0]) and torch.equal(first[1], second[1])

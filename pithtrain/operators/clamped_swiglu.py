@@ -1,11 +1,8 @@
 """
-Fused clamped SwiGLU used in OpenAI's gpt-oss: ``(uc + 1) * gc * sigmoid(alpha * gc)``
-with ``gc = min(gate, L)`` and ``uc = clamp(up, +/-L)``, where ``gate`` and
-``up`` are the even/odd columns of an interleaved ``gate_up [M, 2N]`` input.
-
-One Triton kernel each for forward and backward (clamped_swiglu_fwd, clamped_swiglu_bwd). Only
-gate_up is saved for backward; gc, uc and the sigmoid are recomputed, and the clamp branches
-contribute zero gradient at saturation.
+Fused clamped SwiGLU of gpt-oss, (up_c + 1) * gate_c * sigmoid(alpha * gate_c) with gate_c =
+min(gate, limit) and up_c = clamp(up, -limit, limit), where gate and up are the even and odd
+columns of gate_up. Only gate_up is saved for backward; the clamped branches get zero
+gradient at saturation.
 """
 
 from __future__ import annotations
@@ -14,10 +11,10 @@ import torch
 
 from pithtrain.kernels import clamped_swiglu_bwd, clamped_swiglu_fwd
 
+__all__ = ["clamped_swiglu"]
 
-class _ClampedSwiGLU(torch.autograd.Function):
-    """Fused clamped SwiGLU with a single-kernel backward."""
 
+class ClampedSwiGLUFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, gate_up: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
         out = clamped_swiglu_fwd(gate_up, alpha, limit)
@@ -33,10 +30,8 @@ class _ClampedSwiGLU(torch.autograd.Function):
 
 
 def clamped_swiglu(gate_up: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
-    """Fused clamped SwiGLU with interleaved gate/up layout.
-
-    ``gate_up`` is ``(M, 2N)`` with gate at even columns and up at odd columns;
-    gate is clamped above at ``+limit``, up symmetrically to ``[-limit, +limit]``.
-    Returns ``(M, N)``.
     """
-    return _ClampedSwiGLU.apply(gate_up, alpha, limit)
+    Clamped SwiGLU of gate_up (M, 2N), gate in the even columns and up in the odd ones, returning
+    (M, N) in gate_up's dtype.
+    """
+    return ClampedSwiGLUFunc.apply(gate_up, alpha, limit)

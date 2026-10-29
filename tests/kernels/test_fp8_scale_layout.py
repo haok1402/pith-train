@@ -1,7 +1,7 @@
 """
-Verifier of ``act_scale_like``: an uninitialized fp32 ``(mn, sf_k)`` 1x128 activation scale with
-the strides this device's activation quantization returns (the fake / meta implementations of the
-FP8 ops allocate their scales with it, so a fake and a real scale must agree).
+Verifier of act_scale_like: an uninitialized fp32 (mn, sf_k) 1x128 activation scale with the
+strides this device's activation quantization returns. Fake implementations of the FP8 ops
+allocate their scales with it, so a fake and a real scale must agree.
 """
 
 import pytest
@@ -35,19 +35,21 @@ MK = [
 
 @pytest.mark.parametrize("mn,sf_k", MN_SFK)
 def test_shape_dtype_device(mn: int, sf_k: int) -> None:
-    s = act_scale_like(mn, sf_k, torch.device("cuda"))
-    assert s.shape == (mn, sf_k)
-    assert s.dtype == torch.float32
-    assert s.device.type == "cuda"
+    scale = act_scale_like(mn, sf_k, torch.device("cuda"))
+    assert scale.shape == (mn, sf_k)
+    assert scale.dtype == torch.float32
+    assert scale.device.type == "cuda"
     # Every logical element has its own storage slot (writable without aliasing).
     if mn * sf_k:
-        s.copy_(torch.arange(mn * sf_k, device="cuda", dtype=torch.float32).view(mn, sf_k))
-        assert torch.equal(s, torch.arange(mn * sf_k, device="cuda").float().view(mn, sf_k))
+        scale.copy_(torch.arange(mn * sf_k, device="cuda", dtype=torch.float32).view(mn, sf_k))
+        assert torch.equal(scale, torch.arange(mn * sf_k, device="cuda").float().view(mn, sf_k))
 
 
 @pytest.mark.parametrize("mn,sf_k", MN_SFK)
 def test_meta_device(mn: int, sf_k: int) -> None:
-    """A fake on the meta device has the strides of the CUDA one."""
+    """
+    A fake on the meta device has the strides of the CUDA one.
+    """
     meta = act_scale_like(mn, sf_k, torch.device("meta"))
     real = act_scale_like(mn, sf_k, torch.device("cuda"))
     assert meta.device.type == "meta" and meta.dtype == torch.float32
@@ -56,7 +58,9 @@ def test_meta_device(mn: int, sf_k: int) -> None:
 
 @pytest.mark.parametrize("M,K", MK)
 def test_matches_rowwise_blockwise_transpose(M: int, K: int) -> None:
-    """The x_scale of fp8cast_rowwise_blockwise_transpose is what act_scale_like describes."""
+    """
+    The x_scale of fp8cast_rowwise_blockwise_transpose is what act_scale_like describes.
+    """
     x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     _, x_scale, _, _ = fp8cast_rowwise_blockwise_transpose(x)
     fake = act_scale_like(M, (K + BLOCK - 1) // BLOCK, x.device)
@@ -66,7 +70,9 @@ def test_matches_rowwise_blockwise_transpose(M: int, K: int) -> None:
 
 @pytest.mark.parametrize("M,K", MK)
 def test_matches_rowwise_transpose(M: int, K: int) -> None:
-    """Both scales of fp8cast_rowwise_transpose are what act_scale_like describes."""
+    """
+    Both scales of fp8cast_rowwise_transpose are what act_scale_like describes.
+    """
     x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     _, x_scale, _, xt_scale = fp8cast_rowwise_transpose(x)
     for scale, mn, k in ((x_scale, M, K), (xt_scale, K, M)):

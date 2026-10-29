@@ -1,4 +1,6 @@
-"""deepseek-ai/DeepSeek-V2 and deepseek-ai/DeepSeek-V2-Lite."""
+"""
+deepseek-ai/DeepSeek-V2 and deepseek-ai/DeepSeek-V2-Lite.
+"""
 
 import math
 
@@ -36,6 +38,8 @@ from pithtrain.operators.token_scatter import (
 from pithtrain.pipeline.dualpipev import layer_partition
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
 
+__all__ = ["DeepSeekV2MoEGate", "DeepSeekV2Model"]
+
 
 class DeepSeekV2RotaryEmbedding(nn.Module):
     def __init__(self, config: DeepseekV2Config) -> None:
@@ -52,18 +56,18 @@ class DeepSeekV2RotaryEmbedding(nn.Module):
             log_den = math.log(base)
             return dim * log_num / (2 * log_den)
 
-        lo = math.floor(correction_dim(beta_fast))
-        hi = math.ceil(correction_dim(beta_slow))
-        return max(lo, 0), min(hi, dim - 1)
+        low = math.floor(correction_dim(beta_fast))
+        high = math.ceil(correction_dim(beta_slow))
+        return max(low, 0), min(high, dim - 1)
 
     @staticmethod
     def yarn_get_mscale(factor: float, mscale: float) -> float:
         return 1.0 if factor <= 1 else 0.1 * mscale * math.log(factor) + 1.0
 
     @staticmethod
-    def yarn_linear_ramp_mask(lo: float, hi: float, dim: int) -> torch.Tensor:
-        hi = hi + 0.001 if lo == hi else hi
-        linear_func = (torch.arange(dim, dtype=torch.float32) - lo) / (hi - lo)
+    def yarn_linear_ramp_mask(low: float, high: float, dim: int) -> torch.Tensor:
+        high = high + 0.001 if low == high else high
+        linear_func = (torch.arange(dim, dtype=torch.float32) - low) / (high - low)
         return torch.clamp(linear_func, 0, 1)
 
     def compute_rope_params(self, config: DeepseekV2Config) -> tuple[torch.Tensor, float]:
@@ -77,8 +81,8 @@ class DeepSeekV2RotaryEmbedding(nn.Module):
                 mscale, mscale_all_dim = rope_scaling["mscale"], rope_scaling["mscale_all_dim"]
                 freq_extra = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
                 freq_inter = 1.0 / (factor * base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))  # fmt: skip
-                lo, hi = self.yarn_find_correction_range(beta_fast, beta_slow, dim, base, original_max_position_embeddings)  # fmt: skip
-                inv_freq_mask = 1.0 - self.yarn_linear_ramp_mask(lo, hi, dim // 2).to(torch.float32)
+                low, high = self.yarn_find_correction_range(beta_fast, beta_slow, dim, base, original_max_position_embeddings)  # fmt: skip
+                inv_freq_mask = 1.0 - self.yarn_linear_ramp_mask(low, high, dim // 2).to(torch.float32)  # fmt: skip
                 inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
                 attn_scale = float(self.yarn_get_mscale(factor, mscale) / self.yarn_get_mscale(factor, mscale_all_dim))  # fmt: skip
                 return inv_freq, attn_scale
@@ -90,8 +94,8 @@ class DeepSeekV2RotaryEmbedding(nn.Module):
     def set_cos_sin(
         self, config: DeepseekV2Config, inv_freq: torch.Tensor, attn_scale: float
     ) -> None:
-        t = torch.arange(config.max_position_embeddings, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)
+        positions = torch.arange(config.max_position_embeddings, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         cos = (emb.cos() * attn_scale).to(torch.bfloat16)
         sin = (emb.sin() * attn_scale).to(torch.bfloat16)
@@ -114,10 +118,10 @@ class DeepSeekV2MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if training.fp8 and fp8_fused_experts_supported() and fp8_mlp_fusable(x):
             return fp8_swiglu_mlp(self.gate_proj, self.up_proj, self.down_proj, x)
-        xq = training.Linear.quantize_input(x)
-        g = self.gate_proj(x, xq)
-        u = self.up_proj(x, xq)
-        return self.down_proj(silu_mul(g, u))
+        quantized_x = training.Linear.quantize_input(x)
+        gate = self.gate_proj(x, quantized_x)
+        up = self.up_proj(x, quantized_x)
+        return self.down_proj(silu_mul(gate, up))
 
     def reference_forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward(x)
@@ -141,19 +145,18 @@ class DeepSeekV2Experts(nn.Module):
         ks_tensor: torch.Tensor | None = None,
         quantized_input: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
-        gi = precompute_group_indices(grouped_mm_offs, x.shape[0])
+        group_indices = precompute_group_indices(grouped_mm_offs, x.shape[0])
         if training.fp8 and fp8_fused_experts_supported() and x.shape[0]:
-            args = (x, grouped_mm_offs, ks, ks_tensor, gi, quantized_input)
+            args = (x, grouped_mm_offs, ks, ks_tensor, group_indices, quantized_input)
             return fp8_swiglu_experts(self.gate_proj, self.up_proj, self.down_proj, *args)
-        kwargs = dict(grouped_mm_offs=grouped_mm_offs, ks=ks, ks_tensor=ks_tensor, group_indices=gi)
-        share = training.fp8 and x.shape[0]
-        xq = quantize_grouped_input(x.detach(), grouped_mm_offs) if share else None
-        g = self.gate_proj(x, **kwargs, quantized_input=xq)
-        u = self.up_proj(x, **kwargs, quantized_input=xq)
-        return self.down_proj(silu_mul(g, u), **kwargs)
+        kwargs = dict(grouped_mm_offs=grouped_mm_offs, ks=ks, ks_tensor=ks_tensor, group_indices=group_indices)  # fmt: skip
+        use_shared_quant = training.fp8 and x.shape[0]
+        quantized_x = quantize_grouped_input(x.detach(), grouped_mm_offs) if use_shared_quant else None  # fmt: skip
+        gate = self.gate_proj(x, **kwargs, quantized_input=quantized_x)
+        up = self.up_proj(x, **kwargs, quantized_input=quantized_x)
+        return self.down_proj(silu_mul(gate, up), **kwargs)
 
     def uses_bf16_cute(self) -> bool:
-        """Whether BF16 stage 3 runs as the fused CuTe experts (operators/bf16_experts.py) in this process."""
         return not training.fp8 and bf16_experts_supported(self.gate_proj.num_groups)
 
     def forward_from_tokens(
@@ -174,9 +177,9 @@ class DeepSeekV2Experts(nn.Module):
             args = (gathered, expert_idxs, expand_idx, self.top_k)
             return bf16_swiglu_experts(self.gate_proj, self.up_proj, self.down_proj, *args), None
         G = self.gate_proj.num_groups
-        x, rsi, offs, ks, ks_tensor, xq = fp8_scatter_quant(gathered, expert_idxs, G, expand_idx, expert_counts)  # fmt: skip
+        x, reverse_shuffle_idxs, offs, ks, ks_tensor, quantized_input = fp8_scatter_quant(gathered, expert_idxs, G, expand_idx, expert_counts)  # fmt: skip
         # self.forward, not self(...): calling the module re-enters FSDP's input cast.
-        return self.forward(x, offs, ks=ks, ks_tensor=ks_tensor, quantized_input=xq), rsi
+        return self.forward(x, offs, ks=ks, ks_tensor=ks_tensor, quantized_input=quantized_input), reverse_shuffle_idxs  # fmt: skip
 
 
 class DeepSeekV2MoEGate(nn.Module):
@@ -200,12 +203,12 @@ class DeepSeekV2MoEGate(nn.Module):
         logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32), None)  # fmt: skip
         scores = logits.softmax(dim=-1, dtype=torch.float32)
         if self.topk_method == "group_limited_greedy":
-            n_tokens = scores.shape[0]
-            group_scores = scores.view(n_tokens, self.num_group, -1).max(dim=-1).values
+            num_tokens = scores.shape[0]
+            group_scores = scores.view(num_tokens, self.num_group, -1).max(dim=-1).values
             group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
             group_mask = torch.zeros_like(group_scores)
             group_mask.scatter_(1, group_idx, 1)
-            score_mask = group_mask.unsqueeze(-1).expand(n_tokens, self.num_group, self.num_experts // self.num_group).reshape(n_tokens, -1)  # fmt: skip
+            score_mask = group_mask.unsqueeze(-1).expand(num_tokens, self.num_group, self.num_experts // self.num_group).reshape(num_tokens, -1)  # fmt: skip
             scores = scores.masked_fill(~score_mask.bool(), 0.0)
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
         if replay_idx is not None:
@@ -304,20 +307,20 @@ class DeepSeekV2Attention(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, S, _ = hidden_states.size()
-        q_in = self.q_proj if self.q_lora_rank is None else self.q_a_proj
-        xq = training.Linear.quantize_input(hidden_states)
-        q = q_in(hidden_states, xq)
-        compressed_kv = self.kv_a_proj_with_mqa(hidden_states, xq)
+        q_in_proj = self.q_proj if self.q_lora_rank is None else self.q_a_proj
+        quantized_hidden = training.Linear.quantize_input(hidden_states)
+        q = q_in_proj(hidden_states, quantized_hidden)
+        compressed_kv = self.kv_a_proj_with_mqa(hidden_states, quantized_hidden)
         if self.q_lora_rank is not None:
             q = self.q_b_proj(self.q_a_layernorm(q))
         q = q.view(B, S, self.num_heads, self.q_head_dim)
-        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)  # fmt: skip
         compressed_kv, k_pe = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)  # fmt: skip
         k_pe = k_pe.view(B, S, 1, self.qk_rope_head_dim)
         normed_kv = self.kv_a_layernorm(compressed_kv)
         q_pe, k_pe = self.apply_rotary_posemb(q_pe, k_pe, rotary_posemb)
         if distributed.cp_size > 1:
-            kv_b_quant = self.kv_b_proj._get_quantized_weight() if training.fp8 else None
+            kv_b_quant = self.kv_b_proj.get_quantized_weight() if training.fp8 else None
             attn_output = mla_ring_attention_func(q_nope, q_pe, normed_kv.contiguous(), k_pe.contiguous(), self.kv_b_proj.weight, sm_scale=self.softmax_scale, qk_nope_head_dim=self.qk_nope_head_dim, v_head_dim=self.v_head_dim, cp_group=distributed.cp_group, kv_b_quant=kv_b_quant)  # fmt: skip
         else:
             kv = self.kv_b_proj(normed_kv).view(B, S, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)  # fmt: skip
@@ -400,9 +403,9 @@ class DeepSeekV2DecoderLayer(nn.Module):
             return self.mlp(gathered_tokens)
         if training.fp8 and fp8_fused_experts_supported():
             expand = expand_idx if distributed.ep_size > 1 else None
-            outs, rsi = self.mlp.experts.forward_from_tokens(gathered_tokens, expert_idxs, expand, expert_counts)  # fmt: skip
+            outs, reverse_shuffle_idxs = self.mlp.experts.forward_from_tokens(gathered_tokens, expert_idxs, expand, expert_counts)  # fmt: skip
             del gathered_tokens
-            return padded_index_gather(outs, rsi)
+            return padded_index_gather(outs, reverse_shuffle_idxs)
         if self.keeps_stage3_input():
             expand = expand_idx if distributed.ep_size > 1 else None
             return self.mlp.experts.forward_from_tokens(gathered_tokens, expert_idxs, expand, None)[0]  # fmt: skip
@@ -463,7 +466,6 @@ class DeepSeekV2Model(nn.Module):
                 stage_count = distributed.pp_size * 2
                 stage_index = stage_count - 1 - distributed.pp_rank
             case -1:
-                # non-pipelined reference: a single stage owns the whole model
                 stage_count = 1
                 stage_index = 0
             case _:
@@ -499,7 +501,7 @@ class DeepSeekV2Model(nn.Module):
             return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
         cp_size = distributed.cp_size
         spans = zigzag_spans(distributed.cp_rank, cp_size, S * cp_size)
-        position_ids = torch.cat([torch.arange(s.start, s.stop, device=device) for s in spans])
+        position_ids = torch.cat([torch.arange(span.start, span.stop, device=device) for span in spans])  # fmt: skip
         cos, sin = self.rotary_emb(S * cp_size)
         return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
 

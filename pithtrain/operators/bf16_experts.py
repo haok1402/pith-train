@@ -1,12 +1,11 @@
 """
-BF16 SwiGLU routed experts on SM90 from the received tokens, as one autograd node.
+BF16 SwiGLU routed experts on SM90 as one autograd node, reading the received tokens in place
+through index maps (bf16_expert_group_slots) instead of an expanded, expert-grouped copy.
 
-Forward, for slots grouped by expert (bf16_expert_group_slots; no expanded or scattered copy of
-the tokens is written):
+Forward:
 
-    preact, h = gated(gathered[a_idx] @ [W_gate | W_up]^T)   one GEMM, SwiGLU in its epilogue
-    out[slot_of[r]] = (h @ W_down^T)[r]                        per expert, rows stored to their
-                                                              received slots by the epilogue
+    preact, h = gated(gathered[a_idx] @ [W_gate | W_up]^T)    one GEMM, SwiGLU in its epilogue
+    out[slot_of[r]] = (h @ W_down^T)[r]                         stored to the received slots
 
 Backward:
 
@@ -15,24 +14,18 @@ Backward:
     grad_gathered[t] = sum of grad_x over the slots of token t      fp32, in expert order
 
 and, deferred to DualPipeV's W phase through WeightGradStore, the weight gradients accumulated
-straight into the fp32 main_grads:
+into the fp32 main_grads:
 
     main_grad_down    += grad_out[slot_of]^T h
-    main_grad_gate|up += grad_preact^T gathered[a_idx]    one GEMM over N = 2I, split on store
+    main_grad_gate|up += grad_preact^T gathered[a_idx]    one GEMM over N = 2I
 
-Only gathered, preact and the index maps are saved. h is the SwiGLU of the bf16-rounded preact in
-both directions, so the backward recomputes the forward's h bit for bit; the grouped expert input
-is never written. Every reduction runs in a fixed order, so the node is deterministic. The math is
-that of the unfused path (gather, scatter, gate/up/down GroupedLinear and silu_mul) with fp32
-accumulation everywhere: the dgrad sums the gate and up contributions and the token's rows in fp32
-before rounding once.
+Only gathered, preact and the index maps are saved; the backward recomputes h bit for bit. Every
+reduction runs in a fixed order, so the node is deterministic, and accumulation is in fp32.
 
-gpt-oss (bf16_clamped_swiglu_experts): per-expert biases added in fp32 inside the two forward
-epilogues, the clamped SwiGLU of the model's limit, and the bias gradients as per-expert row sums
-(expert_slot_segment_sum) returned with the input gradient.
+bf16_clamped_swiglu_experts (gpt-oss) adds per-expert biases in fp32 in the two forward
+epilogues, uses the clamped SwiGLU, and returns the bias gradients as per-expert row sums.
 
-SM90 only: the models import this module lazily, after pithtrain.kernels.bf16_experts_supported
-said yes.
+SM90 only: import this module after bf16_experts_supported says yes.
 """
 
 from functools import partial
@@ -59,11 +52,11 @@ from pithtrain.operators.main_grad import raw_main_grad
 __all__ = ["BF16SwiGLUExpertsFunc", "bf16_swiglu_experts", "bf16_clamped_swiglu_experts"]
 
 
-class _WeightGradTargets:
+class WeightGradTargets:
     """
     Where the weight gradients go: (owner, parameter name, row slice) for gate, up and down. A
-    weight with an fp32 main_grad (GroupedLinear.main_grad, or raw_main_grad for a raw parameter)
-    accumulates there; one without gets an fp32 temporary added to its bf16 .grad.
+    weight with an fp32 main_grad accumulates there; one without gets an fp32 temporary added to
+    its bf16 .grad.
     """
 
     def __init__(self, targets):
@@ -91,8 +84,8 @@ class _WeightGradTargets:
             param.grad = grad if param.grad is None else param.grad.add_(grad)
 
 
-def _accumulate_wgrads(
-    targets: _WeightGradTargets,
+def accumulate_wgrads(
+    targets: WeightGradTargets,
     x,
     grad_out,
     h,
@@ -116,10 +109,6 @@ def _accumulate_wgrads(
 
 
 class BF16SwiGLUExpertsFunc(torch.autograd.Function):
-    """
-    See the module docstring. Returns the expert outputs in received-slot order.
-    """
-
     @staticmethod
     def forward(
         ctx: torch.autograd.function.FunctionCtx,
@@ -130,7 +119,7 @@ class BF16SwiGLUExpertsFunc(torch.autograd.Function):
         bias_gate_up: torch.Tensor | None,
         bias_down: torch.Tensor | None,
         maps: NamedTuple,
-        wgrad_targets: _WeightGradTargets,
+        wgrad_targets: WeightGradTargets,
         max_slots: int,
         act_params: tuple,
         cu_seqlens_host: list[int] | None,
@@ -141,10 +130,8 @@ class BF16SwiGLUExpertsFunc(torch.autograd.Function):
         )
         out = bf16_expert_down_forward_scattered(h, w_down, cu_seqlens, maps.slot_of, bias_down)
         del h
-        # The received tokens (and, in backward, grad_out) come from an all-to-all on the comm
-        # stream and are read again by the deferred weight gradient on this stream: tie their reuse
-        # to this stream, so the allocator cannot hand the block to the next all-to-all before the
-        # wgrad has run.
+        # The received tokens (and grad_out in backward) come from the comm stream and are read
+        # by the deferred wgrad on this stream; without this the next all-to-all could reuse them.
         gathered.record_stream(torch.cuda.current_stream())
         ctx.save_for_backward(gathered, preact)
         ctx.weights = (w_gate, w_up, w_down)
@@ -169,7 +156,7 @@ class BF16SwiGLUExpertsFunc(torch.autograd.Function):
         del preact
         grad_bias_gate_up = grad_bias_down = None
         if ctx.bias_dtypes[0] is not None:
-            # gpt-oss: gate is the lower address, so grad_preact's pairs interleave like the bias
+            # gpt-oss: gate is the lower address, so grad_preact's pairs interleave like the bias.
             cu_seqlens_host = ctx.cu_seqlens_host
             if cu_seqlens_host is None:
                 cu_seqlens_host = cu_seqlens.tolist()
@@ -186,7 +173,7 @@ class BF16SwiGLUExpertsFunc(torch.autograd.Function):
             grad_gathered = bf16_expert_gather_rows(grad_x, maps.row_of)
         del grad_x
         wgrad = partial(
-            _accumulate_wgrads,
+            accumulate_wgrads,
             ctx.wgrad_targets,
             gathered.detach(),
             grad_out.detach(),
@@ -225,9 +212,9 @@ def bf16_swiglu_experts(
 ) -> torch.Tensor:
     """
     down_proj(silu(gate(x)) * up(x)) per expert for the slots of the received tokens, x =
-    gathered[expand_idx] grouped by expert_idxs, returned in slot order. gate and up are gate_proj
-    and up_proj (GroupedLinear), or with up_proj None the two halves of a fused gate_proj whose
-    rows are [gate; up].
+    gathered[expand_idx] grouped by expert_idxs, returned in slot order. gate and up are the
+    GroupedLinear gate_proj and up_proj, or with up_proj None the two halves of a fused gate_proj
+    whose rows are [gate; up].
     """
     G = gate_proj.num_groups
     maps = bf16_expert_group_slots(expert_idxs, expand_idx, G, gathered.shape[0])
@@ -241,7 +228,7 @@ def bf16_swiglu_experts(
         gate_rows = (slice(None), slice(None, intermediate_size))
         up_rows = (slice(None), slice(intermediate_size, None))
         targets = [(gate_proj, "weight", gate_rows), (gate_proj, "weight", up_rows)]
-    wgrad_targets = _WeightGradTargets(targets + [(down_proj, "weight", None)])
+    wgrad_targets = WeightGradTargets(targets + [(down_proj, "weight", None)])
     return BF16SwiGLUExpertsFunc.apply(
         gathered,
         w_gate,
@@ -268,15 +255,15 @@ def bf16_clamped_swiglu_experts(
     limit: float,
 ) -> torch.Tensor:
     """
-    gpt-oss's experts (raw gate_up_proj (G, 2I, H) with interleaved gate / up rows, down_proj and
-    their biases): down(clamped_swiglu(gate_up(x) + b_gate_up)) + b_down per expert for the slots of
-    the received tokens, returned in slot order.
+    gpt-oss experts, down(clamped_swiglu(gate_up(x) + b_gate_up)) + b_down per expert for the
+    slots of the received tokens, returned in slot order. experts holds the raw gate_up_proj (G,
+    2I, H) with interleaved gate and up rows, down_proj and their biases.
     """
     G = experts.num_experts
     maps = bf16_expert_group_slots(expert_idxs, expand_idx, G, gathered.shape[0])
     gate_up_weight = experts.gate_up_proj
     gate_rows, up_rows = (slice(None), slice(0, None, 2)), (slice(None), slice(1, None, 2))
-    wgrad_targets = _WeightGradTargets(
+    wgrad_targets = WeightGradTargets(
         [
             (experts, "gate_up_proj", gate_rows),
             (experts, "gate_up_proj", up_rows),

@@ -1,11 +1,8 @@
 """
-Expert-parallel dispatch: from the router's top-k to the received, deduplicated tokens and the
-routing metadata of stages 3-5 (RoutingInfo).
-
-The index math runs in the kernel library (fused_dedup_prepare_dispatch, expert_and_expand_idx);
-this module does the metadata and expand_idx all-to-alls, the host-side split arithmetic and the
-token gather. prepare_dispatch_issue and PendingDispatch.finish split it so that independent GPU
-work can be enqueued while the metadata travels to the host.
+Expert-parallel dispatch: from the router's top-k to the deduplicated tokens to send and the
+routing metadata of stages 3-5 (RoutingInfo). prepare_dispatch_issue and PendingDispatch.finish
+split it in two, so that independent GPU work can be enqueued while the metadata is copied
+to the host.
 """
 
 from dataclasses import dataclass
@@ -19,17 +16,18 @@ from pithtrain.models.interface import AllToAllSplits, RoutingInfo
 from pithtrain.operators.all_to_all import all_to_all_sync
 from pithtrain.operators.token_scatter import padded_index_gather
 
+__all__ = ["PendingDispatch", "prepare_dispatch", "prepare_dispatch_issue"]
+
 # At most one deferred dispatch is outstanding per process: its metadata lands in the single
 # pinned buffer below, which the next issue would overwrite.
-_outstanding_dispatches: list["PendingDispatch"] = []
+outstanding_dispatches: list["PendingDispatch"] = []
 
 
 @lru_cache(maxsize=None)
-def _pinned_meta(numel: int, dtype: torch.dtype) -> torch.Tensor:
+def pinned_meta_buffer(numel: int, dtype: torch.dtype) -> torch.Tensor:
     """
-    The pinned host buffer the dispatch metadata is copied into, one per size, cached because
-    freeing a pinned tensor records a CUDA event in PyTorch's host allocator. Shared by every
-    dispatch: the MoE ops run on one thread at a time.
+    Pinned host buffer for the dispatch metadata, one per size and shared by every dispatch. Cached
+    because freeing a pinned tensor records a CUDA event in PyTorch's host allocator.
     """
     return torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True)
 
@@ -37,12 +35,8 @@ def _pinned_meta(numel: int, dtype: torch.dtype) -> torch.Tensor:
 @dataclass(slots=True, eq=False)
 class PendingDispatch:
     """
-    A dispatch whose device work has been issued but whose host-side split arithmetic, expand_idx
-    all-to-all and token gather have not run yet; finish() completes it.
-
-    Between prepare_dispatch_issue() and finish() the host is free to enqueue independent GPU
-    work. finish() then waits on an event that fires once the metadata reached the pinned buffer,
-    rather than on the whole stream.
+    A dispatch whose device work has been issued; finish() waits for its metadata to reach the
+    host and completes it. Only one may be outstanding at a time.
     """
 
     hidden_states: torch.Tensor
@@ -65,26 +59,24 @@ class PendingDispatch:
         """
         assert not self.is_finished, "finish() called twice on the same pending dispatch"
         self.is_finished = True
-        assert _outstanding_dispatches and _outstanding_dispatches[-1] is self
+        assert outstanding_dispatches and outstanding_dispatches[-1] is self
         ep_size, experts_per_rank, ep_group = self.ep_size, self.experts_per_rank, self.ep_group
         self.meta_copied.synchronize()
         host_counts = self.meta_host.tolist()
-        _outstanding_dispatches.pop()
+        outstanding_dispatches.pop()
         stride = experts_per_rank + 1
         input_splits = host_counts[:ep_size]
         dedup_input_splits = host_counts[ep_size : 2 * ep_size]
         recv_counts = host_counts[2 * ep_size :]
         dedup_output_splits = recv_counts[experts_per_rank::stride]
-        # Rows this rank receives from each sender (summed over its local experts), and rows per
-        # local expert summed over senders: what stage 3 groups its GEMMs by, known here for free
-        # so the scatter there need not sync again.
+        # Rows received per sender and rows per local expert; stage 3 groups its GEMMs by the
+        # latter, so its scatter need not sync to learn them.
         output_splits = [sum(recv_counts[sender * stride : sender * stride + experts_per_rank]) for sender in range(ep_size)]  # fmt: skip
         expert_counts = [
             sum(recv_counts[expert::stride][:ep_size]) for expert in range(experts_per_rank)
         ]
 
-        # One entry per received token slot; stage 3 indexes the gathered rows by expand_idx, so
-        # the row count is decided by the senders, never by this rank's own token count.
+        # One entry per received token slot: the senders decide the row count, not this rank.
         expand_idx = self.expand_idx
         received_expand_idx = expand_idx.new_empty(sum(output_splits))
         all_to_all_sync(received_expand_idx, expand_idx, output_splits, input_splits, ep_group)
@@ -119,12 +111,11 @@ def prepare_dispatch_issue(
     ep_group: dist.ProcessGroup,
 ) -> PendingDispatch:
     """
-    Issue the device side of an expert-parallel dispatch (ep_size > 1) without blocking the host:
-    the dedup kernels, the metadata all-to-all and the device-to-host copy of the metadata, all on
-    the current stream. Returns a PendingDispatch whose finish() completes the dispatch.
+    Issue the device side of an expert-parallel dispatch (ep_size > 1) on the current stream
+    without blocking the host. Returns a PendingDispatch whose finish() completes the dispatch.
     """
     assert ep_size > 1
-    assert not _outstanding_dispatches, "a deferred dispatch is still outstanding"
+    assert not outstanding_dispatches, "a deferred dispatch is still outstanding"
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
     # One int64 buffer holds everything the host needs, so one device-to-host copy fetches it:
@@ -140,7 +131,7 @@ def prepare_dispatch_issue(
     recv_meta = meta[2 * ep_size :]
     all_to_all_sync(recv_meta, send_meta, group=ep_group)
 
-    meta_host = _pinned_meta(meta.shape[0], meta.dtype)
+    meta_host = pinned_meta_buffer(meta.shape[0], meta.dtype)
     meta_copied = torch.cuda.Event()
     meta_host.copy_(meta, non_blocking=True)
     meta_copied.record()
@@ -149,7 +140,7 @@ def prepare_dispatch_issue(
         hidden_states, topk_weight, dispatch_token_idxs, idxs, expand_idx, meta, meta_host,
         meta_copied, ep_size, experts_per_rank, ep_group,
     )  # fmt: skip
-    _outstanding_dispatches.append(pending)
+    outstanding_dispatches.append(pending)
     return pending
 
 
@@ -164,14 +155,10 @@ def prepare_dispatch(
     ep_group: dist.ProcessGroup,
 ) -> tuple[torch.Tensor, RoutingInfo]:
     """
-    Expert-parallel dispatch with token deduplication.
-
-    When ep_size > 1, deduplicates tokens routed to the same EP rank via
-    multiple experts to cut all-to-all volume, and computes expand_idx to
-    reconstruct the full mapping on the receiver side. When ep_size == 1,
-    replicates each token once per selected expert.
+    Dispatch the tokens to their experts: (dispatch_tokens, RoutingInfo). With ep_size > 1 a token
+    sent to several experts on one EP rank is sent once, and expand_idx restores the copies on the
+    receiver; with ep_size == 1 each token is repeated once per selected expert.
     """
-
     k = topk_ids.shape[1]
     expert_idxs = topk_ids.view(-1)
 

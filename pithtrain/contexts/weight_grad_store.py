@@ -2,8 +2,8 @@
 Deferred weight gradients for zero-bubble pipeline scheduling.
 
 Expert layers whose backward defers its weight-gradient GEMMs put them here as closures, and
-DualPipeV runs them in its W phase (pithtrain/pipeline/execution.py). Unlike the other contexts this
-is per-step state that the pipeline drives, not a value set once at startup.
+DualPipeV runs them in its W phase. Unlike the other contexts this is per-step state that the
+pipeline drives, not a value set once at startup.
 
 WeightGradStore is derived from dualpipe/utils.py in DeepSeek's DualPipe project
 (https://github.com/deepseek-ai/DualPipe), licensed under the MIT License. Copyright (c) 2025
@@ -13,10 +13,15 @@ DeepSeek. See pithtrain/pipeline/LICENSE for the full license text.
 import queue
 from typing import Callable, List
 
-# fmt: off
+__all__ = ["WeightGradStore"]
 
 
 class WeightGradStore:
+    """
+    Class-level queue of weight-gradient closures. While enabled is True, a backward defers its
+    weight gradients with put; flush closes the current group and pop runs the oldest group.
+    """
+
     enabled: bool = False
     cache: List[Callable] = []
     funcs_queue = queue.Queue()
@@ -39,5 +44,8 @@ class WeightGradStore:
 
     @classmethod
     def clear(cls) -> None:
+        """
+        Drop the current group and every queued group without running them.
+        """
         cls.cache = []
         cls.funcs_queue = queue.Queue()

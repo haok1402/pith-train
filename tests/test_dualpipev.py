@@ -68,7 +68,9 @@ def objective(
     model_outputs: Tuple[torch.Tensor, ...],
     objective_inputs: Tuple[torch.Tensor, ...],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Wrap criterion in the objective contract, returning the detached loss to the caller."""
+    """
+    Return the loss for backward and its detached copy for the caller.
+    """
     (output,) = model_outputs
     (target,) = objective_inputs
     loss = criterion(output, target)
@@ -79,29 +81,28 @@ def records_empty(model: DualPipeV) -> bool:
     records = []
     for chunk in model.chunk_records[0] + model.chunk_records[1]:
         records += [chunk.prolog, chunk.epilog]
-        records += [getattr(layer, f.name) for layer in chunk.layers for f in fields(layer)]
-    return all(getattr(r, f.name) is None for r in records if r is not None for f in fields(r))
+        records += [getattr(layer, field.name) for layer in chunk.layers for field in fields(layer)]
+    return all(getattr(record, field.name) is None for record in records if record is not None for field in fields(record))  # fmt: skip
 
 
 def reference_step(chunks, model: DeepSeekV2Model):
-    """Run the reference forward/backward over the same micro-batches DualPipeV will see."""
-    ys, ls = [], []
-    for micro_x, micro_l, cu in chunks:
-        micro_y = model.reference_forward(micro_x, cu)
-        loss = criterion(micro_y, micro_l)
+    """
+    Run the reference forward and backward over the micro-batches DualPipeV will see.
+    """
+    outputs, losses = [], []
+    for micro_x, micro_labels, cu_seqlens in chunks:
+        micro_y = model.reference_forward(micro_x, cu_seqlens)
+        loss = criterion(micro_y, micro_labels)
         loss.backward()
-        ys.append(micro_y)
-        ls.append(loss)
-    return torch.stack(ls), ys
+        outputs.append(micro_y)
+        losses.append(loss)
+    return torch.stack(losses), outputs
 
 
 def zigzag_shard(x: torch.Tensor, cp_rank: int, cp_size: int) -> torch.Tensor:
     """
-    Take the zigzag half-pair for this CP rank along dim 1.
-
-    The sequence is cut into 2 * cp_size equal blocks and rank r keeps blocks r and
-    2 * cp_size - r - 1, balancing the causal workload. Same layout as get_global_batch in
-    tasks/pretrain_lm.py and forward_posemb in each model.
+    Take this CP rank's zigzag pair of blocks along dim 1: of 2 * cp_size equal blocks, rank r
+    keeps blocks r and 2 * cp_size - r - 1, the layout the loader and forward_posemb use.
     """
     if cp_size == 1:
         return x
@@ -112,7 +113,9 @@ def zigzag_shard(x: torch.Tensor, cp_rank: int, cp_size: int) -> torch.Tensor:
 
 
 def shard_layers(layers: nn.ModuleDict, local: nn.Module) -> nn.ModuleDict:
-    """The reference layers a pipeline stage owns: the ids the stage model built for itself."""
+    """
+    Return the reference layers a pipeline stage owns: the ids the stage model built for itself.
+    """
     return nn.ModuleDict({i: layers[i] for i in local.layers})
 
 
@@ -123,14 +126,14 @@ def shard_experts(model, ep_rank, ep_size):
             num_experts = child.num_groups
             break
     if num_experts is None:
-        gu = getattr(model, "gate_up_proj", None)
-        if isinstance(gu, nn.Parameter):
+        gate_up = getattr(model, "gate_up_proj", None)
+        if isinstance(gate_up, nn.Parameter):
             num_experts = getattr(model, "num_experts", None)
     if num_experts is not None and num_experts % ep_size == 0 and num_experts > 1:
         experts_per_ep_rank = num_experts // ep_size
         expert_begin = ep_rank * experts_per_ep_rank
         expert_end = (ep_rank + 1) * experts_per_ep_rank
-        for pname, param in list(model.named_parameters(recurse=False)):
+        for param_name, param in list(model.named_parameters(recurse=False)):
             if param.dim() >= 1 and param.shape[0] == num_experts:
                 new_param = nn.Parameter(
                     param.data[expert_begin:expert_end].clone(),
@@ -138,7 +141,7 @@ def shard_experts(model, ep_rank, ep_size):
                 )
                 if param.grad is not None:
                     new_param.grad = param.grad[expert_begin:expert_end].clone()
-                setattr(model, pname, new_param)
+                setattr(model, param_name, new_param)
 
     for name, child in model.named_children():
         if isinstance(child, (GroupedLinear, FP8GroupedLinear)):
@@ -168,32 +171,35 @@ def canonical_state_dict(model: nn.Module, ep_rank: int) -> dict:
 
 
 def apply_fsdp(model, dtype):
-    # Mirrors modules.training.apply_fsdp: the expert parameters replicate over the dp axis of the
-    # expert view, the attention parameters over the flattened dp x cp stage of the attention view.
+    # Mirrors modules.training.apply_fsdp: expert parameters shard over the dp axis of the expert
+    # view, attention parameters over the flattened dp x cp stage of the attention view.
     expt_fsdp_mesh = distributed.expt_mesh["dp"]
     attn_fsdp_mesh = distributed.attn_mesh["dp", "cp"]._flatten()
-    mp = MixedPrecisionPolicy(
+    mp_policy = MixedPrecisionPolicy(
         param_dtype=dtype,
         reduce_dtype=torch.float32,
         output_dtype=None,
         cast_forward_inputs=True,
     )
-    # FSDP recommends shard models from the bottom to the top.
+    # FSDP recommends sharding from the bottom up.
     for i in range(2):
         if model[i].embed_tokens is not None:
             fully_shard(
                 model[i].embed_tokens,
                 mesh=attn_fsdp_mesh,
                 reshard_after_forward=True,
-                mp_policy=mp,
+                mp_policy=mp_policy,
             )
         if model[i].norm is not None:
             assert model[i].lm_head is not None
             fully_shard(
-                model[i].norm, mesh=attn_fsdp_mesh, reshard_after_forward=True, mp_policy=mp
+                model[i].norm, mesh=attn_fsdp_mesh, reshard_after_forward=True, mp_policy=mp_policy
             )
             fully_shard(
-                model[i].lm_head, mesh=attn_fsdp_mesh, reshard_after_forward=True, mp_policy=mp
+                model[i].lm_head,
+                mesh=attn_fsdp_mesh,
+                reshard_after_forward=True,
+                mp_policy=mp_policy,
             )
         for layer in model[i].layers.values():
             if hasattr(layer.mlp, "experts"):
@@ -201,17 +207,17 @@ def apply_fsdp(model, dtype):
                     layer.mlp.experts,
                     mesh=expt_fsdp_mesh,
                     reshard_after_forward=False,
-                    mp_policy=mp,
+                    mp_policy=mp_policy,
                 )
                 if hasattr(layer.mlp.experts, "forward_from_tokens"):
                     torch.distributed.fsdp.register_fsdp_forward_method(
                         layer.mlp.experts, "forward_from_tokens"
                     )
-            fully_shard(layer, mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
+            fully_shard(layer, mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp_policy)  # fmt: skip
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage1")
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage3")
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage5")
-        fully_shard(model[i], mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
+        fully_shard(model[i], mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp_policy)
     # Plain-sum reduction, as in modules.training.apply_fsdp. Both classes then hold the
     # gradient summed over their own replica group, which equals the reference gradient.
     for module in model.modules():
@@ -221,15 +227,6 @@ def apply_fsdp(model, dtype):
 
 
 def main(model_name: str):
-    """
-    Main testing function.
-
-    Parameters
-    ----------
-    model_name : str
-        Model name or local config path.
-    """
-
     dp_size, pp_size, ep_size = distributed.dp_size, distributed.pp_size, distributed.ep_size
     cp_size, cp_rank = distributed.cp_size, distributed.cp_rank
     pp_rank, dp_rank, ep_rank = distributed.pp_rank, distributed.dp_rank, distributed.ep_rank
@@ -247,16 +244,16 @@ def main(model_name: str):
     torch.set_default_device(torch.cuda.current_device())
     dtype = torch.bfloat16
 
-    # This test builds models directly, bypassing setup_model; bind the BF16 linear backend it sets.
-    # The fused classes act as nn.Linear in the single-device reference, and fused accumulation is
+    # The test builds models directly, bypassing setup_model, so it binds the linear backend itself.
+    # The fused classes act as nn.Linear in the single-device reference; fused accumulation is
     # installed on the DualPipeV copy only, as setup_model does.
     training.fp8 = False
     training.Linear = BF16Linear
     training.GroupedLinear = GroupedLinear
     if os.environ.get("FP8", "0") == "1":
-        # FP8 on both copies: the reference runs the same FP8 layers unpipelined. Expect the expert
-        # weight gradients to differ by a few percent: the 128-row colwise quantization of their
-        # wgrad operands follows token order, which the EP dispatch changes.
+        # FP8 on both copies: the reference runs the same FP8 layers unpipelined. Expert weight
+        # gradients differ by a few percent, since the 128-row colwise quantization of their wgrad
+        # operands follows token order, which the EP dispatch changes.
         training.fp8 = True
         training.Linear = FP8Linear
         training.GroupedLinear = FP8GroupedLinear
@@ -299,12 +296,12 @@ def main(model_name: str):
 
     vocab_size = config.vocab_size
 
-    # Build the micro-batches, one entry per global chunk, ordered data-parallel-major so dp rank
-    # r owns chunks [r * num_chunks, (r + 1) * num_chunks). dp alone splits the data: the expert
-    # rank says which experts a rank hosts, never which data it sees.
+    # One micro-batch per global chunk, ordered data-parallel-major so dp rank r owns chunks
+    # [r * num_chunks, (r + 1) * num_chunks). dp alone splits the data; the expert rank decides
+    # only which experts a rank hosts.
     #
-    # Two steps are run, so the shapes agreed for one step cannot leak into the next: under
-    # ragged the second step uses different sequence lengths than the first.
+    # Two steps run so the shapes agreed for one step cannot leak into the next: under ragged the
+    # second step uses different sequence lengths.
     num_global_chunks = dp_size * num_chunks
     label_scale = 10.0  # scaled up so MSE grads on small bias terms clear the bf16 noise floor
 
@@ -343,16 +340,15 @@ def main(model_name: str):
 
     chunk_steps = [build_chunks(0), build_chunks(1)]
 
-    # Reference runs single-device and full-sequence (pp=ep=cp=1); restore before DualPipeV.
-    # cp_rank must be forced too: forward_posemb reads it unguarded to build the zigzag position
-    # ids, so a nonzero cp_rank gives the reference the wrong slice of the RoPE table.
+    # The reference runs single-device and full-sequence (pp=ep=cp=1); restored before DualPipeV.
+    # cp_rank is forced too: forward_posemb reads it unguarded, so a nonzero cp_rank would give the
+    # reference the wrong slice of the RoPE table.
     distributed.pp_size = distributed.ep_size = distributed.cp_size = 1
     distributed.cp_rank = 0
     full_modules = ModelClass(config, phase=-1)
     full_modules.to(dtype=dtype)
     full_modules.apply(fill_weights)
 
-    # Run the reference step.
     if distributed.rank == 0:
         print("[INFO] Running the reference step.", flush=True)
     torch.distributed.barrier()
@@ -397,14 +393,13 @@ def main(model_name: str):
     install_wgrad_accumulation(local_modules)
     install_raw_main_grad(local_modules)
 
-    # Wrap the modules with DualPipeV.
     dualpipev_model = DualPipeV(local_modules)
 
-    def shard(x: torch.Tensor, cu: torch.Tensor | None) -> torch.Tensor:
+    def shard(x: torch.Tensor, cu_seqlens: torch.Tensor | None) -> torch.Tensor:
         # A packed sample is sharded one document at a time; cu_seqlens stays the whole sample's.
-        if cu is None:
+        if cu_seqlens is None:
             return zigzag_shard(x, cp_rank, cp_size)
-        return x[:, zigzag_varlen_index(cp_rank, cp_size, cu, x.shape[1])]
+        return x[:, zigzag_varlen_index(cp_rank, cp_size, cu_seqlens, x.shape[1])]
 
     def collect(model_outputs, objective_inputs):
         # Check before step cleanup can hide retained activations.
@@ -412,19 +407,18 @@ def main(model_name: str):
         (output,), (target,) = model_outputs, objective_inputs
         return None, criterion(output, target)
 
-    # Run the DualPipeV step.
     for step_index, chunks in enumerate(chunk_steps):
-        # Every pipeline rank builds the same micro-batches, so each derives its own P2P
-        # shapes; only the first rank reads the tensors.
-        # dp picks the samples, then cp picks the zigzag slice this rank takes from each one.
+        # Every pipeline rank builds the same micro-batches, so each derives its own P2P shapes;
+        # only the first rank reads the tensors. dp picks the samples, then cp picks the zigzag
+        # slice this rank takes from each one.
         local_chunks = chunks[dp_rank * num_chunks : (dp_rank + 1) * num_chunks]
         microbatches = [
             Microbatch(
-                model_inputs=(shard(x, cu),),
-                cu_seqlens=cu,
-                objective_inputs=(shard(lab, cu),),
+                model_inputs=(shard(x, cu_seqlens),),
+                cu_seqlens=cu_seqlens,
+                objective_inputs=(shard(labels, cu_seqlens),),
             )
-            for x, lab, cu in local_chunks
+            for x, labels, cu_seqlens in local_chunks
         ]
 
         if distributed.rank == 0:
@@ -442,7 +436,6 @@ def main(model_name: str):
             print("[INFO] Completed DualPipeV step %d." % step_index, flush=True)
         torch.distributed.barrier()
 
-        # Validate the loss.
         if pp_rank == 0:
             loss = torch.stack(objective_outputs)
             torch.testing.assert_close(torch.stack(collected_outputs), loss, rtol=0, atol=5e-3)
@@ -465,15 +458,14 @@ def main(model_name: str):
             print("[INFO] Loss matches the reference at step %d." % step_index, flush=True)
         torch.distributed.barrier()
 
-    # Validate the gradients.
     eps = 1e-2
     largest_diff = 0
     largest_diff_param = None
     failed = False
 
-    for (n, p), p_ref in zip(local_modules.named_parameters(), local_full_modules.parameters()):
-        if p.grad is None:
-            print("[ERROR] rank-%d, Parameter %s has no gradient." % (distributed.rank, n))
+    for (param_name, param), param_ref in zip(local_modules.named_parameters(), local_full_modules.parameters()):  # fmt: skip
+        if param.grad is None:
+            print("[ERROR] rank-%d, Parameter %s has no gradient." % (distributed.rank, param_name))
             failed = True
             continue
         # Both parameter classes reduce with a plain sum over their own replica group, and either
@@ -481,71 +473,67 @@ def main(model_name: str):
         # and the expt replica group covers all the data too, since every member receives the
         # tokens of a whole EP group through the all-to-all. A mismatch here points at the mesh
         # or at the gradient divide factor.
-        p_grad = p.grad
-        if isinstance(p_grad, torch.distributed.tensor.DTensor):
-            p_grad = p_grad.full_tensor()
+        param_grad = param.grad
+        if isinstance(param_grad, torch.distributed.tensor.DTensor):
+            param_grad = param_grad.full_tensor()
         if cp_size > 1:
             # Each CP rank takes a mean over S/cp tokens, which is cp times its share of the
             # full-sequence mean, so the summed gradient overshoots the reference by exactly cp.
-            p_grad = p_grad / cp_size
-        if torch.all(p_grad == 0) and torch.all(p_ref.grad == 0):
+            param_grad = param_grad / cp_size
+        if torch.all(param_grad == 0) and torch.all(param_ref.grad == 0):
             print(
                 "[warn] rank-%d, Parameter %s has all-zero gradient, skipping."
-                % (distributed.rank, n)
+                % (distributed.rank, param_name)
             )
             continue
-        # Reference accumulates in bf16, DualPipeV in fp32; cosine-diff on
-        # noise-floor grads (e.g. gpt-oss router.bias ~1e-8) is meaningless. Routed expert
-        # weights are exempt: their gradients scale as 1/num_experts, so a fixed floor drops
-        # every one of them on a many-expert config and leaves the expert path unchecked.
-        ref_max = p_ref.grad.abs().max().item()
-        if ref_max < 1e-5 and ".experts." not in n:
+        # The reference accumulates in bf16 and DualPipeV in fp32, so the diff of gradients at the
+        # noise floor (gpt-oss router.bias, about 1e-8) is meaningless. Routed expert weights are
+        # exempt: their gradients scale as 1/num_experts, so a fixed floor would skip them all on
+        # a many-expert config.
+        ref_max = param_ref.grad.abs().max().item()
+        if ref_max < 1e-5 and ".experts." not in param_name:
             print(
                 "[warn] rank-%d, Parameter %s grad max=%.2e at bf16 noise floor, skipping."
-                % (distributed.rank, n, ref_max)
+                % (distributed.rank, param_name, ref_max)
             )
             continue
-        diff = calculate_difference(p_grad, p_ref.grad)
+        diff = calculate_difference(param_grad, param_ref.grad)
         if diff > largest_diff:
             largest_diff = diff
-            largest_diff_param = n
-        # A_log and dt_bias are the gated-delta decay params, both feeding the gate
-        # g = -exp(A_log) * softplus(a + dt_bias) that drives the linear-attention recurrence;
-        # their tiny grads accumulate over it and are dominated by non-deterministic bf16
-        # scatter-add / all-to-all ordering, varying run-to-run (~0.005-0.016) past the eps.
-        param_eps = 3e-2 if n.endswith(("linear_attn.A_log", "linear_attn.dt_bias")) else eps
-        # Under FP8 the expert wgrad quantization follows token order, which EP changes (~0.065
-        # measured on Qwen3-30B-A3B); a broken accumulation shows up as diff near 1 or above.
-        if training.fp8 and ".experts." in n:
+            largest_diff_param = param_name
+        # A_log and dt_bias feed the gated-delta decay g = -exp(A_log) * softplus(a + dt_bias).
+        # Their tiny gradients accumulate over the recurrence and are dominated by
+        # non-deterministic bf16 scatter-add and all-to-all ordering, which varies past eps.
+        param_eps = 3e-2 if param_name.endswith(("linear_attn.A_log", "linear_attn.dt_bias")) else eps  # fmt: skip
+        # Under FP8 the expert wgrad quantization follows token order, which EP changes; a broken
+        # accumulation shows up as a diff near 1 or above.
+        if training.fp8 and ".experts." in param_name:
             param_eps = 0.1
-        # Qwen3.5 under FP8: FP8 rounding in every dense projection is amplified through the
-        # gated-delta-net recurrence (~0.065 measured on every non-expert weight, unchanged by
-        # switching any single group of layers back to BF16), not one broken layer.
+        # Qwen3.5 under FP8: the FP8 rounding of every dense projection is amplified through the
+        # gated-delta-net recurrence, on every non-expert weight rather than one broken layer.
         if training.fp8 and config.model_type == "qwen3_5_moe_text":
             param_eps = max(param_eps, 0.1)
-            # The decay parameters already need 3e-2 under BF16 (above); FP8 noise is ~6x the
-            # BF16 noise on every dense weight, and these read 0.11-0.17 on the round-3 code too.
-            if n.endswith(("linear_attn.A_log", "linear_attn.dt_bias")):
+            # The decay parameters already need 3e-2 under BF16, and FP8 noise is about 6x the
+            # BF16 noise on every dense weight.
+            if param_name.endswith(("linear_attn.A_log", "linear_attn.dt_bias")):
                 param_eps = 0.3
-        # DeepSeek-V2 under FP8: on this fixture (8 layers, 128-token sequences, ~18 rows per
-        # expert per micro-batch) a +-1 ulp BF16 perturbation of the embedding alone moves the FP8
-        # gradients by 0.04 mean / 0.11 max on dense weights and 0.19 / 0.29 on experts (BF16:
-        # 0.001 / 0.009). Pipelined vs reference measures 0.019 / 0.035 dense and up to 0.22 (CP1)
-        # / 0.53 (CP2) on experts, the same on one GPU with pp=ep=cp=1, and no single group of
-        # layers carries it. A broken dense layer or accumulation reads ~1.
+        # DeepSeek-V2 under FP8: with so few rows per expert on this small fixture, a 1-ulp BF16
+        # perturbation of the embedding alone moves the FP8 gradients by up to 0.11 on dense
+        # weights and 0.29 on experts, also on one GPU with pp=ep=cp=1. A broken dense layer or
+        # accumulation reads about 1.
         if training.fp8 and config.model_type == "deepseek_v2":
-            param_eps = max(param_eps, 0.6 if ".experts." in n else 0.05)
+            param_eps = max(param_eps, 0.6 if ".experts." in param_name else 0.05)
         if diff > param_eps:
             failed = True
             print(
                 "[ERROR] rank-%d, Parameter %s grad mismatch: diff=%.6f, eps=%.6f, p_grad:%s..., p_ref.grad:%s..."
                 % (
                     distributed.rank,
-                    n,
+                    param_name,
                     diff,
                     param_eps,
-                    p_grad.flatten()[:5],
-                    p_ref.grad.flatten()[:5],
+                    param_grad.flatten()[:5],
+                    param_ref.grad.flatten()[:5],
                 )
             )
     assert not failed
@@ -567,16 +555,16 @@ def main(model_name: str):
     for updated in (False, True):
         if updated:
             with torch.no_grad():
-                for p in dualpipev_model.parameters():
-                    w = p.to_local()
-                    w.neg_().masked_fill_(w == 0, 1)
+                for param in dualpipev_model.parameters():
+                    weight = param.to_local()
+                    weight.neg_().masked_fill_(weight == 0, 1)
         reference = canonical_state_dict(local_full_modules[0], ep_rank)
         reference.update(canonical_state_dict(local_full_modules[1], ep_rank))
         for name, tensor in iter_canonical_parameters():
-            w = reference.pop(name)
+            weight = reference.pop(name)
             if updated:
-                w = w.neg().masked_fill_(w == 0, 1)
-            assert torch.equal(tensor, w), (distributed.rank, name, updated)
+                weight = weight.neg().masked_fill_(weight == 0, 1)
+            assert torch.equal(tensor, weight), (distributed.rank, name, updated)
         assert not reference, (distributed.rank, sorted(reference)[:5])
     torch.distributed.barrier()
     if distributed.rank == 0:
@@ -584,7 +572,7 @@ def main(model_name: str):
 
 
 @record
-def _entry() -> None:
+def entry() -> None:
     models = []
     models.append("examples/pretrain_lm/deepseek-v2-lite/config.json")
     models.append("examples/pretrain_lm/qwen3-30b-a3b/config.json")
@@ -610,4 +598,4 @@ def _entry() -> None:
 
 
 if __name__ == "__main__":
-    _entry()
+    entry()
