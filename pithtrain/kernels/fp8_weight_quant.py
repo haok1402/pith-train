@@ -2,9 +2,10 @@
 Picker of the weight-side 128x128 blockwise FP8 quantization: the blockwise transposes of a weight
 and the FP8 parameter all-gather kernels.
 
-Every kernel runs the CuTe-DSL port on SM90 and the Triton kernel on SM100. Every scale is
-row-major, and every scale is the E8M0 2^ceil(log2(max(amax, 1e-4) / 448)) of the amax of
-its 128x128 tile.
+The blockwise transposes run the Triton kernel on both architectures: they are called inside
+torch.compile regions, which cannot trace the CuTe-DSL launchers. The all-gather kernels run the
+CuTe-DSL port on SM90 and the Triton kernel on SM100. Every scale is row-major: the E8M0
+2^ceil(log2(max(amax, 1e-4) / 448)) of its 128x128 tile's amax.
 """
 
 from typing import Any, Optional, Sequence
@@ -12,47 +13,32 @@ from typing import Any, Optional, Sequence
 import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR
+from pithtrain.kernels.fp8_weight_quant_sm100 import fp8cast_blockwise_transpose_batched_sm100, fp8cast_blockwise_transpose_sm100
 
 __all__ = ["fp8_pack_transpose", "fp8_scales", "fp8_scales_multi", "fp8_shard_amax", "fp8_shard_amax_multi", "fp8_shard_cast", "fp8cast_blockwise_transpose", "fp8cast_blockwise_transpose_batched"]
 
 
 def fp8cast_blockwise_transpose(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    128x128 blockwise FP8 of a weight and of its transpose from one read: (w_fp8,
-    w_scale, wt_fp8, wt_scale).
+    128x128 blockwise FP8 of a weight and of its transpose from one read: (w_fp8, w_scale, wt_fp8,
+    wt_scale).
 
     x is 2-D (N, K) bf16 (or fp32), any N and K (a partial tile is quantized over its valid
     elements), unit stride along K (rows may be strided; a transposed view is not supported). w_fp8
     is e4m3 (N, K), w_scale fp32 (ceil(N / 128), ceil(K / 128)); wt_fp8 is e4m3 (K, N), exactly
     w_fp8.T, and wt_scale is w_scale.T. All outputs are fresh and contiguous.
     """
-    match ARCH_MAJOR:
-        case 9:
-            from pithtrain.kernels.fp8_weight_quant_sm90 import fp8cast_blockwise_transpose_sm90
-            return fp8cast_blockwise_transpose_sm90(x)
-        case 10:
-            from pithtrain.kernels.fp8_weight_quant_sm100 import fp8cast_blockwise_transpose_sm100
-            return fp8cast_blockwise_transpose_sm100(x)
-        case _:
-            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
+    return fp8cast_blockwise_transpose_sm100(x)
 
 
 def fp8cast_blockwise_transpose_batched(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     fp8cast_blockwise_transpose of each expert of a grouped weight x, 3-D (G, N, K) bf16 (or fp32),
-    unit stride along K. Returns w_fp8 e4m3 (G, N, K), w_scale fp32 (G, ceil(N / 128), ceil(K /
-    128)), wt_fp8 e4m3 (G, K, N) and wt_scale fp32 (G, ceil(K / 128), ceil(N / 128)), all
-    contiguous. Tiles never straddle experts.
+    unit stride along K. Returns w_fp8 e4m3 (G, N, K), w_scale fp32 (G, ceil(N / 128),
+    ceil(K / 128)), wt_fp8 e4m3 (G, K, N) and wt_scale fp32 (G, ceil(K / 128), ceil(N / 128)),
+    all contiguous. Tiles never straddle experts.
     """
-    match ARCH_MAJOR:
-        case 9:
-            from pithtrain.kernels.fp8_weight_quant_sm90 import fp8cast_blockwise_transpose_batched_sm90
-            return fp8cast_blockwise_transpose_batched_sm90(x)
-        case 10:
-            from pithtrain.kernels.fp8_weight_quant_sm100 import fp8cast_blockwise_transpose_batched_sm100
-            return fp8cast_blockwise_transpose_batched_sm100(x)
-        case _:
-            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
+    return fp8cast_blockwise_transpose_batched_sm100(x)
 
 
 def fp8_shard_amax(shard: torch.Tensor, amax: torch.Tensor, row_offset: int, group_offset: int) -> None:

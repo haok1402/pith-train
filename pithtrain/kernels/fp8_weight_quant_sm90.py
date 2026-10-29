@@ -1,7 +1,9 @@
 """
 CuTe-DSL (SM90) kernels of the fp8_weight_quant feature, bit-identical to the Triton ones in
 fp8_weight_quant_sm100: the blockwise transposes, the FP8 parameter all-gather kernels, and
-one-launch variants of the shard amax and the scales over a fixed list of tensors.
+one-launch variants of the shard amax and the scales over a fixed list of tensors. The picker does
+not use the blockwise transposes: their callers run inside torch.compile regions, which cannot
+trace the CuTe-DSL launchers.
 
 Numerics follow compute_fp8_scale (SM90 branch) exactly. The tile amax is an integer max over the
 magnitude bits (|x| of finite non-negative floats orders like its bit pattern), so a NaN orders
@@ -424,38 +426,38 @@ def compile_blockwise(dtype: torch.dtype, mode: str, is_batched: bool):
     return fn
 
 
-def store_mode(num_tiles: int, M: int, K: int, *tensors: torch.Tensor) -> str:
+def store_mode(num_tiles: int, N: int, K: int, *tensors: torch.Tensor) -> str:
     """
     Store path for the blockwise kernels: the widest the shape and pointers allow.
     """
     if any(tensor.data_ptr() % 16 for tensor in tensors):
         mode = "scalar"
-    elif M % 16 == 0 and K % 16 == 0 and num_tiles >= SMEM_MIN_TILES:
+    elif N % 16 == 0 and K % 16 == 0 and num_tiles >= SMEM_MIN_TILES:
         mode = "smem"
     else:
-        mode = "v8" if M % 8 == 0 and K % 8 == 0 else "scalar"
+        mode = "v8" if N % 8 == 0 and K % 8 == 0 else "scalar"
     return mode
 
 
 def fp8cast_blockwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    CuTe-DSL fp8cast_blockwise_transpose: x 2-D (M, K) bf16 / fp32.
+    CuTe-DSL fp8cast_blockwise_transpose: x 2-D (N, K) bf16 / fp32.
     """
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     if x.stride(1) != 1:
         x = x.contiguous()
-    M, K = x.shape
-    num_row_tiles, num_col_tiles = (M + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
+    N, K = x.shape
+    num_row_tiles, num_col_tiles = (N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
     device = x.device
-    out = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=device)
+    out = torch.empty((N, K), dtype=torch.float8_e4m3fn, device=device)
     scale = torch.empty((num_row_tiles, num_col_tiles), dtype=torch.float32, device=device)
-    out_t = torch.empty((K, M), dtype=torch.float8_e4m3fn, device=device)
+    out_t = torch.empty((K, N), dtype=torch.float8_e4m3fn, device=device)
     scale_t = torch.empty((num_col_tiles, num_row_tiles), dtype=torch.float32, device=device)
-    if M == 0 or K == 0:
+    if N == 0 or K == 0:
         return out, scale, out_t, scale_t
     if x.stride(0) != K:
         x = x.contiguous()
-    fn = compile_blockwise(x.dtype, store_mode(num_row_tiles * num_col_tiles, M, K, x, out, out_t), False)
+    fn = compile_blockwise(x.dtype, store_mode(num_row_tiles * num_col_tiles, N, K, x, out, out_t), False)
     fn(x, out, scale, out_t, scale_t)
     return out, scale, out_t, scale_t
 
