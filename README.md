@@ -87,7 +87,7 @@ PithTrain is structured in three layers:
   - *Pipeline Engine* — DualPipeV scheduler with 5-stage overlapped forward-backward execution and P2P communication.
   - *Distributed Training* — Pipeline, data, context, and expert parallelism (PP x FSDP x CP x EP).
   - *Training Infrastructure* — `torch.compile`, optimizer and LR scheduling, checkpointing, logging, etc.
-- **Operator** — PyTorch (basic ops, NCCL), operator libraries (DeepGEMM, FlashAttention), and Python DSLs (Triton).
+- **Operator** — PyTorch (basic ops, NCCL), operator libraries (DeepGEMM, FlashAttention), and Python DSLs (CuTeDSL, Triton).
 
 ## Contributing
 
