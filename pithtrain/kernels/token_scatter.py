@@ -38,7 +38,6 @@ def compute_group_offsets_kernel(
 ):
     pid = tl.program_id(0)
 
-    # bincount over all CTAs
     for token_start in range(pid * BLOCK, num_tokens, num_ctas * BLOCK):
         token_offs = token_start + tl.arange(0, BLOCK)
         token_mask = token_offs < num_tokens

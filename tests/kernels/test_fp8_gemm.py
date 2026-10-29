@@ -462,7 +462,7 @@ KGROUPED_CASES = [
     ([256, 0, 384], 384, 256, None, None),  # transposed, small
     # padded operands (more channels than d), as the fused ops lay them out
     ([256, 0, 384], 2880, 2880, 3072, None),  # a padded to a multiple of 256
-    ([256, 0, 384], 2880, 2880, None, 3072),  # only b padded: transposed temporary
+    ([256, 0, 384], 2880, 2880, None, 3072),  # transposed temporary
     ([256, 0, 384], 2880, 2880, 3072, 3072),
     ([256, 0, 384], 5760, 2880, 5888, 3072),
     ([256, 0, 384], 2880, 1024, 2944, None),  # a padded to an odd block count
@@ -550,6 +550,5 @@ def test_act_weight_gemm_and_dgrad_wgrad(M: int, K: int, N: int) -> None:
     dyt_q, dyt_scale = ref_rowwise(dy.T.contiguous())
     ref_wg = dq_rowwise(dyt_q, dyt_scale) @ dq_blockwise(xt_fp8, xt_scale).T
     assert calc_diff(weight_grad, ref_wg) < 1e-3
-    # and close to the unquantized products
     assert calc_diff(grad_input, dy.float() @ w.float()) < 1e-2
     assert calc_diff(weight_grad, dy.float().T @ x.float()) < 1e-2

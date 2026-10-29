@@ -601,7 +601,7 @@ class DualPipeV(nn.Module):
             self.forward_chunk(1, send=(not self.is_last_pp_rank) or (i < step_2 - 1))
             self.send_forward(0)
 
-        # Step 3: nB1W1F1 (Use zero bubble)
+        # Step 3: nB1W1F1
         step_3 = pp_size - pp_rank - 1
         for i in range(step_3):
             self.backward_chunk(1, enable_zb=True)
@@ -643,7 +643,7 @@ class DualPipeV(nn.Module):
                 enable_zb = True
             self.backward_chunk(0, enable_zb=enable_zb)
 
-        # Step 7: nWB0 (Use zero bubble)
+        # Step 7: nWB0
         step_7 = pp_size - pp_rank - 1
         for i in range(step_7):
             self.weight_chunk()
@@ -719,8 +719,8 @@ def overlapped_forward_backward(
     module1_layers = list(module1.layers.values())
 
     (hidden_states,) = inputs0
-    layer_idx0 = 0  # Index into chunk_record0.layers
-    dispatch_tokens_grad = moe_outs = None  # carried across loop iterations
+    layer_idx0 = 0
+    dispatch_tokens_grad = moe_outs = None
 
     ctx = ExecutionCtx(comm_stream=comm_stream)
 

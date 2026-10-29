@@ -215,7 +215,6 @@ def test_edge_cases():
     device = torch.device("cuda")
     dtype = torch.float32
 
-    # All groups empty.
     num_groups = 4
     group_sizes = [0, 0, 0, 0]
     M_total = sum(group_sizes)
@@ -233,7 +232,6 @@ def test_edge_cases():
     assert x.grad.shape == x.shape, "Input grad shape mismatch"
     assert weight.grad.shape == weight.shape, "Weight grad shape mismatch"
 
-    # One token per group.
     num_groups = 8
     group_sizes = [1, 1, 1, 1, 1, 1, 1, 1]
     M_total = sum(group_sizes)
@@ -251,7 +249,6 @@ def test_edge_cases():
         f"Single token per group mismatch! Max diff: {max_diff}"
     )
 
-    # One large group.
     num_groups = 1
     group_sizes = [1000]
     M_total = sum(group_sizes)
@@ -368,7 +365,6 @@ def test_scatter_for_grouped_gemm_edge_cases():
     device = torch.device("cuda")
     dtype = torch.float32
 
-    # m = 0.
     sorted_tokens = torch.randn(0, 128, device=device, dtype=dtype)
     expert_idxs = torch.empty(0, device=device, dtype=torch.int64)
     out, reverse, offs, _, _ = scatter_for_grouped_gemm(sorted_tokens, expert_idxs, 8)
@@ -376,7 +372,6 @@ def test_scatter_for_grouped_gemm_edge_cases():
     assert reverse.shape == (0,), f"Expected (0,), got {reverse.shape}"
     assert offs.shape == (0,), f"Expected (0,), got {offs.shape}"
 
-    # All tokens to one expert.
     m, hidden_size, num_groups = 32, 256, 8
     sorted_tokens = torch.randn(m, hidden_size, device=device, dtype=dtype)
     expert_idxs = torch.full((m,), 3, device=device, dtype=torch.int64)
@@ -385,7 +380,6 @@ def test_scatter_for_grouped_gemm_edge_cases():
         sorted_tokens, expert_idxs, num_groups
     )
     verify_scatter_result(sorted_tokens, expert_idxs, num_groups, out_new, reverse_new, offs_new)
-    # Every group but 3 is all-zero padding.
     group_starts = [0] + offs_new.tolist()
     for group_idx in range(num_groups):
         if group_idx != 3:
@@ -402,7 +396,6 @@ def test_scatter_for_grouped_gemm_edge_cases():
     )
     verify_scatter_result(sorted_tokens, expert_idxs, num_groups, out_new, reverse_new, offs_new)
 
-    # hidden_size = 1.
     m, hidden_size, num_groups = 8, 1, 2
     sorted_tokens = torch.randn(m, hidden_size, device=device, dtype=dtype)
     expert_idxs = torch.randint(0, num_groups, (m,), device=device, dtype=torch.int64)
@@ -412,7 +405,6 @@ def test_scatter_for_grouped_gemm_edge_cases():
     )
     verify_scatter_result(sorted_tokens, expert_idxs, num_groups, out_new, reverse_new, offs_new)
 
-    # bf16.
     m, hidden_size, num_groups = 24, 256, 4
     sorted_tokens = torch.randn(m, hidden_size, device=device, dtype=torch.bfloat16)
     expert_idxs = torch.randint(0, num_groups, (m,), device=device, dtype=torch.int64)
@@ -531,13 +523,11 @@ def test_grouped_linear_weight_grad_store():
     x_raw = torch.randn(M_total, in_features, device=device, dtype=dtype)
     grad = torch.randn(M_total, out_features, device=device, dtype=dtype)
 
-    # Reference: no WeightGradStore.
     x_ref = x_raw.detach().clone().requires_grad_(True)
     layer_ref(x_ref, grouped_mm_offs).backward(grad)
     ref_weight_grad = layer_ref.weight.grad.clone()
     ref_input_grad = x_ref.grad.clone()
 
-    # Deferred path.
     layer = GroupedLinear(num_groups, in_features, out_features).to(device).to(dtype)
     layer.weight.data.copy_(layer_ref.weight.data)
     x_def = x_raw.detach().clone().requires_grad_(True)
@@ -612,13 +602,11 @@ def test_gpt_oss_experts_weight_grad_store_matches_direct(monkeypatch):
     experts_def = experts_def.to(device=device, dtype=dtype)
     experts_def.load_state_dict(experts_ref.state_dict())
 
-    # Run 1: WeightGradStore disabled.
     x_ref = x_raw.detach().clone().requires_grad_(True)
     out_ref = experts_ref(x_ref, offs, ks=ks)
     grad = torch.randn_like(out_ref)
     out_ref.backward(grad)
 
-    # Run 2: WeightGradStore enabled (weight wgrads deferred, bias bgrads eager).
     x_def = x_raw.detach().clone().requires_grad_(True)
     WeightGradStore.enabled = True
     try:

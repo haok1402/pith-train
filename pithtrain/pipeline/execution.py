@@ -440,7 +440,6 @@ def stage5_stage1_f(ctx: ExecutionCtx, prev_layer: LayerProtocol, next_layer: La
     moe_local_idxs = routing.moe_local_idxs if routing is not None else None
     fused = getattr(next_layer, "forward_stage5_stage1", None)
     if fused is not None:
-        # One compiled region for prev_layer's stage 5 and next_layer's stage 1 (model opt-in).
         dispatch_tokens, next_residual, next_routing = fused(prev_layer, moe_outs, moe_local_idxs, topk_weight, residual, rotary_posemb, cu_seqlens)  # fmt: skip
     else:
         hidden_states = prev_layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)

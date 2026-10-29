@@ -314,7 +314,7 @@ def test_param_gather_pipeline(shape: tuple, n: int, kind: str) -> None:
     full_fp8, full_scale = ref_blockwise(as_3d(master.bfloat16()))
     full_fp8_t, full_scale_t = ref_blockwise(as_3d(master.bfloat16()).transpose(1, 2))
 
-    # 1. Per-shard amax into a zeroed grid (only the tiles the shard touches), then MAX-reduce.
+    # Per-shard amax into a zeroed grid (only the tiles the shard touches), then MAX-reduce.
     amax = torch.zeros(G, R, C, device="cuda")
     for local, row_offset, group_offset in shards:
         shard_amax = torch.zeros(G, R, C, device="cuda")
@@ -323,14 +323,13 @@ def test_param_gather_pipeline(shape: tuple, n: int, kind: str) -> None:
         amax = torch.maximum(amax, shard_amax)
     assert_f32_equal("reduced amax", amax, ref_amax(as_3d(master.bfloat16())))
 
-    # 2. Scales and their transpose.
     scale = torch.full((G, R, C), -1.0, device="cuda")
     scale_t = torch.full((G, C, R), -1.0, device="cuda")
     fp8_scales(amax, scale, scale_t)
     assert_f32_equal("scale", scale, full_scale)
     assert_f32_equal("scale_t", scale_t, full_scale_t)
 
-    # 3. Each shard cast with the reduced grid; the gathered bytes are the full weight's FP8.
+    # Each shard cast with the reduced grid; the gathered bytes are the full weight's FP8.
     parts = []
     for local, row_offset, group_offset in shards:
         out = torch.empty(local.shape, dtype=torch.float8_e4m3fn, device="cuda")
@@ -339,7 +338,6 @@ def test_param_gather_pipeline(shape: tuple, n: int, kind: str) -> None:
     gathered = torch.cat(parts, dim=1 if len(shape) == 2 else 0)
     assert_fp8_equal("gathered fp8", gathered, full_fp8)
 
-    # 4. Pack with the transpose into one flat byte buffer.
     numel = gathered.numel()
     packed = torch.full((2 * numel,), 0x55, dtype=torch.uint8, device="cuda")
     fp8_pack_transpose(gathered, packed)

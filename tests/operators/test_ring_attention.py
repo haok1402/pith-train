@@ -107,9 +107,7 @@ def test_ring_attention_vs_dense(cp_size: int, req: Request) -> None:
     launch(cfg, verify, req)
 
 
-# ---------------------------------------------------------------------------
 # Packed sequences: every document zigzag-sharded on its own.
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -204,11 +202,6 @@ def test_ring_attention_varlen_vs_full(cp_size: int, req: VarlenRequest) -> None
     cfg = DistributedCfg()
     cfg.context_parallel_size = cp_size
     launch(cfg, verify_varlen, req)
-
-
-# ---------------------------------------------------------------------------
-# MLA "pass the latent" ring attention.
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -345,11 +338,6 @@ def test_mla_ring_attention_vs_dense(cp_size: int, req: MLARequest) -> None:
     cfg = DistributedCfg()
     cfg.context_parallel_size = cp_size
     launch(cfg, verify_mla, req)
-
-
-# ---------------------------------------------------------------------------
-# FP8 in-ring kv_b decompression (pass-latent CP with training.fp8 enabled).
-# ---------------------------------------------------------------------------
 
 
 def record_mla_fp8(req: MLARequest):

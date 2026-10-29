@@ -31,7 +31,7 @@ __all__ = ["dense_gated_delta_rule", "gated_delta_rule"]
 # head_k_dim=128.
 fla.ops.common.chunk_o.TRITON_ABOVE_3_4_0 = False
 
-CHUNK_SIZE = 64  # FLA chunk size (BT) for the gated delta rule
+CHUNK_SIZE = 64  # FLA's chunk size (BT)
 
 
 @lru_cache(maxsize=None)

@@ -247,7 +247,7 @@ def memoized_launch(kind: str, inputs: Dict[str, Optional[torch.Tensor]], scalar
     key = signature(kind, inputs, *scalars)
     plan = plans.get(key, MISSING)
     if plan is MISSING:
-        # First call of the signature: plain entry, which compiles whatever it needs.
+        # The plain entry compiles whatever this signature needs.
         plans[key] = SEEN
         return entry()
     if plan is SEEN:

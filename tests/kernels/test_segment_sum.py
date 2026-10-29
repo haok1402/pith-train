@@ -49,7 +49,6 @@ def check(counts, H, dtype, out_dtype, seed=0):
     offs = offsets(counts)
     got = segment_sum_along_rows(x, offs, out_dtype)
     assert got.dtype == out_dtype and got.shape == (len(counts), H)
-    # Deterministic run to run.
     assert torch.equal(got, segment_sum_along_rows(x, offs, out_dtype))
     # Close to the exact sum (fp32 accumulation, then one rounding to out_dtype).
     got32 = segment_sum_along_rows(x, offs, torch.float32)

@@ -446,7 +446,6 @@ class Qwen35MoeDecoderLayer(nn.Module):
         self.input_layernorm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)  # fmt: skip
 
-        # Convert at the ends of each run of linear-attention layers.
         layer_types = config.layer_types
         linear_at = lambda i: 0 <= i < len(layer_types) and layer_types[i] == "linear_attention"
         sharded = distributed.cp_size > 1

@@ -358,7 +358,6 @@ def install_raw_fp8_param_gather(model: nn.Module) -> None:
             holder = RawParamHolder()
             holder.register_buffer("weight_scale", torch.empty(grid, dtype=torch.float32, device=device), persistent=False)  # fmt: skip
             holder.register_buffer("weight_scale_t", torch.empty(G, grid[2], grid[1], dtype=torch.float32, device=device), persistent=False)  # fmt: skip
-            # Plain dict in __dict__: not a submodule, so invisible to state_dict and FSDP.
             module.__dict__.setdefault(HOLDERS_KEY, {})[name] = holder
             state = FP8ParamState(holder, fsdp_param, shape, 0, offset, torch.empty(0))
             group = mesh_info.shard_process_group

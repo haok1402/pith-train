@@ -189,7 +189,7 @@ def test_swiglu_forward_backward(case, layout):
     wd = (torch.randn(G, H, inter, device="cuda") * inter**-0.5).to(torch.bfloat16)
     xg = x[a_idx.long()]
 
-    # gated forward: preact (gate, up) pairs whatever the address order; h from rounded preact
+    # preact (gate, up) pairs whatever the address order; h from rounded preact
     pre, h = bf16_expert_gated_forward(x, wg, wu, cu, a_idx)
     assert pre.shape == (M, 2 * inter) and h.shape == (M, inter)
     g_ref, g_abs = gmm(xg, wg, counts)
@@ -200,14 +200,13 @@ def test_swiglu_forward_backward(case, layout):
     h_ref = swiglu_ref(g16, u16)
     assert_within(h, h_ref, h_ref.abs(), "h")
 
-    # down, rows scattered to slot_of
     out = bf16_expert_down_forward_scattered(h, wd, cu, slot_of)
     y_ref, y_abs = gmm(h, wd, counts)
     ref, ref_abs = torch.empty_like(y_ref), torch.empty_like(y_abs)
     ref[slot_of.long()], ref_abs[slot_of.long()] = y_ref, y_abs
     assert_within(out, ref, ref_abs, "down")
 
-    # dgated: dy read by slot_of, dpre in the weights' address order, h re-emitted bit for bit
+    # dy read by slot_of, dpre in the weights' address order, h re-emitted bit for bit
     dy = torch.randn(M, H, **BF16)
     dpre, h2, swapped = bf16_expert_dgated_backward(dy, wd, pre, cu, slot_of, wg, wu)
     assert swapped == (wu.data_ptr() < wg.data_ptr()) == (layout == "swapped")
@@ -219,13 +218,12 @@ def test_swiglu_forward_backward(case, layout):
     assert_within(dg, dg_ref, dg_abs.abs(), "dgate")
     assert_within(du, du_ref, du_abs.abs(), "dup")
 
-    # dgrad: one GEMM over K = 2I summing the gate and up halves in fp32
+    # one GEMM over K = 2I summing the gate and up halves in fp32
     dx = bf16_expert_dgrad(dpre, wg, wu, cu, swapped)
     a, a_abs = gmm(dg, wg, counts, trans=False)
     b, b_abs = gmm(du, wu, counts, trans=False)
     assert_within(dx, a + b, a_abs + b_abs, "dgrad")
 
-    # deterministic
     pre2, h3 = bf16_expert_gated_forward(x, wg, wu, cu, a_idx)
     assert torch.equal(pre, pre2) and torch.equal(h, h3)
     assert torch.equal(out, bf16_expert_down_forward_scattered(h, wd, cu, slot_of))

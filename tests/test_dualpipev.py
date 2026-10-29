@@ -378,7 +378,6 @@ def main(model_name: str):
         shard_experts(local_full_modules[0], ep_rank=ep_rank, ep_size=ep_size)
         shard_experts(local_full_modules[1], ep_rank=ep_rank, ep_size=ep_size)
 
-    # Create the local modules with the same weights but zero gradients.
     local_modules = []
 
     local_modules.append(ModelClass(config, phase=0))

@@ -36,7 +36,7 @@ def check(x, expert_idxs, G, alignment=128, group_counts=None):
     pos = reverse_idxs - starts[expert_idxs]
     assert torch.all(pos >= 0) and torch.all(pos < counts.to(x.device)[expert_idxs])
     assert torch.unique(reverse_idxs).numel() == m
-    assert torch.equal(out[reverse_idxs], x)  # bit for bit
+    assert torch.equal(out[reverse_idxs], x)
     # All other rows (the padding of every group) are zero.
     pad = torch.ones(out.shape[0], dtype=torch.bool, device=x.device)
     pad[reverse_idxs] = False

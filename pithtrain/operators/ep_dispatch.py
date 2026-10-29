@@ -69,8 +69,7 @@ class PendingDispatch:
         dedup_input_splits = host_counts[ep_size : 2 * ep_size]
         recv_counts = host_counts[2 * ep_size :]
         dedup_output_splits = recv_counts[experts_per_rank::stride]
-        # Rows received per sender and rows per local expert; stage 3 groups its GEMMs by the
-        # latter, so its scatter need not sync to learn them.
+        # Stage 3 groups its GEMMs by expert_counts, so its scatter need not sync to learn them.
         output_splits = [sum(recv_counts[sender * stride : sender * stride + experts_per_rank]) for sender in range(ep_size)]  # fmt: skip
         expert_counts = [
             sum(recv_counts[expert::stride][:ep_size]) for expert in range(experts_per_rank)

@@ -143,7 +143,6 @@ def test_non_contiguous_logits_return_a_copy():
     assert grad.is_contiguous() and grad.data_ptr() != wide.data_ptr()
     torch.testing.assert_close(loss, want_loss, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(grad.float(), want_grad, rtol=2**-8, atol=1e-6 / num_counted)
-    # Strided target (every other element of a longer tensor).
     strided_target = torch.stack([target, torch.zeros_like(target)], 1).reshape(-1)[::2]
     assert not strided_target.is_contiguous() or strided_target.stride(-1) != 1
     loss2, _ = cross_entropy_fwd_inplace(logits.contiguous(), strided_target, IGNORE)

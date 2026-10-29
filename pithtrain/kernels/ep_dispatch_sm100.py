@@ -18,7 +18,7 @@ def dedup_bincount_kernel(
     per_cta_expert_hist_ptr,  # [num_ctas * NE_PADDED] int64, output
     per_cta_rank_hist_ptr,  # [num_ctas * EP_PADDED] int64, output
     M,
-    topk_row_stride,  # topk_ids.stride(0)
+    topk_row_stride,
     TOPK: tl.constexpr,
     EP_SIZE: tl.constexpr,
     EXPERTS_PER_RANK: tl.constexpr,
