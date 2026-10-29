@@ -14,7 +14,6 @@ import sys
 import textwrap
 
 import pytest
-import torch
 
 from pithtrain.kernels import bf16_experts_supported, fp8_fused_experts_supported
 
@@ -30,7 +29,7 @@ def quack_version() -> str | None:
 
 def h200() -> bool:
     """The H200 (SM90) path, told by a capability query rather than an architecture probe."""
-    return torch.cuda.is_available() and fp8_fused_experts_supported()
+    return fp8_fused_experts_supported()
 
 
 def run(code: str) -> None:
@@ -94,7 +93,6 @@ def test_other_quack_version_disables_and_warns_once(version):
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_non_sm90_disables_and_warns_once():
     run(
         """

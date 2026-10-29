@@ -188,7 +188,6 @@ class GuardSkip:
             _ambient(),
             modes,
             training.fp8,
-            getattr(training, "fp8_param_gather", None),
             distributed.ep_size,
             distributed.cp_size,
             distributed.pp_size,

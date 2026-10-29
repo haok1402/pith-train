@@ -71,8 +71,6 @@ def make_inputs(
 
 
 def h200_path_available() -> bool:
-    if not torch.cuda.is_available():
-        return False
     q, k, v, g, beta, _ = make_inputs(64)
     return gated_delta_rule_pinned_supported(q, k, v, g, beta)
 

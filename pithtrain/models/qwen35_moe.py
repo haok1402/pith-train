@@ -219,7 +219,7 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         if distributed.cp_size > 1:
             core_attn_out = gated_delta_rule(query, key, value, g, beta, distributed.cp_group)
         else:
-            core_attn_out = gated_delta_rule(query, key, value, g, beta, pinned=training.fp8)
+            core_attn_out = gated_delta_rule(query, key, value, g, beta)
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         core_attn_out = self.norm(core_attn_out, z)

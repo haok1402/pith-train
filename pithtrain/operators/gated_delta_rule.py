@@ -173,20 +173,21 @@ def _fold_batch(t: torch.Tensor) -> torch.Tensor:
     """
     return t.transpose(0, 1).reshape(1, t.shape[1], -1, *t.shape[3:])
 
-def gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, cp_group: Optional[ProcessGroup] = None, pinned: bool = False) -> torch.Tensor:
+def gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, cp_group: Optional[ProcessGroup] = None) -> torch.Tensor:
     """
     Chunked gated delta rule over [b, s, heads, dim], returning [b, s, value_heads, value_dim].
     q and k may have fewer heads than v, g and beta (a divisor): each key head then serves a
     group of consecutive value heads.
 
     With a cp_group the recurrence is sharded over it, s is the rank-local length, and the
-    caller must already hold the contiguous layout. pinned routes the dense path (no cp_group)
-    through FLA's kernels launched with their autotuned configs pinned (dense_gated_delta_rule),
-    which also reads grouped q / k without repeating them; bit-identical and far cheaper on the
-    host, where the installed versions, GPU and call geometry match the recorded configs. The
-    other paths repeat_interleave grouped q / k first.
+    caller must already hold the contiguous layout. Without a cp_group the dense path goes
+    through FLA's kernels launched with their autotuned configs pinned (dense_gated_delta_rule)
+    wherever gated_delta_rule_pinned_supported says the installed versions, GPU and call geometry
+    match the recorded configs; it reads grouped q / k without repeating them, and is
+    bit-identical and far cheaper on the host. The other paths repeat_interleave grouped q / k
+    first.
     """
-    if cp_group is None and pinned and gated_delta_rule_pinned_supported(q, k, v, g, beta):
+    if cp_group is None and gated_delta_rule_pinned_supported(q, k, v, g, beta):
         return dense_gated_delta_rule(q, k, v, g, beta)
     repeats = v.shape[2] // q.shape[2]
     if repeats > 1:

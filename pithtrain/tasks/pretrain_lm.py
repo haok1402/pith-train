@@ -231,7 +231,7 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
-    if training.fp8_param_gather:
+    if training.fp8:
         precompute_fp8_param_scales()
     MoELoadBalanceLossTracker.reset()
 
@@ -337,7 +337,7 @@ def launch(cfg: PretrainLMCfg) -> None:
     step = find_checkpoint(cfg.training.save_location)
     if step is not None:
         load_checkpoint(cfg.training.save_location, step)
-        if training.fp8_param_gather:
+        if training.fp8:
             precompute_fp8_param_scales()
     step = step or 0
     # Freeze the startup heap (model, datasets, compiled graphs) out of the collector, so the

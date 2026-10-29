@@ -402,7 +402,9 @@ def apply_fsdp(model, hsdp_replica: int = 1):
         if isinstance(module, FSDPModule):
             module.set_gradient_divide_factor(1.0)
 
-    if training.fp8_param_gather:
+    # FP8 weights are always all-gathered in FP8, as Megatron-LM's --fp8-param-gather does: the
+    # operands are bit-identical to quantizing the gathered bf16 weight (see fp8_param_gather.py).
+    if training.fp8:
         install_fp8_param_gather(model, (FP8Linear, FP8GroupedLinear))
         # gpt-oss keeps its routed experts as raw parameters; after the call above, which resets
         # the gather's registry.
@@ -415,10 +417,6 @@ def setup_model(
     distributed_cfg: DistributedCfg,
 ) -> None:
     training.fp8 = cfg.fp8
-    # FP8 weights are always all-gathered in FP8, as Megatron-LM's --fp8-param-gather does: the
-    # operands are bit-identical to quantizing the gathered bf16 weight (see fp8_param_gather.py).
-    training.fp8_param_gather = cfg.fp8
-    training.norm_recompute = not cfg.fp8  # BF16: recompute the RMSNorm outputs (recompute.py)
     training.Linear = FP8Linear if cfg.fp8 else BF16Linear
     training.GroupedLinear = FP8GroupedLinear if cfg.fp8 else GroupedLinear
 

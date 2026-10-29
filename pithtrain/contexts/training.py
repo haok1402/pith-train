@@ -31,18 +31,6 @@ This and the two class bindings below are read from module constructors and kern
 configuration object, so they live here rather than being passed down.
 """
 
-fp8_param_gather: bool = False
-"""
-Whether the FP8 linear weights are all-gathered in FP8 (see pithtrain/modules/fp8_param_gather.py).
-Always equal to fp8.
-"""
-
-norm_recompute: bool = False
-"""
-Whether BF16 compiled stage 1 recomputes the two hidden-size RMSNorm outputs in backward instead of
-saving them (set for every BF16 run; pithtrain/modules/recompute.py).
-"""
-
 
 Linear: type[linear.BF16Linear | linear.FP8Linear]
 """

@@ -25,8 +25,6 @@ import torch
 
 from pithtrain.kernels import expert_and_expand_idx, fused_dedup_prepare_dispatch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-
 # (num_experts, top-k) of the models: deepseek-v2-lite, qwen3-30b-a3b, qwen3.5-35b-a3b,
 # gpt-oss-20b, gpt-oss-120b
 MODELS = [(64, 6), (128, 8), (256, 8), (32, 4), (128, 4)]

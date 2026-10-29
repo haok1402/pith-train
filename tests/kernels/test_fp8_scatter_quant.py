@@ -27,7 +27,7 @@ import torch
 from pithtrain.kernels import fp8_fused_experts_supported, scatter_quant
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not fp8_fused_experts_supported(),
+    not fp8_fused_experts_supported(),
     reason="needs the fused FP8 expert path (fp8_fused_experts_supported)",
 )
 

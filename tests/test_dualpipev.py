@@ -260,8 +260,6 @@ def main(model_name: str):
         training.fp8 = True
         training.Linear = FP8Linear
         training.GroupedLinear = FP8GroupedLinear
-    # As setup_model: under BF16, stage 1 recomputes its two RMSNorm outputs, unless NORM_RECOMPUTE=0.
-    training.norm_recompute = not training.fp8
 
     packed = os.environ.get("PACKED_SEQLEN", "0") == "1"
     ragged = os.environ.get("RAGGED_MICROBATCH", "0") == "1"

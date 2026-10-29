@@ -49,7 +49,6 @@ __all__ = [
     "FP8ScatterQuantFunc",
     "FP8SwiGLUExpertsFunc",
     "FP8SwiGLUGateUpExpertsFunc",
-    "RECOMPUTE_GATE_UP",
     "fp8_clamped_swiglu_experts",
     "fp8_padded_wgrad",
     "fp8_scatter_quant",
@@ -72,11 +71,8 @@ class FP8SwiGLUExpertsFunc(torch.autograd.Function):
 
     The K-major FP8 h that down_proj's wgrad reads is not kept from the forward but quantized
     again from the saved gate and up in backward (one more silu_mul_quant pass, deterministic, so
-    the bytes are the same), which drops it from the saved activations. recompute_h = False keeps
-    it.
+    the bytes are the same), which drops it from the saved activations.
     """
-
-    recompute_h: bool = True
 
     @staticmethod
     def forward(
@@ -104,15 +100,13 @@ class FP8SwiGLUExpertsFunc(torch.autograd.Function):
         up = fp8_m_grouped_gemm(
             (x_fp8, x_scale), quantized_up[:2], inter, grouped_mm_offs, group_indices
         )
-        h_fp8, h_scale, h_kmajor, h_kmajor_scale = silu_mul_quant_fwd(gate, up, grouped_mm_offs)
+        h_fp8, h_scale, _, _ = silu_mul_quant_fwd(gate, up, grouped_mm_offs)
         y = fp8_m_grouped_gemm(
             (h_fp8, h_scale), quantized_down[:2], hidden, grouped_mm_offs, group_indices
         )
         del h_fp8, h_scale
-        if FP8SwiGLUExpertsFunc.recompute_h:
-            h_kmajor = h_kmajor_scale = None
         ctx.save_for_backward(
-            gate, up, x_kmajor, x_kmajor_scale, h_kmajor, h_kmajor_scale,
+            gate, up, x_kmajor, x_kmajor_scale,
             grouped_mm_offs, ks_tensor,
             quantized_gate[2], quantized_gate[3], quantized_up[2], quantized_up[3],
             quantized_down[2], quantized_down[3],
@@ -124,7 +118,7 @@ class FP8SwiGLUExpertsFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dy: torch.Tensor):
         (
-            gate, up, x_kmajor, x_kmajor_scale, h_kmajor, h_kmajor_scale,
+            gate, up, x_kmajor, x_kmajor_scale,
             grouped_mm_offs, ks_tensor,
             w_gate_t, w_gate_scale_t, w_up_t, w_up_scale_t, w_down_t, w_down_scale_t,
         ) = ctx.saved_tensors  # fmt: skip
@@ -135,8 +129,7 @@ class FP8SwiGLUExpertsFunc(torch.autograd.Function):
 
         # Locals are dropped as soon as their last reader is queued, to keep the transient peak of
         # the backward low; the deferred wgrads keep only the K-major operands they need.
-        if h_kmajor is None:
-            _, _, h_kmajor, h_kmajor_scale = silu_mul_quant_fwd(gate, up, grouped_mm_offs)
+        _, _, h_kmajor, h_kmajor_scale = silu_mul_quant_fwd(gate, up, grouped_mm_offs)
         dy_fp8, dy_scale, dy_kmajor, dy_kmajor_scale = quantize_grouped_input(dy, grouped_mm_offs)
         del dy
         dh = fp8_m_grouped_gemm(
@@ -411,15 +404,6 @@ def fp8_padded_wgrad(
         accumulate_wgrad(a, b, ks, ks_tensor)
 
 
-RECOMPUTE_GATE_UP: bool = False
-"""
-Keep x's rowwise FP8 (1 B/element of hidden) instead of the bf16 gate_up GEMM output
-(2 B/element of 2 * intermediate, 4x more for gpt-oss) and redo the gate_up GEMM in backward.
-Bit-identical (the GEMM is deterministic); trades one extra grouped GEMM per layer and micro-batch
-for the saved gate_up activation. Off by default.
-"""
-
-
 class FP8ClampedSwiGLUExpertsFunc(torch.autograd.Function):
     """
     gate_up (+bias) -> clamped SwiGLU -> down (+bias) for gpt-oss FP8 experts on Hopper. See the
@@ -461,18 +445,11 @@ class FP8ClampedSwiGLUExpertsFunc(torch.autograd.Function):
             (h_fp8, h_scale), quantized_down[:2], hidden, grouped_mm_offs, group_indices
         )
         group_bias_add_(y, b_down, group_indices)
-        recompute = RECOMPUTE_GATE_UP
-        saved = (
-            (x_fp8, x_scale, quantized_gate_up[0], quantized_gate_up[1])
-            if recompute
-            else (gate_up,)
-        )
         ctx.save_for_backward(
             b_gate_up, x_kmajor, x_kmajor_scale, grouped_mm_offs, ks_tensor,
             quantized_gate_up[2], quantized_gate_up[3], quantized_down[2], quantized_down[3],
-            *saved,
+            gate_up,
         )  # fmt: skip
-        ctx.recompute = recompute
         ctx.weights = (w_gate_up, w_down)
         ctx.main_grads = main_grads
         ctx.ks, ctx.group_indices = ks, group_indices
@@ -484,24 +461,11 @@ class FP8ClampedSwiGLUExpertsFunc(torch.autograd.Function):
     def backward(ctx, dy: torch.Tensor):
         (
             b_gate_up, x_kmajor, x_kmajor_scale, grouped_mm_offs, ks_tensor,
-            w_gate_up_t, w_gate_up_scale_t, w_down_t, w_down_scale_t, *saved,
+            w_gate_up_t, w_gate_up_scale_t, w_down_t, w_down_scale_t, gate_up,
         ) = ctx.saved_tensors  # fmt: skip
         w_gate_up, w_down = ctx.weights
         ks, group_indices = ctx.ks, ctx.group_indices
         inter, hidden = w_down.shape[2], w_down.shape[1]
-        if ctx.recompute:
-            x_fp8, x_scale, w_gate_up_fp8, w_gate_up_scale = saved
-            gate_up = fp8_m_grouped_gemm(
-                (x_fp8, x_scale),
-                (w_gate_up_fp8, w_gate_up_scale),
-                w_gate_up.shape[1],
-                grouped_mm_offs,
-                group_indices,
-            )
-            del saved, x_fp8, x_scale
-        else:
-            (gate_up,) = saved
-
         dy = dy.contiguous()
         d_b_down = segment_sum_along_rows(dy, grouped_mm_offs, ctx.b_down_dtype)
         dy_fp8, dy_scale, dy_kmajor, dy_kmajor_scale = quantize_grouped_input(dy, grouped_mm_offs)

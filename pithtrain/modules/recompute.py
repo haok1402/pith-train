@@ -8,9 +8,9 @@ forward to backward. Megatron-LM's ``recompute_modules=["layernorm"]`` drops the
 again in backward. :func:`norm_recompute` does the same with a selective-checkpoint policy: only
 ``aten._fused_rms_norm`` on hidden-size inputs is recomputed (the q/k head norms and DeepSeek's
 latent norms have other widths and stay saved); GEMMs, attention and the pithtrain custom ops must
-be saved; everything else is left to the partitioner as before. BF16 only (``training.
-norm_recompute``); the forward is unchanged and the recomputed norms are the same kernels on the
-same saved inputs.
+be saved; everything else is left to the partitioner as before. BF16 only (``training.fp8``
+unset); the forward is unchanged and the recomputed norms are the same kernels on the same saved
+inputs.
 """
 
 from functools import partial
@@ -50,8 +50,8 @@ def _context(hidden_size: int):
 def norm_recompute(fn, hidden_size: int, *args):
     """
     ``fn(*args)``, with the hidden-size RMSNorm outputs recomputed in backward instead of saved
-    when ``training.norm_recompute`` is set. Call it inside the compiled region.
+    under BF16 (``training.fp8`` unset). Call it inside the compiled region.
     """
-    if not training.norm_recompute:
+    if training.fp8:
         return fn(*args)
     return checkpoint(fn, *args, use_reentrant=False, context_fn=partial(_context, hidden_size))

@@ -162,12 +162,6 @@ class DualPipeV(nn.Module):
     gradients once at the end of the step.
     """
 
-    reduce_on_compute_stream: bool = True
-    """
-    Run FSDP's end-of-step reduce-scatter copies on the compute stream (see step()). Numerics are
-    unchanged; it only decides which caching-allocator pool the reduce buffers come from.
-    """
-
     def __init__(self, modules: Tuple[nn.Module, nn.Module]) -> None:
         super().__init__()
 
@@ -721,13 +715,12 @@ class DualPipeV(nn.Module):
         for module in self.module:
             if not isinstance(module, FSDPModule):
                 continue
-            if self.reduce_on_compute_stream:
-                # Nothing overlaps the end-of-step reduce, so run its copies on the compute
-                # stream: buffers then come from the compute stream's allocator pool, which the
-                # pipeline has just emptied, instead of a reduce-scatter pool per root that stays
-                # reserved (and unusable by the pipeline) through the whole next step.
-                comm_ctx = fully_shard.state(module)._comm_ctx
-                comm_ctx.reduce_scatter_stream = torch.cuda.current_stream()
+            # Nothing overlaps the end-of-step reduce, so run its copies on the compute stream:
+            # buffers then come from the compute stream's allocator pool, which the pipeline has
+            # just emptied, instead of a reduce-scatter pool per root that stays reserved (and
+            # unusable by the pipeline) through the whole next step.
+            comm_ctx = fully_shard.state(module)._comm_ctx
+            comm_ctx.reduce_scatter_stream = torch.cuda.current_stream()
             module.set_is_last_backward(True)
             module.set_reshard_after_backward(True)
             module.set_requires_gradient_sync(True)

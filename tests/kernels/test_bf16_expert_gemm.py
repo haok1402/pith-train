@@ -41,7 +41,7 @@ from pithtrain.kernels import (
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not bf16_experts_supported(),
+    not bf16_experts_supported(),
     reason="needs the fused BF16 CuTe experts (bf16_experts_supported)",
 )
 
