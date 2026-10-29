@@ -7,10 +7,10 @@ import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR
 
-__all__ = ["fp8cast_rowwise_transpose"]
+__all__ = ["fp8_quant_grad"]
 
 
-def fp8cast_rowwise_transpose(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8_quant_grad(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Rowwise 1x128 FP8 of x and of x.T from one read of x, returning (x_fp8, x_scale, xt_fp8,
     xt_scale): the grad_output operands of the dense FP8 linear's dgrad and wgrad.
@@ -26,10 +26,10 @@ def fp8cast_rowwise_transpose(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     """
     match ARCH_MAJOR:
         case 9:
-            from pithtrain.kernels.fp8_rowwise_transpose_sm90 import fp8cast_rowwise_transpose_sm90
-            return fp8cast_rowwise_transpose_sm90(x)
+            from pithtrain.kernels.fp8_rowwise_transpose_sm90 import fp8_quant_grad_sm90
+            return fp8_quant_grad_sm90(x)
         case 10:
-            from pithtrain.kernels.fp8_rowwise_transpose_sm100 import fp8cast_rowwise_transpose_sm100
-            return fp8cast_rowwise_transpose_sm100(x)
+            from pithtrain.kernels.fp8_rowwise_transpose_sm100 import fp8_quant_grad_sm100
+            return fp8_quant_grad_sm100(x)
         case _:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")

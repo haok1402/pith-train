@@ -12,7 +12,7 @@ import triton.language as tl
 from pithtrain.kernels.arch import NATIVE_E8M0
 from pithtrain.kernels.fp8_scale import compute_fp8_scale
 
-__all__ = ["fp8_pack_transpose_sm100", "fp8_scales_sm100", "fp8_shard_amax_sm100", "fp8_shard_cast_sm100", "fp8cast_blockwise_transpose_batched_sm100", "fp8cast_blockwise_transpose_sm100"]
+__all__ = ["fp8_pack_transpose_sm100", "fp8_scales_sm100", "fp8_shard_amax_sm100", "fp8_shard_cast_sm100", "fp8_quant_weight_grouped_sm100", "fp8_quant_weight_sm100"]
 
 
 @triton.jit
@@ -53,9 +53,9 @@ def fp8cast_blockwise_transpose_kernel(x_ptr, out_ptr, scale_ptr, out_t_ptr, sca
     tl.store(scale_t_ptr + scale_t_offset, scale)
 
 
-def fp8cast_blockwise_transpose_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8_quant_weight_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Triton fp8cast_blockwise_transpose: x 2-D (M, K) bf16 / fp32.
+    Triton fp8_quant_weight: x 2-D (M, K) bf16 / fp32.
     """
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     M, K = x.shape
@@ -115,9 +115,9 @@ def fp8cast_blockwise_transpose_batched_kernel(x_ptr, out_ptr, scale_ptr, out_t_
     tl.store(scale_t_ptr + scale_t_offset, scale)
 
 
-def fp8cast_blockwise_transpose_batched_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8_quant_weight_grouped_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Triton fp8cast_blockwise_transpose_batched: x 3-D (G, N, K) bf16 / fp32.
+    Triton fp8_quant_weight_grouped: x 3-D (G, N, K) bf16 / fp32.
     """
     assert x.ndim == 3, f"Expected 3D tensor, got {x.ndim}D"
     G, N, K = x.shape

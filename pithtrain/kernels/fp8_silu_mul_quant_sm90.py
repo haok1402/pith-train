@@ -24,7 +24,7 @@ from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import fp8cast_rowwise_kmajor_sm9
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale, mn_pad
 from pithtrain.kernels.silu_mul import silu_mul_bwd, silu_mul_fwd
 
-__all__ = ["SiluMulQuant", "SiluMulQuantGU", "silu_mul_bwd_quant_gu_sm90", "silu_mul_bwd_quant_sm90", "silu_mul_quant_fusable", "silu_mul_quant_fwd_sm90", "silu_mul_quant_gu_fusable", "silu_mul_quant_gu_fwd_sm90"]
+__all__ = ["SiluMulQuant", "SiluMulQuantGU", "fp8_silu_mul_gu_bwd_sm90", "fp8_silu_mul_bwd_sm90", "silu_mul_quant_fusable", "fp8_silu_mul_fwd_sm90", "silu_mul_quant_gu_fusable", "fp8_silu_mul_gu_fwd_sm90"]
 
 BLOCK = 128  # rows per quantization group and columns per CTA tile
 THREADS = 512
@@ -525,7 +525,7 @@ def silu_mul_quant_gu_fusable(N: int, M: int, grouped_mm_offs: torch.Tensor) -> 
     return N % BLOCK == 0 and M % BLOCK == 0 and 0 < grouped_mm_offs.shape[0] <= G_CAP
 
 
-def silu_mul_quant_fwd_sm90(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8_silu_mul_fwd_sm90(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     fp8cast_rowwise_kmajor(silu_mul_fwd(g, u), grouped_mm_offs) without writing h.
     """
@@ -539,7 +539,7 @@ def silu_mul_quant_fwd_sm90(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: t
     return out
 
 
-def silu_mul_bwd_quant_sm90(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+def fp8_silu_mul_bwd_sm90(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     """
     fp8cast_rowwise_kmajor of each gradient of silu_mul_bwd(dh, g, u) without writing them.
     """
@@ -554,7 +554,7 @@ def silu_mul_bwd_quant_sm90(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, 
     return grad_gate_out, grad_up_out
 
 
-def silu_mul_quant_gu_fwd_sm90(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8_silu_mul_gu_fwd_sm90(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     fp8cast_rowwise_kmajor(silu_mul_fwd(gu[:, :N], gu[:, N:]), grouped_mm_offs) for gu (M, 2N).
     """
@@ -569,7 +569,7 @@ def silu_mul_quant_gu_fwd_sm90(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) 
     return out
 
 
-def silu_mul_bwd_quant_gu_sm90(dh: torch.Tensor, gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8_silu_mul_gu_bwd_sm90(dh: torch.Tensor, gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     fp8cast_rowwise_kmajor(cat([dg, du], 1), grouped_mm_offs) of the SwiGLU gradients of gu (M, 2N).
     """

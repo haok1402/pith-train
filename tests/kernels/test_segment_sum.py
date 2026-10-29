@@ -1,5 +1,5 @@
 """
-Verifier of segment_sum_along_rows against plain PyTorch: run-to-run equality, equality with each
+Verifier of segment_sum against plain PyTorch: run-to-run equality, equality with each
 group summed alone (which takes the kernel's other internal path when the full call has many
 groups), closeness to a float64 sum, and the documented summation order.
 """
@@ -7,7 +7,7 @@ groups), closeness to a float64 sum, and the documented summation order.
 import pytest
 import torch
 
-from pithtrain.kernels import segment_sum_along_rows
+from pithtrain.kernels import segment_sum
 
 
 def offsets(counts):
@@ -40,11 +40,11 @@ def check(counts, H, dtype, out_dtype, seed=0):
     M = sum(counts)
     x = (torch.randn(M, H, generator=gen, device="cuda") * 3).to(dtype)
     offs = offsets(counts)
-    got = segment_sum_along_rows(x, offs, out_dtype)
+    got = segment_sum(x, offs, out_dtype)
     assert got.dtype == out_dtype and got.shape == (len(counts), H)
-    assert torch.equal(got, segment_sum_along_rows(x, offs, out_dtype))
+    assert torch.equal(got, segment_sum(x, offs, out_dtype))
     # Close to the exact sum (fp32 accumulation, then one rounding to out_dtype).
-    got32 = segment_sum_along_rows(x, offs, torch.float32)
+    got32 = segment_sum(x, offs, torch.float32)
     want = reference(x, offs)
     assert ((got32.double() - want).abs() <= tolerance(x, offs)).all()
     assert torch.equal(got, got32.to(out_dtype))
@@ -52,7 +52,7 @@ def check(counts, H, dtype, out_dtype, seed=0):
     start = 0
     for group_idx, count in enumerate(counts):
         # A fresh copy, since a sliced base pointer can change Triton's specialization.
-        alone = segment_sum_along_rows(x[start : start + count].clone(), offsets([count]), torch.float32)  # fmt: skip
+        alone = segment_sum(x[start : start + count].clone(), offsets([count]), torch.float32)  # fmt: skip
         assert torch.equal(alone[0], got32[group_idx]), f"group {group_idx} differs when summed alone"  # fmt: skip
         start += count
     return got32
@@ -99,15 +99,15 @@ def test_all_empty_and_trailing_padding():
             assert torch.all(got[1] == 0)  # rows 100..255 belong to no group
     # An offset past M is clamped to M: group 1 is rows 128..255.
     offs = torch.tensor([128, 512], device="cuda", dtype=torch.int32)
-    got = segment_sum_along_rows(x, offs, torch.float32)
+    got = segment_sum(x, offs, torch.float32)
     assert ((got.double() - reference(x, offs)).abs() <= tolerance(x, offs)).all()
-    alone = segment_sum_along_rows(x[128:].clone(), offsets([128]), torch.float32)
+    alone = segment_sum(x[128:].clone(), offsets([128]), torch.float32)
     assert torch.equal(got[1], alone[0])
 
 
 def test_zero_rows():
     x = torch.empty(0, 2880, device="cuda", dtype=torch.bfloat16)
-    got = segment_sum_along_rows(x, offsets([0, 0, 0, 0]), torch.bfloat16)
+    got = segment_sum(x, offsets([0, 0, 0, 0]), torch.bfloat16)
     assert got.shape == (4, 2880) and torch.all(got == 0)
 
 
@@ -121,7 +121,7 @@ def test_large_and_cancelling_values():
 
 def check_tensor(x, counts):
     offs = offsets(counts)
-    got = segment_sum_along_rows(x, offs, torch.float32)
+    got = segment_sum(x, offs, torch.float32)
     assert ((got.double() - reference(x, offs)).abs() <= tolerance(x, offs)).all()
     return got
 
@@ -134,18 +134,16 @@ def test_order_is_tile_order():
     counts = [8192] * 4
     gen = torch.Generator(device="cuda").manual_seed(9)
     x = (torch.randn(sum(counts), 2880, generator=gen, device="cuda") * 3).to(torch.bfloat16)
-    got = segment_sum_along_rows(x, offsets(counts), torch.float32)
-    tiles = segment_sum_along_rows(x[:8192].clone(), offsets([128] * 64), torch.float32)
+    got = segment_sum(x, offsets(counts), torch.float32)
+    tiles = segment_sum(x[:8192].clone(), offsets([128] * 64), torch.float32)
     acc = torch.zeros(2880, device="cuda")
     for tile_sum in tiles:
         acc = acc + tile_sum
     assert torch.equal(acc, got[0])
     halves = torch.stack(
         [
-            segment_sum_along_rows(x[i * 8192 : i * 8192 + 4096], offsets([4096]), torch.float32)[0]
-            + segment_sum_along_rows(
-                x[i * 8192 + 4096 : (i + 1) * 8192], offsets([4096]), torch.float32
-            )[0]
+            segment_sum(x[i * 8192 : i * 8192 + 4096], offsets([4096]), torch.float32)[0]
+            + segment_sum(x[i * 8192 + 4096 : (i + 1) * 8192], offsets([4096]), torch.float32)[0]
             for i in range(4)
         ]
     )

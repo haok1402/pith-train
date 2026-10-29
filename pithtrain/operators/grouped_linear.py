@@ -9,10 +9,10 @@ import torch.nn.functional as F
 from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
 from pithtrain.contexts.weight_grad_store import WeightGradStore
 from pithtrain.kernels import (
-    fp8_m_grouped_gemm,
-    fp8cast_blockwise_transpose_batched,
+    fp8_grouped_gemm,
+    fp8_quant_grouped,
+    fp8_quant_weight_grouped,
     k_grouped_fp8_gemm,
-    quantize_grouped_input,
 )
 
 __all__ = [
@@ -113,7 +113,7 @@ def fp8_grouped_wgrad(
 ) -> None:
     """
     Weight gradient of an FP8 grouped linear from the per-channel FP8 (data, scale) pairs that
-    quantize_grouped_input gives for grad_output (grad_ch) and input (input_ch). With an fp32
+    fp8_quant_grouped gives for grad_output (grad_ch) and input (input_ch). With an fp32
     weight.main_grad the GEMM accumulates into it; otherwise the (G, N, K) result of the given shape
     is added into weight.grad in bf16. Deferred to DualPipeV's W phase when
     WeightGradStore is enabled.
@@ -144,7 +144,7 @@ class FP8GroupedLinearFunc(torch.autograd.Function):
     """
     FP8 grouped linear, output = input @ weight[g].T for the rows of each group g, from the
     quantized weight that FP8GroupedLinear.get_quantized_weight returns. quantized_input, when
-    given, is quantize_grouped_input(input) computed once for several projections.
+    given, is fp8_quant_grouped(input) computed once for several projections.
     """
 
     @staticmethod
@@ -164,10 +164,10 @@ class FP8GroupedLinearFunc(torch.autograd.Function):
         num_groups, N, _ = weight.shape
 
         if quantized_input is None:
-            quantized_input = quantize_grouped_input(input, grouped_mm_offs)
+            quantized_input = fp8_quant_grouped(input, grouped_mm_offs)
         input_fp8, scale_input, input_ch_fp8, scale_input_ch = quantized_input
 
-        output = fp8_m_grouped_gemm(
+        output = fp8_grouped_gemm(
             (input_fp8, scale_input), (weight_fp8, scale_weight), N, grouped_mm_offs, group_indices
         )
 
@@ -193,11 +193,11 @@ class FP8GroupedLinearFunc(torch.autograd.Function):
         group_indices = ctx.group_indices
         K, N, num_groups = ctx.K, ctx.N, ctx.num_groups
 
-        grad_fp8, scale_grad, grad_ch_fp8, scale_grad_ch = quantize_grouped_input(
+        grad_fp8, scale_grad, grad_ch_fp8, scale_grad_ch = fp8_quant_grouped(
             grad_output, grouped_mm_offs
         )
 
-        grad_input = fp8_m_grouped_gemm(
+        grad_input = fp8_grouped_gemm(
             (grad_fp8, scale_grad),
             (weight_t_fp8, scale_weight_t),
             K,
@@ -245,11 +245,11 @@ class FP8GroupedLinear(nn.Module):
         if self.fp8_param_gather:
             return self.weight_fp8, self.weight_scale, self.weight_t_fp8, self.weight_scale_t
         if torch.compiler.is_compiling():
-            return fp8cast_blockwise_transpose_batched(self.weight)
+            return fp8_quant_weight_grouped(self.weight)
         ver = FP8WeightCacheControl.version
         if self.quantized_weight_version == ver:
             return self.quantized_weight_cache
-        result = fp8cast_blockwise_transpose_batched(self.weight)
+        result = fp8_quant_weight_grouped(self.weight)
         self.quantized_weight_cache = result
         self.quantized_weight_version = ver
         return result

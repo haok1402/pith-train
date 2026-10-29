@@ -8,7 +8,7 @@ from typing import Optional
 import torch
 
 from pithtrain.contexts import training
-from pithtrain.kernels import m_grouped_group_indices, scatter_by_expert
+from pithtrain.kernels import fp8_group_indices, scatter_by_expert
 
 __all__ = [
     "PaddedIndexGather",
@@ -116,5 +116,5 @@ def precompute_group_indices(grouped_mm_offs: torch.Tensor, M: int) -> Optional[
     takes no such hint.
     """
     if training.fp8:
-        return m_grouped_group_indices(grouped_mm_offs, M)
+        return fp8_group_indices(grouped_mm_offs, M)
     return None

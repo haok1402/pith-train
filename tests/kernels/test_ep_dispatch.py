@@ -1,5 +1,5 @@
 """
-Verifies the ep_dispatch kernels, fused_dedup_prepare_dispatch and expert_and_expand_idx, against
+Verifies the ep_dispatch kernels, ep_dispatch_send_idx and ep_dispatch_recv_idx, against
 PyTorch. Names: m tokens, k experts per token, ne experts, ep EP ranks, epr experts per rank.
 
 Sender side, where a token routed to several experts of one EP rank is sent to it once:
@@ -11,7 +11,7 @@ Sender side, where a token routed to several experts of one EP rank is sent to i
   where they are compared as per-bucket sets plus the invariant
   dispatch_token_idxs[rank_start + expand_idx] == idxs // k.
 
-Receiver side, expert_and_expand_idx carries no order and is compared exactly. End-to-end tests
+Receiver side, ep_dispatch_recv_idx carries no order and is compared exactly. End-to-end tests
 emulate the operator's all-to-alls in one process and check that every received slot resolves to
 its token and expert.
 
@@ -21,7 +21,7 @@ The routing contract: a token's top-k experts are distinct, as torch.topk return
 import pytest
 import torch
 
-from pithtrain.kernels import expert_and_expand_idx, fused_dedup_prepare_dispatch
+from pithtrain.kernels import ep_dispatch_recv_idx, ep_dispatch_send_idx
 
 # (num_experts, top-k) of the models: deepseek-v2-lite, qwen3-30b-a3b, qwen3.5-35b-a3b,
 # gpt-oss-20b, gpt-oss-120b
@@ -130,7 +130,7 @@ def check_any_order(outs, ref, topk_ids: torch.Tensor, ep: int, epr: int) -> Non
 
 
 def run_dispatch(topk_ids: torch.Tensor, ep: int, epr: int, meta_out=None):
-    outs = fused_dedup_prepare_dispatch(topk_ids, ep * epr, ep, epr, meta_out)
+    outs = ep_dispatch_send_idx(topk_ids, ep * epr, ep, epr, meta_out)
     check_shapes(outs, topk_ids.shape[0], topk_ids.shape[1], ep, epr)
     return outs
 
@@ -300,7 +300,7 @@ def recv_case(ep: int, epr: int, total_target: int, seed: int, zero_frac: float 
 
 
 def check_expand(meta, received_expand_idx, ep, epr, ref_expand_idx=None) -> None:
-    got = expert_and_expand_idx(meta, received_expand_idx, ep, epr)
+    got = ep_dispatch_recv_idx(meta, received_expand_idx, ep, epr)
     ref = expand_reference(meta, received_expand_idx if ref_expand_idx is None else ref_expand_idx, ep, epr)  # fmt: skip
     assert got[0].dtype == got[1].dtype == torch.int64
     assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])
@@ -317,21 +317,21 @@ EXPAND_GEOMETRIES = [
 
 
 @pytest.mark.parametrize("ep,epr", EXPAND_GEOMETRIES)
-def test_expert_and_expand_idx(ep: int, epr: int) -> None:
+def test_ep_dispatch_recv_idx(ep: int, epr: int) -> None:
     for seed, total in ((0, 3000), (1, 70000), (2, 1), (3, 1023), (4, 1025)):
         meta, received_expand_idx = recv_case(ep, epr, total, seed)
         check_expand(meta, received_expand_idx, ep, epr)
 
 
-def test_expert_and_expand_idx_empty() -> None:
+def test_ep_dispatch_recv_idx_empty() -> None:
     for ep, epr in ((4, 8), (1, 64), (8, 32)):
         meta = torch.zeros(ep * (epr + 1), dtype=torch.int64, device="cuda")
         received_expand_idx = torch.empty(0, dtype=torch.int64, device="cuda")
-        expert_idxs, expand_idx = expert_and_expand_idx(meta, received_expand_idx, ep, epr)
+        expert_idxs, expand_idx = ep_dispatch_recv_idx(meta, received_expand_idx, ep, epr)
         assert expert_idxs.shape == expand_idx.shape == (0,) and expert_idxs.dtype == expand_idx.dtype == torch.int64  # fmt: skip
 
 
-def test_expert_and_expand_idx_sensitive() -> None:
+def test_ep_dispatch_recv_idx_sensitive() -> None:
     """
     One segment count off by one shifts later slots, and the comparison notices.
     """
@@ -339,11 +339,11 @@ def test_expert_and_expand_idx_sensitive() -> None:
     bad = meta.clone()
     bad[0] += 1
     bad[1] -= 1
-    got = expert_and_expand_idx(bad, received_expand_idx, 4, 32)
+    got = ep_dispatch_recv_idx(bad, received_expand_idx, 4, 32)
     assert not torch.equal(got[0], expand_reference(meta, received_expand_idx, 4, 32)[0])
 
 
-def test_expert_and_expand_idx_fallback_strided() -> None:
+def test_ep_dispatch_recv_idx_fallback_strided() -> None:
     """
     A non-contiguous received expand_idx, which the CuTe kernel does not cover.
     """
@@ -385,7 +385,7 @@ def test_dispatch_round_trip(ne: int, k: int, ep: int) -> None:
             dedup_start, dedup_end = int(dedup[:recv_rank].sum()), int(dedup[: recv_rank + 1].sum())
             dedup_tokens.append(dispatch_token_idxs[dedup_start:dedup_end] + sender * 1_000_000)
         received_expand_idx = torch.cat(received_expand_idx)
-        expert_idxs, expand_idx = expert_and_expand_idx(recv_meta, received_expand_idx, ep, epr)
+        expert_idxs, expand_idx = ep_dispatch_recv_idx(recv_meta, received_expand_idx, ep, epr)
         assert torch.equal(expert_idxs, torch.cat(experts))
         assert torch.equal(torch.cat(dedup_tokens)[expand_idx], torch.cat(tokens))
 
@@ -425,7 +425,7 @@ def test_fused_dedup_dispatch(ms: int, k: int, num_experts: int, ep_size: int, s
 def test_fused_dedup_end_to_end(ms: int, k: int, num_experts: int, ep_size: int, seed: int) -> None:
     """
     Full sender -> receiver pipeline on hidden states: each receiver gathers the senders' dedup
-    token chunks and expand_idx segments, makes expand_idx global through expert_and_expand_idx,
+    token chunks and expand_idx segments, makes expand_idx global through ep_dispatch_recv_idx,
     and the expanded rows equal each slot's own token row.
     """
     torch.manual_seed(seed)
@@ -447,7 +447,7 @@ def test_fused_dedup_end_to_end(ms: int, k: int, num_experts: int, ep_size: int,
     for recv_rank in range(ep_size):
         recv_meta = torch.cat([sender["meta"][recv_rank] for sender in senders])
         received_expand_idx = torch.cat([sender["expand_chunks"][recv_rank] for sender in senders])
-        _, expand_idx = expert_and_expand_idx(recv_meta, received_expand_idx, ep_size, epr)
+        _, expand_idx = ep_dispatch_recv_idx(recv_meta, received_expand_idx, ep_size, epr)
         gathered = torch.cat([sender["dedup_chunks"][recv_rank] for sender in senders])
         if expand_idx.numel():
             assert int(expand_idx.min()) >= 0 and int(expand_idx.max()) < gathered.shape[0]
@@ -470,7 +470,7 @@ def recv_meta_of(tokens_per_expert: torch.Tensor, dedup: torch.Tensor) -> torch.
 
 @pytest.mark.parametrize("ms,k,num_experts,ep_size", SIM_CONFIGS)
 @pytest.mark.parametrize("seed", [0, 42])
-def test_expert_and_expand_idx_sim(
+def test_ep_dispatch_recv_idx_sim(
     ms: int, k: int, num_experts: int, ep_size: int, seed: int
 ) -> None:
     """
@@ -485,12 +485,12 @@ def test_expert_and_expand_idx_sim(
     sender = torch.arange(ep_size, device="cuda").repeat_interleave(splits)
     received_expand_idx = (torch.rand(total, device="cuda") * dedup[sender]).long()
     meta = recv_meta_of(tokens_per_expert, dedup)
-    expert_idxs, _ = expert_and_expand_idx(meta, received_expand_idx, ep_size, epr)
+    expert_idxs, _ = ep_dispatch_recv_idx(meta, received_expand_idx, ep_size, epr)
     assert expert_idxs.numel() == total, "one entry per received token slot"
     check_expand(meta, received_expand_idx, ep_size, epr)
 
 
-def test_expert_and_expand_idx_slot_count_from_input() -> None:
+def test_ep_dispatch_recv_idx_slot_count_from_input() -> None:
     """
     The slot count is the received expand_idx's length, decided by the senders, even where the
     metadata's segment counts add up to more: the outputs have exactly that many entries, those
@@ -507,6 +507,6 @@ def test_expert_and_expand_idx_slot_count_from_input() -> None:
     check_expand(meta, received_expand_idx, ep_size, epr)
     ref_expert, ref_expand = expand_reference(meta, received_expand_idx, ep_size, epr)
     for short in (total - 1, 4096, 1000, 1):
-        expert_idxs, expand_idx = expert_and_expand_idx(meta, received_expand_idx[:short], ep_size, epr)  # fmt: skip
+        expert_idxs, expand_idx = ep_dispatch_recv_idx(meta, received_expand_idx[:short], ep_size, epr)  # fmt: skip
         assert expert_idxs.shape == expand_idx.shape == (short,)
         assert torch.equal(expert_idxs, ref_expert[:short]) and torch.equal(expand_idx, ref_expand[:short])  # fmt: skip

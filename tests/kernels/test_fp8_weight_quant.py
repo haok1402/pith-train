@@ -2,7 +2,7 @@
 Verifier of the fp8_weight_quant feature against a PyTorch 128x128 blockwise FP8 quantization (one
 E8M0 scale per 128x128 tile, from the tile amax).
 
-- fp8cast_blockwise_transpose and fp8cast_blockwise_transpose_batched: the blockwise FP8 of W and
+- fp8_quant_weight and fp8_quant_weight_grouped: the blockwise FP8 of W and
   of W.T (per expert for a (G, N, K) weight), with row-major scales.
 - The FP8 parameter all-gather kernels, driven as the FP8 parameter gather drives them. FSDP dim-0
   shards of an fp32 master (rows of a 2D weight, experts of a 3D one) each write the per-tile amax
@@ -22,13 +22,13 @@ import torch.nn.functional as F
 
 from pithtrain.kernels import (
     fp8_pack_transpose,
+    fp8_quant_weight,
+    fp8_quant_weight_grouped,
     fp8_scales,
     fp8_scales_multi,
     fp8_shard_amax,
     fp8_shard_amax_multi,
     fp8_shard_cast,
-    fp8cast_blockwise_transpose,
-    fp8cast_blockwise_transpose_batched,
 )
 
 BLOCK = 128
@@ -122,7 +122,7 @@ KINDS = ["randn", "outliers", "zeros", "tiny", "wide", "huge", "negative", "pow2
 
 
 def check_blockwise_transpose(x: torch.Tensor) -> None:
-    w_fp8, w_scale, wt_fp8, wt_scale = fp8cast_blockwise_transpose(x)
+    w_fp8, w_scale, wt_fp8, wt_scale = fp8_quant_weight(x)
     ref_fp8, ref_scale = ref_blockwise(x.unsqueeze(0))
     ref_fp8_t, ref_scale_t = ref_blockwise(x.T.unsqueeze(0))
     assert_fp8_equal("w_fp8", w_fp8, ref_fp8[0])
@@ -134,7 +134,7 @@ def check_blockwise_transpose(x: torch.Tensor) -> None:
 
 
 def check_blockwise_transpose_batched(x: torch.Tensor) -> None:
-    w_fp8, w_scale, wt_fp8, wt_scale = fp8cast_blockwise_transpose_batched(x)
+    w_fp8, w_scale, wt_fp8, wt_scale = fp8_quant_weight_grouped(x)
     ref_fp8, ref_scale = ref_blockwise(x)
     ref_fp8_t, ref_scale_t = ref_blockwise(x.transpose(1, 2))
     assert_fp8_equal("w_fp8", w_fp8, ref_fp8)
@@ -225,7 +225,7 @@ def test_blockwise_transpose_batched_fp32_and_zeros() -> None:
 def test_blockwise_transpose_empty() -> None:
     for shape in [(0, 256), (256, 0)]:
         x = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
-        w_fp8, w_scale, wt_fp8, wt_scale = fp8cast_blockwise_transpose(x)
+        w_fp8, w_scale, wt_fp8, wt_scale = fp8_quant_weight(x)
         N, K = shape
         assert w_fp8.shape == (N, K) and wt_fp8.shape == (K, N)
         assert w_scale.shape == (cdiv(N, BLOCK), cdiv(K, BLOCK))
@@ -235,7 +235,7 @@ def test_blockwise_transpose_empty() -> None:
 def test_blockwise_transpose_batched_empty() -> None:
     for shape in [(0, 256, 128), (2, 0, 128), (2, 128, 0)]:
         x = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
-        w_fp8, w_scale, wt_fp8, wt_scale = fp8cast_blockwise_transpose_batched(x)
+        w_fp8, w_scale, wt_fp8, wt_scale = fp8_quant_weight_grouped(x)
         G, N, K = shape
         assert w_fp8.shape == (G, N, K) and wt_fp8.shape == (G, K, N)
         assert w_scale.shape == (G, cdiv(N, BLOCK), cdiv(K, BLOCK))
@@ -347,10 +347,10 @@ def test_param_gather_pipeline(shape: tuple, n: int, kind: str) -> None:
 
     # Bit-identical to the blockwise transpose of the bf16 weight.
     if len(shape) == 2:
-        ref = fp8cast_blockwise_transpose(master.bfloat16())
+        ref = fp8_quant_weight(master.bfloat16())
         ref = [t.unsqueeze(0) for t in ref]
     else:
-        ref = fp8cast_blockwise_transpose_batched(master.bfloat16())
+        ref = fp8_quant_weight_grouped(master.bfloat16())
     assert_fp8_equal("vs blockwise fp8", gathered, ref[0])
     assert_f32_equal("vs blockwise scale", scale, ref[1])
     assert_fp8_equal("vs blockwise fp8_t", packed_t, ref[2])

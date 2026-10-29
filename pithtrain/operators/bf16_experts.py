@@ -36,16 +36,16 @@ import torch.nn as nn
 
 from pithtrain.contexts.weight_grad_store import WeightGradStore
 from pithtrain.kernels import (
-    bf16_expert_dgated_backward,
-    bf16_expert_dgrad,
-    bf16_expert_down_forward_scattered,
-    bf16_expert_gated_forward,
+    bf16_expert_down_dgrad,
+    bf16_expert_down_fwd,
+    bf16_expert_down_wgrad,
+    bf16_expert_gate_up_dgrad,
+    bf16_expert_gate_up_fwd,
+    bf16_expert_gate_up_wgrad,
     bf16_expert_gather_rows,
     bf16_expert_gather_sum,
     bf16_expert_group_slots,
-    bf16_expert_wgrad_down,
-    bf16_expert_wgrad_gate_up,
-    expert_slot_segment_sum,
+    bf16_expert_segment_sum,
 )
 from pithtrain.operators.main_grad import raw_main_grad
 
@@ -94,8 +94,8 @@ def accumulate_wgrads(
     maps: NamedTuple,
 ) -> None:
     def accumulate(main_grad_gate, main_grad_up, main_grad_down):
-        bf16_expert_wgrad_down(grad_out, h, main_grad_down, maps.cu_seqlens, maps.slot_of)
-        bf16_expert_wgrad_gate_up(
+        bf16_expert_down_wgrad(grad_out, h, main_grad_down, maps.cu_seqlens, maps.slot_of)
+        bf16_expert_gate_up_wgrad(
             x,
             grad_preact,
             is_grad_preact_swapped,
@@ -125,10 +125,10 @@ class BF16SwiGLUExpertsFunc(torch.autograd.Function):
         cu_seqlens_host: list[int] | None,
     ) -> torch.Tensor:
         cu_seqlens = maps.cu_seqlens
-        preact, h = bf16_expert_gated_forward(
+        preact, h = bf16_expert_gate_up_fwd(
             gathered, w_gate, w_up, cu_seqlens, maps.a_idx, bias_gate_up, act_params
         )
-        out = bf16_expert_down_forward_scattered(h, w_down, cu_seqlens, maps.slot_of, bias_down)
+        out = bf16_expert_down_fwd(h, w_down, cu_seqlens, maps.slot_of, bias_down)
         del h
         # The received tokens (and grad_out in backward) come from the comm stream and are read
         # by the deferred wgrad on this stream; without this the next all-to-all could reuse them.
@@ -150,7 +150,7 @@ class BF16SwiGLUExpertsFunc(torch.autograd.Function):
         cu_seqlens = maps.cu_seqlens
         grad_out = grad_out.contiguous()
         grad_out.record_stream(torch.cuda.current_stream())
-        grad_preact, h, is_grad_preact_swapped = bf16_expert_dgated_backward(
+        grad_preact, h, is_grad_preact_swapped = bf16_expert_down_dgrad(
             grad_out, w_down, preact, cu_seqlens, maps.slot_of, w_gate, w_up, ctx.act_params
         )
         del preact
@@ -160,13 +160,15 @@ class BF16SwiGLUExpertsFunc(torch.autograd.Function):
             cu_seqlens_host = ctx.cu_seqlens_host
             if cu_seqlens_host is None:
                 cu_seqlens_host = cu_seqlens.tolist()
-            grad_bias_gate_up = expert_slot_segment_sum(
+            grad_bias_gate_up = bf16_expert_segment_sum(
                 grad_preact, cu_seqlens_host, cu_seqlens
             ).to(ctx.bias_dtypes[0])
-            grad_bias_down = expert_slot_segment_sum(
+            grad_bias_down = bf16_expert_segment_sum(
                 grad_out, cu_seqlens_host, cu_seqlens, maps.slot_of
             ).to(ctx.bias_dtypes[1])
-        grad_x = bf16_expert_dgrad(grad_preact, w_gate, w_up, cu_seqlens, is_grad_preact_swapped)
+        grad_x = bf16_expert_gate_up_dgrad(
+            grad_preact, w_gate, w_up, cu_seqlens, is_grad_preact_swapped
+        )
         if maps.mask is not None:
             grad_gathered = bf16_expert_gather_sum(grad_x, maps, w_gate.shape[0], ctx.max_slots)
         else:

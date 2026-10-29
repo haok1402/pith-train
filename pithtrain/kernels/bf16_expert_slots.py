@@ -8,7 +8,7 @@ from typing import NamedTuple
 
 import torch
 
-__all__ = ["bf16_expert_gather_rows", "bf16_expert_gather_sum", "bf16_expert_group_slots", "expert_slot_segment_sum"]
+__all__ = ["bf16_expert_gather_rows", "bf16_expert_gather_sum", "bf16_expert_group_slots", "bf16_expert_segment_sum"]
 
 
 def bf16_expert_group_slots(expert_idxs: torch.Tensor, expand_idx: torch.Tensor | None, num_groups: int, num_tokens: int) -> NamedTuple:
@@ -57,7 +57,7 @@ def bf16_expert_gather_sum(grad: torch.Tensor, maps: NamedTuple, num_groups: int
     return bf16_expert_gather_sum_sm90(grad, maps, num_groups, max_slots)
 
 
-def expert_slot_segment_sum(x: torch.Tensor, cu_host: list[int], cu: torch.Tensor, idx: torch.Tensor | None = None) -> torch.Tensor:
+def bf16_expert_segment_sum(x: torch.Tensor, cu_host: list[int], cu: torch.Tensor, idx: torch.Tensor | None = None) -> torch.Tensor:
     """
     Per-segment column sums (the bias gradient of grouped rows): a fresh fp32 (G, N) whose row g
     sums rows r in [cu[g], cu[g + 1]) of x, read as x[idx[r]] when idx is given.
@@ -68,5 +68,5 @@ def expert_slot_segment_sum(x: torch.Tensor, cu_host: list[int], cu: torch.Tenso
     - Order: each segment is cut into 256-row chunks from its start, each chunk summed row by row in
       fp32, then the chunk sums added in order; deterministic. An empty segment sums to zero.
     """
-    from pithtrain.kernels.bf16_expert_slots_sm90 import expert_slot_segment_sum_sm90
-    return expert_slot_segment_sum_sm90(x, cu_host, cu, idx)
+    from pithtrain.kernels.bf16_expert_slots_sm90 import bf16_expert_segment_sum_sm90
+    return bf16_expert_segment_sum_sm90(x, cu_host, cu, idx)

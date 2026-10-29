@@ -1,7 +1,7 @@
 """
 Picker of the expert-parallel dispatch index math: the sender-side dedup / counting-sort metadata
-(fused_dedup_prepare_dispatch) and the receiver-side expert and expand indices
-(expert_and_expand_idx). SM90 runs the CuTe-DSL kernels of ep_dispatch_sm90, SM100 the Triton
+(ep_dispatch_send_idx) and the receiver-side expert and expand indices
+(ep_dispatch_recv_idx). SM90 runs the CuTe-DSL kernels of ep_dispatch_sm90, SM100 the Triton
 kernels of ep_dispatch_sm100.
 """
 
@@ -9,10 +9,10 @@ import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR
 
-__all__ = ["expert_and_expand_idx", "fused_dedup_prepare_dispatch"]
+__all__ = ["ep_dispatch_recv_idx", "ep_dispatch_send_idx"]
 
 
-def fused_dedup_prepare_dispatch(topk_ids: torch.Tensor, num_experts: int, ep_size: int, experts_per_rank: int, meta_out: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
+def ep_dispatch_send_idx(topk_ids: torch.Tensor, num_experts: int, ep_size: int, experts_per_rank: int, meta_out: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
     """
     Sender-side metadata of a deduplicated EP dispatch (each token is sent once to every EP rank
     hosting one of its experts). Returns (tokens_per_ep_rank, dedup_tokens_per_gpu,
@@ -41,16 +41,16 @@ def fused_dedup_prepare_dispatch(topk_ids: torch.Tensor, num_experts: int, ep_si
     """
     match ARCH_MAJOR:
         case 9:
-            from pithtrain.kernels.ep_dispatch_sm90 import fused_dedup_prepare_dispatch_sm90
-            return fused_dedup_prepare_dispatch_sm90(topk_ids, num_experts, ep_size, experts_per_rank, meta_out)
+            from pithtrain.kernels.ep_dispatch_sm90 import ep_dispatch_send_idx_sm90
+            return ep_dispatch_send_idx_sm90(topk_ids, num_experts, ep_size, experts_per_rank, meta_out)
         case 10:
-            from pithtrain.kernels.ep_dispatch_sm100 import fused_dedup_prepare_dispatch_sm100
-            return fused_dedup_prepare_dispatch_sm100(topk_ids, num_experts, ep_size, experts_per_rank, meta_out)
+            from pithtrain.kernels.ep_dispatch_sm100 import ep_dispatch_send_idx_sm100
+            return ep_dispatch_send_idx_sm100(topk_ids, num_experts, ep_size, experts_per_rank, meta_out)
         case _:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
-def expert_and_expand_idx(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, torch.Tensor]:
+def ep_dispatch_recv_idx(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Receiver-side indices of the received token slots: (expert_idxs, expand_idx), fresh int64
     (total,) with total = received_expand_idx.shape[0]. Deterministic, identical on both paths.
@@ -66,10 +66,10 @@ def expert_and_expand_idx(recv_meta: torch.Tensor, received_expand_idx: torch.Te
     """
     match ARCH_MAJOR:
         case 9:
-            from pithtrain.kernels.ep_dispatch_sm90 import expert_and_expand_idx_sm90
-            return expert_and_expand_idx_sm90(recv_meta, received_expand_idx, ep_size, experts_per_rank)
+            from pithtrain.kernels.ep_dispatch_sm90 import ep_dispatch_recv_idx_sm90
+            return ep_dispatch_recv_idx_sm90(recv_meta, received_expand_idx, ep_size, experts_per_rank)
         case 10:
-            from pithtrain.kernels.ep_dispatch_sm100 import expert_and_expand_idx_sm100
-            return expert_and_expand_idx_sm100(recv_meta, received_expand_idx, ep_size, experts_per_rank)
+            from pithtrain.kernels.ep_dispatch_sm100 import ep_dispatch_recv_idx_sm100
+            return ep_dispatch_recv_idx_sm100(recv_meta, received_expand_idx, ep_size, experts_per_rank)
         case _:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")

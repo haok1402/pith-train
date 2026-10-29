@@ -53,9 +53,9 @@ from torch.distributed import (
 from torch.distributed.distributed_c10d import _resolve_process_group
 
 from pithtrain.kernels import (
-    fp8_act_weight_gemm,
-    fp8_dgrad_wgrad,
-    fp8cast_rowwise_blockwise_transpose,
+    fp8_gemm_bwd,
+    fp8_gemm_fwd,
+    fp8_quant_act,
 )
 
 __all__ = ["mla_ring_attention_func", "ring_attention_func", "ring_attention_varlen_func"]
@@ -652,7 +652,7 @@ def mla_decompress(
     batch, seq_len, _ = normed_kv.shape
     if use_fp8:
         x_2d = normed_kv.reshape(batch * seq_len, normed_kv.shape[-1])
-        kv_2d, _, _ = fp8_act_weight_gemm(x_2d, weight_fp8, scale_weight)
+        kv_2d, _, _ = fp8_gemm_fwd(x_2d, weight_fp8, scale_weight)
         kv = kv_2d.view(batch, seq_len, num_heads, qk_nope_head_dim + v_head_dim)
     else:
         kv = F.linear(normed_kv, kv_b_weight).view(batch, seq_len, num_heads, qk_nope_head_dim + v_head_dim)  # fmt: skip
@@ -840,10 +840,10 @@ def mla_zigzag_backward(
                 .reshape(batch * kv_len, out_features)
                 .to(normed_kv.dtype)
             )
-            _, _, x_t_fp8, scale_x_t = fp8cast_rowwise_blockwise_transpose(
+            _, _, x_t_fp8, scale_x_t = fp8_quant_act(
                 normed_kv_block.reshape(batch * kv_len, lora_rank)
             )
-            d_normed_kv_2d, dW_block = fp8_dgrad_wgrad(
+            d_normed_kv_2d, dW_block = fp8_gemm_bwd(
                 dy_2d, weight_t_fp8, scale_weight_t, x_t_fp8, scale_x_t, lora_rank
             )
             d_normed_kv_block = d_normed_kv_2d.view(batch, kv_len, lora_rank).to(torch.float32)

@@ -1,5 +1,5 @@
 """
-Verifies causal_conv1d_fwd, causal_conv1d_bwd and causal_conv1d_out_like, the channels-last causal
+Verifies causal_conv1d_fwd, causal_conv1d_bwd and causal_conv1d_empty, the channels-last causal
 depthwise conv of the Qwen3.5 Gated DeltaNet, against PyTorch.
 
 Contract: x (B, offset + S, C) contiguous, weight (C, 1, K); output t reads
@@ -8,14 +8,14 @@ conv1d(x.transpose(1, 2), weight, groups=C, padding=K - 1)[..., offset:offset + 
 and the input gradient are bit-identical to ATen's depthwise conv (taps accumulated in fp32 in
 order, rounded once). The weight gradient is an fp32 reduction in another order, so it matches the
 exact sum to fp32 rounding, then one bf16 rounding. The output is (B, S, C) stored channels-first,
-the layout causal_conv1d_out_like returns.
+the layout causal_conv1d_empty returns.
 """
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from pithtrain.kernels import causal_conv1d_bwd, causal_conv1d_fwd, causal_conv1d_out_like
+from pithtrain.kernels import causal_conv1d_bwd, causal_conv1d_empty, causal_conv1d_fwd
 
 
 def reference(x, weight, offset, grad_out):
@@ -61,7 +61,7 @@ def check(x, weight, grad_out, offset):
     y_ref, dx_ref, dw_ref = reference(x, weight, offset, grad_out)
 
     y = causal_conv1d_fwd(x, weight, offset)
-    like = causal_conv1d_out_like(x, offset)
+    like = causal_conv1d_empty(x, offset)
     assert y.shape == like.shape == (B, S, C)
     assert y.stride() == like.stride() == (C * S, 1, S)  # (B, C, S) dense, transposed
     assert y.dtype == like.dtype == x.dtype
@@ -76,7 +76,7 @@ def check(x, weight, grad_out, offset):
     bound = 4 * torch.finfo(torch.float32).eps * abs_sum + torch.finfo(weight.dtype).eps * dw_exact.abs()  # fmt: skip
     assert ((dw.double() - dw_exact).abs() <= bound + 1e-30).all()
     # The gradient in the output's own (channels-first) layout gives the same result.
-    grad_out_like = causal_conv1d_out_like(x, offset).copy_(grad_out)
+    grad_out_like = causal_conv1d_empty(x, offset).copy_(grad_out)
     dx2, dw2 = causal_conv1d_bwd(grad_out_like, x, weight, offset)
     assert torch.equal(dx2, dx) and torch.equal(dw2, dw)
     dx3, dw3 = causal_conv1d_bwd(grad_out, x, weight, offset)

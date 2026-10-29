@@ -2,7 +2,7 @@
 Verifier of scatter_quant (feature fp8_scatter_quant) against plain PyTorch.
 
 Contract: expand the deduplicated rows (gathered[expand_idx]), scatter the tokens into per-expert
-groups padded with zero rows to a multiple of 128, and quantize the result as quantize_grouped_input
+groups padded with zero rows to a multiple of 128, and quantize the result as fp8_quant_grouped
 does on SM90 (rowwise 1x128 plus the per-channel FP8 K-major per group). Returns (quantized 4-tuple,
 reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor).
 
@@ -48,7 +48,7 @@ def quantize_bytes(x: torch.Tensor, rcp: torch.Tensor) -> torch.Tensor:
 
 def quantize_grouped_ref(x: torch.Tensor, offs: torch.Tensor) -> tuple[torch.Tensor, ...]:
     """
-    Return quantize_grouped_input on SM90 in PyTorch: x_fp8 (M, K) as uint8, x_scale (M,
+    Return fp8_quant_grouped on SM90 in PyTorch: x_fp8 (M, K) as uint8, x_scale (M,
     ceil(K/128)), x_ch flat (M*K,) uint8 K-major per group, and x_ch_scale (K, M/128).
     """
     M, K = x.shape

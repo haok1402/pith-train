@@ -1,10 +1,10 @@
 """
-Verifies the fp8_clamped_swiglu_quant feature (clamped_swiglu_quant_rowwise,
-clamped_swiglu_quant_kmajor, clamped_swiglu_bwd_quant) against PyTorch.
+Verifies the fp8_clamped_swiglu_quant feature (fp8_clamped_swiglu_rowwise,
+fp8_clamped_swiglu_kmajor, fp8_clamped_swiglu_bwd) against PyTorch.
 
 Contract: gpt-oss's clamped SwiGLU of gate_up + bias[group] (gate at even and up at odd columns; the
 bf16 bias added in fp32 and rounded to bf16), rounded to bf16 as clamped_swiglu_fwd /
-clamped_swiglu_bwd round it, then quantized as quantize_grouped_input does on SM90: rowwise 1x128
+clamped_swiglu_bwd round it, then quantized as fp8_quant_grouped does on SM90: rowwise 1x128
 plus per-channel FP8 K-major per group. With padded=True the K-major pair has ceil(C / 256) * 256
 channels (C = N forward, 2N backward) where the fused kernel runs and C on the unfused fallback; the
 extra channels are unwritten. The backward also returns the per-group bias gradient: fp32 sums of
@@ -28,13 +28,13 @@ import torch
 
 from pithtrain.kernels import (
     clamped_swiglu_bwd,
-    clamped_swiglu_bwd_quant,
     clamped_swiglu_fwd,
-    clamped_swiglu_quant_kmajor,
-    clamped_swiglu_quant_rowwise,
+    fp8_clamped_swiglu_bwd,
+    fp8_clamped_swiglu_kmajor,
+    fp8_clamped_swiglu_rowwise,
     fp8_fused_experts_supported,
+    fp8_quant_grouped,
     k_grouped_fp8_gemm,
-    quantize_grouped_input,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -71,7 +71,7 @@ def quantize_e4m3(x: torch.Tensor, rcp: torch.Tensor) -> torch.Tensor:
 
 def quantize_grouped_ref(x: torch.Tensor, offs: torch.Tensor) -> tuple[torch.Tensor, ...]:
     """
-    quantize_grouped_input on SM90 in PyTorch: (x_fp8 (M, K) as uint8, x_scale (M, ceil(K / 128)),
+    fp8_quant_grouped on SM90 in PyTorch: (x_fp8 (M, K) as uint8, x_scale (M, ceil(K / 128)),
     x_ch flat (M * K,) uint8 K-major per group, x_ch_scale (K, M / 128)).
     """
     M, K = x.shape
@@ -282,7 +282,7 @@ def test_quant_rowwise(M: int, N: int, G: int) -> None:
     h = clamped_swiglu_fwd(x, ALPHA, LIMIT)
     check_fwd_activation(x, h)
     ref = quantize_grouped_ref(h, offs)
-    got = clamped_swiglu_quant_rowwise(gu, bias, offs, ALPHA, LIMIT)
+    got = fp8_clamped_swiglu_rowwise(gu, bias, offs, ALPHA, LIMIT)
     assert_quant_equal(got, ref[:2], ROW)
 
 
@@ -294,7 +294,7 @@ def test_quant_kmajor(M: int, N: int, G: int, padded: bool) -> None:
     gu, bias, _, offs = make_inputs(M, N, G, seed=3 * M + N + G)
     h = clamped_swiglu_fwd(biased_ref(gu, bias, offs), ALPHA, LIMIT)
     ref = quantize_grouped_ref(h, offs)
-    got = clamped_swiglu_quant_kmajor(gu, bias, offs, ALPHA, LIMIT, padded=padded)
+    got = fp8_clamped_swiglu_kmajor(gu, bias, offs, ALPHA, LIMIT, padded=padded)
     assert_kmajor(got, ref[2:], offs, N, padded)
 
 
@@ -305,7 +305,7 @@ def test_bwd_quant(M: int, N: int, G: int, padded: bool) -> None:
     dgu = clamped_swiglu_bwd(dh, x, ALPHA, LIMIT)
     check_bwd_activation(dh, x, dgu)
     ref = quantize_grouped_ref(dgu, offs)
-    got, d_bias = clamped_swiglu_bwd_quant(dh, gu, bias, offs, ALPHA, LIMIT, padded=padded)
+    got, d_bias = fp8_clamped_swiglu_bwd(dh, gu, bias, offs, ALPHA, LIMIT, padded=padded)
     assert_quant_equal(got[:2], ref[:2], ROW)
     assert_kmajor(got[2:], ref[2:], offs, 2 * N, padded)
     check_bias_grad(d_bias, dgu, offs, bias)
@@ -324,15 +324,15 @@ def test_padded_layout_feeds_k_grouped_gemm(backward: bool) -> None:
     torch.empty(64 << 20, dtype=torch.uint8, device="cuda").fill_(0x7F)  # FP8 NaN bytes
     if backward:
         C = 2 * N
-        pad = clamped_swiglu_bwd_quant(dh, gu, bias, offs, ALPHA, LIMIT, padded=True)[0][2:]
-        flat = clamped_swiglu_bwd_quant(dh, gu, bias, offs, ALPHA, LIMIT)[0][2:]
+        pad = fp8_clamped_swiglu_bwd(dh, gu, bias, offs, ALPHA, LIMIT, padded=True)[0][2:]
+        flat = fp8_clamped_swiglu_bwd(dh, gu, bias, offs, ALPHA, LIMIT)[0][2:]
     else:
         C = N
-        pad = clamped_swiglu_quant_kmajor(gu, bias, offs, ALPHA, LIMIT, padded=True)
-        flat = clamped_swiglu_quant_kmajor(gu, bias, offs, ALPHA, LIMIT)
+        pad = fp8_clamped_swiglu_kmajor(gu, bias, offs, ALPHA, LIMIT, padded=True)
+        flat = fp8_clamped_swiglu_kmajor(gu, bias, offs, ALPHA, LIMIT)
     assert pad[1].shape[0] == padded_channels(C) and flat[1].shape[0] == C
     other = torch.randn(M, 2048, device="cuda").to(torch.bfloat16)
-    b = quantize_grouped_input(other, offs)[2:]
+    b = fp8_quant_grouped(other, offs)[2:]
     ks = [int(size) for size in torch.diff(offs, prepend=offs.new_zeros(1)).tolist()]
     kt = torch.tensor(ks, dtype=torch.int32, device="cuda")
     got = torch.zeros(G, C, 2048, device="cuda")
@@ -360,14 +360,14 @@ def test_every_bf16_gate_and_up(backward: bool) -> None:
     x = biased_ref(gu, bias, offs)
     if not backward:
         ref = quantize_grouped_ref(clamped_swiglu_fwd(x, ALPHA, LIMIT), offs)
-        assert_quant_equal(clamped_swiglu_quant_rowwise(gu, bias, offs, ALPHA, LIMIT), ref[:2], ROW)
+        assert_quant_equal(fp8_clamped_swiglu_rowwise(gu, bias, offs, ALPHA, LIMIT), ref[:2], ROW)
         for padded in (False, True):
-            got = clamped_swiglu_quant_kmajor(gu, bias, offs, ALPHA, LIMIT, padded=padded)
+            got = fp8_clamped_swiglu_kmajor(gu, bias, offs, ALPHA, LIMIT, padded=padded)
             assert_kmajor(got, ref[2:], offs, N, padded)
         return
     dh = torch.randn(M, N, generator=gen).to(torch.bfloat16).cuda()
     dgu = clamped_swiglu_bwd(dh, x, ALPHA, LIMIT)
-    out, _ = clamped_swiglu_bwd_quant(dh, gu, bias, offs, ALPHA, LIMIT)
+    out, _ = fp8_clamped_swiglu_bwd(dh, gu, bias, offs, ALPHA, LIMIT)
     assert_quant_equal(out, quantize_grouped_ref(dgu, offs), ALL)
 
 
@@ -382,9 +382,9 @@ def test_zeros() -> None:
     dh = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
     offs = torch.tensor([128, 128, 384], dtype=torch.int32, device="cuda")
     floor = e8m0_scale(torch.zeros(1, device="cuda"))[0].item()
-    row = clamped_swiglu_quant_rowwise(gu, bias, offs, ALPHA, LIMIT)
-    km = clamped_swiglu_quant_kmajor(gu, bias, offs, ALPHA, LIMIT)
-    (q, d_bias) = clamped_swiglu_bwd_quant(dh, gu, bias, offs, ALPHA, LIMIT)
+    row = fp8_clamped_swiglu_rowwise(gu, bias, offs, ALPHA, LIMIT)
+    km = fp8_clamped_swiglu_kmajor(gu, bias, offs, ALPHA, LIMIT)
+    (q, d_bias) = fp8_clamped_swiglu_bwd(dh, gu, bias, offs, ALPHA, LIMIT)
     for fp8, scale in (row, km, q[:2], q[2:]):
         assert not bool(fp8.view(torch.uint8).any())
         assert bool((scale == floor).all())
@@ -400,10 +400,10 @@ def test_empty_input() -> None:
     bias = torch.randn(G, 2 * N, device="cuda").to(torch.bfloat16)
     dh = torch.empty(0, N, dtype=torch.bfloat16, device="cuda")
     offs = torch.zeros(G, dtype=torch.int32, device="cuda")
-    q, s = clamped_swiglu_quant_rowwise(gu, bias, offs, ALPHA, LIMIT)
+    q, s = fp8_clamped_swiglu_rowwise(gu, bias, offs, ALPHA, LIMIT)
     assert q.shape == (0, N) and s.shape == (0, -(-N // BLOCK))
-    km, kms = clamped_swiglu_quant_kmajor(gu, bias, offs, ALPHA, LIMIT)
+    km, kms = fp8_clamped_swiglu_kmajor(gu, bias, offs, ALPHA, LIMIT)
     assert km.numel() == 0 and kms.shape == (N, 0)
-    out, d_bias = clamped_swiglu_bwd_quant(dh, gu, bias, offs, ALPHA, LIMIT)
+    out, d_bias = fp8_clamped_swiglu_bwd(dh, gu, bias, offs, ALPHA, LIMIT)
     assert out[0].shape == (0, 2 * N) and out[2].numel() == 0 and out[3].shape == (2 * N, 0)
     assert d_bias.shape == bias.shape and d_bias.dtype == bias.dtype and not bool(d_bias.any())

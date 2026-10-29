@@ -10,7 +10,7 @@ import triton.language as tl
 from pithtrain.kernels.arch import NATIVE_E8M0
 from pithtrain.kernels.fp8_scale import compute_fp8_scale
 
-__all__ = ["fp8cast_rowwise_transpose_sm100"]
+__all__ = ["fp8_quant_grad_sm100"]
 
 
 @triton.jit
@@ -60,9 +60,9 @@ def fp8cast_rowwise_transpose_kernel(x_ptr, out_tok_ptr, scale_tok_ptr, out_t_pt
     tl.store(scale_t_ptrs, scale_t, mask=col_offs < N)
 
 
-def fp8cast_rowwise_transpose_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8_quant_grad_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    fp8cast_rowwise_transpose with both scales row-major.
+    fp8_quant_grad with both scales row-major.
     """
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     M, N = x.shape

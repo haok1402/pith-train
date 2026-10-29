@@ -1,12 +1,12 @@
 """
 x + bias[group_ids] for rows sorted by expert, with an atomic-free backward: the bias gradient is
-a per-group row sum (segment_sum_along_rows) instead of autograd's index_put_ with bf16 atomic
+a per-group row sum (segment_sum) instead of autograd's index_put_ with bf16 atomic
 adds, which dominates GPU time for gpt-oss's expert biases.
 """
 
 import torch
 
-from pithtrain.kernels import segment_sum_along_rows
+from pithtrain.kernels import segment_sum
 
 __all__ = ["indexed_bias_add"]
 
@@ -28,7 +28,7 @@ class IndexedBiasAddFunc(torch.autograd.Function):
             bias_grad = grad_out.new_zeros(ctx.bias_shape, dtype=ctx.bias_dtype)
             return grad_out, bias_grad, None, None
         grad_out_contig = grad_out.contiguous()
-        bias_grad = segment_sum_along_rows(grad_out_contig, offs, ctx.bias_dtype)
+        bias_grad = segment_sum(grad_out_contig, offs, ctx.bias_dtype)
         return grad_out, bias_grad, None, None
 
 

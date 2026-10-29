@@ -1,5 +1,5 @@
 """
-Triton per-group column sums over rows sorted by group: segment_sum_along_rows (the expert bias
+Triton per-group column sums over rows sorted by group: segment_sum (the expert bias
 gradient) and block_segment_sum (per-expert sums of 128-row-block partials). Deterministic and
 atomic-free; both architectures run them.
 """
@@ -10,7 +10,7 @@ import triton.language as tl
 
 from pithtrain.kernels.arch import SM_COUNT
 
-__all__ = ["block_segment_sum", "segment_sum_along_rows"]
+__all__ = ["block_segment_sum", "segment_sum"]
 
 
 @triton.jit
@@ -92,7 +92,7 @@ def segment_tile_reduce_kernel(partials_ptr, offs_padded_ptr, out_ptr, G, H: tl.
     tl.store(out_ptr + group_idx * H + h_offs, acc_sum, mask=h_mask)
 
 
-def segment_sum_along_rows(x: torch.Tensor, grouped_mm_offs: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+def segment_sum(x: torch.Tensor, grouped_mm_offs: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     """
     Per-group column sums of rows already sorted by group (the bias gradient when x is the gradient
     of y = z + bias[group_ids]): a new (G, H) tensor of out_dtype, row g the sum of rows

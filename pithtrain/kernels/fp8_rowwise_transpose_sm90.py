@@ -18,10 +18,10 @@ from cutlass.cutlass_dsl import T
 
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
 from pithtrain.kernels.cute_ptx_sm90 import lds_v4, max2, prmt, st_b32, st_v2, st_v4
-from pithtrain.kernels.fp8_rowwise_transpose_sm100 import fp8cast_rowwise_transpose_sm100
+from pithtrain.kernels.fp8_rowwise_transpose_sm100 import fp8_quant_grad_sm100
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale, to_mn_major
 
-__all__ = ["fp8cast_rowwise_transpose_sm90", "supports_rowwise_transpose"]
+__all__ = ["fp8_quant_grad_sm90", "supports_rowwise_transpose"]
 
 TILE, THREADS = 128, 256
 
@@ -461,15 +461,15 @@ def supports_rowwise_transpose(x: torch.Tensor) -> bool:
     return x.dtype is torch.bfloat16 and x.is_contiguous() and bool(M) and bool(N)
 
 
-def fp8cast_rowwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8_quant_grad_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    fp8cast_rowwise_transpose with both scales MN-major; inputs supports_rowwise_transpose rejects
+    fp8_quant_grad with both scales MN-major; inputs supports_rowwise_transpose rejects
     go to the Triton kernel.
     """
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     M, N = x.shape
     if not supports_rowwise_transpose(x):
-        out_tok, scale_tok, out_t, scale_t = fp8cast_rowwise_transpose_sm100(x)
+        out_tok, scale_tok, out_t, scale_t = fp8_quant_grad_sm100(x)
         return out_tok, to_mn_major(scale_tok), out_t, to_mn_major(scale_t)
     device = x.device
     out_tok = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=device)

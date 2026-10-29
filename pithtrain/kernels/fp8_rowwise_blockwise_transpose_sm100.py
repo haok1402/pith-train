@@ -10,7 +10,7 @@ import triton.language as tl
 from pithtrain.kernels.arch import NATIVE_E8M0
 from pithtrain.kernels.fp8_scale import compute_fp8_scale
 
-__all__ = ["fp8cast_rowwise_blockwise_transpose_sm100"]
+__all__ = ["fp8_quant_act_sm100"]
 
 
 @triton.jit
@@ -54,9 +54,9 @@ def fp8cast_rowwise_blockwise_transpose_kernel(x_ptr, out_tok_ptr, scale_tok_ptr
     tl.store(scale_blk_t_ptr + pid_col * scale_blk_t_cols + pid_row, blk_scale)
 
 
-def fp8cast_rowwise_blockwise_transpose_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8_quant_act_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    fp8cast_rowwise_blockwise_transpose with the rowwise scale row-major.
+    fp8_quant_act with the rowwise scale row-major.
     """
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     M, K = x.shape

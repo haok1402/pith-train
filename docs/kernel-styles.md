@@ -41,8 +41,8 @@ and their speed unchanged (section 9). Rules marked **(checked)** are enforced b
           raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
   ```
 - A single condition stays a comparison: `return ARCH_MAJOR == 9`, `if ARCH_MAJOR != 9: return None`.
-- The picker exports the contract name (`fp8cast_rowwise_transpose`); its implementations carry the
-  file's suffix (`fp8cast_rowwise_transpose_sm90`, `fp8cast_rowwise_transpose_sm100`).
+- The picker exports the contract name (`fp8_quant_grad`); its implementations carry the file's
+  suffix (`fp8_quant_grad_sm90`, `fp8_quant_grad_sm100`).
 
 ## 3. Names
 
@@ -106,7 +106,8 @@ gradients (`gate`, `up`, `grad_gate`, `dX`), the same in the code as in the docs
   `<feature>_supported`. Kernel classes are nouns (`BlockwiseTranspose`).
 - A name that would clash with a builtin or an import gets a more specific name
   (`compile_kernel`, `ptx_f32`, `struct_fields`), not an underscore.
-- Generic names in the flat namespace get a feature prefix (`bf16_expert_dgrad`, not `dgrad`).
+- Generic names in the flat namespace get a feature prefix (`bf16_expert_gate_up_dgrad`, not
+  `dgrad`).
 - Exported names (anything in `__all__` of `__init__.py`) and their parameters are the public
   contract: renaming one is an interface change, made across every caller at once.
 

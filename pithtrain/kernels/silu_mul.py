@@ -52,7 +52,7 @@ def silu_mul_fwd(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 
     gate, up: contiguous, same shape and float dtype (bf16 in practice); not modified. Computed in
     fp32 and rounded once to the dtype; close to, not bit-identical with, the PyTorch fp32 formula
-    (Triton's sigmoid). Deterministic; silu_mul_quant_fwd reproduces it bit for bit.
+    (Triton's sigmoid). Deterministic; fp8_silu_mul_fwd reproduces it bit for bit.
     """
     assert gate.shape == up.shape, f"shape mismatch: {gate.shape} vs {up.shape}"
     assert gate.dtype == up.dtype, f"dtype mismatch: {gate.dtype} vs {up.dtype}"
@@ -71,7 +71,7 @@ def silu_mul_bwd(grad_output: torch.Tensor, gate: torch.Tensor, up: torch.Tensor
 
     grad_output, gate, up: contiguous, same shape and dtype; not modified. With s = sigmoid(gate)
     in fp32: grad_up = grad_output * gate * s, grad_gate = grad_output * up * s * (1 + gate -
-    gate * s), each rounded once to the dtype. Deterministic; silu_mul_bwd_quant reproduces both
+    gate * s), each rounded once to the dtype. Deterministic; fp8_silu_mul_bwd reproduces both
     bit for bit.
     """
     assert grad_output.shape == gate.shape, f"grad_output shape {grad_output.shape} != gate shape {gate.shape}"

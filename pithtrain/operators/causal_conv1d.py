@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import torch
 
-from pithtrain.kernels import causal_conv1d_bwd, causal_conv1d_fwd, causal_conv1d_out_like
+from pithtrain.kernels import causal_conv1d_bwd, causal_conv1d_empty, causal_conv1d_fwd
 
 __all__ = ["causal_conv1d"]
 
@@ -21,7 +21,7 @@ def conv_fwd(x: torch.Tensor, w: torch.Tensor, offset: int) -> torch.Tensor:
 
 @conv_fwd.register_fake
 def _(x: torch.Tensor, w: torch.Tensor, offset: int) -> torch.Tensor:
-    return causal_conv1d_out_like(x, offset)
+    return causal_conv1d_empty(x, offset)
 
 
 @torch.library.custom_op("pithtrain::qwen35_causal_conv1d_bwd", mutates_args=())
@@ -54,7 +54,7 @@ conv_fwd.register_autograd(conv_backward, setup_context=conv_setup_context)
 def causal_conv1d(x: torch.Tensor, weight: torch.Tensor, offset: int = 0) -> torch.Tensor:
     """
     Depthwise causal conv of bf16 x (B, offset + S, C) with weight (C, 1, K) or (C, K), no bias.
-    Returns (B, S, C) in bf16, stored channels-first (as causal_conv1d_out_like allocates it).
+    Returns (B, S, C) in bf16, stored channels-first (as causal_conv1d_empty allocates it).
     """
     assert x.dtype == torch.bfloat16 and x.dim() == 3
     return conv_fwd(x.contiguous(), weight, offset)

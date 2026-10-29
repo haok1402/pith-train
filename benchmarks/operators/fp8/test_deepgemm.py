@@ -24,7 +24,7 @@ import torch.nn as nn
 from triton.testing import do_bench
 
 from benchmarks.operators.utilities import Metrics
-from pithtrain.kernels import m_grouped_group_indices
+from pithtrain.kernels import fp8_group_indices
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
 from pithtrain.operators.linear import FP8Linear
 from pithtrain.operators.token_scatter import scatter_for_grouped_gemm
@@ -179,7 +179,7 @@ def bench_normal_bwd(M: int, N: int, K: int) -> Metrics:
 
 
 def _make_group_indices(grouped_mm_offs: torch.Tensor, M: int):
-    return m_grouped_group_indices(grouped_mm_offs, M)
+    return fp8_group_indices(grouped_mm_offs, M)
 
 
 def _make_grouped_inputs(

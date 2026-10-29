@@ -11,7 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
-__all__ = ["cross_entropy_fwd_inplace"]
+__all__ = ["cross_entropy_fwd_bwd"]
 
 
 @triton.jit
@@ -58,7 +58,7 @@ def cross_entropy_fwd(logits_ptr, logits_row_stride, target_ptr, target_stride, 
     tl.store(loss_ptr + row_idx * loss_stride, loss)
 
 
-def cross_entropy_fwd_inplace(inp: torch.Tensor, target: torch.Tensor, ignore_index: int) -> tuple[torch.Tensor, torch.Tensor]:
+def cross_entropy_fwd_bwd(inp: torch.Tensor, target: torch.Tensor, ignore_index: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Mean cross-entropy of the logits inp against target, overwriting the logits with the gradient of
     that mean. Returns (loss, grad).

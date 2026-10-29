@@ -9,8 +9,8 @@ import torch
 
 from pithtrain.kernels import (
     act_scale_like,
-    fp8cast_rowwise_blockwise_transpose,
-    fp8cast_rowwise_transpose,
+    fp8_quant_act,
+    fp8_quant_grad,
 )
 
 BLOCK = 128
@@ -59,7 +59,7 @@ def test_meta_device(mn: int, sf_k: int) -> None:
 @pytest.mark.parametrize("M,K", MK)
 def test_matches_rowwise_blockwise_transpose(M: int, K: int) -> None:
     x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
-    _, x_scale, _, _ = fp8cast_rowwise_blockwise_transpose(x)
+    _, x_scale, _, _ = fp8_quant_act(x)
     fake = act_scale_like(M, (K + BLOCK - 1) // BLOCK, x.device)
     assert fake.shape == x_scale.shape and fake.dtype == x_scale.dtype
     assert fake.stride() == x_scale.stride(), (fake.stride(), x_scale.stride())
@@ -68,10 +68,10 @@ def test_matches_rowwise_blockwise_transpose(M: int, K: int) -> None:
 @pytest.mark.parametrize("M,K", MK)
 def test_matches_rowwise_transpose(M: int, K: int) -> None:
     """
-    Both scales of fp8cast_rowwise_transpose are what act_scale_like describes.
+    Both scales of fp8_quant_grad are what act_scale_like describes.
     """
     x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
-    _, x_scale, _, xt_scale = fp8cast_rowwise_transpose(x)
+    _, x_scale, _, xt_scale = fp8_quant_grad(x)
     for scale, mn, k in ((x_scale, M, K), (xt_scale, K, M)):
         fake = act_scale_like(mn, (k + BLOCK - 1) // BLOCK, x.device)
         assert fake.shape == scale.shape and fake.dtype == scale.dtype

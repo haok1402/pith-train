@@ -21,7 +21,7 @@ from pithtrain.kernels.cute_compile_sm90 import TORCH2CUTE, fake_stream
 from pithtrain.kernels.fp8_e8m0_scale_sm90 import e8m0_scale, exact_rcp
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale
 
-__all__ = ["fp8cast_rowwise_blockwise_transpose_sm90"]
+__all__ = ["fp8_quant_act_sm90"]
 
 BLOCK = 128
 
@@ -340,9 +340,9 @@ def resolve(dtype: torch.dtype, M: int, K: int, x_row_stride: int, x_addr: int) 
     return fn, num_k_tiles, num_m_tiles
 
 
-def fp8cast_rowwise_blockwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8_quant_act_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    fp8cast_rowwise_blockwise_transpose with the rowwise scale MN-major.
+    fp8_quant_act with the rowwise scale MN-major.
     """
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     M, K = x.shape

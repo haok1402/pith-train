@@ -16,11 +16,11 @@ from torch._inductor.lowering import fallback_handler, register_lowering
 from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
 from pithtrain.kernels import (
     act_scale_like,
-    fp8_act_weight_gemm,
-    fp8_dgrad_wgrad,
+    fp8_gemm_bwd,
+    fp8_gemm_fwd,
     fp8_gemm_nt,
-    fp8cast_blockwise_transpose,
-    fp8cast_rowwise_blockwise_transpose,
+    fp8_quant_act,
+    fp8_quant_weight,
 )
 
 __all__ = ["BF16Linear", "BF16LinearFunc", "FP8Linear"]
@@ -40,7 +40,7 @@ def fp8_linear_fwd(
     and, saved for the wgrad, input_t_fp8 (K, M) with its scale_input_t. weight is taken only to
     give it a gradient; the GEMM reads weight_fp8.
     """
-    return fp8_act_weight_gemm(input_2d, weight_fp8, scale_weight)
+    return fp8_gemm_fwd(input_2d, weight_fp8, scale_weight)
 
 
 @fp8_linear_fwd.register_fake
@@ -65,9 +65,7 @@ def fp8_linear_bwd(
     """
     Returns (grad_input (M, K), weight_grad (N, K)) for an (M, N) grad_output_2d.
     """
-    return fp8_dgrad_wgrad(
-        grad_output_2d, weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t, K
-    )
+    return fp8_gemm_bwd(grad_output_2d, weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t, K)
 
 
 @fp8_linear_bwd.register_fake
@@ -104,7 +102,7 @@ def fp8_quantize_activation(
     The input quantization of fp8_linear_fwd on its own, so projections that share an input
     quantize it once. Returns (input_fp8, scale_input, input_t_fp8, scale_input_t).
     """
-    return fp8cast_rowwise_blockwise_transpose(input_2d)
+    return fp8_quant_act(input_2d)
 
 
 @fp8_quantize_activation.register_fake
@@ -187,11 +185,11 @@ class FP8Linear(nn.Linear):
         if self.fp8_param_gather:
             return self.weight_fp8, self.weight_scale, self.weight_t_fp8, self.weight_scale_t
         if torch.compiler.is_compiling():
-            return fp8cast_blockwise_transpose(self.weight)
+            return fp8_quant_weight(self.weight)
         ver = FP8WeightCacheControl.version
         if self.quantized_weight_version == ver:
             return self.quantized_weight_cache
-        result = fp8cast_blockwise_transpose(self.weight)
+        result = fp8_quant_weight(self.weight)
         self.quantized_weight_cache = result
         self.quantized_weight_version = ver
         return result

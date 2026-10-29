@@ -1,7 +1,7 @@
 """
-Verifier of fp8cast_rowwise_transpose against a PyTorch implementation of the E8M0 FP8 recipe.
+Verifier of fp8_quant_grad against a PyTorch implementation of the E8M0 FP8 recipe.
 
-fp8cast_rowwise_transpose(x) returns (x_fp8, x_scale, xt_fp8, xt_scale): the rowwise 1x128
+fp8_quant_grad(x) returns (x_fp8, x_scale, xt_fp8, xt_scale): the rowwise 1x128
 quantization of x ((M, N) e4m3, scale (M, ceil(N/128))) and of x.T ((N, M) e4m3, scale (N,
 ceil(M/128))). FP8 bytes and scale values must match the reference exactly; scale strides are
 unspecified, so scales are compared by logical value.
@@ -11,7 +11,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from pithtrain.kernels import fp8cast_rowwise_transpose
+from pithtrain.kernels import fp8_quant_grad
 
 BLOCK = 128
 
@@ -52,7 +52,7 @@ def assert_scale_equal(name: str, out: torch.Tensor, ref: torch.Tensor) -> None:
 
 
 def check(x: torch.Tensor) -> None:
-    x_fp8, x_scale, xt_fp8, xt_scale = fp8cast_rowwise_transpose(x)
+    x_fp8, x_scale, xt_fp8, xt_scale = fp8_quant_grad(x)
     ref_fp8, ref_scale = ref_rowwise(x)
     ref_fp8_t, ref_scale_t = ref_rowwise(x.T)
     assert_fp8_equal("x_fp8", x_fp8, ref_fp8)
@@ -147,5 +147,5 @@ def test_non_contiguous() -> None:
 
 def test_empty() -> None:
     x = torch.empty(0, 256, device="cuda", dtype=torch.bfloat16)
-    out = fp8cast_rowwise_transpose(x)
+    out = fp8_quant_grad(x)
     assert [tuple(t.shape) for t in out] == [(0, 256), (0, 2), (256, 0), (256, 0)]

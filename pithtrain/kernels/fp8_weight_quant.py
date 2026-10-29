@@ -13,12 +13,12 @@ from typing import Any, Optional, Sequence
 import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR
-from pithtrain.kernels.fp8_weight_quant_sm100 import fp8cast_blockwise_transpose_batched_sm100, fp8cast_blockwise_transpose_sm100
+from pithtrain.kernels.fp8_weight_quant_sm100 import fp8_quant_weight_grouped_sm100, fp8_quant_weight_sm100
 
-__all__ = ["fp8_pack_transpose", "fp8_scales", "fp8_scales_multi", "fp8_shard_amax", "fp8_shard_amax_multi", "fp8_shard_cast", "fp8cast_blockwise_transpose", "fp8cast_blockwise_transpose_batched"]
+__all__ = ["fp8_pack_transpose", "fp8_scales", "fp8_scales_multi", "fp8_shard_amax", "fp8_shard_amax_multi", "fp8_shard_cast", "fp8_quant_weight", "fp8_quant_weight_grouped"]
 
 
-def fp8cast_blockwise_transpose(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8_quant_weight(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     128x128 blockwise FP8 of a weight and its transpose from one read.
 
@@ -26,17 +26,17 @@ def fp8cast_blockwise_transpose(x: torch.Tensor) -> tuple[torch.Tensor, torch.Te
     elements). w_fp8 is e4m3 (N, K), w_scale fp32 (ceil(N / 128), ceil(K / 128)); wt_fp8 is e4m3
     (K, N), exactly w_fp8.T, and wt_scale is w_scale.T. All outputs are fresh and contiguous.
     """
-    return fp8cast_blockwise_transpose_sm100(x)
+    return fp8_quant_weight_sm100(x)
 
 
-def fp8cast_blockwise_transpose_batched(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8_quant_weight_grouped(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    fp8cast_blockwise_transpose of each expert of a grouped weight x, 3-D (G, N, K) bf16 (or fp32),
+    fp8_quant_weight of each expert of a grouped weight x, 3-D (G, N, K) bf16 (or fp32),
     any strides. Returns w_fp8 e4m3 (G, N, K), w_scale fp32 (G, ceil(N / 128), ceil(K / 128)),
     wt_fp8 e4m3 (G, K, N) and wt_scale fp32 (G, ceil(K / 128), ceil(N / 128)), all contiguous.
     Tiles never straddle experts.
     """
-    return fp8cast_blockwise_transpose_batched_sm100(x)
+    return fp8_quant_weight_grouped_sm100(x)
 
 
 def fp8_shard_amax(shard: torch.Tensor, amax: torch.Tensor, row_offset: int, group_offset: int) -> None:
@@ -68,7 +68,7 @@ def fp8_shard_cast(shard: torch.Tensor, amax: torch.Tensor, out: torch.Tensor, r
 
     shard, row_offset and group_offset are as in fp8_shard_amax; amax is the reduced grid (read
     only). out, e4m3 of the shard's shape and contiguous, is overwritten with e4m3(bf16(x) / scale).
-    The gathered shards equal the w_fp8 of fp8cast_blockwise_transpose_batched on the bf16 weight.
+    The gathered shards equal the w_fp8 of fp8_quant_weight_grouped on the bf16 weight.
     """
     match ARCH_MAJOR:
         case 9:

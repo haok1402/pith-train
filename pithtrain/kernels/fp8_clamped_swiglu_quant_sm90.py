@@ -35,7 +35,7 @@ from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import fp8cast_rowwise_kmajor_sm9
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale, mn_pad
 from pithtrain.kernels.segment_sum import block_segment_sum
 
-__all__ = ["ClampedSwiGLUQuant", "clamped_swiglu_bwd_quant_sm90", "clamped_swiglu_quant_fusable", "clamped_swiglu_quant_fwd_sm90", "clamped_swiglu_quant_kmajor_sm90", "clamped_swiglu_quant_rowwise_sm90"]
+__all__ = ["ClampedSwiGLUQuant", "fp8_clamped_swiglu_bwd_sm90", "clamped_swiglu_quant_fusable", "clamped_swiglu_quant_fwd_sm90", "fp8_clamped_swiglu_kmajor_sm90", "fp8_clamped_swiglu_rowwise_sm90"]
 
 BLOCK = 128  # rows per quantization group and output columns per CTA tile
 THREADS = 512
@@ -593,7 +593,7 @@ def clamped_swiglu_quant_fwd_sm90(gate_up: torch.Tensor, bias: torch.Tensor, gro
     return out
 
 
-def clamped_swiglu_quant_rowwise_sm90(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float) -> tuple[torch.Tensor, torch.Tensor]:
+def fp8_clamped_swiglu_rowwise_sm90(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Only the rowwise pair of clamped_swiglu_quant_fwd_sm90.
     """
@@ -607,7 +607,7 @@ def clamped_swiglu_quant_rowwise_sm90(gate_up: torch.Tensor, bias: torch.Tensor,
     return tok, tok_scale
 
 
-def clamped_swiglu_quant_kmajor_sm90(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+def fp8_clamped_swiglu_kmajor_sm90(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Only the K-major pair of clamped_swiglu_quant_fwd_sm90.
     """
@@ -623,7 +623,7 @@ def clamped_swiglu_quant_kmajor_sm90(gate_up: torch.Tensor, bias: torch.Tensor, 
     return kmajor, kmajor_scale
 
 
-def clamped_swiglu_bwd_quant_sm90(dh: torch.Tensor, gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+def fp8_clamped_swiglu_bwd_sm90(dh: torch.Tensor, gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
     """
     (grad_gate_up_quant, bias_grad): fp8cast_rowwise_kmajor of the bf16 (M, 2N) input gradient and
     the (G, 2N) bias gradient; kmajor_channels as in clamped_swiglu_quant_fwd_sm90, for 2N channels.

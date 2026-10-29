@@ -24,7 +24,7 @@ from pithtrain.kernels.cute_compile_sm90 import TORCH2CUTE, fake, fake_stream
 from pithtrain.kernels.cute_ptx_sm90 import lds_v4, max_u16x2, prmt_args_last, st_v2, st_v4
 from pithtrain.kernels.fp8_e8m0_scale_sm90 import AMAX_MIN, FP8_MAX_RCP
 
-__all__ = ["fp8cast_blockwise_transpose_sm90", "fp8cast_blockwise_transpose_batched_sm90", "fp8_shard_amax_sm90", "fp8_shard_cast_sm90", "fp8_scales_sm90", "fp8_pack_transpose_sm90", "fp8_shard_amax_multi_sm90", "fp8_scales_multi_sm90"]
+__all__ = ["fp8_quant_weight_sm90", "fp8_quant_weight_grouped_sm90", "fp8_shard_amax_sm90", "fp8_shard_cast_sm90", "fp8_scales_sm90", "fp8_pack_transpose_sm90", "fp8_shard_amax_multi_sm90", "fp8_scales_multi_sm90"]
 
 BLOCK = 128
 # Below this many tiles the extra barrier of the shared-memory store path costs more than its
@@ -441,9 +441,9 @@ def store_mode(num_tiles: int, N: int, K: int, *tensors: torch.Tensor) -> str:
     return mode
 
 
-def fp8cast_blockwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8_quant_weight_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    CuTe-DSL fp8cast_blockwise_transpose: x 2-D (N, K) bf16 / fp32.
+    CuTe-DSL fp8_quant_weight: x 2-D (N, K) bf16 / fp32.
     """
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     if x.stride(1) != 1:
@@ -464,9 +464,9 @@ def fp8cast_blockwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Tensor, tor
     return out, scale, out_t, scale_t
 
 
-def fp8cast_blockwise_transpose_batched_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8_quant_weight_grouped_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    CuTe-DSL fp8cast_blockwise_transpose_batched: x 3-D (G, N, K) bf16 / fp32.
+    CuTe-DSL fp8_quant_weight_grouped: x 3-D (G, N, K) bf16 / fp32.
     """
     assert x.ndim == 3, f"Expected 3D tensor, got {x.ndim}D"
     if not x.is_contiguous():

@@ -15,9 +15,9 @@ from cutlass import Int32, Int64, Uint32
 from pithtrain.kernels.arch import SM_COUNT
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
 from pithtrain.kernels.cute_ptx_sm90 import asm, atom_add_u64, fence_gpu, lanemask_lt, ld_b32, ld_relaxed, lds_b32, red_add_shared, red_or_shared, st_b32, st_b64, sts_b32
-from pithtrain.kernels.ep_dispatch_sm100 import expert_and_expand_idx_sm100, fused_dedup_prepare_dispatch_sm100
+from pithtrain.kernels.ep_dispatch_sm100 import ep_dispatch_recv_idx_sm100, ep_dispatch_send_idx_sm100
 
-__all__ = ["dispatch_index", "expand_index", "expert_and_expand_idx_sm90", "fused_dedup_prepare_dispatch_sm90", "supports_expand", "supports_index"]
+__all__ = ["dispatch_index", "expand_index", "ep_dispatch_recv_idx_sm90", "ep_dispatch_send_idx_sm90", "supports_expand", "supports_index"]
 
 THREADS = 256
 WARPS = THREADS // 32
@@ -457,7 +457,7 @@ def supports_index(topk_ids: torch.Tensor, ep_size: int, experts_per_rank: int) 
 
 def dispatch_index(topk_ids: torch.Tensor, num_experts: int, ep_size: int, experts_per_rank: int, meta_out: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
     """
-    The outputs of fused_dedup_prepare_dispatch with stable placement, plus inv_idxs (m * k,)
+    The outputs of ep_dispatch_send_idx with stable placement, plus inv_idxs (m * k,)
     (inv_idxs[idxs[p]] == p) as a seventh. All index outputs share one int64 allocation.
     """
     M, K = topk_ids.shape
@@ -492,7 +492,7 @@ def supports_expand(received_expand_idx: torch.Tensor, ep_size: int, experts_per
 
 def expand_index(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    The outputs of expert_and_expand_idx, sharing one int64 allocation.
+    The outputs of ep_dispatch_recv_idx, sharing one int64 allocation.
     """
     total = received_expand_idx.shape[0]
     out = received_expand_idx.new_empty(2 * total)
@@ -506,19 +506,19 @@ def expand_index(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_
     return out[:total], out[total:]
 
 
-def fused_dedup_prepare_dispatch_sm90(topk_ids: torch.Tensor, num_experts: int, ep_size: int, experts_per_rank: int, meta_out: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
+def ep_dispatch_send_idx_sm90(topk_ids: torch.Tensor, num_experts: int, ep_size: int, experts_per_rank: int, meta_out: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
     """
     dispatch_index's first six outputs, or the Triton path for inputs it does not cover.
     """
     if supports_index(topk_ids, ep_size, experts_per_rank):
         return dispatch_index(topk_ids, num_experts, ep_size, experts_per_rank, meta_out)[:6]
-    return fused_dedup_prepare_dispatch_sm100(topk_ids, num_experts, ep_size, experts_per_rank, meta_out)
+    return ep_dispatch_send_idx_sm100(topk_ids, num_experts, ep_size, experts_per_rank, meta_out)
 
 
-def expert_and_expand_idx_sm90(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, torch.Tensor]:
+def ep_dispatch_recv_idx_sm90(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
     expand_index, or the Triton path for inputs it does not cover.
     """
     if supports_expand(received_expand_idx, ep_size, experts_per_rank):
         return expand_index(recv_meta, received_expand_idx, ep_size, experts_per_rank)
-    return expert_and_expand_idx_sm100(recv_meta, received_expand_idx, ep_size, experts_per_rank)
+    return ep_dispatch_recv_idx_sm100(recv_meta, received_expand_idx, ep_size, experts_per_rank)

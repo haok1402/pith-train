@@ -9,7 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
-__all__ = ["expert_and_expand_idx_sm100", "fused_dedup_prepare_dispatch_sm100"]
+__all__ = ["ep_dispatch_recv_idx_sm100", "ep_dispatch_send_idx_sm100"]
 
 
 @triton.jit
@@ -173,7 +173,7 @@ def dedup_scatter_expand_kernel(
         tl.store(expand_idx_ptr + sorted_idx, local_pos, mask=tok_mask)
 
 
-# Scratch of fused_dedup_prepare_dispatch_sm100, one int64 allocation per shape and stream. Only
+# Scratch of ep_dispatch_send_idx_sm100, one int64 allocation per shape and stream. Only
 # temporaries consumed in stream order before the next call on the same stream live here (and
 # send_meta, documented as valid until then); outputs that outlive the call are fresh.
 SCRATCH: dict[tuple, tuple[torch.Tensor, ...]] = {}
@@ -202,9 +202,9 @@ def dispatch_scratch(device: torch.device, M: int, num_ctas: int, ne_padded: int
     return scratch_views
 
 
-def fused_dedup_prepare_dispatch_sm100(topk_ids: torch.Tensor, num_experts: int, ep_size: int, experts_per_rank: int, meta_out: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def ep_dispatch_send_idx_sm100(topk_ids: torch.Tensor, num_experts: int, ep_size: int, experts_per_rank: int, meta_out: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    The Triton path of fused_dedup_prepare_dispatch (atomic order within each bucket).
+    The Triton path of ep_dispatch_send_idx (atomic order within each bucket).
     """
     M, num_topk = topk_ids.shape
     device = topk_ids.device
@@ -283,9 +283,9 @@ def expert_and_expand_idx_kernel(
     tl.store(expand_idx_ptr + slot_offs, received_idx + slot_dedup_start, mask=slot_mask)
 
 
-def expert_and_expand_idx_sm100(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, torch.Tensor]:
+def ep_dispatch_recv_idx_sm100(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    The Triton path of expert_and_expand_idx.
+    The Triton path of ep_dispatch_recv_idx.
     """
     # the kernel indexes both inputs with unit stride
     recv_meta, received_expand_idx = recv_meta.contiguous(), received_expand_idx.contiguous()

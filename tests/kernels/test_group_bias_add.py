@@ -1,5 +1,5 @@
 """
-Verifier of group_bias_add_ against plain PyTorch.
+Verifier of group_bias_add against plain PyTorch.
 
 Contract: y += bias[group_indices] in place, bit-identical to y + bias[group_indices] in PyTorch
 (one fp32 add rounded once to y's dtype). This holds for the kernel's inputs (same dtype, M a
@@ -9,7 +9,7 @@ multiple of 128, contiguous) and for every other input, which takes a PyTorch fa
 import pytest
 import torch
 
-from pithtrain.kernels import group_bias_add_
+from pithtrain.kernels import group_bias_add
 
 
 def group_ids(counts, index_dtype=torch.int32):
@@ -24,7 +24,7 @@ def group_ids(counts, index_dtype=torch.int32):
 def check(y, bias, group_indices):
     want = (y + bias[group_indices]).to(y.dtype)
     ptr = y.data_ptr()
-    assert group_bias_add_(y, bias, group_indices) is None
+    assert group_bias_add(y, bias, group_indices) is None
     assert y.data_ptr() == ptr
     assert torch.equal(y, want)
 

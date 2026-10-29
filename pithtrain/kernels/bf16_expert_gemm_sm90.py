@@ -490,7 +490,7 @@ def order_by_address(first: torch.Tensor, second: torch.Tensor) -> tuple[torch.T
     return (first, second, False) if byte_gap > 0 else (second, first, True)
 
 
-def bf16_expert_gated_forward_sm90(x, w_gate, w_up, cu, a_idx, bias=None, act=()):
+def bf16_expert_gate_up_fwd_sm90(x, w_gate, w_up, cu, a_idx, bias=None, act=()):
     M, inter = a_idx.shape[0], w_gate.shape[1]
     w_lower, w_higher, swapped = order_by_address(w_gate, w_up)
     preact, h = x.new_empty(M, 2 * inter), x.new_empty(M, inter)
@@ -505,7 +505,7 @@ def bf16_expert_gated_forward_sm90(x, w_gate, w_up, cu, a_idx, bias=None, act=()
     return preact, h
 
 
-def bf16_expert_down_forward_scattered_sm90(h, w_down, cu, slot_of, bias=None):
+def bf16_expert_down_fwd_sm90(h, w_down, cu, slot_of, bias=None):
     M, H = h.shape[0], w_down.shape[1]
     out = h.new_empty(M, H)
     if M == 0:
@@ -518,7 +518,7 @@ def bf16_expert_down_forward_scattered_sm90(h, w_down, cu, slot_of, bias=None):
     return out
 
 
-def bf16_expert_dgated_backward_sm90(dy, w_down, preact, cu, slot_of, w_gate, w_up, act=()):
+def bf16_expert_down_dgrad_sm90(dy, w_down, preact, cu, slot_of, w_gate, w_up, act=()):
     M, inter = preact.shape[0], preact.shape[1] // 2
     swapped = w_up.data_ptr() < w_gate.data_ptr()
     dpre, h = preact.new_empty(M, 2 * inter), preact.new_empty(M, inter)
@@ -532,7 +532,7 @@ def bf16_expert_dgated_backward_sm90(dy, w_down, preact, cu, slot_of, w_gate, w_
     return dpre, h, swapped
 
 
-def bf16_expert_dgrad_sm90(dpre, w_gate, w_up, cu, dpre_swapped):
+def bf16_expert_gate_up_dgrad_sm90(dpre, w_gate, w_up, cu, dpre_swapped):
     M, H = dpre.shape[0], w_gate.shape[2]
     w_lower, w_higher, swapped = order_by_address(w_gate, w_up)
     assert swapped == dpre_swapped, "the weights moved between the dgated backward and the dgrad"
@@ -542,7 +542,7 @@ def bf16_expert_dgrad_sm90(dpre, w_gate, w_up, cu, dpre_swapped):
     return dx
 
 
-def bf16_expert_wgrad_gate_up_sm90(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a_idx):
+def bf16_expert_gate_up_wgrad_sm90(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a_idx):
     if a_idx.shape[0] == 0:
         return
     mg_lower, mg_higher, mg_swapped = order_by_address(mg_gate, mg_up)
@@ -551,10 +551,10 @@ def bf16_expert_wgrad_gate_up_sm90(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a_
     fn(x, dpre, mg_lower, mg_higher, cu, a_idx)
 
 
-def bf16_expert_wgrad_down_sm90(dy, h, mg_down, cu, slot_of):
+def bf16_expert_down_wgrad_sm90(dy, h, mg_down, cu, slot_of):
     if slot_of.shape[0] == 0:
         return
     compile_gemm("wgrad_down", False, gemm_config("wgrad_down", False, h.shape[1], dy.shape[1], mg_down.shape[0], (), slot_of.shape[0]), dy.device)(dy, h, mg_down, cu, slot_of)
 
 
-__all__ = ["bf16_expert_gated_forward_sm90", "bf16_expert_down_forward_scattered_sm90", "bf16_expert_dgated_backward_sm90", "bf16_expert_dgrad_sm90", "bf16_expert_wgrad_gate_up_sm90", "bf16_expert_wgrad_down_sm90"]
+__all__ = ["bf16_expert_gate_up_fwd_sm90", "bf16_expert_down_fwd_sm90", "bf16_expert_down_dgrad_sm90", "bf16_expert_gate_up_dgrad_sm90", "bf16_expert_gate_up_wgrad_sm90", "bf16_expert_down_wgrad_sm90"]

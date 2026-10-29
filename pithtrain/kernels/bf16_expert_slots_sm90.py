@@ -20,7 +20,7 @@ from pithtrain.kernels.bf16_expert_support import MAX_GROUPS
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
 from pithtrain.kernels.cute_ptx_sm90 import asm, bf16x2_to_f32, f32x2_to_bf16x2, lanemask_lt, ld_b32, ld_v4, lds_b32, match_any, red_add_shared, st_b32, st_b64, st_v4, sts_b32
 
-__all__ = ["SlotMaps", "bf16_expert_group_slots_sm90", "bf16_expert_gather_rows_sm90", "bf16_expert_gather_sum_sm90", "expert_slot_segment_sum_sm90"]
+__all__ = ["SlotMaps", "bf16_expert_group_slots_sm90", "bf16_expert_gather_rows_sm90", "bf16_expert_gather_sum_sm90", "bf16_expert_segment_sum_sm90"]
 
 THREADS = 512
 WARPS = THREADS // 32
@@ -437,7 +437,7 @@ class SegmentSum:
             st_b32(partial_addr + k * 4, Uint32(asm(T.i32(), [cutlass.Float32(acc_sum[k]).ir_value()], "mov.b32 $0, $1;", "=r,f")), vec_ok)
 
 
-def expert_slot_segment_sum_sm90(x: torch.Tensor, cu_host: list[int], cu: torch.Tensor, idx: torch.Tensor | None = None) -> torch.Tensor:
+def bf16_expert_segment_sum_sm90(x: torch.Tensor, cu_host: list[int], cu: torch.Tensor, idx: torch.Tensor | None = None) -> torch.Tensor:
     G, N = len(cu_host) - 1, x.shape[1]
     num_group_chunks = [-(-(cu_host[group_idx + 1] - cu_host[group_idx]) // SEG_ROWS) for group_idx in range(G)]
     chunks = [(group_idx, group_chunk_idx) for group_idx in range(G) for group_chunk_idx in range(num_group_chunks[group_idx])]

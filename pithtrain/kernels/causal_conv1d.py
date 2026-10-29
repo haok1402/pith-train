@@ -13,7 +13,7 @@ import torch
 import triton
 import triton.language as tl
 
-__all__ = ["BLOCK_C", "BLOCK_T", "BWD", "causal_conv1d_bwd", "causal_conv1d_fwd", "causal_conv1d_out_like"]
+__all__ = ["BLOCK_C", "BLOCK_T", "BWD", "causal_conv1d_bwd", "causal_conv1d_fwd", "causal_conv1d_empty"]
 
 
 @triton.jit
@@ -88,7 +88,7 @@ BLOCK_T, BLOCK_C = 64, 128
 BWD = dict(BLOCK_T=128, BLOCK_C=64, num_warps=4)  # tuned on H200, (1, 4096, 8192)
 
 
-def causal_conv1d_out_like(x: torch.Tensor, offset: int) -> torch.Tensor:
+def causal_conv1d_empty(x: torch.Tensor, offset: int) -> torch.Tensor:
     """
     Uninitialized output of causal_conv1d_fwd for x (B, offset + S, C), on any device (meta
     included): logical (B, S, C) in x's dtype, a transposed view of a dense (B, C, S) tensor
@@ -105,13 +105,13 @@ def causal_conv1d_fwd(x: torch.Tensor, w: torch.Tensor, offset: int) -> torch.Te
 
     x: bf16 (B, offset + S, C) contiguous, its first offset rows history. w: (C, 1, K) or (C, K)
     contiguous, any float dtype (read as fp32). Neither is modified. Returns a fresh bf16 (B, S, C)
-    in the layout of causal_conv1d_out_like, bit-identical to ATen's CUDA conv1d(x.transpose(1, 2),
+    in the layout of causal_conv1d_empty, bit-identical to ATen's CUDA conv1d(x.transpose(1, 2),
     w, padding=K - 1, groups=C)[..., offset:offset + S].transpose(1, 2).
     """
     B, L, C = x.shape
     K = w.shape[-1]
     S = L - offset
-    y = causal_conv1d_out_like(x, offset)
+    y = causal_conv1d_empty(x, offset)
     grid = (triton.cdiv(S, BLOCK_T), triton.cdiv(C, BLOCK_C), B)
     conv_fwd_kernel[grid](x, w, y, L, S, C, offset, *y.stride(), K=K, BLOCK_T=BLOCK_T, BLOCK_C=BLOCK_C)
     return y

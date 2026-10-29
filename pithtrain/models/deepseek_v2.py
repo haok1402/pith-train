@@ -13,7 +13,7 @@ from pithtrain.contexts import distributed, training
 from pithtrain.kernels import (
     bf16_experts_supported,
     fp8_fused_experts_supported,
-    quantize_grouped_input,
+    fp8_quant_grouped,
 )
 from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.load_balance import (
@@ -151,7 +151,7 @@ class DeepSeekV2Experts(nn.Module):
             return fp8_swiglu_experts(self.gate_proj, self.up_proj, self.down_proj, *args)
         kwargs = dict(grouped_mm_offs=grouped_mm_offs, ks=ks, ks_tensor=ks_tensor, group_indices=group_indices)  # fmt: skip
         use_shared_quant = training.fp8 and x.shape[0]
-        quantized_x = quantize_grouped_input(x.detach(), grouped_mm_offs) if use_shared_quant else None  # fmt: skip
+        quantized_x = fp8_quant_grouped(x.detach(), grouped_mm_offs) if use_shared_quant else None  # fmt: skip
         gate = self.gate_proj(x, **kwargs, quantized_input=quantized_x)
         up = self.up_proj(x, **kwargs, quantized_input=quantized_x)
         return self.down_proj(silu_mul(gate, up), **kwargs)

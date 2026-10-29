@@ -10,7 +10,7 @@ from functools import lru_cache
 import torch
 import torch.distributed as dist
 
-from pithtrain.kernels import expert_and_expand_idx, fused_dedup_prepare_dispatch
+from pithtrain.kernels import ep_dispatch_recv_idx, ep_dispatch_send_idx
 from pithtrain.models.interface import AllToAllSplits, RoutingInfo
 from pithtrain.operators.all_to_all import all_to_all_sync
 from pithtrain.operators.token_scatter import padded_index_gather
@@ -79,7 +79,7 @@ class PendingDispatch:
         received_expand_idx = expand_idx.new_empty(sum(output_splits))
         all_to_all_sync(received_expand_idx, expand_idx, output_splits, input_splits, ep_group)
         recv_meta = self.meta[2 * ep_size :]
-        expert_idxs, expand_idx = expert_and_expand_idx(
+        expert_idxs, expand_idx = ep_dispatch_recv_idx(
             recv_meta, received_expand_idx, ep_size, experts_per_rank
         )
 
@@ -122,7 +122,7 @@ def prepare_dispatch_issue(
     # followed by its dedup count. The kernel writes the first two parts in place.
     stride = experts_per_rank + 1
     meta = torch.empty(2 * ep_size + ep_size * stride, dtype=torch.int64, device=topk_ids.device)
-    _, _, dispatch_token_idxs, idxs, expand_idx, send_meta = fused_dedup_prepare_dispatch(
+    _, _, dispatch_token_idxs, idxs, expand_idx, send_meta = ep_dispatch_send_idx(
         topk_ids, num_experts, ep_size, experts_per_rank, meta
     )
 

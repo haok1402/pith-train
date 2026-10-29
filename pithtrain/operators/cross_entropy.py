@@ -9,7 +9,7 @@
 
 import torch
 
-from pithtrain.kernels import cross_entropy_fwd_inplace
+from pithtrain.kernels import cross_entropy_fwd_bwd
 
 __all__ = ["cross_entropy"]
 
@@ -17,7 +17,7 @@ __all__ = ["cross_entropy"]
 class CrossEntropy(torch.autograd.Function):
     @staticmethod
     def forward(ctx, inp, target, ignore_index):
-        loss, inp = cross_entropy_fwd_inplace(inp, target, ignore_index)
+        loss, inp = cross_entropy_fwd_bwd(inp, target, ignore_index)
         ctx.save_for_backward(inp.detach())
         return loss
 

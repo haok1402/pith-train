@@ -35,7 +35,7 @@ from pithtrain.contexts import training
 from pithtrain.kernels import (
     bf16_experts_supported,
     fp8_fused_experts_supported,
-    fp8_grouped_wgrad_buffer,
+    fp8_grouped_wgrad_empty,
 )
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
 from pithtrain.operators.linear import BF16Linear
@@ -66,7 +66,7 @@ def install_wgrad_accumulation(model: nn.Module) -> None:
                 if isinstance(owner, FP8GroupedLinear):
                     # Laid out as the k-grouped FP8 wgrad accumulates in place (transposed where
                     # it computes the product transposed), not transposed twice per micro-batch.
-                    owner.main_grad = fp8_grouped_wgrad_buffer(size, device)
+                    owner.main_grad = fp8_grouped_wgrad_empty(size, device)
                 else:
                     owner.main_grad = torch.empty(size, dtype=torch.float32, device=device)
                 owner.main_grad.untyped_storage().resize_(0)

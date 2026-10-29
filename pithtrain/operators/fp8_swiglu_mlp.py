@@ -12,9 +12,9 @@ import torch
 
 from pithtrain.kernels import (
     fp8_gemm_nt,
-    fp8cast_rowwise_blockwise_transpose,
-    fp8cast_rowwise_transpose,
-    silu_mul_bwd_quant,
+    fp8_quant_act,
+    fp8_quant_grad,
+    fp8_silu_mul_bwd,
 )
 from pithtrain.operators.silu_mul import silu_mul
 
@@ -55,11 +55,11 @@ def swiglu_mlp_fwd(
     it gets a gradient) and FP8Linear's quantized-weight tuple (fp8, scale, t, t_scale).
     """
     M, inter, hidden = x.shape[0], wg_fp8.shape[0], wd_fp8.shape[0]
-    x_fp8, x_scale, x_t, x_t_scale = fp8cast_rowwise_blockwise_transpose(x)
+    x_fp8, x_scale, x_t, x_t_scale = fp8_quant_act(x)
     g = fp8_gemm_nt(x_fp8, x_scale, wg_fp8, wg_scale, M, inter, x.device, x.dtype)
     u = fp8_gemm_nt(x_fp8, x_scale, wu_fp8, wu_scale, M, inter, x.device, x.dtype)
     del x_fp8, x_scale
-    h_fp8, h_scale, h_t, h_t_scale = fp8cast_rowwise_blockwise_transpose(silu_mul(g, u))
+    h_fp8, h_scale, h_t, h_t_scale = fp8_quant_act(silu_mul(g, u))
     y = fp8_gemm_nt(h_fp8, h_scale, wd_fp8, wd_scale, M, hidden, x.device, x.dtype)
     return y, g, u, x_t, x_t_scale, h_t, h_t_scale
 
@@ -102,12 +102,12 @@ def swiglu_mlp_bwd(
     """
     (M, hidden), inter = dy.shape, g.shape[1]
     device, dtype = dy.device, dy.dtype
-    dy_fp8, dy_scale, dy_t, dy_t_scale = fp8cast_rowwise_transpose(dy)
+    dy_fp8, dy_scale, dy_t, dy_t_scale = fp8_quant_grad(dy)
     dh = fp8_gemm_nt(dy_fp8, dy_scale, wd_t, wd_t_scale, M, inter, device, dtype)
     dw_down = fp8_gemm_nt(dy_t, dy_t_scale, h_t, h_t_scale, hidden, inter, device, dtype)
     del dy_fp8, dy_scale, dy_t, dy_t_scale
     grouped_mm_offs = torch.full((1,), M, dtype=torch.int32, device=device)
-    dg_quant, du_quant = silu_mul_bwd_quant(dh, g, u, grouped_mm_offs)
+    dg_quant, du_quant = fp8_silu_mul_bwd(dh, g, u, grouped_mm_offs)
     del dh
     dx = fp8_gemm_nt(dg_quant[0], dg_quant[1], wg_t, wg_t_scale, M, hidden, device, dtype)
     dx += fp8_gemm_nt(du_quant[0], du_quant[1], wu_t, wu_t_scale, M, hidden, device, dtype)

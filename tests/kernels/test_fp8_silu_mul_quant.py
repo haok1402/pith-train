@@ -1,9 +1,9 @@
 """
-Verifier of the fp8_silu_mul_quant feature (silu_mul_quant_fwd, silu_mul_bwd_quant,
-silu_mul_quant_gu_fwd, silu_mul_bwd_quant_gu) against plain PyTorch.
+Verifier of the fp8_silu_mul_quant feature (fp8_silu_mul_fwd, fp8_silu_mul_bwd,
+fp8_silu_mul_gu_fwd, fp8_silu_mul_gu_bwd) against plain PyTorch.
 
 Contract: the SwiGLU silu(g) * u (or its two gradients), rounded to bf16 as the plain kernels
-silu_mul_fwd and silu_mul_bwd round it, then quantized as quantize_grouped_input does on SM90:
+silu_mul_fwd and silu_mul_bwd round it, then quantized as fp8_quant_grouped does on SM90:
 rowwise 1x128 FP8 plus the per-channel FP8 laid out K-major per group.
 
 The kernels' sigmoid uses ex2.approx, which PyTorch cannot reproduce bit for bit, so the test checks
@@ -20,12 +20,12 @@ import torch
 
 from pithtrain.kernels import (
     fp8_fused_experts_supported,
+    fp8_silu_mul_bwd,
+    fp8_silu_mul_fwd,
+    fp8_silu_mul_gu_bwd,
+    fp8_silu_mul_gu_fwd,
     silu_mul_bwd,
-    silu_mul_bwd_quant,
-    silu_mul_bwd_quant_gu,
     silu_mul_fwd,
-    silu_mul_quant_fwd,
-    silu_mul_quant_gu_fwd,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -60,7 +60,7 @@ def quantize_bytes(x: torch.Tensor, rcp: torch.Tensor) -> torch.Tensor:
 
 def quantize_grouped_ref(x: torch.Tensor, offs: torch.Tensor) -> tuple[torch.Tensor, ...]:
     """
-    Return quantize_grouped_input on SM90 in PyTorch: x_fp8 (M, K) as uint8, x_scale (M,
+    Return fp8_quant_grouped on SM90 in PyTorch: x_fp8 (M, K) as uint8, x_scale (M,
     ceil(K/128)), x_ch flat (M*K,) uint8 K-major per group, and x_ch_scale (K, M/128).
     """
     M, K = x.shape
@@ -212,37 +212,37 @@ def make_case(groups: str, N: int, kind: str, seed: int):
 
 
 @pytest.mark.parametrize("groups,N,kind", CASES)
-def test_silu_mul_quant_fwd(groups: str, N: int, kind: str) -> None:
+def test_fp8_silu_mul_fwd(groups: str, N: int, kind: str) -> None:
     offs, _, g, u = make_case(groups, N, kind, seed=0)
     h = silu_mul_fwd(g, u)
     check_fwd_activation(g, u, h)
-    assert_quant_equal(silu_mul_quant_fwd(g, u, offs), quantize_grouped_ref(h, offs))
+    assert_quant_equal(fp8_silu_mul_fwd(g, u, offs), quantize_grouped_ref(h, offs))
 
 
 @pytest.mark.parametrize("groups,N,kind", CASES)
-def test_silu_mul_quant_gu_fwd(groups: str, N: int, kind: str) -> None:
+def test_fp8_silu_mul_gu_fwd(groups: str, N: int, kind: str) -> None:
     offs, _, g, u = make_case(groups, N, kind, seed=1)
     gu = torch.cat([g, u], 1).contiguous()
     h = silu_mul_fwd(g, u)
-    assert_quant_equal(silu_mul_quant_gu_fwd(gu, offs), quantize_grouped_ref(h, offs))
+    assert_quant_equal(fp8_silu_mul_gu_fwd(gu, offs), quantize_grouped_ref(h, offs))
 
 
 @pytest.mark.parametrize("groups,N,kind", CASES)
-def test_silu_mul_bwd_quant(groups: str, N: int, kind: str) -> None:
+def test_fp8_silu_mul_bwd(groups: str, N: int, kind: str) -> None:
     offs, dh, g, u = make_case(groups, N, kind, seed=2)
     dg, du = silu_mul_bwd(dh, g, u)
     check_bwd_activation(dh, g, u, dg, du)
-    got_g, got_u = silu_mul_bwd_quant(dh, g, u, offs)
+    got_g, got_u = fp8_silu_mul_bwd(dh, g, u, offs)
     assert_quant_equal(got_g, quantize_grouped_ref(dg, offs))
     assert_quant_equal(got_u, quantize_grouped_ref(du, offs))
 
 
 @pytest.mark.parametrize("groups,N,kind", CASES)
-def test_silu_mul_bwd_quant_gu(groups: str, N: int, kind: str) -> None:
+def test_fp8_silu_mul_gu_bwd(groups: str, N: int, kind: str) -> None:
     offs, dh, g, u = make_case(groups, N, kind, seed=3)
     gu = torch.cat([g, u], 1).contiguous()
     dg, du = silu_mul_bwd(dh, g, u)
-    got = silu_mul_bwd_quant_gu(dh, gu, offs)
+    got = fp8_silu_mul_gu_bwd(dh, gu, offs)
     assert_quant_equal(got, quantize_grouped_ref(torch.cat([dg, du], 1), offs))
 
 
@@ -268,14 +268,14 @@ def test_exhaustive_bf16_gate() -> None:
         h = silu_mul_fwd(g, u)
         check_fwd_activation(g, u, h)
         ref_h = quantize_grouped_ref(h, offs)
-        assert_quant_equal(silu_mul_quant_fwd(g, u, offs), ref_h)
-        assert_quant_equal(silu_mul_quant_gu_fwd(gu, offs), ref_h)
+        assert_quant_equal(fp8_silu_mul_fwd(g, u, offs), ref_h)
+        assert_quant_equal(fp8_silu_mul_gu_fwd(gu, offs), ref_h)
         dg, du = silu_mul_bwd(dh, g, u)
         check_bwd_activation(dh, g, u, dg, du)
-        got_g, got_u = silu_mul_bwd_quant(dh, g, u, offs)
+        got_g, got_u = fp8_silu_mul_bwd(dh, g, u, offs)
         assert_quant_equal(got_g, quantize_grouped_ref(dg, offs))
         assert_quant_equal(got_u, quantize_grouped_ref(du, offs))
-        got = silu_mul_bwd_quant_gu(dh, gu, offs)
+        got = fp8_silu_mul_gu_bwd(dh, gu, offs)
         assert_quant_equal(got, quantize_grouped_ref(torch.cat([dg, du], 1), offs))
 
 
@@ -288,10 +288,10 @@ def test_zeros() -> None:
     offs = make_offs([128, 256])
     floor = e8m0_scale_rcp(torch.zeros(1, device="cuda"))[0].item()
     for out in (
-        silu_mul_quant_fwd(zeros, zeros, offs),
-        silu_mul_quant_gu_fwd(torch.cat([zeros, zeros], 1), offs),
-        *silu_mul_bwd_quant(zeros, zeros, zeros, offs),
-        silu_mul_bwd_quant_gu(zeros, torch.cat([zeros, zeros], 1), offs),
+        fp8_silu_mul_fwd(zeros, zeros, offs),
+        fp8_silu_mul_gu_fwd(torch.cat([zeros, zeros], 1), offs),
+        *fp8_silu_mul_bwd(zeros, zeros, zeros, offs),
+        fp8_silu_mul_gu_bwd(zeros, torch.cat([zeros, zeros], 1), offs),
     ):
         assert not bool(out[0].view(torch.uint8).any()) and not bool(out[2].view(torch.uint8).any())
         assert bool((out[1] == floor).all()) and bool((out[3] == floor).all())
@@ -312,12 +312,12 @@ def test_empty_input() -> None:
         assert out[2].numel() == 0 and out[2].dtype == torch.float8_e4m3fn
         assert out[3].shape == (K, 0) and out[3].dtype == torch.float32
 
-    shapes(silu_mul_quant_fwd(g, g, offs), N)
-    shapes(silu_mul_quant_gu_fwd(gu, offs), N)
-    grad_gate_quant, grad_up_quant = silu_mul_bwd_quant(g, g, g, offs)
+    shapes(fp8_silu_mul_fwd(g, g, offs), N)
+    shapes(fp8_silu_mul_gu_fwd(gu, offs), N)
+    grad_gate_quant, grad_up_quant = fp8_silu_mul_bwd(g, g, g, offs)
     shapes(grad_gate_quant, N)
     shapes(grad_up_quant, N)
-    shapes(silu_mul_bwd_quant_gu(g, gu, offs), 2 * N)
+    shapes(fp8_silu_mul_gu_bwd(g, gu, offs), 2 * N)
 
 
 QWEN35_COUNTS = [[1024] * 16, [0, 128, 256, 0, 640, 128, 1024, 0], [128]]
@@ -335,8 +335,8 @@ def test_gu_qwen35_cases(counts: list[int], N: int) -> None:
     g, u = gu[:, :N].contiguous(), gu[:, N:].contiguous()
     h = silu_mul_fwd(g, u)
     check_fwd_activation(g, u, h)
-    assert_quant_equal(silu_mul_quant_gu_fwd(gu, offs), quantize_grouped_ref(h, offs))
+    assert_quant_equal(fp8_silu_mul_gu_fwd(gu, offs), quantize_grouped_ref(h, offs))
     dg, du = silu_mul_bwd(dh, g, u)
     check_bwd_activation(dh, g, u, dg, du)
-    got = silu_mul_bwd_quant_gu(dh, gu, offs)
+    got = fp8_silu_mul_gu_bwd(dh, gu, offs)
     assert_quant_equal(got, quantize_grouped_ref(torch.cat([dg, du], 1), offs))

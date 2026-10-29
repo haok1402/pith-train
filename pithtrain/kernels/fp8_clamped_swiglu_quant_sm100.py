@@ -10,7 +10,7 @@ from pithtrain.kernels.clamped_swiglu import clamped_swiglu_bwd, clamped_swiglu_
 from pithtrain.kernels.fp8_rowwise_kmajor_sm100 import fp8cast_rowwise_kmajor_sm100, kmajor_empty_outputs
 from pithtrain.kernels.segment_sum import block_segment_sum
 
-__all__ = ["biased_gate_up", "clamped_swiglu_bwd_biased", "clamped_swiglu_bwd_quant_sm100", "clamped_swiglu_quant_fwd_sm100", "clamped_swiglu_quant_kmajor_sm100", "clamped_swiglu_quant_rowwise_sm100"]
+__all__ = ["biased_gate_up", "clamped_swiglu_bwd_biased", "fp8_clamped_swiglu_bwd_sm100", "clamped_swiglu_quant_fwd_sm100", "fp8_clamped_swiglu_kmajor_sm100", "fp8_clamped_swiglu_rowwise_sm100"]
 
 BLOCK = 128
 
@@ -44,21 +44,21 @@ def clamped_swiglu_quant_fwd_sm100(gate_up: torch.Tensor, bias: torch.Tensor, gr
     return fp8cast_rowwise_kmajor_sm100(activation, grouped_mm_offs)
 
 
-def clamped_swiglu_quant_rowwise_sm100(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float) -> tuple[torch.Tensor, torch.Tensor]:
+def fp8_clamped_swiglu_rowwise_sm100(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float) -> tuple[torch.Tensor, torch.Tensor]:
     """
     The rowwise pair of clamped_swiglu_quant_fwd_sm100.
     """
     return clamped_swiglu_quant_fwd_sm100(gate_up, bias, grouped_mm_offs, alpha, limit)[:2]
 
 
-def clamped_swiglu_quant_kmajor_sm100(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+def fp8_clamped_swiglu_kmajor_sm100(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """
     The K-major pair of clamped_swiglu_quant_fwd_sm100.
     """
     return clamped_swiglu_quant_fwd_sm100(gate_up, bias, grouped_mm_offs, alpha, limit)[2:]
 
 
-def clamped_swiglu_bwd_quant_sm100(dh: torch.Tensor, gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+def fp8_clamped_swiglu_bwd_sm100(dh: torch.Tensor, gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
     """
     fp8cast_rowwise_kmajor_sm100 of the bf16 (M, 2N) input gradient, and the (G, 2N) bias
     gradient in bias.dtype.

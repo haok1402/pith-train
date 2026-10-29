@@ -7,7 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
-__all__ = ["group_bias_add_"]
+__all__ = ["group_bias_add"]
 
 
 @triton.jit
@@ -20,7 +20,7 @@ def group_bias_add_kernel(y_ptr, bias_ptr, group_idx_ptr, H, BLOCK_M: tl.constex
     tl.store(y_ptr + y_offs, (y + bias).to(y_ptr.dtype.element_ty), mask=h_mask)
 
 
-def group_bias_add_(y: torch.Tensor, bias: torch.Tensor, group_indices: torch.Tensor) -> None:
+def group_bias_add(y: torch.Tensor, bias: torch.Tensor, group_indices: torch.Tensor) -> None:
     """
     In place y[r] += bias[group_indices[r]] per row, without materializing bias[group_indices].
 

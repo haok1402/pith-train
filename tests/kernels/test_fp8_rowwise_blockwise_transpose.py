@@ -1,8 +1,8 @@
 """
-Verifies fp8cast_rowwise_blockwise_transpose against a PyTorch implementation of
+Verifies fp8_quant_act against a PyTorch implementation of
 the E8M0 FP8 recipe.
 
-(x_fp8, x_scale, xt_fp8, xt_scale) = fp8cast_rowwise_blockwise_transpose(x) is the rowwise 1x128
+(x_fp8, x_scale, xt_fp8, xt_scale) = fp8_quant_act(x) is the rowwise 1x128
 quantization of x ((M, K) e4m3, scale (M, ceil(K / 128))) plus the 128x128 blockwise quantization
 of x.T ((K, M) e4m3, scale (ceil(K / 128), ceil(M / 128))). FP8 bytes and scale values must equal
 the reference; the rowwise scale's strides are unspecified, so scales are compared by value.
@@ -12,7 +12,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from pithtrain.kernels import fp8cast_rowwise_blockwise_transpose
+from pithtrain.kernels import fp8_quant_act
 
 BLOCK = 128
 
@@ -73,7 +73,7 @@ def assert_scale_equal(name: str, out: torch.Tensor, ref: torch.Tensor) -> None:
 
 
 def check(x: torch.Tensor) -> None:
-    x_fp8, x_scale, xt_fp8, xt_scale = fp8cast_rowwise_blockwise_transpose(x)
+    x_fp8, x_scale, xt_fp8, xt_scale = fp8_quant_act(x)
     q, scale = ref_rowwise(x)
     q_t, scale_t = ref_blockwise(x.T)
     assert_fp8_equal("x_fp8", x_fp8, q)
@@ -161,5 +161,5 @@ def test_degenerate_shapes() -> None:
     check(torch.randn(1000, 1, device="cuda", dtype=torch.bfloat16))
     check(torch.randn(1, 1000, device="cuda", dtype=torch.bfloat16).T)
     x = torch.empty(0, 256, device="cuda", dtype=torch.bfloat16)
-    out = fp8cast_rowwise_blockwise_transpose(x)
+    out = fp8_quant_act(x)
     assert [tuple(t.shape) for t in out] == [(0, 256), (0, 2), (256, 0), (2, 0)]

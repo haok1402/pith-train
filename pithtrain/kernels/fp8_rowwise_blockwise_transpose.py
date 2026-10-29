@@ -1,15 +1,15 @@
 """
-Picker of fp8cast_rowwise_blockwise_transpose: the CuTe-DSL kernel on SM90, Triton on SM100.
+Picker of fp8_quant_act: the CuTe-DSL kernel on SM90, Triton on SM100.
 """
 
 import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR
 
-__all__ = ["fp8cast_rowwise_blockwise_transpose"]
+__all__ = ["fp8_quant_act"]
 
 
-def fp8cast_rowwise_blockwise_transpose(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8_quant_act(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Rowwise 1x128 FP8 of x and 128x128 blockwise FP8 of x.T from one read of x, returning (x_fp8,
     x_scale, xt_fp8, xt_scale): the activation operands of the dense FP8 linear.
@@ -25,10 +25,10 @@ def fp8cast_rowwise_blockwise_transpose(x: torch.Tensor) -> tuple[torch.Tensor, 
     """
     match ARCH_MAJOR:
         case 9:
-            from pithtrain.kernels.fp8_rowwise_blockwise_transpose_sm90 import fp8cast_rowwise_blockwise_transpose_sm90
-            return fp8cast_rowwise_blockwise_transpose_sm90(x)
+            from pithtrain.kernels.fp8_rowwise_blockwise_transpose_sm90 import fp8_quant_act_sm90
+            return fp8_quant_act_sm90(x)
         case 10:
-            from pithtrain.kernels.fp8_rowwise_blockwise_transpose_sm100 import fp8cast_rowwise_blockwise_transpose_sm100
-            return fp8cast_rowwise_blockwise_transpose_sm100(x)
+            from pithtrain.kernels.fp8_rowwise_blockwise_transpose_sm100 import fp8_quant_act_sm100
+            return fp8_quant_act_sm100(x)
         case _:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")

@@ -31,12 +31,12 @@ import torch
 import torch.nn.functional as F
 
 from pithtrain.kernels import (
-    bf16_expert_dgated_backward,
-    bf16_expert_dgrad,
-    bf16_expert_down_forward_scattered,
-    bf16_expert_gated_forward,
-    bf16_expert_wgrad_down,
-    bf16_expert_wgrad_gate_up,
+    bf16_expert_down_dgrad,
+    bf16_expert_down_fwd,
+    bf16_expert_down_wgrad,
+    bf16_expert_gate_up_dgrad,
+    bf16_expert_gate_up_fwd,
+    bf16_expert_gate_up_wgrad,
     bf16_experts_supported,
     tune_kernels,
 )
@@ -190,7 +190,7 @@ def test_swiglu_forward_backward(case, layout):
     xg = x[a_idx.long()]
 
     # preact (gate, up) pairs whatever the address order; h from rounded preact
-    pre, h = bf16_expert_gated_forward(x, wg, wu, cu, a_idx)
+    pre, h = bf16_expert_gate_up_fwd(x, wg, wu, cu, a_idx)
     assert pre.shape == (M, 2 * inter) and h.shape == (M, inter)
     g_ref, g_abs = gmm(xg, wg, counts)
     u_ref, u_abs = gmm(xg, wu, counts)
@@ -200,7 +200,7 @@ def test_swiglu_forward_backward(case, layout):
     h_ref = swiglu_ref(g16, u16)
     assert_within(h, h_ref, h_ref.abs(), "h")
 
-    out = bf16_expert_down_forward_scattered(h, wd, cu, slot_of)
+    out = bf16_expert_down_fwd(h, wd, cu, slot_of)
     y_ref, y_abs = gmm(h, wd, counts)
     ref, ref_abs = torch.empty_like(y_ref), torch.empty_like(y_abs)
     ref[slot_of.long()], ref_abs[slot_of.long()] = y_ref, y_abs
@@ -208,7 +208,7 @@ def test_swiglu_forward_backward(case, layout):
 
     # dy read by slot_of, dpre in the weights' address order
     dy = torch.randn(M, H, **BF16)
-    dpre, h2, swapped = bf16_expert_dgated_backward(dy, wd, pre, cu, slot_of, wg, wu)
+    dpre, h2, swapped = bf16_expert_down_dgrad(dy, wd, pre, cu, slot_of, wg, wu)
     assert swapped == (wu.data_ptr() < wg.data_ptr()) == (layout == "swapped")
     assert torch.equal(h, h2), "the backward must re-emit the forward's h bit for bit"
     dh, dh_abs = gmm(dy[slot_of.long()], wd, counts, trans=False)
@@ -219,16 +219,16 @@ def test_swiglu_forward_backward(case, layout):
     assert_within(du, du_ref, du_abs.abs(), "dup")
 
     # one GEMM over K = 2I summing the gate and up halves in fp32
-    dx = bf16_expert_dgrad(dpre, wg, wu, cu, swapped)
+    dx = bf16_expert_gate_up_dgrad(dpre, wg, wu, cu, swapped)
     a, a_abs = gmm(dg, wg, counts, trans=False)
     b, b_abs = gmm(du, wu, counts, trans=False)
     assert_within(dx, a + b, a_abs + b_abs, "dgrad")
 
-    pre2, h3 = bf16_expert_gated_forward(x, wg, wu, cu, a_idx)
+    pre2, h3 = bf16_expert_gate_up_fwd(x, wg, wu, cu, a_idx)
     assert torch.equal(pre, pre2) and torch.equal(h, h3)
-    assert torch.equal(out, bf16_expert_down_forward_scattered(h, wd, cu, slot_of))
-    assert torch.equal(dpre, bf16_expert_dgated_backward(dy, wd, pre, cu, slot_of, wg, wu)[0])
-    assert torch.equal(dx, bf16_expert_dgrad(dpre, wg, wu, cu, swapped))
+    assert torch.equal(out, bf16_expert_down_fwd(h, wd, cu, slot_of))
+    assert torch.equal(dpre, bf16_expert_down_dgrad(dy, wd, pre, cu, slot_of, wg, wu)[0])
+    assert torch.equal(dx, bf16_expert_gate_up_dgrad(dpre, wg, wu, cu, swapped))
 
 
 WGRAD_CASES = [
@@ -265,8 +265,8 @@ def test_swiglu_wgrads(case, w_layout, mg_layout):
     mg_g, mg_u = pair(G, inter, H, mg_layout, dtype=torch.float32, scale=3.0)
     mg_d = torch.randn(G, H, inter, device="cuda") * 3.0
     start = [t.clone() for t in (mg_g, mg_u, mg_d)]
-    bf16_expert_wgrad_gate_up(x, dpre, swapped, mg_g, mg_u, cu, a_idx)
-    bf16_expert_wgrad_down(dy, h, mg_d, cu, slot_of)
+    bf16_expert_gate_up_wgrad(x, dpre, swapped, mg_g, mg_u, cu, a_idx)
+    bf16_expert_down_wgrad(dy, h, mg_d, cu, slot_of)
 
     xg = x[a_idx.long()]
     dg, du = lanes(dpre, swapped)
@@ -281,8 +281,8 @@ def test_swiglu_wgrads(case, w_layout, mg_layout):
     before = [t.clone() for t in (mg_g, mg_u, mg_d)]
     for t, s0 in zip((mg_g, mg_u, mg_d), start):
         t.copy_(s0)
-    bf16_expert_wgrad_gate_up(x, dpre, swapped, mg_g, mg_u, cu, a_idx)
-    bf16_expert_wgrad_down(dy, h, mg_d, cu, slot_of)
+    bf16_expert_gate_up_wgrad(x, dpre, swapped, mg_g, mg_u, cu, a_idx)
+    bf16_expert_down_wgrad(dy, h, mg_d, cu, slot_of)
     for a, b in zip(before, (mg_g, mg_u, mg_d)):
         assert torch.equal(a, b)
 
@@ -302,13 +302,13 @@ def test_down_scattered(case):
     ident = torch.arange(M, device="cuda", dtype=torch.int32)
     y_ref, y_abs = gmm(h, wd, counts)
     for bias in (None, (torch.randn(G, H, device="cuda") * 4).to(torch.bfloat16)):
-        grouped = bf16_expert_down_forward_scattered(h, wd, cu, ident, bias)
+        grouped = bf16_expert_down_fwd(h, wd, cu, ident, bias)
         ref, ref_abs = y_ref, y_abs
         if bias is not None:
             rows = per_row_bias(bias, counts)
             ref, ref_abs = ref + rows, ref_abs + rows.abs()
         assert_within(grouped, ref, ref_abs, f"down bias={bias is not None}")
-        out = bf16_expert_down_forward_scattered(h, wd, cu, slot_of, bias)
+        out = bf16_expert_down_fwd(h, wd, cu, slot_of, bias)
         expect = torch.empty_like(grouped)
         expect[slot_of.long()] = grouped
         assert torch.equal(out, expect)
@@ -341,7 +341,7 @@ def test_gptoss(counts_case, limit):
     bd = (torch.randn(G, H, device="cuda") * 2).to(torch.bfloat16)
     xg = x[a_idx.long()]
 
-    pre, h = bf16_expert_gated_forward(x, wg, wu, cu, a_idx, bias, act)
+    pre, h = bf16_expert_gate_up_fwd(x, wg, wu, cu, a_idx, bias, act)
     for lane, w, what in ((0, wg, "gate"), (1, wu, "up")):
         ref, ref_abs = gmm(xg, w, counts)
         rows = per_row_bias(bias[:, lane::2], counts)
@@ -351,7 +351,7 @@ def test_gptoss(counts_case, limit):
     h_ref = oai_ref(g16, u16, alpha, limit)
     assert_within(h, h_ref, h_ref.abs(), "h")
 
-    out = bf16_expert_down_forward_scattered(h, wd, cu, slot_of, bd)
+    out = bf16_expert_down_fwd(h, wd, cu, slot_of, bd)
     y_ref, y_abs = gmm(h, wd, counts)
     rows = per_row_bias(bd, counts)
     ref, ref_abs = torch.empty_like(y_ref), torch.empty_like(y_abs)
@@ -359,7 +359,7 @@ def test_gptoss(counts_case, limit):
     assert_within(out, ref, ref_abs, "down")
 
     dy = torch.randn(M, H, **BF16)
-    dpre, h2, swapped = bf16_expert_dgated_backward(dy, wd, pre, cu, slot_of, wg, wu, act)
+    dpre, h2, swapped = bf16_expert_down_dgrad(dy, wd, pre, cu, slot_of, wg, wu, act)
     assert not swapped
     assert torch.equal(h, h2)
     dh, dh_abs = gmm(dy[slot_of.long()], wd, counts, trans=False)
@@ -370,7 +370,7 @@ def test_gptoss(counts_case, limit):
     assert_within(du, du_ref, du_abs.abs(), "dup")
     assert torch.all(dg[g16 > limit] == 0) and torch.all(du[u16.abs() > limit] == 0)
 
-    dx = bf16_expert_dgrad(dpre, wg, wu, cu, swapped)
+    dx = bf16_expert_gate_up_dgrad(dpre, wg, wu, cu, swapped)
     a, a_abs = gmm(dg, wg, counts, trans=False)
     b, b_abs = gmm(du, wu, counts, trans=False)
     assert_within(dx, a + b, a_abs + b_abs, "dgrad")
@@ -378,8 +378,8 @@ def test_gptoss(counts_case, limit):
     mg_g, mg_u = pair(G, inter, H, "interleaved", dtype=torch.float32)
     mg_d = torch.randn(G, H, inter, device="cuda")
     start = [t.clone() for t in (mg_g, mg_u, mg_d)]
-    bf16_expert_wgrad_gate_up(x, dpre, swapped, mg_g, mg_u, cu, a_idx)
-    bf16_expert_wgrad_down(dy, h, mg_d, cu, slot_of)
+    bf16_expert_gate_up_wgrad(x, dpre, swapped, mg_g, mg_u, cu, a_idx)
+    bf16_expert_down_wgrad(dy, h, mg_d, cu, slot_of)
     for mg, s0, (inc, inc_abs), what in (
         (mg_g, start[0], kgrouped(dg, xg, counts), "mg_gate"),
         (mg_u, start[1], kgrouped(du, xg, counts), "mg_up"),
@@ -410,20 +410,20 @@ def test_zero_rows(H, inter, G, gptoss):
     bias = torch.randn(G, 2 * inter, **BF16) if gptoss else None
     bd = torch.randn(G, H, **BF16) if gptoss else None
     act = (1.702, 7.0) if gptoss else ()
-    pre, h = bf16_expert_gated_forward(x, wg, wu, cu, idx, bias, act)
+    pre, h = bf16_expert_gate_up_fwd(x, wg, wu, cu, idx, bias, act)
     assert pre.shape == (0, 2 * inter) and h.shape == (0, inter)
-    out = bf16_expert_down_forward_scattered(h, wd, cu, idx, bd)
+    out = bf16_expert_down_fwd(h, wd, cu, idx, bd)
     assert out.shape == (0, H)
     dy = torch.empty(0, H, **BF16)
-    dpre, h2, swapped = bf16_expert_dgated_backward(dy, wd, pre, cu, idx, wg, wu, act)
+    dpre, h2, swapped = bf16_expert_down_dgrad(dy, wd, pre, cu, idx, wg, wu, act)
     assert dpre.shape == (0, 2 * inter) and h2.shape == (0, inter)
-    dx = bf16_expert_dgrad(dpre, wg, wu, cu, swapped)
+    dx = bf16_expert_gate_up_dgrad(dpre, wg, wu, cu, swapped)
     assert dx.shape == (0, H)
     mg_g, mg_u = pair(G, inter, H, layout, dtype=torch.float32)
     mg_d = torch.randn(G, H, inter, device="cuda")
     start = [t.clone() for t in (mg_g, mg_u, mg_d)]
-    bf16_expert_wgrad_gate_up(x, dpre, swapped, mg_g, mg_u, cu, idx)
-    bf16_expert_wgrad_down(dy, h, mg_d, cu, idx)
+    bf16_expert_gate_up_wgrad(x, dpre, swapped, mg_g, mg_u, cu, idx)
+    bf16_expert_down_wgrad(dy, h, mg_d, cu, idx)
     for a, b in zip(start, (mg_g, mg_u, mg_d)):
         assert torch.equal(a, b)
 
@@ -439,7 +439,7 @@ def test_wrong_group_offsets_fail():
     g_ref, g_abs = gmm(x[a_idx.long()], wg, counts)
     bad = cu.clone()
     bad[1:-1] += 1
-    pre, _ = bf16_expert_gated_forward(x, wg, wu, bad, a_idx)
+    pre, _ = bf16_expert_gate_up_fwd(x, wg, wu, bad, a_idx)
     with pytest.raises(AssertionError):
         assert_within(pre[:, 0::2], g_ref, g_abs, "preact gate")
 

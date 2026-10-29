@@ -14,7 +14,7 @@ from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
 from pithtrain.kernels import (
     bf16_experts_supported,
     fp8_fused_experts_supported,
-    fp8cast_blockwise_transpose_batched,
+    fp8_quant_weight_grouped,
 )
 from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.fp8_param_gather import fp8_param_operands
@@ -166,14 +166,14 @@ class GptOssExperts(nn.Module):
         if (gathered := fp8_param_operands(self, name)) is not None:
             return gathered
         if torch.compiler.is_compiling():
-            return fp8cast_blockwise_transpose_batched(weight)
+            return fp8_quant_weight_grouped(weight)
         version = FP8WeightCacheControl.version
         cache = self.quantized_weight_cache
         if self.quantized_weight_version != version or cache is None:
             cache = self.quantized_weight_cache = {}
             self.quantized_weight_version = version
         if name not in cache:
-            cache[name] = fp8cast_blockwise_transpose_batched(weight)
+            cache[name] = fp8_quant_weight_grouped(weight)
         return cache[name]
 
     def apply_grouped_linear(

@@ -10,7 +10,7 @@ transpose into one buffer of the bf16 weight's size. The unsharded parameter is 
 that buffer, so autograd and FSDP's gradient path are unchanged, and the module reads the operands
 through the weight_fp8 and weight_t_fp8 buffers that view the same storage.
 
-The FP8 bytes and scales are bit-identical to fp8cast_blockwise_transpose of the bf16 weight. The
+The FP8 bytes and scales are bit-identical to fp8_quant_weight of the bf16 weight. The
 hooks are plain functions set on the sharded local tensor, so no tensor subclass is involved.
 """
 

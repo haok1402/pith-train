@@ -16,7 +16,7 @@ __all__ = ["scatter_quant"]
 def scatter_quant(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor] = None, padding_alignment: int = 128, group_counts: Optional[list[int]] = None) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
     """
     The MoE stage-3 FP8 input: x = gathered[expand_idx] scattered by expert as scatter_by_expert
-    does, then quantized as quantize_grouped_input does on SM90. Returns ((x_fp8, x_scale, x_ch_fp8,
+    does, then quantized as fp8_quant_grouped does on SM90. Returns ((x_fp8, x_scale, x_ch_fp8,
     x_ch_scale), reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor).
 
     - gathered: bf16 (m_src, N) received (deduplicated) tokens. expert_idxs: int64 (m,), the
@@ -26,7 +26,7 @@ def scatter_quant(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups:
     - padding_alignment must be 128. group_counts: the true per-expert slot counts on the host, if
       known; it must match expert_idxs and saves the device-to-host copy (and host sync) of the
       padded group sizes.
-    - The 4-tuple is quantize_grouped_input's SM90 K-major layout over the M = sum(ks) grouped rows
+    - The 4-tuple is fp8_quant_grouped's SM90 K-major layout over the M = sum(ks) grouped rows
       (each group padded with zero rows to a multiple of 128). reverse_shuffle_idxs: int64 (m,), the
       grouped row of each slot. grouped_mm_offs: int32 (G,) cumulative padded group ends. ks: host
       list of the padded group sizes; ks_tensor: the same as int32 (G,) on the device. With m == 0

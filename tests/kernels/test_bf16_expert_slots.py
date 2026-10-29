@@ -10,7 +10,7 @@ bit for bit.
 - bf16_expert_gather_sum: each token's grouped rows summed in fp32 in ascending expert order and
   rounded once to bf16.
 - bf16_expert_gather_rows: x[idx] (the no-expand input gradient dx[row_of]).
-- expert_slot_segment_sum: per-segment fp32 row sums, 256-row chunks summed in row order and then
+- bf16_expert_segment_sum: per-segment fp32 row sums, 256-row chunks summed in row order and then
   the chunk sums in order, as the contract fixes.
 """
 
@@ -21,8 +21,8 @@ from pithtrain.kernels import (
     bf16_expert_gather_rows,
     bf16_expert_gather_sum,
     bf16_expert_group_slots,
+    bf16_expert_segment_sum,
     bf16_experts_supported,
-    expert_slot_segment_sum,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -247,8 +247,8 @@ def test_segment_sum(case, gather):
     for count in counts:
         cu_host.append(cu_host[-1] + count)
     cu = torch.tensor(cu_host, dtype=torch.int32, device="cuda")
-    out = expert_slot_segment_sum(x if gather else x[:M], cu_host, cu, idx)
+    out = bf16_expert_segment_sum(x if gather else x[:M], cu_host, cu, idx)
     ref = segment_sum_reference(x if gather else x[:M], counts, idx)
     assert out.dtype == torch.float32 and out.shape == (len(counts), N)
     assert torch.equal(out, ref)
-    assert torch.equal(out, expert_slot_segment_sum(x if gather else x[:M], cu_host, cu, idx))
+    assert torch.equal(out, bf16_expert_segment_sum(x if gather else x[:M], cu_host, cu, idx))
