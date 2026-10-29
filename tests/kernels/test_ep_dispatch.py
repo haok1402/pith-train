@@ -161,7 +161,9 @@ def test_dispatch_odd_experts_per_rank(k: int, ep: int, m: int) -> None:
 
 
 @pytest.mark.parametrize("kind", ["one_expert", "one_rank", "ragged"])
-@pytest.mark.parametrize("ep,epr,k", [(4, 32, 8), (8, 32, 8), (4, 64, 8), (8, 8, 6), (4, 8, 4), (8, 16, 4)])  # fmt: skip
+@pytest.mark.parametrize(
+    "ep,epr,k", [(4, 32, 8), (8, 32, 8), (4, 64, 8), (8, 8, 6), (4, 8, 4), (8, 16, 4)]
+)
 def test_dispatch_skewed(kind: str, ep: int, epr: int, k: int) -> None:
     """Hot experts, every token on one rank, empty experts and ranks."""
     if kind == "one_rank" and epr < k:

@@ -89,7 +89,9 @@ def assert_f32_equal(name: str, out: torch.Tensor, ref: torch.Tensor) -> None:
     assert torch.equal(out, ref), f"{name}: {(out != ref).sum().item()} mismatching values"
 
 
-def make_weight(shape: tuple, dtype: torch.dtype = torch.bfloat16, kind: str = "randn") -> torch.Tensor:  # fmt: skip
+def make_weight(
+    shape: tuple, dtype: torch.dtype = torch.bfloat16, kind: str = "randn"
+) -> torch.Tensor:
     g = torch.Generator(device="cuda").manual_seed(zlib.crc32(repr((shape, kind)).encode()))
     x = torch.randn(shape, device="cuda", generator=g, dtype=torch.float32)
     if kind == "outliers":
@@ -297,7 +299,9 @@ SHARDED = [
 ]
 
 
-@pytest.mark.parametrize("shape,n", SHARDED, ids=lambda v: "x".join(map(str, v)) if isinstance(v, tuple) else str(v))  # fmt: skip
+@pytest.mark.parametrize(
+    "shape,n", SHARDED, ids=lambda v: "x".join(map(str, v)) if isinstance(v, tuple) else str(v)
+)
 @pytest.mark.parametrize("kind", ["wide", "outliers"])
 def test_param_gather_pipeline(shape: tuple, n: int, kind: str) -> None:
     master = make_weight(shape, dtype=torch.float32, kind=kind)
@@ -367,7 +371,9 @@ def test_shard_amax_rounds_to_bf16() -> None:
     assert_fp8_equal("cast", out, w.bfloat16().float().to(torch.float8_e4m3fn))
 
 
-@pytest.mark.parametrize("grid", [(1, 32, 16), (16, 6, 16), (16, 16, 6), (2, 5, 86), (3, 1, 1), (1, 171, 23)])  # fmt: skip
+@pytest.mark.parametrize(
+    "grid", [(1, 32, 16), (16, 6, 16), (16, 16, 6), (2, 5, 86), (3, 1, 1), (1, 171, 23)]
+)
 def test_scales(grid: tuple) -> None:
     amax = make_weight(grid, dtype=torch.float32, kind="wide").abs()
     amax.view(-1)[0] = 0.0
@@ -379,7 +385,22 @@ def test_scales(grid: tuple) -> None:
     assert_f32_equal("scale_t", scale_t, e8m0_scale(amax).transpose(1, 2))
 
 
-@pytest.mark.parametrize("shape", [(1, 4096, 2048), (1, 512, 2048), (1, 2048, 4096), (16, 768, 2048), (16, 2048, 768), (1, 576, 10944), (2, 5760, 2880), (5, 384, 192), (3, 100, 260), (1, 129, 136), (2, 24, 40)])  # fmt: skip
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1, 4096, 2048),
+        (1, 512, 2048),
+        (1, 2048, 4096),
+        (16, 768, 2048),
+        (16, 2048, 768),
+        (1, 576, 10944),
+        (2, 5760, 2880),
+        (5, 384, 192),
+        (3, 100, 260),
+        (1, 129, 136),
+        (2, 24, 40),
+    ],
+)
 def test_pack_transpose(shape: tuple) -> None:
     x = make_weight(shape, kind="wide").to(torch.float8_e4m3fn)
     numel = x.numel()
@@ -395,7 +416,16 @@ def test_pack_transpose(shape: tuple) -> None:
 
 # The FP8 weights of one FSDP shard group: 2D and 3D, tiles straddling shards, an unaligned K
 # (258, no 16-byte rows), and a weight whose last rank holds nothing.
-GROUP = [(1536, 2048), (2048, 768), (1000, 2880), (4, 1536, 2048), (4, 2048, 768), (300, 258), (6, 256), (3, 130, 66)]  # fmt: skip
+GROUP = [
+    (1536, 2048),
+    (2048, 768),
+    (1000, 2880),
+    (4, 1536, 2048),
+    (4, 2048, 768),
+    (300, 258),
+    (6, 256),
+    (3, 130, 66),
+]
 RANKS = 4
 
 
@@ -436,7 +466,9 @@ def test_multi_launch_param_gather() -> None:
         assert_f32_equal(f"reduced amax {shape}", a, ref_amax(as_3d(w.bfloat16())))
 
     scales = [torch.full(grid_of(s), -1.0, device="cuda") for s in GROUP]
-    scales_t = [torch.full(grid_of(s), -1.0, device="cuda").transpose(1, 2).contiguous() for s in GROUP]  # fmt: skip
+    scales_t = [
+        torch.full(grid_of(s), -1.0, device="cuda").transpose(1, 2).contiguous() for s in GROUP
+    ]
     scales_launch = fp8_scales_multi(reduced_views, scales, scales_t)
     assert scales_launch is not None and callable(scales_launch), (
         "H200 must have a one-launch scales"

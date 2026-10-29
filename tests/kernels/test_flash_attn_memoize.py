@@ -9,8 +9,6 @@ tensors (``inputs`` names the tensors it reads, ``inputs["q"]`` included). With 
 ``pithtrain.operators.flash_attn_v4`` calls it) the replayed outputs equal FA4's own (forward bit
 for bit; backward up to FA4's atomic accumulation order) and plain attention in PyTorch.
 
-Moved from tests/operators/test_fa4_fastpath.py, rewritten against the public call only.
-
     pytest tests/kernels/test_flash_attn_memoize.py -v
 """
 
@@ -69,11 +67,37 @@ class Counted:
 
 
 def fwd_entry(q, k, v, s_, scale, causal, window):
-    return lambda: tuple(_flash_attn_fwd(q, k, v, softmax_scale=scale, causal=causal, window_size_left=window[0], window_size_right=window[1], learnable_sink=s_, return_lse=True)[:2])  # fmt: skip
+    return lambda: tuple(
+        _flash_attn_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=scale,
+            causal=causal,
+            window_size_left=window[0],
+            window_size_right=window[1],
+            learnable_sink=s_,
+            return_lse=True,
+        )[:2]
+    )
 
 
 def bwd_entry(q, k, v, o, lse, do, s_, scale, causal, window):
-    return lambda: tuple(_flash_attn_bwd(q, k, v, o, do, lse, softmax_scale=scale, causal=causal, window_size_left=window[0], window_size_right=window[1], learnable_sink=s_))  # fmt: skip
+    return lambda: tuple(
+        _flash_attn_bwd(
+            q,
+            k,
+            v,
+            o,
+            do,
+            lse,
+            softmax_scale=scale,
+            causal=causal,
+            window_size_left=window[0],
+            window_size_right=window[1],
+            learnable_sink=s_,
+        )
+    )
 
 
 def memo_fwd(q, k, v, s_, scale, causal, window):
@@ -153,7 +177,9 @@ def test_forward(case):
         assert torch.equal(o, ref_o) and torch.equal(lse, ref_lse)
     if fa4_memoized():
         assert calls[-2:] == [0, 0], f"no replay: entry calls per call {calls}"
-    want_o, want_lse = attention_reference(q.float(), k.float(), v.float(), s_, scale, causal, window)  # fmt: skip
+    want_o, want_lse = attention_reference(
+        q.float(), k.float(), v.float(), s_, scale, causal, window
+    )
     assert rel(o, want_o) < 1e-2
     torch.testing.assert_close(lse, want_lse, atol=2e-3, rtol=1e-3)
     if s_ is None:
@@ -207,7 +233,9 @@ def test_back_to_back_calls_own_their_buffers():
     for _ in range(3):
         memo_bwd(q, k, v, o, lse, do, s_, scale, causal, window)
         memo_fwd(q, k, v, s_, scale, causal, window)
-    (first, _), (second, _) = (memo_bwd(q, k, v, o, lse, do, s_, scale, causal, window) for _ in range(2))  # fmt: skip
+    (first, _), (second, _) = (
+        memo_bwd(q, k, v, o, lse, do, s_, scale, causal, window) for _ in range(2)
+    )
     assert not {t.data_ptr() for t in first} & {t.data_ptr() for t in second}
     (f1, _), (f2, _) = (memo_fwd(q, k, v, s_, scale, causal, window) for _ in range(2))
     kept = [t.clone() for t in f1]

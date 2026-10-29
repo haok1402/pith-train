@@ -35,7 +35,7 @@ pytest tests/test_deepgemm_fp8_linear_correctness.py -v
 pytest tests/test_grouped_linear_correctness.py -v
 pytest tests/test_ep_dedup_dispatch.py -v
 pytest tests/test_silu_mul.py tests/test_clamped_swiglu.py tests/test_indexed_bias_add.py tests/test_log_prob.py -v
-pytest tests/operators -v              # operator-level tests (ring attention, CP sequence, conv)
+pytest tests/operators -v              # operator-level tests (ring attention, CP sequence)
 pytest tests/test_import_layers.py -v  # import layering, kernel naming, kernels interface and verifier coverage (CPU only, AST)
 
 # Single test function

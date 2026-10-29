@@ -45,7 +45,7 @@ from pithtrain.kernels import (
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not fp8_fused_experts_supported(),
-    reason="the fused FP8 expert ops run only where fp8_fused_experts_supported()",
+    reason="needs the fused FP8 expert path (fp8_fused_experts_supported)",
 )
 
 BLOCK = 128

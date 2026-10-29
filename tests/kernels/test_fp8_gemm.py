@@ -11,10 +11,8 @@ Verifier of the ``fp8_gemm`` feature of ``pithtrain.kernels`` against plain PyTo
   / ``fp8_dgrad_wgrad``: against fp32 PyTorch matmuls of the dequantized FP8 operands.
 - ``fp8_grouped_wgrad_buffer`` layout and ``fp8_fused_experts_supported``.
 
-Covers the cases of the former tests/operators/test_fp8_gemm.py, test_group_indices_sm90.py,
-test_fp8_rowwise_kmajor_sm90.py, tests/test_memory_kgrouped_parity.py (the deadlock-guard shapes, still
-in a subprocess under a timeout), the fp8_gemm_nt shapes of test_fp8_scale_layout.py and the
-grouped-input (rowwise_colwise) shapes of test_fp8_quantize.py, through the public interface.
+The deadlock-guard shapes of k_grouped_fp8_gemm run in a subprocess under a timeout, so a hang
+fails the test instead of the session.
 """
 
 import json
@@ -42,7 +40,7 @@ from pithtrain.kernels import (
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not fp8_fused_experts_supported(),
-    reason="verifies the H200 (SM90) path: K-major grouped layout, group ids, deadlock guard",
+    reason="needs the fused FP8 expert path (fp8_fused_experts_supported)",
 )
 
 DEV = "cuda"
@@ -467,7 +465,7 @@ KGROUPED_CASES = [
     ([40960, 0, 30720, 128], 256, 128, None, None),
     ([70016], 256, 128, None, None),
     ([128, 66048, 0, 256], 256, 128, None, None),
-    # deadlock guard (odd first-operand block count), from the former parity test
+    # deadlock guard (odd first-operand block count)
     ([512, 256, 384, 128], 2880, 2880, None, None),  # gpt-oss down: both odd, pads a
     ([256, 128, 640], 2880, 1024, None, None),  # odd M, even N: transposed product
     ([384, 128], 5760, 2880, None, None),  # gpt-oss gate_up: pads a
@@ -499,8 +497,10 @@ def test_k_grouped_gemm(ks: list[int], N: int, K: int, NA: int | None, KB: int |
     try:
         r = subprocess.run(
             [sys.executable, "-c", SUBPROCESS, os.path.abspath(__file__), args],
-            capture_output=True, text=True, timeout=300,
-        )  # fmt: skip
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
     except subprocess.TimeoutExpired:
         pytest.fail(f"k_grouped_fp8_gemm hung for (N, K, NA, KB) = ({N}, {K}, {NA}, {KB}), {ks}")
     assert r.returncode == 0 and "OK" in r.stdout, r.stdout[-2000:] + r.stderr[-4000:]

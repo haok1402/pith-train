@@ -287,7 +287,9 @@ NAMES = ("o", "g_cum", "A", "dq", "dk", "dv", "dg", "dbeta")
 
 
 @pytest.mark.parametrize("H", [32, 16])
-@pytest.mark.parametrize("S,resets", [(4096, ()), (1000, ()), (4096, (0, 300, 1777, 2048, 4091)), (8192, ())])  # fmt: skip
+@pytest.mark.parametrize(
+    "S,resets", [(4096, ()), (1000, ()), (4096, (0, 300, 1777, 2048, 4091)), (8192, ())]
+)
 def test_bit_exact_against_fla(monkeypatch: pytest.MonkeyPatch, S: int, resets, H: int) -> None:
     """H = 16 runs grouped value heads on unrepeated q / k; FLA gets them repeated."""
     pin_fla(monkeypatch, RECORDED)

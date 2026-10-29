@@ -36,7 +36,7 @@ from pithtrain.kernels import (
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not fp8_fused_experts_supported(),
-    reason="the fused FP8 expert ops run only where fp8_fused_experts_supported()",
+    reason="needs the fused FP8 expert path (fp8_fused_experts_supported)",
 )
 
 BLOCK = 128
@@ -329,8 +329,9 @@ QWEN35_COUNTS = [[1024] * 16, [0, 128, 256, 0, 640, 128, 1024, 0], [128]]
 @pytest.mark.parametrize("counts", QWEN35_COUNTS)
 @pytest.mark.parametrize("N", [512, 768, 520])
 def test_gu_qwen35_cases(counts: list[int], N: int) -> None:
-    """The fused gate_up entry points on qwen3.5-like groups (moved from
-    tests/test_fp8_qwen35_experts.py::test_kernels_match_unfused)."""
+    """
+    The fused gate_up entry points on qwen3.5-like groups.
+    """
     gen = torch.Generator(device="cuda").manual_seed(0)
     M, offs = sum(counts), _offs(counts)
     gu = torch.randn(M, 2 * N, device="cuda", generator=gen).to(torch.bfloat16) * 3

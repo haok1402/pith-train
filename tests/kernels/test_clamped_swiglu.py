@@ -156,5 +156,9 @@ def test_deterministic():
     gen = torch.Generator(device="cuda").manual_seed(4)
     gate_up = (torch.randn(4096, 2 * 2880, generator=gen, device="cuda") * 4).to(torch.bfloat16)
     do = torch.randn(4096, 2880, generator=gen, device="cuda").to(torch.bfloat16)
-    assert torch.equal(clamped_swiglu_fwd(gate_up, ALPHA, LIMIT), clamped_swiglu_fwd(gate_up, ALPHA, LIMIT))  # fmt: skip
-    assert torch.equal(clamped_swiglu_bwd(do, gate_up, ALPHA, LIMIT), clamped_swiglu_bwd(do, gate_up, ALPHA, LIMIT))  # fmt: skip
+    assert torch.equal(
+        clamped_swiglu_fwd(gate_up, ALPHA, LIMIT), clamped_swiglu_fwd(gate_up, ALPHA, LIMIT)
+    )
+    assert torch.equal(
+        clamped_swiglu_bwd(do, gate_up, ALPHA, LIMIT), clamped_swiglu_bwd(do, gate_up, ALPHA, LIMIT)
+    )

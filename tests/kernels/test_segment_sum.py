@@ -8,10 +8,9 @@ each group's column sums accumulated in fp32 (cast to ``out_dtype``). The summat
 groups, so the result is deterministic and a group's sum does not depend on the other groups:
 checked run to run and against the same group summed alone, plus closeness to a float64 sum.
 
-Moved from tests/operators/test_segment_sum.py, which compared bitwise against a copy of the
-one-block-per-group Triton kernel; here the kernel's own two internal paths (many groups: one
-block per group; few groups: tile partials then an ordered pass) are compared against each other
-through the public call (the same group summed among many groups and alone).
+The kernel's two internal paths (many groups: one block per group; few groups: tile partials then
+an ordered pass) are compared against each other through the public call (the same group summed
+among many groups and alone).
 
     pytest tests/kernels/test_segment_sum.py -v
 """
@@ -153,7 +152,7 @@ def test_order_is_tile_order():
             segment_sum_along_rows(x[i * 8192 : i * 8192 + 4096], offsets([4096]), torch.float32)[0]
             + segment_sum_along_rows(
                 x[i * 8192 + 4096 : (i + 1) * 8192], offsets([4096]), torch.float32
-            )[0]  # fmt: skip
+            )[0]
             for i in range(4)
         ]
     )

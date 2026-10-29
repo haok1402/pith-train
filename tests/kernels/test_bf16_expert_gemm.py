@@ -42,7 +42,7 @@ from pithtrain.kernels import (
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not bf16_experts_supported(),
-    reason="needs the fused BF16 CuTe experts (SM90, validated quack-kernels)",
+    reason="needs the fused BF16 CuTe experts (bf16_experts_supported)",
 )
 
 BF16 = dict(device="cuda", dtype=torch.bfloat16)
@@ -233,16 +233,27 @@ def test_swiglu_forward_backward(case, layout):
     assert torch.equal(dx, bf16_expert_dgrad(dpre, wg, wu, cu, swapped))
 
 
-WGRAD_CASES = ["qwen3-edges", "qwen3-imbalanced", "qwen3-large", "qwen3-g64-ragged",
-               "dsv2-g8-ragged", "q35-g32"]  # fmt: skip
+WGRAD_CASES = [
+    "qwen3-edges",
+    "qwen3-imbalanced",
+    "qwen3-large",
+    "qwen3-g64-ragged",
+    "dsv2-g8-ragged",
+    "q35-g32",
+]
 
 
 @pytest.mark.parametrize("case", WGRAD_CASES)
 @pytest.mark.parametrize(
     "w_layout,mg_layout",
-    [("separate", "separate"), ("separate", "swapped"), ("swapped", "separate"),
-     ("swapped", "swapped"), ("halves", "halves")],
-)  # fmt: skip
+    [
+        ("separate", "separate"),
+        ("separate", "swapped"),
+        ("swapped", "separate"),
+        ("swapped", "swapped"),
+        ("halves", "halves"),
+    ],
+)
 def test_swiglu_wgrads(case, w_layout, mg_layout):
     H, inter, counts = CASES[case]
     G, M = len(counts), sum(counts)
@@ -379,9 +390,13 @@ def test_gptoss(counts_case, limit):
 
 @pytest.mark.parametrize(
     "H,inter,G,gptoss",
-    [(2048, 768, 16, False), (2048, 1408, 8, False), (2048, 512, 32, False),
-     (2880, 2880, 32, True)],
-)  # fmt: skip
+    [
+        (2048, 768, 16, False),
+        (2048, 1408, 8, False),
+        (2048, 512, 32, False),
+        (2880, 2880, 32, True),
+    ],
+)
 def test_zero_rows(H, inter, G, gptoss):
     """0 rows (every group empty): empty outputs, main grads untouched."""
     cu = torch.zeros(G + 1, dtype=torch.int32, device="cuda")

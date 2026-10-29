@@ -116,7 +116,9 @@ def test_special_values_copied_bitwise():
 
 def test_empty_input():
     x = torch.empty(0, 2048, device="cuda", dtype=torch.bfloat16)
-    out, rsi, offs, ks_t, ks = scatter_by_expert(x, torch.empty(0, dtype=torch.long, device="cuda"), 8)  # fmt: skip
+    out, rsi, offs, ks_t, ks = scatter_by_expert(
+        x, torch.empty(0, dtype=torch.long, device="cuda"), 8
+    )
     assert out.shape == (0, 2048) and rsi.shape == (0,) and ks == []
     # With no tokens the offsets and sizes come back empty, not (G,) zeros.
     assert offs.numel() == 0 and ks_t.numel() == 0
