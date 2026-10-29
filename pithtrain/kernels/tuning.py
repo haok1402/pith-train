@@ -157,14 +157,9 @@ def read_cache() -> list:
 
 
 def write_cache(entries: list) -> None:
-    """
-    Write the entries, replacing the file in one rename so a concurrent reader sees all or nothing.
-    """
     path = cache_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(sorted(entries, key=repr)))
-    os.replace(tmp, path)
+    path.write_text(json.dumps(sorted(entries, key=repr)))
 
 
 def time_launch(launch: Callable, config) -> float:
@@ -251,7 +246,7 @@ def tune_kernels() -> dict:
 
     if rank == 0 and times_of:
         entries = {(name, tunable.fingerprint, key, bucket): tunable.candidates.index(config) for name, tunable in TUNABLES.items() for key, buckets in tunable.installed.items() for bucket, config in buckets.items()}
-        for name, fingerprint, key, bucket, idx in read_cache():  # keep what other runs added meanwhile
+        for name, fingerprint, key, bucket, idx in CACHED:
             entries.setdefault((name, fingerprint, key, bucket), idx)
         write_cache([(*entry, idx) for entry, idx in entries.items()])
     for name, key, config in sorted({(name, key, config) for name, tunable in TUNABLES.items() for key in tunable.seen for config in tunable.installed.get(key, {}).values()}, key=repr):
