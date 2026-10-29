@@ -25,7 +25,6 @@ from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
 from pithtrain.operators.fp8_experts import fp8_scatter_quant, fp8_swiglu_experts
 from pithtrain.operators.linear import BF16Linear
-from pithtrain.operators.qwen3_attention import fp8_o_proj, fp8_qkv_projection
 from pithtrain.operators.ring_attention import ring_attention_func, ring_attention_varlen_func
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
@@ -211,18 +210,10 @@ class Qwen3MoeAttention(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, S, _ = hidden_states.size()
-        if training.fp8 and self.q_proj.bias is None and hidden_states.numel():
-            q, k, v = fp8_qkv_projection(hidden_states, self.q_proj, self.k_proj, self.v_proj)
-            query_states = q.view(B, S, self.num_heads, self.head_dim)
-            key_states = k.view(B, S, self.num_kv_heads, self.head_dim)
-            value_states = v.view(B, S, self.num_kv_heads, self.head_dim)
-        else:
-            quantized_hidden = training.Linear.quantize_input(hidden_states)
-            query_states = self.q_proj(hidden_states, quantized_hidden).view(B, S, self.num_heads, self.head_dim)  # fmt: skip
-            key_states = self.k_proj(hidden_states, quantized_hidden).view(B, S, self.num_kv_heads, self.head_dim)  # fmt: skip
-            value_states = self.v_proj(hidden_states, quantized_hidden).view(
-                B, S, self.num_kv_heads, self.head_dim
-            )
+        quantized_hidden = training.Linear.quantize_input(hidden_states)
+        query_states = self.q_proj(hidden_states, quantized_hidden).view(B, S, self.num_heads, self.head_dim)  # fmt: skip
+        key_states = self.k_proj(hidden_states, quantized_hidden).view(B, S, self.num_kv_heads, self.head_dim)  # fmt: skip
+        value_states = self.v_proj(hidden_states, quantized_hidden).view(B, S, self.num_kv_heads, self.head_dim)  # fmt: skip
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
         query_states, key_states = self.apply_rotary_posemb(query_states, key_states, rotary_posemb)
@@ -235,8 +226,6 @@ class Qwen3MoeAttention(nn.Module):
         else:
             attn_output = flash_attn_func(query_states, key_states, value_states, softmax_scale=self.scaling, causal=True)  # fmt: skip
         attn_output = attn_output.reshape(B, S, self.num_heads * self.head_dim)
-        if training.fp8 and self.o_proj.bias is None and attn_output.numel():
-            return fp8_o_proj(attn_output, self.o_proj)
         return self.o_proj(attn_output)
 
 

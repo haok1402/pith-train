@@ -136,7 +136,7 @@ Only what training code calls directly: autograd functions and custom ops with t
 - **AllToAll** (`all_to_all.py`) — Differentiable collective wrapper
 - **EP Dispatch** (`ep_dispatch.py`) — orchestration of expert-parallel token dispatch with deduplication (index math: `fused_dedup_prepare_dispatch`, `expert_and_expand_idx`)
 - **Token Scatter** (`token_scatter.py`) — scatter of tokens by expert ahead of the grouped GEMM, padded index gather, per-row group ids
-- **Fused activations / heads** — `silu_mul.py`, `clamped_swiglu.py`, `indexed_bias_add.py`, `cross_entropy.py`, `log_prob.py`, `qwen3_attention.py` (FP8 q/k/v and o projections)
+- **Fused activations / heads** — `silu_mul.py`, `clamped_swiglu.py`, `indexed_bias_add.py`, `cross_entropy.py`, `log_prob.py`
 
 Operators import kernels only as `from pithtrain.kernels import <name>` and never branch on the architecture: where a fused path may be missing they call a capability query (`fp8_fused_experts_supported`, `bf16_experts_supported`, `gated_delta_rule_pinned_supported`). Operators keep a PyTorch reference for correctness testing (operator-level tests in `tests/operators/` and `tests/`); every kernel they call is verified against a pure-PyTorch reference in `tests/kernels/test_<feature>.py`.
 
