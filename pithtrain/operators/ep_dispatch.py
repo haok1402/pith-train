@@ -25,19 +25,13 @@ outstanding_dispatches: list["PendingDispatch"] = []
 @lru_cache(maxsize=None)
 def pinned_meta_buffer(numel: int, dtype: torch.dtype) -> torch.Tensor:
     """
-    Pinned host buffer for the dispatch metadata, one per size and shared by every dispatch. Cached
-    because freeing a pinned tensor records a CUDA event in PyTorch's host allocator.
+    Cached because freeing a pinned tensor records a CUDA event in PyTorch's host allocator.
     """
     return torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True)
 
 
 @dataclass(slots=True, eq=False)
 class PendingDispatch:
-    """
-    A dispatch whose device work has been issued; finish() waits for its metadata to reach the host
-    and completes it. Only one may be outstanding at a time.
-    """
-
     hidden_states: torch.Tensor
     topk_weight: torch.Tensor
     dispatch_token_idxs: torch.Tensor
@@ -53,9 +47,6 @@ class PendingDispatch:
 
     @torch.compiler.disable
     def finish(self) -> tuple[torch.Tensor, RoutingInfo]:
-        """
-        Complete the dispatch on the current stream: (dispatch_tokens, RoutingInfo).
-        """
         assert not self.is_finished, "finish() called twice on the same pending dispatch"
         self.is_finished = True
         assert outstanding_dispatches and outstanding_dispatches[-1] is self
@@ -109,8 +100,8 @@ def prepare_dispatch_issue(
     ep_group: dist.ProcessGroup,
 ) -> PendingDispatch:
     """
-    Issue the device side of an expert-parallel dispatch (ep_size > 1) on the current stream without
-    blocking the host. Returns a PendingDispatch whose finish() completes the dispatch.
+    Issue the device side of an expert-parallel dispatch on the current stream without
+    blocking the host.
     """
     assert ep_size > 1
     assert not outstanding_dispatches, "a deferred dispatch is still outstanding"
@@ -153,9 +144,8 @@ def prepare_dispatch(
     ep_group: dist.ProcessGroup,
 ) -> tuple[torch.Tensor, RoutingInfo]:
     """
-    Dispatch the tokens to their experts: (dispatch_tokens, RoutingInfo). With ep_size > 1 a token
-    sent to several experts on one EP rank is sent once, and expand_idx restores the copies on the
-    receiver; with ep_size == 1 each token is repeated once per selected expert.
+    With ep_size > 1 a token sent to several experts on one EP rank is sent once, and expand_idx
+    restores the copies on the receiver.
     """
     k = topk_ids.shape[1]
     expert_idxs = topk_ids.view(-1)

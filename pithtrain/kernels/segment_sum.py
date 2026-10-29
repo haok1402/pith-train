@@ -1,7 +1,5 @@
 """
-Triton per-group column sums over rows sorted by group: segment_sum (the expert bias
-gradient) and block_segment_sum (per-expert sums of 128-row-block partials). Deterministic and
-atomic-free; both architectures run them.
+Per-group column sums over rows sorted by group, deterministic and atomic-free.
 """
 
 import torch
@@ -15,9 +13,6 @@ __all__ = ["block_segment_sum", "segment_sum"]
 
 @triton.jit
 def segment_sum_kernel(x_ptr, offs_padded_ptr, out_ptr, H: tl.constexpr, HEAD_BLOCK: tl.constexpr, BLOCK_M: tl.constexpr):
-    """
-    One block reduces rows [row_start, row_end) of group group_idx over HEAD_BLOCK columns, in fp32.
-    """
     group_idx, h_block_idx = tl.program_id(0), tl.program_id(1)
     row_start, row_end = tl.load(offs_padded_ptr + group_idx), tl.load(offs_padded_ptr + group_idx + 1)
 
@@ -52,8 +47,8 @@ def segment_tile(offs_padded_ptr, G, BLOCK_M: tl.constexpr, BLOCK_G: tl.constexp
 @triton.jit
 def segment_tile_sum_kernel(x_ptr, offs_padded_ptr, partials_ptr, G, H: tl.constexpr, HEAD_BLOCK: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_G: tl.constexpr):
     """
-    fp32 column sums of row tile tile_idx of x, written to row tile_idx of partials. The tile is the
-    one the per-group loop of segment_sum_kernel would take, so its sum has the same bits.
+    The tile is the one the per-group loop of segment_sum_kernel would take, so its sum has
+    the same bits.
     """
     tile_idx, h_block_idx = tl.program_id(0), tl.program_id(1)
     first_tile, num_tiles, group_starts, group_ends = segment_tile(offs_padded_ptr, G, BLOCK_M, BLOCK_G)
@@ -76,9 +71,6 @@ def segment_tile_sum_kernel(x_ptr, offs_padded_ptr, partials_ptr, G, H: tl.const
 
 @triton.jit
 def segment_tile_reduce_kernel(partials_ptr, offs_padded_ptr, out_ptr, G, H: tl.constexpr, HEAD_BLOCK: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_G: tl.constexpr):
-    """
-    out[group_idx] = the tile sums of the group added in row order, starting from zero (fp32).
-    """
     group_idx, h_block_idx = tl.program_id(0), tl.program_id(1)
     first_tile, num_tiles, _, _ = segment_tile(offs_padded_ptr, G, BLOCK_M, BLOCK_G)
     group_mask = tl.arange(0, BLOCK_G) == group_idx
@@ -136,10 +128,6 @@ def segment_sum(x: torch.Tensor, grouped_mm_offs: torch.Tensor, out_dtype: torch
 
 @triton.jit
 def block_segment_sum_kernel(partials_ptr, offs_ptr, out_ptr, H, BLOCK_H: tl.constexpr):
-    """
-    out[group_idx] = the 128-row-block partials of expert group_idx added in row order in fp32, then
-    cast to the dtype of out.
-    """
     group_idx = tl.program_id(0)
     h_offs = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = h_offs < H

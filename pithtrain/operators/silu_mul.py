@@ -1,6 +1,5 @@
 """
-Fused silu(gate) * up with a one-kernel forward and a one-kernel backward. Only gate and up are
-saved for backward; silu(gate) is recomputed there.
+silu(gate) is not saved for backward; silu_mul_bwd recomputes it from gate to save memory.
 """
 
 from __future__ import annotations

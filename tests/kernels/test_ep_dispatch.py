@@ -149,7 +149,7 @@ def test_dispatch_models(ne: int, k: int, ep: int, m: int) -> None:
 @pytest.mark.parametrize("m", [4096, 65536, 70000])
 def test_dispatch_odd_experts_per_rank(k: int, ep: int, m: int) -> None:
     """
-    Odd experts per rank, up to 32 EP ranks, token counts across many CTAs.
+    The token counts span many CTAs.
     """
     epr = 5 if ep <= 4 else 3
     topk_ids = routing(m, k, ep * epr, epr, seed=m + k)
@@ -161,9 +161,6 @@ def test_dispatch_odd_experts_per_rank(k: int, ep: int, m: int) -> None:
     "ep,epr,k", [(4, 32, 8), (8, 32, 8), (4, 64, 8), (8, 8, 6), (4, 8, 4), (8, 16, 4)]
 )
 def test_dispatch_skewed(kind: str, ep: int, epr: int, k: int) -> None:
-    """
-    Hot experts, every token on one rank, empty experts and ranks.
-    """
     if kind == "one_rank" and epr < k:
         pytest.skip("needs k experts on one rank")
     topk_ids = routing(4096, k, ep * epr, epr, kind, seed=3)
@@ -401,7 +398,7 @@ SIM_CONFIGS = [
     (10, 4, 8, 2),
     (32, 1, 8, 4),  # k=1: no dedup
     (32, 4, 8, 2),
-    (2, 2, 4, 2),  # tiny
+    (2, 2, 4, 2),
     (1, 2, 8, 4),  # single token
     (2048, 8, 128, 2),  # Qwen3-30B-A3B: many experts, few EP ranks
 ]
@@ -473,9 +470,6 @@ def recv_meta_of(tokens_per_expert: torch.Tensor, dedup: torch.Tensor) -> torch.
 def test_ep_dispatch_recv_idx_sim(
     ms: int, k: int, num_experts: int, ep_size: int, seed: int
 ) -> None:
-    """
-    Random received counts and expand_idx, checked against expand_reference.
-    """
     torch.manual_seed(seed)
     epr = num_experts // ep_size
     tokens_per_expert = torch.randint(0, max(ms, 2), (ep_size, epr), device="cuda")

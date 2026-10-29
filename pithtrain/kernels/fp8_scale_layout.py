@@ -19,23 +19,14 @@ def mn_pad(mn: int) -> int:
 
 
 def mn_major_scale(mn: int, sf_k: int, device: torch.device) -> torch.Tensor:
-    """
-    Uninitialized fp32 scale of mn rows by sf_k K blocks, with strides (1, mn_pad(mn)).
-    """
     return torch.empty_strided((mn, sf_k), (1, mn_pad(mn)), dtype=torch.float32, device=device)
 
 
 def is_mn_major(sf: torch.Tensor) -> bool:
-    """
-    Whether the scale sf is 2D and MN-major, so DeepGEMM takes it as it is.
-    """
     return sf.dim() == 2 and sf.stride(0) == 1 and sf.stride(1) == mn_pad(sf.shape[0])
 
 
 def to_mn_major(sf: torch.Tensor) -> torch.Tensor:
-    """
-    sf in the MN-major layout (a copy unless it already is).
-    """
     if is_mn_major(sf):
         return sf
     out = mn_major_scale(sf.shape[0], sf.shape[1], sf.device)
@@ -46,8 +37,8 @@ def to_mn_major(sf: torch.Tensor) -> torch.Tensor:
 def act_scale_like(mn: int, sf_k: int, device: torch.device) -> torch.Tensor:
     """
     Uninitialized fp32 (mn, sf_k) tensor on device (meta included) with the strides this library's
-    quantization ops give a 1x128 activation scale: MN-major on SM90, row-major on SM100. For fake /
-    meta implementations. The architecture is the one probed at import, not device's.
+    quantization ops give a 1x128 activation scale (MN-major on SM90, row-major on SM100), for fake
+    and meta implementations. The architecture is the one probed at import, not that of device.
     """
     match ARCH_MAJOR:
         case 9:

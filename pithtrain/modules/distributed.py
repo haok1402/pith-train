@@ -96,8 +96,7 @@ def bind_cpu_affinity(device_id: int) -> None:
 
 def setup_default_process_group(cfg: DistributedCfg, device_id: int) -> None:
     """
-    Create the default process group with cfg.timeout, destroy it at a clean exit, and install an
-    excepthook that hard-exits on an uncaught exception, since a collective teardown would wait on
+    The excepthook hard-exits on an uncaught exception, since a collective teardown would wait on
     peers that already died.
     """
     kwargs = dict(backend="nccl", device_id=device_id, timeout=cfg.timeout)
@@ -123,10 +122,8 @@ def setup_default_process_group(cfg: DistributedCfg, device_id: int) -> None:
 
 def setup_device_mesh(cfg: DistributedCfg, device_id: int) -> None:
     """
-    Publish the rank, the device and two meshes over the same ranks into the distributed context,
-    following MoE parallel folding (https://arxiv.org/abs/2504.14960): (pp, dp, cp) for attention
-    and (pp, dp, ep) for the experts. pp is outermost in both, and the cp and ep groups are
-    contiguous rank blocks. The attention dp_rank alone decides which data a rank loads.
+    MoE parallel folding (https://arxiv.org/abs/2504.14960): attention and the experts get separate
+    meshes over the same ranks, and the cp and ep groups are each a contiguous rank block.
     """
     distributed.rank = torch.distributed.get_rank()
     distributed.world_size = torch.distributed.get_world_size()
@@ -169,9 +166,6 @@ def setup_device_mesh(cfg: DistributedCfg, device_id: int) -> None:
 
 
 def setup_distributed(cfg: object) -> None:
-    """
-    Initialize the distributed runtime under torchrun from cfg.distributed.
-    """
     assert hasattr(cfg, "distributed") and isinstance(cfg.distributed, DistributedCfg)
     setup_torch_runtime()
     device_id = int(os.environ["LOCAL_RANK"])

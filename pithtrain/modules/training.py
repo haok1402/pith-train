@@ -56,11 +56,6 @@ PIPELINE_STAGE_MODELS = (DeepSeekV2Model, GptOssModel, Qwen3MoeModel, Qwen35MoeM
 
 
 def is_muon_param(name: str, param: torch.Tensor) -> bool:
-    """
-    True if Muon should optimize param: the 2D hidden weights and the stacked 3D expert weights.
-    AdamW takes the rest: 1D norms, biases and sinks, embeddings, LM head, MoE gate and router, and
-    stacked expert biases.
-    """
     if param.ndim < 2:
         return False
     if name.endswith(".bias") or name.endswith("_bias"):
@@ -74,8 +69,8 @@ def is_muon_param(name: str, param: torch.Tensor) -> bool:
 
 def make_muon_optimizer(cfg: TrainingCfg, *, weight_decay: float = 0.1) -> tuple[Optimizer, ...]:
     """
-    Muon for the parameters is_muon_param selects, AdamW for the rest, both with weight_decay
-    (0.1, per "Muon is Scalable for LLM Training"; decaying the norm weights bounds output RMS).
+    The default weight_decay of 0.1 follows "Muon is Scalable for LLM Training"; decaying the norm
+    weights too bounds the output RMS.
     """
     muon_params, adamw_params = [], []
     for name, param in training.model.named_parameters():
@@ -90,9 +85,6 @@ def make_muon_optimizer(cfg: TrainingCfg, *, weight_decay: float = 0.1) -> tuple
 
 
 def make_adamw_optimizer(cfg: TrainingCfg, *, weight_decay: float = 0.1) -> tuple[Optimizer, ...]:
-    """
-    Fused AdamW over all parameters.
-    """
     kwargs = dict(lr=cfg.lr, weight_decay=weight_decay)
     return (AdamW(training.model.parameters(), fused=True, **kwargs),)
 
@@ -217,9 +209,6 @@ class TrainingCfg(SlottedDefault):
     """
 
     init_std: float = 0.02
-    """
-    Standard deviation of the weight initialization; see init_weights.
-    """
 
     nsys_start: Optional[int] = None
     """
@@ -281,10 +270,6 @@ def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02, seed
 
 
 def weight_generator(seed: int, name: str, device: torch.device, *index: int) -> torch.Generator:
-    """
-    A generator for the weight called name (and an expert index within it), seeded by numpy's
-    SeedSequence from seed with the name's bytes and the index as the spawn key.
-    """
     key = (*name.encode(), *index)
     state = np.random.SeedSequence(seed, spawn_key=key).generate_state(1, np.uint64)[0]
     return torch.Generator(device=device).manual_seed(int(state))
@@ -292,8 +277,8 @@ def weight_generator(seed: int, name: str, device: torch.device, *index: int) ->
 
 def split_replicas(mesh: DeviceMesh, hsdp_replica: int) -> DeviceMesh:
     """
-    Reshape a 1D mesh into a 2D (replica, shard) mesh with hsdp_replica replicas, the layout FSDP2
-    reads as replicate-then-shard. Each shard group is a contiguous block of the mesh.
+    The (replica, shard) layout FSDP2 reads as replicate-then-shard; each shard group is a
+    contiguous block of the mesh.
     """
     size = mesh.size()
     assert size % hsdp_replica == 0, f"{size=} not divisible by {hsdp_replica=}"
@@ -364,10 +349,6 @@ def setup_model(
     cfg: TrainingCfg,
     distributed_cfg: DistributedCfg,
 ) -> None:
-    """
-    Build this rank's two V-chunks of cfg.model, initialize and shard them, and publish the
-    DualPipeV model and the linear-layer classes into the training context.
-    """
     training.fp8 = cfg.fp8
     training.Linear = FP8Linear if cfg.fp8 else BF16Linear
     training.GroupedLinear = FP8GroupedLinear if cfg.fp8 else GroupedLinear
@@ -466,8 +447,6 @@ def storage_bytes(storage: torch.UntypedStorage) -> torch.Tensor:
 
 def training_state_storages() -> list[torch.UntypedStorage]:
     """
-    The distinct CUDA storages behind this rank's parameter shards and optimizer state.
-
     Deduplicated by address, because FSDP2's padded shard buffer and a parameter's local tensor
     share one allocation.
     """
@@ -534,9 +513,6 @@ def reload_training_state() -> None:
 
 
 def setup_training(cfg: object) -> None:
-    """
-    Build the model, the optimizers and the schedulers of this run into the training runtime state.
-    """
     assert hasattr(cfg, "training") and isinstance(cfg.training, TrainingCfg)
     random.seed(cfg.training.seed)
     np.random.seed(cfg.training.seed)

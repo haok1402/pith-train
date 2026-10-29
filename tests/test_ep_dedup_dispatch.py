@@ -1,6 +1,6 @@
 """
-Test of the dedup EP dispatch operator (prepare_dispatch) across EP ranks with ragged token
-counts. Its index kernels are verified in tests/kernels/test_ep_dispatch.py.
+The index kernels of prepare_dispatch are verified in tests/kernels/test_ep_dispatch.py; this file
+runs the operator across EP ranks.
 """
 
 import pytest

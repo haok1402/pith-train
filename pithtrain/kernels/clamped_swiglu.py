@@ -1,8 +1,3 @@
-"""
-gpt-oss's clamped SwiGLU (see clamped_swiglu_fwd), forward and backward Triton kernels over an
-interleaved gate_up (M, 2N). Both architectures run them.
-"""
-
 from __future__ import annotations
 
 import torch
@@ -14,7 +9,6 @@ __all__ = ["BLOCK_SIZE", "clamped_swiglu_bwd", "clamped_swiglu_fwd"]
 
 @triton.jit
 def clamped_swiglu_fwd_kernel(gate_up_ptr, out_ptr, num_elements, alpha, limit, BLOCK_SIZE: tl.constexpr):
-    # elem_offs indexes the flat (M, N) output; gate is at 2 * elem_offs and up at 2 * elem_offs + 1.
     block_start = tl.program_id(0).to(tl.int64) * BLOCK_SIZE
     elem_offs = block_start + tl.arange(0, BLOCK_SIZE)
     elem_mask = elem_offs < num_elements

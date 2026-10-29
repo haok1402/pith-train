@@ -155,8 +155,8 @@ def fp8_swiglu_experts(
     quantized_input: tuple[torch.Tensor, ...] | None = None,
 ) -> torch.Tensor:
     """
-    down_proj(silu(gate_proj(x)) * up_proj(x)), all three FP8GroupedLinear. With quantized_input
-    (from fp8_scatter_quant) x is only a gradient carrier and is never read.
+    down_proj(silu(gate_proj(x)) * up_proj(x)). With quantized_input (from fp8_scatter_quant) x is
+    only a gradient carrier and is never read.
     """
     return FP8SwiGLUExpertsFunc.apply(
         x, gate_proj.weight, up_proj.weight, down_proj.weight, grouped_mm_offs, ks, ks_tensor,

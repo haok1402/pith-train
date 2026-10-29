@@ -30,18 +30,13 @@ def fast_path_enabled() -> bool:
 
 FAST_PATH = fast_path_enabled()
 
-# aten ops FA4's entry may run without disqualifying a plan: allocations, zero-fills and views.
+# aten ops FA4's entry may run without disqualifying a plan.
 ALLOC_OPS = {"empty.memory_format", "empty_like.default", "empty_strided.default", "zeros.default", "zeros_like.default", "new_empty.default", "new_zeros.default"}
 ZERO_OPS = {"zero_.default"}
 VIEW_OPS = {"detach.default", "alias.default", "view.default", "_unsafe_view.default", "t.default", "transpose.int", "permute.default", "as_strided.default", "slice.Tensor", "select.int", "squeeze.dim", "unsqueeze.default", "expand.default"}
 
 
 class Recording(TorchDispatchMode):
-    """
-    Logs the aten ops run under it: allocations, which buffers are zero-filled, and every op that
-    is not an allocation, zero-fill or view.
-    """
-
     def __init__(self) -> None:
         super().__init__()
         self.allocs: List[torch.Tensor] = []
@@ -72,10 +67,6 @@ class Recorder:
 
 
 class RecordingCache:
-    """
-    Stands in for one FA4 compile cache during a recorded call.
-    """
-
     def __init__(self, inner: Any, launch_log: list) -> None:
         self.inner, self.launch_log, self.inserted = inner, launch_log, False
 
@@ -141,9 +132,6 @@ def template(x: Any, inputs: Dict[str, torch.Tensor], allocs: List[torch.Tensor]
 
 
 def build(recipe: Any, inputs: Dict[str, torch.Tensor], allocs: List[torch.Tensor]) -> Any:
-    """
-    The value a template recipe describes, rebuilt from the live inputs and fresh allocations.
-    """
     kind = recipe[0]
     if kind == "const":
         return recipe[1]
@@ -199,9 +187,6 @@ def record(entry: Callable[[], Tuple[torch.Tensor, ...]], inputs: Dict[str, torc
 
 
 def replay(plan: Plan, inputs: Dict[str, torch.Tensor], device: torch.device) -> Tuple[torch.Tensor, ...]:
-    """
-    Run a plan on the live inputs: fresh allocations, then the recorded kernel calls.
-    """
     allocs = [torch.zeros(shape, dtype=dtype, device=device) if zeroed else torch.empty_strided(shape, stride, dtype=dtype, device=device) for shape, stride, dtype, zeroed in plan.allocs]
     detached = {name: tensor.detach() for name, tensor in inputs.items() if tensor is not None}
     for fn, consts, slots in plan.fast_calls:

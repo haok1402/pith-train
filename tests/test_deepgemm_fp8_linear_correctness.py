@@ -1,8 +1,3 @@
-"""
-Tests of FP8Linear and FP8GroupedLinear (DeepGEMM) against their BF16 counterparts, compared by
-normalized squared error (calc_diff) below 1e-3.
-"""
-
 # Imported so that a missing deep_gemm fails at collection.
 import deep_gemm  # noqa: F401
 import pytest
@@ -191,10 +186,6 @@ def test_fp8_grouped_linear_backward():
 
 
 def test_fp8_grouped_linear_weight_grad_store():
-    """
-    Under WeightGradStore, FP8GroupedLinear defers its weight gradient to pop(), where it matches
-    the direct one.
-    """
     from pithtrain.contexts.weight_grad_store import WeightGradStore
     from pithtrain.operators.grouped_linear import FP8GroupedLinear
     from pithtrain.operators.token_scatter import scatter_for_grouped_gemm

@@ -30,8 +30,8 @@ MAX_SEGMENTS = 8 * THREADS
 
 def exclusive_scan(s_src: Int32, s_dst: Int32, num_values: int, s_scan: Int32, tidx: Int32) -> None:
     """
-    Exclusive prefix sum of num_values int32 in shared memory (s_src -> s_dst, which may alias) by
-    the whole CTA; s_scan holds 2 * THREADS words. Ends with a barrier.
+    Shared memory, run by the whole CTA; s_dst may alias s_src, s_scan holds 2 * THREADS words. Ends
+    with a barrier.
     """
     values_per_thread = (num_values + THREADS - 1) // THREADS
     values = []
@@ -62,10 +62,6 @@ def exclusive_scan(s_src: Int32, s_dst: Int32, num_values: int, s_scan: Int32, t
 
 
 class IndexBuffers:
-    """
-    Addresses the phases of DispatchIndex share: the output sections, the scratch and shared memory.
-    """
-
     def __init__(self, out_base: Int64, num_slots: Int64, hist_base: Int64, s_counts: Int32, s_starts: Int32, s_next_pos: Int32, s_lane_masks: Int32, s_scan: Int32) -> None:
         self.out_base, self.num_slots = out_base, num_slots
         self.idxs_base, self.expand_base, self.inv_base = out_base, out_base + num_slots * 8, out_base + 2 * num_slots * 8
@@ -147,9 +143,6 @@ class DispatchIndex:
                 cute.arch.sync_threads()
 
     def load_ids(self, mTopk: cute.Tensor, chunk_idx: Int32, tidx: Int32) -> tuple:
-        """
-        Expert ids of this thread's tokens (ROUNDS x K), first-visit flags, validity, token index.
-        """
         M = mTopk.shape[0]
         row_stride = Int64(mTopk.stride[0])
         topk_base = mTopk.iterator.toint()
@@ -174,9 +167,6 @@ class DispatchIndex:
 
     @cute.jit
     def publish_histograms(self, mTopk: cute.Tensor, buffers, tidx, cta_idx, num_ctas, num_chunks) -> None:
-        """
-        Phase 1: count every owned chunk's slots and first visits per bin into hist.
-        """
         num_experts, num_bins, experts_per_rank = self.num_experts, self.num_bins, self.experts_per_rank
         s_counts, hist_base = buffers.s_counts, buffers.hist_base
         for chunk_idx in cutlass.range(cta_idx, num_chunks, num_ctas, unroll=1):
@@ -200,7 +190,7 @@ class DispatchIndex:
     @cute.jit
     def grid_barrier(self, counter_base, tidx, num_ctas) -> None:
         """
-        Wait until every CTA has arrived, making each CTA's hist stores visible to all of them.
+        Also makes each CTA's hist stores visible to every CTA.
         """
         fence_gpu()
         cute.arch.sync_threads()
@@ -234,7 +224,7 @@ class DispatchIndex:
     @cute.jit
     def scan_totals(self, buffers, tidx, num_chunks) -> None:
         """
-        Sum every chunk's histogram into s_counts and scan the totals into s_starts (each CTA).
+        Every CTA computes the totals and starts itself.
         """
         num_bins, s_counts, hist_base = self.num_bins, buffers.s_counts, buffers.hist_base
         for j in cutlass.range_constexpr((num_bins + THREADS - 1) // THREADS):
@@ -292,9 +282,6 @@ class DispatchIndex:
         cute.arch.sync_threads()
 
     def mark_lanes(self, token_experts: list, is_first: list, token_ok: Int32, buffers: IndexBuffers, warp: Int32, lane_bit: Uint32) -> None:
-        """
-        Set the thread's lane bit in its warp's mask of every bin its token lands in this round.
-        """
         num_experts, experts_per_rank, s_lane_masks = self.num_experts, self.experts_per_rank, buffers.s_lane_masks
         for j in range(self.K):
             expert_idx = token_experts[j]
@@ -303,8 +290,8 @@ class DispatchIndex:
 
     def place_round(self, token_experts: list, is_first: list, token_ok: Int32, token_idx: Int32, buffers: IndexBuffers, warp: Int32, lt_mask: Uint32, rank_bins_start: Int32) -> None:
         """
-        Rank the thread's slots among this round's lower lanes in each bin and store idxs,
-        expand_idx, inv_idxs and dispatch_token_idxs at the resulting positions.
+        Rank the thread's slots among this round's lower lanes (lower warps, then lower lanes of its
+        own warp) in each bin.
         """
         K, num_experts, experts_per_rank = self.K, self.num_experts, self.experts_per_rank
         s_lane_masks, s_next_pos, s_starts = buffers.s_lane_masks, buffers.s_next_pos, buffers.s_starts
@@ -328,9 +315,6 @@ class DispatchIndex:
 
     @cute.jit
     def advance_positions(self, buffers, tidx) -> None:
-        """
-        Advance each bin's next position by this round's count and clear its lane masks.
-        """
         num_bins, s_lane_masks, s_next_pos = self.num_bins, buffers.s_lane_masks, buffers.s_next_pos
         for j in cutlass.range_constexpr((num_bins + THREADS - 1) // THREADS):
             bin_idx = j * THREADS + tidx
@@ -373,9 +357,6 @@ class ExpertAndExpandIdx:
 
     @cute.jit
     def scan_segments(self, meta_base, s_seg_starts, s_dedup_starts, s_scan, tidx) -> None:
-        """
-        Scan recv_meta's segment sizes into starts and sum each sender's predecessors' dedup counts.
-        """
         ep_size, experts_per_rank, num_segments = self.ep_size, self.experts_per_rank, self.num_segments
         for j in cutlass.range_constexpr((num_segments + THREADS - 1) // THREADS):
             seg_idx = j * THREADS + tidx
@@ -393,9 +374,6 @@ class ExpertAndExpandIdx:
 
     @cute.jit
     def expand_slots(self, mRecv: cute.Tensor, out_base, s_seg_starts, s_dedup_starts, tidx, cta_idx) -> None:
-        """
-        Find each of the thread's slots' segment and store its local expert and global expand index.
-        """
         experts_per_rank, num_segments = self.experts_per_rank, self.num_segments
         num_slots = mRecv.shape[0]
         recv_base = mRecv.iterator.toint()
@@ -423,10 +401,6 @@ EXPAND: dict = {}
 
 
 class Scratch:
-    """
-    Per-device scratch of the index kernel: chunk histograms and the grid barrier counter.
-    """
-
     def __init__(self, device: torch.device, num_chunks: int, num_bins: int) -> None:
         self.num_chunks, self.num_bins = num_chunks, num_bins
         self.hist = torch.empty(num_chunks * num_bins, dtype=torch.int32, device=device)
@@ -437,9 +411,6 @@ SCRATCH: dict = {}
 
 
 def get_scratch(device: torch.device, num_chunks: int, num_bins: int) -> Scratch:
-    """
-    The device's scratch, regrown (to at least 64 chunks) when it is too small.
-    """
     cached = SCRATCH.get(device.index)
     if cached is None or cached.num_chunks < num_chunks or cached.num_bins < num_bins:
         num_chunks, num_bins = max(num_chunks, cached.num_chunks if cached is not None else 0, 64), max(num_bins, cached.num_bins if cached is not None else 0)
@@ -507,18 +478,12 @@ def expand_index(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_
 
 
 def ep_dispatch_send_idx_sm90(topk_ids: torch.Tensor, num_experts: int, ep_size: int, experts_per_rank: int, meta_out: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
-    """
-    dispatch_index's first six outputs, or the Triton path for inputs it does not cover.
-    """
     if supports_index(topk_ids, ep_size, experts_per_rank):
         return dispatch_index(topk_ids, num_experts, ep_size, experts_per_rank, meta_out)[:6]
     return ep_dispatch_send_idx_sm100(topk_ids, num_experts, ep_size, experts_per_rank, meta_out)
 
 
 def ep_dispatch_recv_idx_sm90(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    expand_index, or the Triton path for inputs it does not cover.
-    """
     if supports_expand(received_expand_idx, ep_size, experts_per_rank):
         return expand_index(recv_meta, received_expand_idx, ep_size, experts_per_rank)
     return ep_dispatch_recv_idx_sm100(recv_meta, received_expand_idx, ep_size, experts_per_rank)

@@ -408,9 +408,6 @@ COMPILED: dict = {}
 
 
 def fake_row_major(dtype, num_dims: int, align: int) -> cute.Tensor:
-    """
-    Fake contiguous tensor of symbolic shape for cute.compile.
-    """
     shape = tuple(cute.sym_int() for _ in range(num_dims))
     stride = tuple(cute.sym_int64() for _ in range(num_dims - 1)) + (1,)
     return fake(dtype, shape, stride, align)
@@ -428,10 +425,6 @@ def compile_blockwise(dtype: torch.dtype, mode: str, is_batched: bool):
 
 
 def store_mode(num_tiles: int, N: int, K: int, *tensors: torch.Tensor) -> str:
-    """
-    Store path for the blockwise kernels: the widest the shape and pointers allow, smem only from
-    SMEM_MIN_TILES tiles up.
-    """
     if any(tensor.data_ptr() % 16 for tensor in tensors):
         mode = "scalar"
     elif N % 16 == 0 and K % 16 == 0 and num_tiles >= SMEM_MIN_TILES:
@@ -442,9 +435,6 @@ def store_mode(num_tiles: int, N: int, K: int, *tensors: torch.Tensor) -> str:
 
 
 def fp8_quant_weight_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    CuTe-DSL fp8_quant_weight: x 2-D (N, K) bf16 / fp32.
-    """
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     if x.stride(1) != 1:
         x = x.contiguous()
@@ -465,9 +455,6 @@ def fp8_quant_weight_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, 
 
 
 def fp8_quant_weight_grouped_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    CuTe-DSL fp8_quant_weight_grouped: x 3-D (G, N, K) bf16 / fp32.
-    """
     assert x.ndim == 3, f"Expected 3D tensor, got {x.ndim}D"
     if not x.is_contiguous():
         x = x.contiguous()
@@ -552,9 +539,6 @@ def load_shard_rows(shard_base: Int64, group_elem_start: Int64, tile_row_start: 
 
 @cute.jit
 def cast_shard_rows(out_base: Int64, amax_addr: Int64, words: list, rows_ok: list, group_elem_start: Int64, tile_row_start: Int32, warp: Int32, col: Int32, K: Int32) -> None:
-    """
-    Cast the warp's rows to e4m3 with the tile's scale and store four bytes per lane.
-    """
     rcp_bits = Uint32(0x7F000000) - compute_scale_bits(ld_scalar_ordered(amax_addr, Int32(1), 4))
     for i in cutlass.range_constexpr(BLOCK // NUM_WARPS):
         row = tile_row_start + i * NUM_WARPS + warp
@@ -615,16 +599,10 @@ def shard_tiles(shard: torch.Tensor, amax: torch.Tensor, out: Optional[torch.Ten
 
 
 def fp8_shard_amax_sm90(shard: torch.Tensor, amax: torch.Tensor, row_offset: int, group_offset: int) -> None:
-    """
-    CuTe-DSL fp8_shard_amax.
-    """
     shard_tiles(shard, amax, None, row_offset, group_offset)
 
 
 def fp8_shard_cast_sm90(shard: torch.Tensor, amax: torch.Tensor, out: torch.Tensor, row_offset: int, group_offset: int) -> None:
-    """
-    CuTe-DSL fp8_shard_cast.
-    """
     shard_tiles(shard, amax, out, row_offset, group_offset)
 
 
@@ -643,9 +621,6 @@ class Scales:
 
 @cute.jit
 def store_scale(amax_base: Int64, scale_base: Int64, scale_t_base: Int64, group_idx: Int64, tile_idx: Int32, amax_rows: Int32, amax_cols: Int32):
-    """
-    Scale of tile tile_idx of group group_idx, stored to scale and transposed to scale_t.
-    """
     num_tiles = amax_rows * amax_cols
     tile_ok = Int32(tile_idx < num_tiles)
     group_start = group_idx * Int64(num_tiles)
@@ -657,9 +632,6 @@ def store_scale(amax_base: Int64, scale_base: Int64, scale_t_base: Int64, group_
 
 
 def fp8_scales_sm90(amax: torch.Tensor, scale: torch.Tensor, scale_t: torch.Tensor) -> None:
-    """
-    CuTe-DSL fp8_scales.
-    """
     fn = COMPILED.get("scales")
     if fn is None:
         fakes = [fake_row_major(cutlass.Float32, 3, 4) for _ in range(3)]
@@ -737,9 +709,6 @@ class PackTranspose:
 
 
 def fp8_pack_transpose_sm90(x: torch.Tensor, out: torch.Tensor) -> None:
-    """
-    CuTe-DSL fp8_pack_transpose.
-    """
     G, N, K = x.shape
     if x.numel() == 0:
         return
@@ -900,14 +869,8 @@ class FP8ScalesGroup:
 
 
 def fp8_shard_amax_multi_sm90(shards: Sequence[torch.Tensor], amaxes: Sequence[torch.Tensor], row_offsets: Sequence[int], group_offsets: Sequence[int]) -> FP8ShardAmaxGroup:
-    """
-    CuTe-DSL fp8_shard_amax_multi.
-    """
     return FP8ShardAmaxGroup(shards, amaxes, row_offsets, group_offsets)
 
 
 def fp8_scales_multi_sm90(amaxes: Sequence[torch.Tensor], scales: Sequence[torch.Tensor], scales_t: Sequence[torch.Tensor]) -> FP8ScalesGroup:
-    """
-    CuTe-DSL fp8_scales_multi.
-    """
     return FP8ScalesGroup(amaxes, scales, scales_t)

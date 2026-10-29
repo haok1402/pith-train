@@ -1,6 +1,4 @@
 """
-Verifies cross_entropy_fwd_bwd against PyTorch.
-
 Contract: the fp32 mean cross-entropy of the (N, V) logits against target over the rows whose
 target is not ignore_index (dividing by at least one, so all-ignored gives 0). The logits are
 overwritten with the gradient of that mean, (softmax(x) - onehot(y)) / n on the n counted rows and
@@ -18,9 +16,6 @@ IGNORE = -100
 
 
 def reference(logits, target, ignore_index):
-    """
-    (loss, grad, num_counted) in fp32: F.cross_entropy and the closed-form gradient of the mean.
-    """
     x = logits.float()
     keep = target != ignore_index
     num_counted = max(int(keep.sum()), 1)
@@ -77,9 +72,6 @@ def test_dtypes(dtype):
 
 
 def test_large_logits_stable():
-    """
-    Online softmax stays finite for large and very negative logits.
-    """
     gen = torch.Generator(device="cuda").manual_seed(2)
     logits = (torch.randn(512, 151936, generator=gen, device="cuda") * 50).to(torch.bfloat16)
     logits[:8, :1000] = -1e4
@@ -120,7 +112,6 @@ def test_other_ignore_index():
 def test_single_row_and_mean_over_counted_rows():
     logits = torch.randn(1, 151936, device="cuda").to(torch.bfloat16)
     check(logits, torch.tensor([123], device="cuda"))
-    # The mean divides by the counted rows only: one counted row out of 100.
     logits = torch.randn(100, 1000, device="cuda").to(torch.bfloat16)
     target = torch.full((100,), IGNORE, device="cuda")
     target[42] = 9
@@ -129,10 +120,6 @@ def test_single_row_and_mean_over_counted_rows():
 
 
 def test_non_contiguous_logits_return_a_copy():
-    """
-    A column slice of a wider buffer is not row-contiguous: the gradient comes back, still
-    correct, in a contiguous copy.
-    """
     gen = torch.Generator(device="cuda").manual_seed(5)
     wide = torch.randn(300, 5000, generator=gen, device="cuda").to(torch.bfloat16)
     logits = wide[:, :4000]

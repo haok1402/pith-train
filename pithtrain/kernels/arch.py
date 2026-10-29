@@ -12,9 +12,6 @@ Compute-capability major of the current device at import: 9 on SM90, 10 on SM100
 """
 
 SM_COUNT = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-"""
-Streaming-multiprocessor count of the current device at import (132 on H200).
-"""
 
 NATIVE_E8M0 = ARCH_MAJOR >= 10
 """

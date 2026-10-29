@@ -26,9 +26,8 @@ __all__ = [
 
 class GroupedLinearFunc(torch.autograd.Function):
     """
-    BF16 grouped linear, output = input @ weight[g].T for the rows of each group g. The weight
-    gradient is deferred to DualPipeV's W phase when WeightGradStore is enabled, and accumulates
-    into main_grad in fp32 when one is given (ks and ks_tensor are then required).
+    The weight gradient accumulates into main_grad in fp32 when one is given; ks and ks_tensor
+    are then required.
     """
 
     @staticmethod
@@ -70,8 +69,7 @@ class GroupedLinearFunc(torch.autograd.Function):
 
 class GroupedLinear(nn.Module):
     """
-    BF16 grouped linear layer with weight (num_groups, out_features, in_features). The input rows
-    are sorted by group, with group boundaries given by grouped_mm_offs.
+    The input rows are sorted by group, with group boundaries given by grouped_mm_offs.
     """
 
     main_grad: Optional[torch.Tensor] = None
@@ -112,11 +110,8 @@ def fp8_grouped_wgrad(
     shape: tuple[int, int, int],
 ) -> None:
     """
-    Weight gradient of an FP8 grouped linear from the per-channel FP8 (data, scale) pairs that
-    fp8_quant_grouped gives for grad_output (grad_ch) and input (input_ch). With an fp32
-    weight.main_grad the GEMM accumulates into it; otherwise the (G, N, K) result of the given shape
-    is added into weight.grad in bf16. Deferred to DualPipeV's W phase when
-    WeightGradStore is enabled.
+    grad_ch and input_ch are the per-channel FP8 (data, scale) pairs that fp8_quant_grouped gives
+    for grad_output and input; shape is the (G, N, K) weight shape.
     """
     main_grad = getattr(weight, "main_grad", None)
 
@@ -142,9 +137,8 @@ def fp8_grouped_wgrad(
 
 class FP8GroupedLinearFunc(torch.autograd.Function):
     """
-    FP8 grouped linear, output = input @ weight[g].T for the rows of each group g, from the
-    quantized weight that FP8GroupedLinear.get_quantized_weight returns. quantized_input, when
-    given, is fp8_quant_grouped(input) computed once for several projections.
+    quantized_weight is what FP8GroupedLinear.get_quantized_weight returns. quantized_input, when
+    given, is fp8_quant_grouped(input) computed once and shared by several projections.
     """
 
     @staticmethod
@@ -215,15 +209,15 @@ class FP8GroupedLinearFunc(torch.autograd.Function):
 
 class FP8GroupedLinear(nn.Module):
     """
-    Drop-in GroupedLinear replacement with FP8 GEMMs, weight (num_groups, out_features,
-    in_features). The bf16 weight is quantized once per pipeline step and reused by every
-    micro-batch of it; with fp8_param_gather set, the weight arrives already quantized.
+    Drop-in GroupedLinear replacement with FP8 GEMMs. The bf16 weight is quantized once per
+    pipeline step and reused by every micro-batch of it; with fp8_param_gather set, the weight
+    arrives already quantized.
     """
 
     fp8_param_gather: bool = False
     main_grad: Optional[torch.Tensor] = None
     """
-    fp32 gradient buffer set by wgrad_accumulation; the wgrad GEMM accumulates into it.
+    fp32 gradient buffer set by wgrad_accumulation.
     """
 
     def __init__(self, num_groups: int, in_features: int, out_features: int):

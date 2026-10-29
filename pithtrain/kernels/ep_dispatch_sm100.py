@@ -203,9 +203,6 @@ def dispatch_scratch(device: torch.device, M: int, num_ctas: int, ne_padded: int
 
 
 def ep_dispatch_send_idx_sm100(topk_ids: torch.Tensor, num_experts: int, ep_size: int, experts_per_rank: int, meta_out: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    The Triton path of ep_dispatch_send_idx (atomic order within each bucket).
-    """
     M, num_topk = topk_ids.shape
     device = topk_ids.device
     assert ep_size <= 32, f"ep_size={ep_size} exceeds int32 bitmask limit of 32"
@@ -246,7 +243,7 @@ def ep_dispatch_send_idx_sm100(topk_ids: torch.Tensor, num_experts: int, ep_size
 
 @triton.jit
 def expert_and_expand_idx_kernel(
-    recv_meta_ptr,  # [EP_SIZE * (EXPERTS_PER_RANK + 1)] int64, the received metadata
+    recv_meta_ptr,  # [EP_SIZE * (EXPERTS_PER_RANK + 1)] int64, input
     received_expand_idx_ptr,  # [total] int64, input
     expert_idxs_ptr,  # [total] int64, output
     expand_idx_ptr,  # [total] int64, output
@@ -284,9 +281,6 @@ def expert_and_expand_idx_kernel(
 
 
 def ep_dispatch_recv_idx_sm100(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    The Triton path of ep_dispatch_recv_idx.
-    """
     # the kernel indexes both inputs with unit stride
     recv_meta, received_expand_idx = recv_meta.contiguous(), received_expand_idx.contiguous()
     total = received_expand_idx.shape[0]

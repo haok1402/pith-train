@@ -1,7 +1,3 @@
-"""
-SwiGLU silu(gate) * up and its backward as element-wise Triton kernels, run on both architectures.
-"""
-
 from __future__ import annotations
 
 import torch
@@ -48,11 +44,10 @@ BLOCK_SIZE = 1024
 
 def silu_mul_fwd(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """
-    silu(gate) * up as a fresh contiguous tensor like gate.
-
-    gate, up: contiguous, same shape and float dtype (bf16 in practice); not modified. Computed in
-    fp32 and rounded once to the dtype; close to, not bit-identical with, the PyTorch fp32 formula
-    (Triton's sigmoid). Deterministic; fp8_silu_mul_fwd reproduces it bit for bit.
+    silu(gate) * up as a new contiguous tensor like gate. gate, up: contiguous, same shape and float
+    dtype (bf16 in practice); not modified. Computed in fp32 and rounded once to the dtype; close
+    to, not bit-identical with, the PyTorch fp32 formula (Triton's sigmoid). Deterministic;
+    fp8_silu_mul_fwd reproduces it bit for bit.
     """
     assert gate.shape == up.shape, f"shape mismatch: {gate.shape} vs {up.shape}"
     assert gate.dtype == up.dtype, f"dtype mismatch: {gate.dtype} vs {up.dtype}"
@@ -67,12 +62,9 @@ def silu_mul_fwd(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 
 def silu_mul_bwd(grad_output: torch.Tensor, gate: torch.Tensor, up: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Gradients of silu_mul_fwd: fresh (grad_gate, grad_up) like gate / up.
-
-    grad_output, gate, up: contiguous, same shape and dtype; not modified. With s = sigmoid(gate)
-    in fp32: grad_up = grad_output * gate * s, grad_gate = grad_output * up * s * (1 + gate -
-    gate * s), each rounded once to the dtype. Deterministic; fp8_silu_mul_bwd reproduces both
-    bit for bit.
+    Gradients of silu_mul_fwd as new (grad_gate, grad_up). grad_output, gate, up: contiguous, same
+    shape and dtype; not modified. Computed in fp32, each rounded once to the dtype. Deterministic;
+    fp8_silu_mul_bwd reproduces both bit for bit.
     """
     assert grad_output.shape == gate.shape, f"grad_output shape {grad_output.shape} != gate shape {gate.shape}"
     assert grad_output.dtype == gate.dtype, f"grad_output dtype {grad_output.dtype} != gate dtype {gate.dtype}"

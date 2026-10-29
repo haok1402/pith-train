@@ -1,7 +1,3 @@
-"""
-Picker of fp8_quant_act: the CuTe-DSL kernel on SM90, Triton on SM100.
-"""
-
 import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR

@@ -47,10 +47,8 @@ __all__ = ["Qwen35MoeGatedDeltaNet", "Qwen35MoeModel", "Qwen35MoeTopKRouter"]
 
 def pipeline_layer_sizes(num_layers: int, stage_count: int) -> list[int]:
     """
-    Layers per pipeline stage for Qwen3.5: the even split, with one layer moved from the last stage
-    (norm, lm_head over a 248k vocabulary and the loss, on pipeline rank 0) to the middle stage (on
-    the last pipeline rank). The move applies only with at least 4 stages and only if the two
-    stages of every rank still differ by at most one layer.
+    Moves one layer from the last stage (norm, lm_head over a 248k vocabulary and the loss, on
+    pipeline rank 0) to the middle stage (on the last pipeline rank).
     """
     sizes = layer_sizes(num_layers, stage_count)
     if stage_count < 4:
@@ -164,9 +162,6 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         self.out_proj = training.Linear(self.value_dim, self.hidden_size, bias=False)
 
     def split_qkv(self, mixed_qkv: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """
-        Split the activated conv output into L2-normalized query and key, and value, per head.
-        """
         B, S, _ = mixed_qkv.shape
         query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)  # fmt: skip
         query = F.normalize(query.reshape(B, S, -1, self.head_k_dim), dim=-1)
@@ -178,8 +173,8 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
 
     def conv_qkv(self, mixed_qkv: torch.Tensor, offset: int) -> tuple[torch.Tensor, ...]:
         """
-        Causal conv, SiLU and split_qkv for unpacked rows. The channels-last conv is bit-identical
-        to self.conv1d on the transposed input sliced to [offset, offset + S).
+        The channels-last conv is bit-identical to self.conv1d on the transposed input sliced to
+        [offset, offset + S).
         """
         conv_out = causal_conv1d(mixed_qkv, self.conv1d.weight, offset)
         return self.split_qkv(F.silu(conv_out))

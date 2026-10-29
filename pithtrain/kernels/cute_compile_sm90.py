@@ -1,6 +1,6 @@
 """
-Compile-time helpers shared by the SM90 CuTe-DSL kernels: the fake tensors and stream cute.compile
-traces a kernel against (launched later through TVM-FFI), and the torch-to-CuTe element types.
+Fake tensors and stream that cute.compile traces the SM90 kernels against; the compiled kernels are
+launched later through TVM-FFI.
 """
 
 import cutlass

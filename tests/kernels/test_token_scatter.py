@@ -1,12 +1,4 @@
 """
-Verifier of scatter_by_expert against plain PyTorch.
-
-Contract: reorder input_tokens (m, H) by expert_idxs (m,) into per-expert groups in expert order,
-each padded with zero rows to a multiple of padding_alignment. Returns (out, reverse_shuffle_idxs,
-grouped_mm_offs, ks_tensor, ks): out (sum(ks), H); reverse_shuffle_idxs (m,) int64, the output row
-of every input token; grouped_mm_offs (G,) int32 cumulative padded sizes; ks_tensor (G,) int32
-padded sizes; and ks the same on the host (from group_counts when given).
-
 Row placement within a group is unspecified, so the test checks the row set: each token lands, bit
 for bit, in its expert's first count rows, and every other row is zero.
 """
@@ -31,7 +23,6 @@ def check(x, expert_idxs, G, alignment=128, group_counts=None):
     assert out.shape == (sum(ks_want), H) and out.dtype == x.dtype
     assert out.stride() == (H, 1)
 
-    # Every token lands in its own expert's token rows, at a distinct row.
     starts = (offs_want - torch.tensor(ks_want)).to(x.device)
     pos = reverse_idxs - starts[expert_idxs]
     assert torch.all(pos >= 0) and torch.all(pos < counts.to(x.device)[expert_idxs])

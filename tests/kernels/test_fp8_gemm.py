@@ -1,18 +1,6 @@
 """
-Verifies the fp8_gemm feature of pithtrain.kernels against PyTorch.
-
-- fp8_quant_grouped: exact FP8 bytes and E8M0 scale values of both outputs (rowwise 1x128
-  per row, and per-channel 128x1 within each group in SM90's K-major per-group layout).
-- fp8_group_indices: exact ids against searchsorted, for offsets the one-launch kernel
-  covers and offsets it does not.
-- fp8_grouped_gemm (with and without the hint), k_grouped_fp8_gemm (in place, the row-limit
-  split, the SM90 deadlock guard's direct, transposed and padded branches, padded operands, both
-  fp8_grouped_wgrad_empty layouts), and the dense fp8_gemm_nt, fp8_gemm_fwd and
-  fp8_gemm_bwd: against fp32 PyTorch matmuls of the dequantized FP8 operands.
-- The fp8_grouped_wgrad_empty layout and fp8_fused_experts_supported.
-
-The deadlock-guard shapes of k_grouped_fp8_gemm run in a subprocess under a timeout, so a hang
-fails the test instead of the session.
+Verifies the fp8_gemm feature of pithtrain.kernels against PyTorch: quantizations by exact FP8
+bytes and E8M0 scale values, GEMMs against fp32 matmuls of the dequantized FP8 operands.
 """
 
 import json
@@ -48,9 +36,6 @@ BLOCK = 128
 
 
 def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
-    """
-    Normalized squared error 1 - 2 sum(xy) / sum(x^2 + y^2) in float64.
-    """
     x, y = x.double(), y.double()
     den = (x * x + y * y).sum()
     if den == 0:
@@ -160,8 +145,8 @@ def make_input(M: int, K: int, kind: str = "randn", seed: int = 0) -> torch.Tens
     elif kind == "outliers":
         mask = torch.rand(M, K, device=DEV, generator=gen) < 1e-3
         x = torch.where(mask, x * 1e4, x)
-        x[:, : min(K, 3)] = 0.0  # all-zero columns
-        x[5::97] = 0.0  # all-zero rows
+        x[:, : min(K, 3)] = 0.0
+        x[5::97] = 0.0
         x[7::131] *= 1e-30  # tiny rows (amax clamp)
         x[11::127] *= 1e-39  # bf16 subnormals
         x[13::89, ::17] = 448.0 * 2.0**-3  # amax exactly 448 * 2^k: a scale boundary
@@ -309,7 +294,7 @@ def test_group_indices(G: int, seed: int) -> None:
     # G <= 1024 int32 contiguous runs the one-launch kernel, G > 1024 the searchsorted fallback.
     gen = torch.Generator().manual_seed(seed)
     counts = torch.randint(0, 3000, (G,), generator=gen)
-    counts[torch.rand(G, generator=gen) < 0.3] = 0  # empty groups
+    counts[torch.rand(G, generator=gen) < 0.3] = 0
     ks = (counts + 127) // 128 * 128
     offs = ks.cumsum(0).to(torch.int32).to(DEV)
     M = int(offs[-1])
@@ -321,7 +306,7 @@ def test_group_indices_uncovered_offsets() -> None:
     ks = [128, 0, 384, 256, 0, 0, 640]
     offs = offsets(ks)
     M = sum(ks)
-    check_group_indices(offs.to(torch.int64), M)  # not int32
+    check_group_indices(offs.to(torch.int64), M)
     wide = torch.stack([offs, torch.zeros_like(offs)], 1).view(-1)
     check_group_indices(wide[::2], M)  # non-contiguous
 
@@ -410,9 +395,6 @@ def check_kgrouped(d: torch.Tensor, ks: list[int], N: int, K: int, **pad) -> Non
 
 
 def run_kgrouped_case(ks: list[int], N: int, K: int, NA: int | None, KB: int | None) -> None:
-    """
-    Check both main_grad layouts: fp8_grouped_wgrad_empty's and a plain contiguous tensor.
-    """
     size = torch.Size((len(ks), N, K))
     for d in (
         fp8_grouped_wgrad_empty(size, torch.device(DEV)),
@@ -445,7 +427,7 @@ KGROUPED_CASES = [
     (RAGGED, 2048, 512, None, None),  # qwen3.5-35b-a3b down
     ([1024, 0, 512, 2048, 128, 0, 768, 256], 256, 384, None, None),
     ([128] * 40, 256, 384, None, None),
-    ([0, 0, 0], 256, 384, None, None),  # no rows at all
+    ([0, 0, 0], 256, 384, None, None),
     ([256, 0, 384], 1024, 2880, None, None),  # even M-blocks: direct
     # above DeepGEMM's 65536-row limit: split at group boundaries / inside a group
     ([40960, 0, 30720, 128], 256, 128, None, None),

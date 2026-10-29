@@ -15,9 +15,6 @@ def offsets(counts):
 
 
 def reference(x, offs):
-    """
-    Return float64 per-group column sums, with offsets clamped to M.
-    """
     M, H = x.shape
     ends = offs.long().clamp(max=M).tolist()
     out, start = torch.zeros(len(ends), H, dtype=torch.float64, device=x.device), 0
@@ -30,7 +27,7 @@ def reference(x, offs):
 
 def tolerance(x, offs):
     """
-    Return the fp32 accumulation error bound: a few eps32 of each group's sum of |x|.
+    Bound on the fp32 accumulation error of each group's sum.
     """
     return 4 * torch.finfo(torch.float32).eps * reference(x.abs(), offs) + 1e-30
 

@@ -1,6 +1,5 @@
 """
-Triton rowwise FP8 quantization of x and of x.T from one read of x (the SM100 path and the
-SM90 kernel's reference).
+The reference the SM90 kernel of fp8_quant_grad is bit-identical to.
 """
 
 import torch
@@ -15,9 +14,6 @@ __all__ = ["fp8_quant_grad_sm100"]
 
 @triton.jit
 def fp8cast_rowwise_transpose_kernel(x_ptr, out_tok_ptr, scale_tok_ptr, out_t_ptr, scale_t_ptr, M, N, stride_x_row, stride_x_col, stride_out_tok_row, scale_tok_cols, stride_out_t_row, stride_scale_t_row, BLOCK_N: tl.constexpr, NATIVE_E8M0: tl.constexpr):
-    """
-    One 128 x BLOCK_N tile of x per program.
-    """
     BLOCK_ROWS: tl.constexpr = 128
     BLOCKS_PER_ROW: tl.constexpr = BLOCK_N // BLOCK_ROWS
 
@@ -61,9 +57,6 @@ def fp8cast_rowwise_transpose_kernel(x_ptr, out_tok_ptr, scale_tok_ptr, out_t_pt
 
 
 def fp8_quant_grad_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    fp8_quant_grad with both scales row-major.
-    """
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     M, N = x.shape
     BLOCK = 128

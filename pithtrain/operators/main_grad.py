@@ -14,14 +14,11 @@ import torch.nn as nn
 __all__ = ["MAIN_GRADS", "raw_main_grad"]
 
 MAIN_GRADS = "_raw_main_grads"
-"""
-Key in a module's __dict__ of its {parameter name: fp32 main_grad} mapping.
-"""
 
 
 def raw_main_grad(module: nn.Module, name: str) -> Optional[torch.Tensor]:
     """
-    The fp32 main_grad of raw parameter name if installed (None otherwise). Its storage is only
-    allocated from the first backward of a step on, so writers check it before writing.
+    The returned tensor's storage is only allocated from the first backward of a step on, so
+    writers check it before writing.
     """
     return module.__dict__.get(MAIN_GRADS, {}).get(name)

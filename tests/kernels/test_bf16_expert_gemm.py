@@ -52,8 +52,8 @@ F64 = torch.float64
 
 def assert_within(out, ref, absref, what, bf16=True):
     """
-    Assert |out - ref| <= rel * |ref| + 1e-5 * absref, with rel half a bf16 ulp (2^-8) for a bf16
-    output or 2 fp32 ulps for an fp32 one; absref bounds the accumulation-order error.
+    rel is half a bf16 ulp for a bf16 output or 2 fp32 ulps for an fp32 one; absref bounds the
+    accumulation-order error.
     """
     rel = 2.0**-8 if bf16 else 2.0**-22
     err = (out.to(F64) - ref).abs()
@@ -171,7 +171,7 @@ CASES = {
     "qwen3-g64-ragged": (2048, 768, ragged(64, 20000, 1, empty=0.3)),
     "qwen3-edges": (2048, 768, [0, 1, 300, 129, 0, 1000, 7, 512, 1, 0, 2048, 33]),
     "qwen3-imbalanced": (2048, 768, [6000, 3, 0, 120, 1, 250, 0, 9]),
-    "qwen3-large": (2048, 768, [9000] * 8),  # 72000 rows in one call
+    "qwen3-large": (2048, 768, [9000] * 8),  # more than 65536 rows in one call
     "dsv2-g8-ragged": (2048, 1408, ragged(8, 12288, 2, empty=0.2)),
     "dsv2-g16": (2048, 1408, [768] * 15 + [0]),
     "q35-g32": (2048, 512, [512] * 32),
@@ -261,7 +261,6 @@ def test_swiglu_wgrads(case, w_layout, mg_layout):
     dpre = torch.randn(M, 2 * inter, **BF16)
     h = torch.randn(M, inter, **BF16)
     dy = torch.randn(M, H, **BF16)
-    # main grads with a nonzero start
     mg_g, mg_u = pair(G, inter, H, mg_layout, dtype=torch.float32, scale=3.0)
     mg_d = torch.randn(G, H, inter, device="cuda") * 3.0
     start = [t.clone() for t in (mg_g, mg_u, mg_d)]
@@ -398,9 +397,6 @@ def test_gptoss(counts_case, limit):
     ],
 )
 def test_zero_rows(H, inter, G, gptoss):
-    """
-    0 rows (every group empty): empty outputs, main grads untouched.
-    """
     cu = torch.zeros(G + 1, dtype=torch.int32, device="cuda")
     idx = torch.empty(0, dtype=torch.int32, device="cuda")
     x = torch.randn(3, H, **BF16)

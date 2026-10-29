@@ -17,9 +17,6 @@ __all__ = ["AMAX_MIN", "FP8_MAX_RCP", "e8m0_scale", "e8m0_scale_bf16x2", "e8m0_s
 
 
 def ptx_f32(x: float) -> str:
-    """
-    PTX hex literal of the float32 nearest to x.
-    """
     return "0f%08X" % struct.unpack("<I", struct.pack("<f", x))[0]
 
 

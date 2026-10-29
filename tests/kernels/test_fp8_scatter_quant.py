@@ -1,6 +1,4 @@
 """
-Verifier of scatter_quant (feature fp8_scatter_quant) against plain PyTorch.
-
 Contract: expand the deduplicated rows (gathered[expand_idx]), scatter the tokens into per-expert
 groups padded with zero rows to a multiple of 128, and quantize the result as fp8_quant_grouped
 does on SM90 (rowwise 1x128 plus the per-channel FP8 K-major per group). Returns (quantized 4-tuple,
@@ -135,7 +133,6 @@ def check(
         assert ks == [(count + BLOCK - 1) // BLOCK * BLOCK for count in counts]
     M = sum(ref_ks)
 
-    # reverse_shuffle_idxs must be a valid placement: inside the token's group, all rows distinct.
     assert reverse_idxs.dtype == torch.int64 and reverse_idxs.shape == (num_tokens,)
     starts = (ref_offs - ref_ks_tensor).long()
     counts_t = torch.bincount(expert_idxs, minlength=G)
@@ -251,9 +248,6 @@ def test_scatter_quant_determinism() -> None:
 
 
 def test_scatter_quant_back_to_back() -> None:
-    """
-    Run many launches with a changing token count.
-    """
     for it, sizes in enumerate([[2048] * 16, [5, 0, 3] + [0] * 13, [4096] * 16, [1] * 16] * 3):
         run_case(sizes, 128, 2, segmented=it % 2 == 0, host_counts=True)
 

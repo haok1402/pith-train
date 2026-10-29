@@ -54,8 +54,8 @@ def all_to_all_async(
     group: torch.distributed.ProcessGroup,
 ) -> Tuple[torch.Tensor, torch.distributed.Work]:
     """
-    Async all-to-all of x, returning (output, work). The caller waits on work before reading output.
-    The split sizes and group are those of torch.distributed.all_to_all_single.
+    The caller waits on work before reading output. The split sizes and group are
+    those of torch.distributed.all_to_all_single.
     """
     valid_size = sum(output_split_sizes)
     # NCCL reads x by these splits; a mismatch would read past the tensor.
@@ -84,10 +84,6 @@ def all_to_all_sync(
     input_split_sizes: List[int] | None = None,
     group: torch.distributed.ProcessGroup | None = None,
 ) -> None:
-    """
-    Blocking all-to-all of x into output, as torch.distributed.all_to_all_single does with
-    async_op=False, through the lean path.
-    """
     if group is None or torch.compiler.is_compiling():
         all_to_all_single_eager(output, x, output_split_sizes, input_split_sizes, group)
         return
@@ -108,10 +104,6 @@ def direct_all_to_all(
     input_split_sizes: List[int],
     group: torch.distributed.ProcessGroup,
 ) -> torch.Tensor:
-    """
-    all_to_all_async, returning the output with its Work handle attached as output.comm_work. The
-    caller waits on it before reading the output.
-    """
     output, comm_work = all_to_all_async(x, output_split_sizes, input_split_sizes, group)
     output.comm_work = comm_work
     return output

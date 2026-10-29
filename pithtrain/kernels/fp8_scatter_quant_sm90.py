@@ -42,10 +42,6 @@ ALIGN = 128
 
 
 class Prep:
-    """
-    Stable per-expert ranking, group offsets and inverse map; one CTA per PREP_CHUNK token slots.
-    """
-
     def __init__(self, num_groups: int, has_expand: bool) -> None:
         assert 0 < num_groups <= MAX_GROUPS
         self.G = num_groups
@@ -69,7 +65,7 @@ class Prep:
 
         smem = cutlass.memory.SmemAllocator()
         s_chunk_count = smem.allocate(G * 4, byte_alignment=16).toint()  # per-expert count in this chunk, running while ranking
-        s_lower_count = smem.allocate(G * 4, byte_alignment=16).toint()  # per-expert count in lower chunks
+        s_lower_count = smem.allocate(G * 4, byte_alignment=16).toint()
         s_warp_count = smem.allocate(PREP_WARPS * G * 4, byte_alignment=16).toint()  # per-warp counts of one round
         s_warp_base = smem.allocate(PREP_WARPS * G * 4, byte_alignment=16).toint()  # per-warp exclusive bases of one round
         s_ticket = smem.allocate(16, byte_alignment=16).toint()
@@ -97,9 +93,6 @@ class Prep:
 
     @cute.jit
     def take_ticket(self, tidx, counter_base, s_ticket):
-        """
-        This CTA's chunk index (its ticket) and the launch's epoch, broadcast through s_ticket.
-        """
         if tidx == 0:
             # the counter packs (epoch << 32) | tickets taken; the old value gives this CTA both
             counter = atom_add_u64(counter_base, Int64(1))
@@ -112,8 +105,7 @@ class Prep:
     @cute.jit
     def load_chunk(self, experts_base, mExp, chunk_idx, tidx, T):
         """
-        Expert, source row, index and validity of each token slot this thread ranks; all loads are
-        issued before any is used.
+        All loads are issued before any is used.
         """
         expert_idxs, src_rows, token_idxs, token_oks = [], [], [], []
         for i in cutlass.range_constexpr(PREP_CHUNK // PREP_THREADS):
@@ -172,9 +164,6 @@ class Prep:
 
     @cute.jit
     def publish_histogram(self, hist_base, flags_base, chunk_idx, epoch, tidx, s_chunk_count) -> None:
-        """
-        Store this chunk's per-expert counts, then release its flag set to the epoch.
-        """
         G = self.G
         if tidx < G:
             st_b32(hist_base + (Int64(chunk_idx) * G + tidx) * 4, lds_b32(s_chunk_count + tidx * 4), Int32(1))
@@ -186,9 +175,6 @@ class Prep:
 
     @cute.jit
     def wait_lower_chunks(self, flags_base, chunk_idx, epoch, tidx) -> None:
-        """
-        Wait until the flag of every lower chunk holds this epoch.
-        """
         for round_idx in cutlass.range((chunk_idx + PREP_THREADS - 1) // PREP_THREADS, unroll=1):
             lower_idx = round_idx * PREP_THREADS + tidx
             # for lower_idx < chunk_idx: spin with acquire loads until that chunk's flag reaches this epoch
@@ -209,9 +195,6 @@ class Prep:
 
     @cute.jit
     def sum_lower_chunks(self, hist_base, chunk_idx, tidx, s_lower_count) -> None:
-        """
-        Add the per-expert counts of every lower chunk into s_lower_count.
-        """
         G = self.G
         num_lower_entries = chunk_idx * G
         for round_idx in cutlass.range((num_lower_entries + PREP_THREADS - 1) // PREP_THREADS, unroll=1):
@@ -223,9 +206,6 @@ class Prep:
 
     @cute.jit
     def store_ranks(self, inv_base, rank_base, T, src_rows, token_idxs, token_oks, safe_expert_idxs, chunk_ranks, s_lower_count) -> None:
-        """
-        Store each slot's rank within its expert and the inverse map inv[g * T + rank] = source row.
-        """
         for i in cutlass.range_constexpr(PREP_CHUNK // PREP_THREADS):
             rank = Int32(lds_b32(s_lower_count + safe_expert_idxs[i] * 4)) + chunk_ranks[i]
             inv_addr = inv_base + (Int64(safe_expert_idxs[i]) * T + rank) * 4
@@ -235,8 +215,7 @@ class Prep:
     @cute.jit
     def store_group_offsets(self, offs_base, ks_base, counts_base, counter_base, num_chunks, tidx, s_chunk_count, s_lower_count) -> None:
         """
-        Run by the last chunk, which has waited for all others: store each group's padded end
-        offset, padded size and token count, and start the next epoch with zero tickets.
+        Run by the last chunk, which has waited for all others.
         """
         G = self.G
         if tidx < G:
@@ -316,8 +295,7 @@ class ScatterQuant(RowwiseKmajor):
     @cute.jit
     def store_reverse_shuffle(self, experts_base, rank_base, offs_base, rsi_base, T, pid_row, pid_col, tidx) -> None:
         """
-        reverse_shuffle_idxs[t] = start of expert(t) + rank(t) for the tile's token slots, stored by
-        the column-block-0 CTAs.
+        reverse_shuffle_idxs[t] = start of expert(t) + rank(t) for the tile's token slots.
         """
         token_idx = Int64(pid_row) * TILE + tidx
         token_ok = Int32(pid_col == 0) & Int32(tidx < TILE) & Int32(token_idx < T)
@@ -379,17 +357,13 @@ def run_unfused(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: i
 
 
 def supports_scatter_quant(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor] = None) -> bool:
-    """
-    Whether the fused kernels cover these inputs (else scatter_quant_sm90 runs the unfused path).
-    """
     T, N = expert_idxs.shape[0], gathered.shape[1]
     return not (T == 0 or N == 0 or not 0 < num_groups <= MAX_GROUPS or gathered.dtype != torch.bfloat16 or N % 8 != 0 or not gathered.is_contiguous() or gathered.data_ptr() % 16 != 0 or expert_idxs.dtype != torch.int64 or not expert_idxs.is_contiguous() or (expand_idx is not None and (expand_idx.dtype != torch.int64 or not expand_idx.is_contiguous())))
 
 
 def scatter_quant_sm90(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor] = None, padding_alignment: int = 128, group_counts: Optional[list[int]] = None, pdl: bool = True) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
     """
-    scatter_quant on SM90 (see the picker for the contract): fused where supports_scatter_quant,
-    else the unfused path. Scales are MN-major. pdl=False launches the main kernel without PDL.
+    Scales are MN-major.
     """
     global copy_stream, copy_event
     assert padding_alignment == ALIGN, "the K-major FP8 layout needs 128-row groups"

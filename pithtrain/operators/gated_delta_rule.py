@@ -37,8 +37,8 @@ CHUNK_SIZE = 64  # FLA's chunk size (BT)
 @lru_cache(maxsize=None)
 def cp_state(group_name: Optional[str], seq_len: int) -> Tuple:
     """
-    FLA's context-parallel context and chunk indices for this rank, or (None, None) without a
-    group. Cached because build_cp_context reaches host memory.
+    FLA's context-parallel context and chunk indices for this rank. Cached because build_cp_context
+    reaches host memory.
     """
     if group_name is None:
         return None, None

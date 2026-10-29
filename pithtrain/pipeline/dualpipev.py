@@ -69,9 +69,8 @@ __all__ = [
 
 def layer_sizes(num_layers: int, stage_count: int) -> list[int]:
     """
-    Return the number of layers each pipeline stage owns, in stage order. Layers are spread as
-    evenly as possible, with any remainder kept off the two edge stages, which also hold
-    embed_tokens and norm plus lm_head.
+    Layers are spread as evenly as possible, with any remainder kept off the two edge stages, which
+    also hold embed_tokens and norm plus lm_head.
     """
     base, remainder = divmod(num_layers, stage_count)
     layers = [base] * stage_count
@@ -88,9 +87,7 @@ def layer_partition(
     num_layers: int, stage_count: int, stage_index: int, sizes: Sequence[int] | None = None
 ) -> range:
     """
-    Return the contiguous layer ids that pipeline stage stage_index owns. sizes, when given,
-    overrides layer_sizes; it must sum to num_layers, and the two stages of one rank may differ by
-    at most one layer, as the overlapped schedule requires.
+    The two stages of one rank may differ by at most one layer, as the overlapped schedule requires.
     """
     if sizes is None:
         sizes = layer_sizes(num_layers, stage_count)
@@ -130,9 +127,6 @@ class Microbatch:
     """
 
     objective_inputs: Any
-    """
-    Whatever the objective needs for this micro-batch, passed through untouched.
-    """
 
 
 class DualPipeV(nn.Module):
@@ -169,9 +163,6 @@ class DualPipeV(nn.Module):
         self.reset_states()
 
     def ensure_chunk_records_allocated(self, num_chunks: int) -> None:
-        """
-        Allocate num_chunks ChunkRecords per chunk, reused across steps until num_chunks changes.
-        """
         if self.num_chunks_allocated == num_chunks:
             return
         self.chunk_records = tuple(
@@ -214,8 +205,7 @@ class DualPipeV(nn.Module):
 
     def setup_step_metadata(self, microbatches: List[Microbatch]) -> int:
         """
-        Record each micro-batch's activation shape and cu_seqlens for this step and return the
-        number of micro-batches. Micro-batches may differ in shape.
+        Micro-batches may differ in shape.
         """
         device = distributed.device
         hidden = self.module[0].hidden_size
@@ -446,10 +436,6 @@ class DualPipeV(nn.Module):
         self.to_free = []
 
     def append_irecv(self, src: int, chunk_id: int) -> List[torch.Tensor]:
-        """
-        Queue a receive from pipeline rank src for each tensor of micro-batch chunk_id, sized by its
-        recorded shape; commit_and_wait_comm posts them.
-        """
         tensors = [
             torch.empty(
                 shape,

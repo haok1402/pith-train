@@ -1,9 +1,3 @@
-"""
-Picker of scatter_quant, the MoE stage-3 FP8 input: dedup expansion, scatter by expert and K-major
-FP8 quantization in one pass. SM90 runs the fused CuTe-DSL kernels (fp8_scatter_quant_sm90), SM100
-the unfused Triton path (fp8_scatter_quant_sm100).
-"""
-
 from typing import Optional
 
 import torch

@@ -1,8 +1,3 @@
-"""
-SM100 fp8_silu_mul_quant: the unfused sequence silu_mul_fwd / silu_mul_bwd, then
-fp8cast_rowwise_kmajor_sm100. Scales are row-major.
-"""
-
 import torch
 
 from pithtrain.kernels.fp8_rowwise_kmajor_sm100 import fp8cast_rowwise_kmajor_sm100, kmajor_empty_outputs

@@ -1,6 +1,4 @@
 """
-Verifier of group_bias_add against plain PyTorch.
-
 Contract: y += bias[group_indices] in place, bit-identical to y + bias[group_indices] in PyTorch
 (one fp32 add rounded once to y's dtype). This holds for the kernel's inputs (same dtype, M a
 multiple of 128, contiguous) and for every other input, which takes a PyTorch fallback.
@@ -13,9 +11,6 @@ from pithtrain.kernels import group_bias_add
 
 
 def group_ids(counts, index_dtype=torch.int32):
-    """
-    Return the per-row group id of rows sorted by group (counts may be zero).
-    """
     return torch.repeat_interleave(
         torch.arange(len(counts), device="cuda"), torch.tensor(counts, device="cuda")
     ).to(index_dtype)
@@ -102,7 +97,7 @@ def test_non_contiguous():
     before = wide.clone()
     bias = torch.randn(2, 2880, generator=gen, device="cuda").to(torch.bfloat16)
     check(y, bias, group_ids(counts))
-    assert torch.equal(wide[:, 2880:], before[:, 2880:])  # untouched outside the view
+    assert torch.equal(wide[:, 2880:], before[:, 2880:])
     y = torch.randn(256, 2880, generator=gen, device="cuda").to(torch.bfloat16)
     bias_t = torch.randn(2880, 2, generator=gen, device="cuda").to(torch.bfloat16).t()
     check(y, bias_t, group_ids(counts))

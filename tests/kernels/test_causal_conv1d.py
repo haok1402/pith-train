@@ -19,9 +19,6 @@ from pithtrain.kernels import causal_conv1d_bwd, causal_conv1d_empty, causal_con
 
 
 def reference(x, weight, offset, grad_out):
-    """
-    ATen's forward, input gradient and weight gradient, by autograd through F.conv1d.
-    """
     K, S = weight.shape[-1], x.shape[1] - offset
     x_leaf, weight_leaf = x.detach().clone().requires_grad_(), weight.detach().clone().requires_grad_()  # fmt: skip
     y = F.conv1d(x_leaf.transpose(1, 2), weight_leaf, groups=weight.shape[0], padding=K - 1)

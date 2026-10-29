@@ -1,10 +1,3 @@
-"""
-Picker of the expert-parallel dispatch index math: the sender-side dedup / counting-sort metadata
-(ep_dispatch_send_idx) and the receiver-side expert and expand indices
-(ep_dispatch_recv_idx). SM90 runs the CuTe-DSL kernels of ep_dispatch_sm90, SM100 the Triton
-kernels of ep_dispatch_sm100.
-"""
-
 import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR

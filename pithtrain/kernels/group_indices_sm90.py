@@ -46,9 +46,6 @@ class GroupIndices:
 
     @cute.jit
     def load_group_ends(self, offs_base, s_offs, tidx) -> None:
-        """
-        Copy the G group ends from global to shared memory.
-        """
         G = self.G
         for j in cutlass.range_constexpr((G + THREADS - 1) // THREADS):
             group_idx = j * THREADS + tidx
@@ -79,17 +76,10 @@ def compile_kernel(G: int) -> Callable:
 
 
 def supports_group_indices(grouped_mm_offs: torch.Tensor, M: int) -> bool:
-    """
-    Whether the kernel covers these inputs: 1-D contiguous int32 grouped_mm_offs of 1 to MAX_GROUPS
-    groups, 0 <= M < 2^31, outside torch.compile tracing.
-    """
     return (grouped_mm_offs.dtype == torch.int32 and grouped_mm_offs.dim() == 1 and 0 < grouped_mm_offs.shape[0] <= MAX_GROUPS and grouped_mm_offs.is_contiguous() and 0 <= M < 2**31 and not torch.compiler.is_compiling())
 
 
 def group_indices(grouped_mm_offs: torch.Tensor, M: int) -> torch.Tensor:
-    """
-    (M,) int32 group id of every row, from the cumulative group ends grouped_mm_offs.
-    """
     G = grouped_mm_offs.shape[0]
     out = torch.empty(M, dtype=torch.int32, device=grouped_mm_offs.device)
     if M == 0:

@@ -86,7 +86,7 @@ def scan_call(args: tuple, kwargs: dict, dtype: torch.dtype | None, grads: list)
 
 def cast_tree(x: Any, dtype: torch.dtype) -> Any:
     """
-    Cast every floating tensor of a plain structure x to dtype, as FSDP's _cast_fp_tensor does.
+    Matches FSDP's _cast_fp_tensor on a plain structure.
     """
     if isinstance(x, torch.Tensor):
         return x.to(dtype) if torch.is_floating_point(x) and x.dtype != dtype else x
@@ -96,9 +96,6 @@ def cast_tree(x: Any, dtype: torch.dtype) -> Any:
 
 
 def replace_grad_tensors(x: Any, replacements) -> Any:
-    """
-    x with its grad-requiring tensors replaced, in order, by the next ones of replacements.
-    """
     if isinstance(x, torch.Tensor):
         return next(replacements) if x.requires_grad else x
     if is_sequence(x):
@@ -108,8 +105,7 @@ def replace_grad_tensors(x: Any, replacements) -> Any:
 
 def backward_state_call_ok(state: Any) -> bool:
     """
-    Whether a call to a module in PRE_BACKWARD needs only the input cast: every group unsharded
-    and no output dtype.
+    Whether a call to a module in PRE_BACKWARD needs only the input cast.
     """
     # The pipeline defers FSDP's root post-backward callback to the end of the step, so a module
     # stays in PRE_BACKWARD after its first backward and FSDP takes its checkpointing branch.

@@ -130,9 +130,6 @@ BF16 = dict(device="cuda", dtype=torch.bfloat16)
 
 
 def gather_sum_reference(grad, expert_idxs, expand_idx, row_of, T):
-    """
-    fp32 sum per token of its grouped rows in ascending expert order, rounded once.
-    """
     out = torch.zeros(T, grad.shape[1], dtype=torch.float32, device=grad.device)
     for expert in torch.unique(expert_idxs).tolist():  # ascending
         # a token chose each expert at most once, so index_add_ adds one row per token
@@ -184,9 +181,6 @@ def test_gather_rows(N, rows):
 
 
 def test_gather_rows_no_expand_input_grad():
-    """
-    Without expand_idx the input gradient is the grouped gradient read back by row_of.
-    """
     G, S = 16, 4000
     expert_idxs = torch.randint(0, G, (S,), device="cuda")
     maps = bf16_expert_group_slots(expert_idxs, None, G, S)
@@ -198,9 +192,6 @@ def test_gather_rows_no_expand_input_grad():
 
 
 def segment_sum_reference(x, counts, idx=None):
-    """
-    fp32 sums of 256-row chunks in row order, then of each segment's chunks in order.
-    """
     G, N = len(counts), x.shape[1]
     rows = x[idx.long()] if idx is not None else x
     out = torch.zeros(G, N, dtype=torch.float32, device=x.device)

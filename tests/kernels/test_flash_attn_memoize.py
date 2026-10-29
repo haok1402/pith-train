@@ -137,16 +137,10 @@ def attention_reference(q, k, v, learnable_sink, scale, causal, window):
 
 
 def rel(a, b):
-    """
-    The relative L2 error of a against b.
-    """
     return ((a.double() - b.double()).norm() / b.double().norm()).item()
 
 
 def test_generic_entry_every_call():
-    """
-    Any entry: the outputs are entry()'s for every call of a signature, with fresh inputs.
-    """
     for i in range(5):
         q = torch.randn(4, 333, device="cuda")
         k = torch.randn(4, 333, device="cuda")
@@ -164,10 +158,6 @@ def test_generic_entry_every_call():
 
 @pytest.mark.parametrize("case", list(CASES))
 def test_forward(case):
-    """
-    First, recording and replayed calls with fresh inputs equal FA4's entry bit for bit and match
-    plain attention; on the validated FA4, later calls replay without calling entry.
-    """
     calls = []
     for _ in range(5):
         q, k, v, do, learnable_sink, scale, causal, window = make(case, next(SEEDS))
@@ -227,10 +217,6 @@ def test_backward(case):
 
 
 def test_back_to_back_calls_own_their_buffers():
-    """
-    Replayed calls allocate their outputs afresh: a later call neither reuses nor overwrites an
-    earlier call's outputs.
-    """
     q, k, v, do, learnable_sink, scale, causal, window = make("qwen3-gqa", 0)
     o, lse = fwd_entry(q, k, v, learnable_sink, scale, causal, window)()
     for _ in range(3):
@@ -250,10 +236,6 @@ def test_back_to_back_calls_own_their_buffers():
 
 
 def test_unseen_signature_calls_entry():
-    """
-    The first call of a signature runs entry itself (it may compile); a changed shape or scalar is
-    a new signature.
-    """
     q, k, v, do, learnable_sink, scale, causal, window = make("qwen3-gqa", 2)
     q2, k2, v2 = (t[:, :640].contiguous() for t in (q, k, v))
     (o, lse), num_entry_calls = memo_fwd(q2, k2, v2, None, scale, causal, (None, None))

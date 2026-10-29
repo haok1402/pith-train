@@ -1,7 +1,4 @@
 """
-Verifier of the fp8_silu_mul_quant feature (fp8_silu_mul_fwd, fp8_silu_mul_bwd,
-fp8_silu_mul_gu_fwd, fp8_silu_mul_gu_bwd) against plain PyTorch.
-
 Contract: the SwiGLU silu(g) * u (or its two gradients), rounded to bf16 as the plain kernels
 silu_mul_fwd and silu_mul_bwd round it, then quantized as fp8_quant_grouped does on SM90:
 rowwise 1x128 FP8 plus the per-channel FP8 laid out K-major per group.
@@ -82,7 +79,7 @@ def quantize_grouped_ref(x: torch.Tensor, offs: torch.Tensor) -> tuple[torch.Ten
 
 def assert_bytes_equal(got: torch.Tensor, ref: torch.Tensor, name: str) -> None:
     """
-    Check for the same e4m3 bytes; a NaN may carry either sign.
+    A NaN may carry either sign.
     """
     got = got.view(torch.uint8)
     nan = (ref & 0x7F) == 0x7F
@@ -161,7 +158,7 @@ def make_inputs(M: int, N: int, kind: str, seed: int) -> list[torch.Tensor]:
     elif kind == "wide":
         for x in xs:
             x.mul_(torch.exp2(torch.randint(-20, 20, (M, 1), device="cuda", generator=gen)))
-    elif kind == "large":  # large finite values (fp32 gradients up to about 1e36)
+    elif kind == "large":  # fp32 gradients up to about 1e36
         for x in xs:
             x.mul_(1e12)
     return [x.to(torch.bfloat16) for x in xs]

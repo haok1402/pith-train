@@ -17,9 +17,6 @@ __all__ = ["fp8_pack_transpose_sm100", "fp8_scales_sm100", "fp8_shard_amax_sm100
 
 @triton.jit
 def fp8cast_blockwise_transpose_kernel(x_ptr, out_ptr, scale_ptr, out_t_ptr, scale_t_ptr, M, K, stride_x_row, stride_x_col, stride_out_row, scale_cols, stride_out_t_row, scale_t_cols, NATIVE_E8M0: tl.constexpr):
-    """
-    One 128x128 tile of x: its FP8 to out (M, K) and out_t (K, M), its scale to scale and scale_t.
-    """
     BLOCK: tl.constexpr = 128
 
     pid_row, pid_col = tl.program_id(0), tl.program_id(1)
@@ -54,9 +51,6 @@ def fp8cast_blockwise_transpose_kernel(x_ptr, out_ptr, scale_ptr, out_t_ptr, sca
 
 
 def fp8_quant_weight_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Triton fp8_quant_weight: x 2-D (M, K) bf16 / fp32.
-    """
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     M, K = x.shape
     BLOCK = 128
@@ -76,9 +70,6 @@ def fp8_quant_weight_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor,
 
 @triton.jit
 def fp8cast_blockwise_transpose_batched_kernel(x_ptr, out_ptr, scale_ptr, out_t_ptr, scale_t_ptr, G, N, K, stride_x_g, stride_x_row, stride_x_col, stride_out_g, stride_out_row, scale_cols, stride_scale_g, stride_out_t_g, stride_out_t_row, scale_t_cols, stride_scale_t_g, NATIVE_E8M0: tl.constexpr):
-    """
-    One 128x128 tile of expert pid(2): grid (ceil(N / 128), ceil(K / 128), G).
-    """
     BLOCK: tl.constexpr = 128
 
     pid_row, pid_col, pid_g = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -116,9 +107,6 @@ def fp8cast_blockwise_transpose_batched_kernel(x_ptr, out_ptr, scale_ptr, out_t_
 
 
 def fp8_quant_weight_grouped_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Triton fp8_quant_weight_grouped: x 3-D (G, N, K) bf16 / fp32.
-    """
     assert x.ndim == 3, f"Expected 3D tensor, got {x.ndim}D"
     G, N, K = x.shape
     BLOCK = 128
@@ -171,10 +159,6 @@ def fp8_shard_tile_kernel(x_ptr, amax_ptr, out_ptr, row_offset, local_rows, K, t
 
 @triton.jit
 def fp8_scale_kernel(amax_ptr, scale_ptr, scale_t_ptr, num_rows, num_cols, NATIVE_E8M0: tl.constexpr):
-    """
-    Scales of the (num_rows, num_cols) amax grid of group pid(1), written as (num_rows, num_cols)
-    and transposed as (num_cols, num_rows).
-    """
     elem_offs = tl.program_id(0) * 1024 + tl.arange(0, 1024)
     group_idx = tl.program_id(1)
     elem_mask = elem_offs < num_rows * num_cols
@@ -187,9 +171,6 @@ def fp8_scale_kernel(amax_ptr, scale_ptr, scale_t_ptr, num_rows, num_cols, NATIV
 
 @triton.jit
 def fp8_pack_transpose_kernel(x_ptr, out_ptr, out_t_ptr, N, K):
-    """
-    One 128x128 byte tile of x (G, N, K) to out and, transposed, to out_t (G, K, N).
-    """
     BLOCK: tl.constexpr = 128
     pid_row, pid_col, pid_g = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     row_offs, col_offs = pid_row * BLOCK + tl.arange(0, BLOCK), pid_col * BLOCK + tl.arange(0, BLOCK)
@@ -202,10 +183,6 @@ def fp8_pack_transpose_kernel(x_ptr, out_ptr, out_t_ptr, N, K):
 
 
 def shard_tiles(shard: torch.Tensor, amax: torch.Tensor, out: Optional[torch.Tensor], row_offset: int, group_offset: int) -> None:
-    """
-    Launch fp8_shard_tile_kernel over the tiles the shard touches: the amax pass when out is None,
-    else the cast into out.
-    """
     num_local_groups, local_rows, K = shard.shape
     if shard.numel() == 0:
         return
@@ -215,32 +192,20 @@ def shard_tiles(shard: torch.Tensor, amax: torch.Tensor, out: Optional[torch.Ten
 
 
 def fp8_shard_amax_sm100(shard: torch.Tensor, amax: torch.Tensor, row_offset: int, group_offset: int) -> None:
-    """
-    Triton fp8_shard_amax.
-    """
     shard_tiles(shard, amax, None, row_offset, group_offset)
 
 
 def fp8_shard_cast_sm100(shard: torch.Tensor, amax: torch.Tensor, out: torch.Tensor, row_offset: int, group_offset: int) -> None:
-    """
-    Triton fp8_shard_cast.
-    """
     shard_tiles(shard, amax, out, row_offset, group_offset)
 
 
 def fp8_scales_sm100(amax: torch.Tensor, scale: torch.Tensor, scale_t: torch.Tensor) -> None:
-    """
-    Triton fp8_scales.
-    """
     G, num_rows, num_cols = amax.shape
     grid = (triton.cdiv(num_rows * num_cols, 1024), G)
     fp8_scale_kernel[grid](amax, scale, scale_t, num_rows, num_cols, NATIVE_E8M0=NATIVE_E8M0)
 
 
 def fp8_pack_transpose_sm100(x: torch.Tensor, out: torch.Tensor) -> None:
-    """
-    Triton fp8_pack_transpose.
-    """
     G, N, K = x.shape
     x, out = x.view(torch.uint8), out.view(torch.uint8)
     grid = (triton.cdiv(N, BLOCK), triton.cdiv(K, BLOCK), G)

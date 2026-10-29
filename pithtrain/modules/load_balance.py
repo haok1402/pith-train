@@ -217,7 +217,7 @@ class MoELoadBalanceLossTracker:
     @classmethod
     def get_total_count_and_clear(cls) -> Tuple[float, int]:
         """
-        Return (total, count) of the accumulated losses and clear them. Syncs with the device.
+        Syncs with the device.
         """
         if not cls.losses:
             return 0.0, 0
@@ -234,10 +234,6 @@ def make_load_balance_loss_fn(
     sequence_length: int = 0,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
-    """
-    Build and register the load-balance loss of type lb_type (micro-batch, global-batch or
-    sequence), a callable (scores, topk_idx, num_experts, top_k) -> loss.
-    """
     match lb_type:
         case "micro-batch":
             loss = MicroBatchLoadBalanceLoss(lb_coef)
@@ -253,9 +249,8 @@ def make_load_balance_loss_fn(
 
 def force_balance(num_experts: int) -> Callable[[int, int], torch.Tensor]:
     """
-    A benchmark-only router replay that spreads tokens round-robin over num_experts, so every
-    expert gets an equal load. It maps (num_tokens, top_k) to the (num_tokens, top_k) indices a
-    gate should use, built once per shape and cached.
+    A benchmark-only router replay that gives every expert an equal load. The returned function maps
+    (num_tokens, top_k) to the (num_tokens, top_k) expert indices a gate should use.
     """
     cache: dict[tuple[int, int], torch.Tensor] = {}
 
@@ -276,8 +271,7 @@ def replay_indices(
     gate: torch.nn.Module, hidden_states: torch.Tensor, top_k: int
 ) -> torch.Tensor | None:
     """
-    The replayed top-k indices from gate.router_replay, or None if none is installed. Call it in
-    eager mode, so the compiled gate takes the indices as an input.
+    Call it in eager mode, so the compiled gate takes the indices as an input.
     """
     if gate.router_replay is None:
         return None

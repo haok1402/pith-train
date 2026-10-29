@@ -1,6 +1,5 @@
 """
-Triton implementation of fp8cast_rowwise_kmajor (contract in fp8_rowwise_kmajor), the reference the
-SM90 kernel is bit-identical to.
+The reference the SM90 kernel of fp8cast_rowwise_kmajor is bit-identical to.
 """
 
 import torch
@@ -14,9 +13,6 @@ BLOCK = 128
 
 
 def fp8cast_rowwise_kmajor_sm100(x: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    fp8cast_rowwise_kmajor in Triton; both scales come back row-major.
-    """
     assert x.ndim == 2 and x.shape[0] % 128 == 0, f"Expected 2D tensor with M%128==0, got shape {x.shape}"
     M, N = x.shape
 
@@ -41,7 +37,4 @@ def fp8cast_rowwise_kmajor_sm100(x: torch.Tensor, grouped_mm_offs: torch.Tensor)
 
 
 def kmajor_empty_outputs(M: int, N: int, device: torch.device) -> tuple[torch.Tensor, ...]:
-    """
-    The four outputs of fp8cast_rowwise_kmajor_sm100 for an empty (M, N) input.
-    """
     return (torch.empty((M, N), dtype=torch.float8_e4m3fn, device=device), torch.empty((M, (N + BLOCK - 1) // BLOCK), dtype=torch.float32, device=device), torch.empty(M * N, dtype=torch.float8_e4m3fn, device=device), torch.empty((N, M // BLOCK), dtype=torch.float32, device=device))

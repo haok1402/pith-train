@@ -17,10 +17,6 @@ __all__ = ["MemmapDataset", "ConcatDataset"]
 
 
 class MemmapDataset:
-    """
-    One packed .npy file of token ids, cut into samples of sequence_length tokens.
-    """
-
     def __init__(self, path: Path, sequence_length: int):
         self.root = path.parent
         self.sequence_length = sequence_length
@@ -39,9 +35,6 @@ class MemmapDataset:
     def get_chunk(
         self, idx: int, seq_offset: int, seq_length: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Tokens and labels of only [seq_offset, seq_offset + seq_length) of sample idx.
-        """
         start = idx * self.sequence_length + seq_offset
         tokens = torch.tensor(self.tokens[start : start + seq_length])
         labels = torch.tensor(self.tokens[start + 1 : start + seq_length + 1])
@@ -49,10 +42,6 @@ class MemmapDataset:
 
 
 class ConcatDataset:
-    """
-    Several MemmapDatasets concatenated and shuffled globally with a seeded permutation.
-    """
-
     def __init__(self, memmap_datasets: List[MemmapDataset], seed: int):
         self.memmap_datasets = memmap_datasets
         root = os.path.commonpath([str(d.root) for d in memmap_datasets])

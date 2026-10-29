@@ -1,10 +1,6 @@
 """
-Verifier of fp8_quant_grad against a PyTorch implementation of the E8M0 FP8 recipe.
-
-fp8_quant_grad(x) returns (x_fp8, x_scale, xt_fp8, xt_scale): the rowwise 1x128
-quantization of x ((M, N) e4m3, scale (M, ceil(N/128))) and of x.T ((N, M) e4m3, scale (N,
-ceil(M/128))). FP8 bytes and scale values must match the reference exactly; scale strides are
-unspecified, so scales are compared by logical value.
+FP8 bytes and scale values must match the PyTorch reference exactly; scale strides are unspecified,
+so scales are compared by logical value.
 """
 
 import pytest

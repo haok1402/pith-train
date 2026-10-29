@@ -43,9 +43,6 @@ class PretrainLMCfg(SlottedDefault):
     distributed: DistributedCfg = field(default_factory=DistributedCfg)
 
     training: TrainingCfg = field(default_factory=TrainingCfg)
-    """
-    Model, optimizer, scheduler and checkpointing configuration.
-    """
 
     logging: LoggingCfg = field(default_factory=LoggingCfg)
 
@@ -56,9 +53,6 @@ class PretrainLMCfg(SlottedDefault):
 
 
 def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset:
-    """
-    Build the shuffled concatenation of every tokenized shard under the corpus root.
-    """
     files = sorted(cfg.dataset.rglob("*.bin"))
     memmaps = [MemmapDataset(file, cfg.training.sequence_length) for file in files]
     dataset = ConcatDataset(memmaps, cfg.training.seed)
@@ -71,11 +65,9 @@ def get_global_batch(
     cfg: PretrainLMCfg, dataset: ConcatDataset, step: int, device: torch.device
 ) -> List[Microbatch]:
     """
-    Load this rank's share of the global batch, split into micro-batches on device.
-
-    The samples depend only on step and dp_rank, and each sample holds this rank's zigzag CP
-    blocks. Every pipeline rank builds the same list, so DualPipeV needs no broadcast of shapes;
-    only pipeline rank 0 feeds the tensors to the model.
+    The samples depend only on step and dp_rank, and each sample holds this rank's zigzag CP blocks.
+    Every pipeline rank builds the same list, so DualPipeV needs no broadcast of shapes; only
+    pipeline rank 0 feeds the tensors to the model.
     """
     micro_batch_size = cfg.training.micro_batch_size
     global_batch_size = cfg.training.global_batch_size
@@ -123,8 +115,7 @@ def objective(
     objective_inputs: Tuple[torch.Tensor, ...],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Cross-entropy loss of one micro-batch, summed over its non-ignored tokens (labels -100 are
-    ignored). Returns the loss and a detached copy for logging; train_step divides both by the
+    The loss is summed over the micro-batch's tokens, not averaged: train_step divides by the
     global token count.
     """
     (logits,) = model_outputs
@@ -137,9 +128,6 @@ def objective(
 
 
 def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
-    """
-    Run one training step: forward, backward, optimizer step, logging, profiling and checkpointing.
-    """
     start = cfg.training.nsys_start
     if start is not None and step == start:
         torch.cuda.cudart().cudaProfilerStart()

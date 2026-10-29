@@ -1,7 +1,3 @@
-"""
-Test the correctness of ring attention under context parallelism.
-"""
-
 from dataclasses import dataclass, fields
 from itertools import accumulate
 
@@ -39,19 +35,11 @@ class Result:
 
 
 def extract_zigzag(x: torch.Tensor, cp_rank: int, cp_size: int) -> torch.Tensor:
-    """
-    Return this rank's zigzag slice along dim 1: of 2*cp_size equal chunks, rank r holds chunk r
-    followed by chunk 2*cp_size - r - 1.
-    """
     chunks = x.chunk(2 * cp_size, dim=1)
     return torch.cat([chunks[cp_rank], chunks[2 * cp_size - cp_rank - 1]], dim=1).contiguous()
 
 
 def record(req: Request) -> tuple[Result, Result]:
-    """
-    Record the forward output and dQ, dK, dV of the baseline, flash_attn_func on the full sequence,
-    and of ring_attention_func on this rank's zigzag slice; the baseline is sliced the same way.
-    """
     cp_group = distributed.cp_group
     cp_rank, cp_size = cp_group.rank(), cp_group.size()
     device = torch.cuda.current_device()
@@ -114,18 +102,12 @@ class VarlenRequest:
 
 
 def extract_zigzag_varlen(x: torch.Tensor, cu_seqlens: torch.Tensor, cp_rank: int, cp_size: int):
-    """
-    Shard each document independently; skip empty documents before chunking.
-    """
     bounds = cu_seqlens.tolist()
     docs = [x[start:end].unsqueeze(0) for start, end in zip(bounds[:-1], bounds[1:]) if end > start]
     return torch.cat([extract_zigzag(doc, cp_rank, cp_size).squeeze(0) for doc in docs])
 
 
 def record_varlen(req: VarlenRequest) -> tuple[Result, Result]:
-    """
-    Compare the packed ring against whole-sample varlen attention with random output gradients.
-    """
     cp_group = distributed.cp_group
     cp_rank, cp_size = cp_group.rank(), cp_group.size()
     device = torch.cuda.current_device()
@@ -225,11 +207,6 @@ class MLAResult:
 
 
 def record_mla(req: MLARequest):
-    """
-    Reference: full-sequence MLA without CP (decompress the latent via kv_b, then flash attention).
-    Implementation: rotate the compressed latent around the zigzag ring, decompressing on each rank.
-    Returns both results on this rank's zigzag slice plus both kv_b weight gradients.
-    """
     cp_group = distributed.cp_group
     cp_rank, cp_size = cp_group.rank(), cp_group.size()
     device = torch.cuda.current_device()
@@ -417,7 +394,7 @@ def verify_mla_fp8(req: MLARequest) -> None:
     # The fp8 reference differs only in the flash recompute order (ring vs dense) and in activation
     # quant blocking (per hop vs whole sequence). Cosine is scale-invariant and would hide a uniform
     # fp8 scale bug, so relative L2 error is checked too.
-    atol_fp8 = 2e-2  # cosine
+    atol_fp8 = 2e-2
     # Per-hop e4m3 block quant gives a relative error of a few percent, worst for dW (about 3.6e-2)
     # since it sums over all CP hops; a broken fp8 GEMM gives O(1).
     rtol_fp8 = 6e-2

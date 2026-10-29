@@ -1,8 +1,3 @@
-"""
-Triton scatter of MoE tokens into the expert-grouped, zero-padded layout of a grouped GEMM
-(scatter_by_expert). Both architectures run it.
-"""
-
 from typing import Optional
 
 import torch
@@ -14,9 +9,6 @@ from pithtrain.kernels.host_transfer import get_pinned_buffer
 __all__ = ["GEMM_ALLOC_ALIGNMENT", "scatter_by_expert"]
 
 GEMM_ALLOC_ALIGNMENT = 1024
-"""
-Row alignment of the scattered output's allocation (the tail rows are zeroed).
-"""
 
 # The padded sizes are copied to the host on a side stream so the copy overlaps the scatter kernel.
 shared_copy_stream: Optional[torch.cuda.Stream] = None
@@ -58,10 +50,6 @@ def compute_group_offsets_kernel(
 
 @triton.jit
 def split_rows(num_rows, num_parts, part_idx):
-    """
-    The range [row_start, row_end) of part part_idx when num_rows rows are cut into num_parts
-    equal ceil-sized parts.
-    """
     rows_per_part = (num_rows + num_parts - 1) // num_parts
     row_start = part_idx * rows_per_part
     row_end = tl.minimum(row_start + rows_per_part, num_rows)
@@ -70,9 +58,6 @@ def split_rows(num_rows, num_parts, part_idx):
 
 @triton.jit
 def zero_rows(output_tokens_ptr, first_row, row_start, row_end, dst_row_stride, hidden_size, zero_dtype: tl.constexpr, BLOCK_H: tl.constexpr, NUM_H_BLOCKS: tl.constexpr):
-    """
-    Zero output rows first_row + [row_start, row_end).
-    """
     for row_idx in range(row_start, row_end):
         row_base = (first_row + row_idx) * dst_row_stride
         for i in tl.static_range(NUM_H_BLOCKS):

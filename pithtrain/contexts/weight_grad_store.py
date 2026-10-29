@@ -17,8 +17,8 @@ __all__ = ["WeightGradStore"]
 
 class WeightGradStore:
     """
-    Class-level queue of weight-gradient closures. While enabled is True, a backward defers its
-    weight gradients with put; flush closes the current group and pop runs the oldest group.
+    While enabled is True, a backward defers its weight gradients with put; flush closes the current
+    group and pop runs the oldest group.
     """
 
     enabled: bool = False
@@ -43,8 +43,5 @@ class WeightGradStore:
 
     @classmethod
     def clear(cls) -> None:
-        """
-        Drop the current group and every queued group without running them.
-        """
         cls.cache = []
         cls.funcs_queue = queue.Queue()

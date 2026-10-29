@@ -70,10 +70,6 @@ def post_ring_kv(
     k_recv: Optional[torch.Tensor] = None,
     v_recv: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[Work]]:
-    """
-    Post one async ring hop: send k and v to dst and receive the same shapes from src, into
-    k_recv and v_recv when given. Returns (k_recv, v_recv, work).
-    """
     if not (k.is_contiguous() and v.is_contiguous()):
         raise ValueError("ring P2P requires contiguous send buffers")
     if k_recv is None:
@@ -103,8 +99,7 @@ def combine_partial(
     start: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Online-softmax merge of a partial flash output into the running fp32 accumulator. When
-    start > 0 only positions [start:] are updated; the first call must have start == 0.
+    Online-softmax merge of a partial flash output into the running fp32 accumulator.
     """
     partial_out = partial_out.to(torch.float32)
     partial_lse = partial_lse.transpose(-2, -1).unsqueeze(-1)
@@ -647,7 +642,6 @@ def mla_decompress(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Decompress a latent block (B, S, kv_lora_rank) into per-head k_nope and value through kv_b.
-    With use_fp8 the GEMM is FP8 Linear's, reading the quantized weight_fp8 and scale_weight.
     """
     batch, seq_len, _ = normed_kv.shape
     if use_fp8:

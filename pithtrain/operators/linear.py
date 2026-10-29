@@ -1,9 +1,5 @@
 """
-BF16 and FP8 linear layers.
-
-FP8Linear is a drop-in nn.Linear replacement whose GEMMs run in FP8 E4M3 with one E8M0 scale per
-128-element block. BF16Linear accumulates its weight gradient into an fp32
-main_grad when one is set.
+FP8Linear runs its GEMMs in FP8 E4M3 with one E8M0 scale per 128-element block.
 """
 
 from typing import Any, Optional, Tuple
@@ -62,9 +58,6 @@ def fp8_linear_bwd(
     scale_input_t: torch.Tensor,
     K: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Returns (grad_input (M, K), weight_grad (N, K)) for an (M, N) grad_output_2d.
-    """
     return fp8_gemm_bwd(grad_output_2d, weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t, K)
 
 
@@ -167,9 +160,9 @@ fp8_linear_fwd_prequantized.register_autograd(
 
 class FP8Linear(nn.Linear):
     """
-    Drop-in nn.Linear replacement with FP8 GEMMs. Outside torch.compile, the bf16 weight is
-    quantized once per step and reused by every micro-batch of it; with fp8_param_gather set, the
-    weight arrives from the all-gather already quantized.
+    Outside torch.compile, the bf16 weight is quantized once per step and reused by every
+    micro-batch of it; with fp8_param_gather set, the weight arrives from the
+    all-gather already quantized.
     """
 
     fp8_param_gather: bool = False
@@ -257,10 +250,6 @@ def lower_wgrad_accumulate(main_grad: Any, a: Any, b: Any) -> None:
 
 
 class BF16LinearFunc(torch.autograd.Function):
-    """
-    BF16 linear whose backward accumulates the weight gradient into main_grad in one GEMM.
-    """
-
     @staticmethod
     def forward(
         ctx: torch.autograd.function.FunctionCtx,
@@ -288,8 +277,7 @@ class BF16LinearFunc(torch.autograd.Function):
 
 class BF16Linear(nn.Linear):
     """
-    BF16 linear layer. With main_grad set, the weight gradient accumulates into it in fp32 instead
-    of a .grad; without it, the layer is nn.Linear.
+    With main_grad set, the weight gradient accumulates into it in fp32 instead of a .grad.
     """
 
     main_grad: Optional[torch.Tensor] = None

@@ -87,7 +87,7 @@ def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
 
 def naive_gdr(q, k, v, g, beta):
     """
-    Run the recurrence token by token in fp32; q / k are per value head (B, T, HV, D).
+    q / k are per value head, (B, T, HV, D).
     """
     B, T, num_heads, K = q.shape
     scale = K**-0.5
@@ -161,7 +161,7 @@ def test_against_naive_recurrence(S: int, H: int, gate: str, resets: tuple[int, 
     assert g_cum.shape == g.shape and g_cum.dtype == torch.float32
     assert A.shape == (1, S, HV, 64)
     dq, dk, dv, dg, dbeta = chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)
-    assert dq.shape == dk.shape == (1, S, HV, D)  # per value head
+    assert dq.shape == dk.shape == (1, S, HV, D)
     assert dv.shape == v.shape and dg.shape == g.shape and dbeta.shape == beta.shape
     assert dg.dtype == torch.float32 and dbeta.dtype == dv.dtype == torch.bfloat16
 
@@ -176,9 +176,6 @@ def test_against_naive_recurrence(S: int, H: int, gate: str, resets: tuple[int, 
 
 
 def test_comparison_is_sensitive() -> None:
-    """
-    A wrong gate (decay a tenth weaker) fails the forward comparison.
-    """
     q, k, v, g, beta, _ = make_inputs(256, gate="model", seed=3)
     o, _, _ = chunk_gdr_fwd_pinned(q, k, v, g * 0.9, beta)
     ref = naive_gdr(
@@ -234,9 +231,6 @@ def fla_kernels() -> dict:
 
 
 def pin_fla(monkeypatch: pytest.MonkeyPatch, configs: dict) -> None:
-    """
-    Give each FLA autotuner the single config of configs.
-    """
     import triton
 
     for name, kernel in fla_kernels().items():
@@ -248,9 +242,6 @@ def pin_fla(monkeypatch: pytest.MonkeyPatch, configs: dict) -> None:
 
 
 def fla_reference(q, k, v, g, beta, do):
-    """
-    Run FLA's dense chunked forward and backward on q / k repeated to the value heads.
-    """
     from fla.ops.gated_delta_rule.chunk import (
         chunk_gated_delta_rule_bwd,
         chunk_gated_delta_rule_fwd,

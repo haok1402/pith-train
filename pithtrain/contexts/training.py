@@ -40,23 +40,14 @@ object, so they live here rather than being passed down.
 
 
 Linear: type[linear.BF16Linear | linear.FP8Linear]
-"""
-The dense linear class the models construct.
-"""
 
 GroupedLinear: type[grouped_linear.GroupedLinear | grouped_linear.FP8GroupedLinear]
-"""
-The grouped linear class the routed experts construct.
-"""
 
 model: DualPipeV
-"""
-The pipeline engine for this rank, wrapping the two V-shaped chunks it owns.
-"""
 
 optimizers: tuple[Optimizer, ...]
 """
-The optimizers stepping this model, one per parameter class under Muon.
+One per parameter class under Muon.
 """
 
 schedulers: tuple[LRScheduler, ...]

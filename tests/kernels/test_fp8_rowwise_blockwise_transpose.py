@@ -1,11 +1,7 @@
 """
-Verifies fp8_quant_act against a PyTorch implementation of
-the E8M0 FP8 recipe.
-
-(x_fp8, x_scale, xt_fp8, xt_scale) = fp8_quant_act(x) is the rowwise 1x128
-quantization of x ((M, K) e4m3, scale (M, ceil(K / 128))) plus the 128x128 blockwise quantization
-of x.T ((K, M) e4m3, scale (ceil(K / 128), ceil(M / 128))). FP8 bytes and scale values must equal
-the reference; the rowwise scale's strides are unspecified, so scales are compared by value.
+Verifies fp8_quant_act against a PyTorch implementation of the E8M0 FP8 recipe: FP8 bytes and scale
+values must equal the reference. The rowwise scale's strides are unspecified, so scales are compared
+by value.
 """
 
 import pytest
@@ -149,9 +145,6 @@ def test_strided_rows() -> None:
 
 
 def test_transposed_input() -> None:
-    """
-    A non-unit inner stride.
-    """
     torch.manual_seed(2)
     check(torch.randn(576, 1000, device="cuda", dtype=torch.bfloat16).T)
 

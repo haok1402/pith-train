@@ -1,17 +1,6 @@
 """
-Benchmark DeepGEMM FP8 linear layers vs BF16 baselines.
-
-Run all benchmarks:
-    python3 -m benchmarks.operators.fp8.test_deepgemm
-
-Section 1 - Non-grouped: FP8Linear vs Linear
-Section 2 - Grouped: FP8GroupedLinear vs GroupedLinear
-
-Forward FLOPS:   2*M*N*K
-Backward FLOPS:  4*M*N*K  (dgrad: 2MNK, wgrad: 2MNK)
-
-Forward I/O  (BF16, 2B/elem): 2*(M*K + N*K + M*N)
-Backward I/O (BF16, 2B/elem): 2*(2*M*N + 2*M*K + 2*N*K)
+Benchmark DeepGEMM FP8 linear layers against BF16 (and Transformer Engine MXFP8 when installed).
+Run with python3 -m benchmarks.operators.fp8.test_deepgemm.
 """
 
 import itertools
@@ -52,7 +41,7 @@ NK_PAIRS = [
     (7168, 2048),
 ]
 
-NormalWorkload = Tuple[int, int, int]  # (M, N, K)
+NormalWorkload = Tuple[int, int, int]
 NORMAL_WORKLOADS: List[NormalWorkload] = [
     (m, n, k) for m, (n, k) in itertools.product(M_VALUES, NK_PAIRS)
 ]
@@ -67,7 +56,7 @@ GROUP_NK_PAIRS = [
     (7168, 2048),
 ]
 
-GroupWorkload = Tuple[int, int, int, int]  # (num_groups, m_per_group, N, K)
+GroupWorkload = Tuple[int, int, int, int]
 GROUP_WORKLOADS: List[GroupWorkload] = [
     (g, mpg, n, k) for (g, mpg), (n, k) in itertools.product(GROUP_SHAPES, GROUP_NK_PAIRS)
 ]
@@ -185,10 +174,6 @@ def _make_group_indices(grouped_mm_offs: torch.Tensor, M: int):
 def _make_grouped_inputs(
     num_groups: int, m_per_group: int, K: int
 ) -> Tuple[torch.Tensor, torch.Tensor, list, torch.Tensor, int, torch.Tensor | None]:
-    """
-    Scatter random tokens to random groups. Return the scattered tokens, grouped_mm_offs, ks,
-    ks_tensor, their row count and the group-index hint (None where the GEMM takes none).
-    """
     m = num_groups * m_per_group
     tokens = torch.randn((m, K), dtype=torch.bfloat16, device="cuda")
     expert_idxs = torch.randint(0, num_groups, (m,), device="cuda")

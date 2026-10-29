@@ -1,7 +1,7 @@
 """
 Causal depthwise conv1d of the Qwen3.5 Gated DeltaNet on the channels-last (B, S, C) layout: one
 Triton pass forward, writing the (B, C, S) storage a sliced nn.Conv1d output has, and one pass
-backward (dx and per-block partials of dw). Both architectures run these kernels.
+backward (dx and per-block partials of dw).
 
 offset is the number of leading rows of x that are history (the K - 1 tokens of conv state prepended
 under context parallelism), not outputs.

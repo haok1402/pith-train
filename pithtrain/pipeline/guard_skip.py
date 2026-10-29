@@ -80,9 +80,6 @@ def ambient_state() -> Tuple:
 
 
 def object_config(obj: Any) -> Tuple | None:
-    """
-    Identity, type and scalar settings of a router-replay or load-balance object.
-    """
     if obj is None:
         return None
     scalars = tuple(
@@ -98,11 +95,9 @@ def object_config(obj: Any) -> Tuple | None:
 def scan_modules(model: torch.nn.Module) -> Tuple[Tuple, Tuple, Tuple, bool]:
     """
     Return the training flag of every module, the router-replay and load-balance configuration of
-    every gate, the decoder layer variants, and whether all layers share one module structure.
-
-    A module's structure is its type and its named children's structures, recursively. A layer's
-    variant is its structure plus the attributes that select a different compiled cache entry
-    (sliding or linear attention, CP layout).
+    every gate, the decoder layer variants, and whether all layers share one module structure. A
+    layer's variant is its structure plus the attributes that select a different
+    compiled cache entry.
     """
     modes, gates, layers = [], [], []
 
@@ -144,18 +139,13 @@ def tensor_signature(tensor: torch.Tensor | None) -> Tuple | None:
 
 
 class GuardSkip:
-    """
-    Per-process record of step signatures that completed a fully guarded step.
-    """
-
     def __init__(self) -> None:
         self.trusted: set[Hashable] = set()
         self.enabled = torch_validated()
 
     def signature(self, model: torch.nn.Module, microbatches: List[Any]) -> Tuple | None:
         """
-        The step's signature, recomputed on every call, or None when the step may never run
-        unguarded (decoder layers of different module structure).
+        None when the step may never run unguarded (decoder layers of different module structure).
         """
         modes, gates, layers, uniform = scan_modules(model)
         if not uniform:
@@ -181,9 +171,6 @@ class GuardSkip:
         )
 
     def run(self, model: torch.nn.Module, microbatches: List[Any], fn, *args, **kwargs):
-        """
-        Return fn(*args, **kwargs), run unguarded when this step's signature is trusted.
-        """
         if not self.enabled:
             return fn(*args, **kwargs)
         key = self.signature(model, microbatches)

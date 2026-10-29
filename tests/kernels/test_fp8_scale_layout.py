@@ -1,7 +1,6 @@
 """
-Verifier of act_scale_like: an uninitialized fp32 (mn, sf_k) 1x128 activation scale with the
-strides this device's activation quantization returns. Fake implementations of the FP8 ops
-allocate their scales with it, so a fake and a real scale must agree.
+act_scale_like must return the strides this device's activation quantization returns: fake
+implementations of the FP8 ops allocate their scales with it, so a fake and a real scale must agree.
 """
 
 import pytest
@@ -47,9 +46,6 @@ def test_shape_dtype_device(mn: int, sf_k: int) -> None:
 
 @pytest.mark.parametrize("mn,sf_k", MN_SFK)
 def test_meta_device(mn: int, sf_k: int) -> None:
-    """
-    A fake on the meta device has the strides of the CUDA one.
-    """
     meta = act_scale_like(mn, sf_k, torch.device("meta"))
     real = act_scale_like(mn, sf_k, torch.device("cuda"))
     assert meta.device.type == "meta" and meta.dtype == torch.float32
@@ -67,9 +63,6 @@ def test_matches_rowwise_blockwise_transpose(M: int, K: int) -> None:
 
 @pytest.mark.parametrize("M,K", MK)
 def test_matches_rowwise_transpose(M: int, K: int) -> None:
-    """
-    Both scales of fp8_quant_grad are what act_scale_like describes.
-    """
     x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     _, x_scale, _, xt_scale = fp8_quant_grad(x)
     for scale, mn, k in ((x_scale, M, K), (xt_scale, K, M)):

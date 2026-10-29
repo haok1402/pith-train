@@ -1,8 +1,3 @@
-"""
-Rowwise FP8 quantization of x and of x.T from one read of x: SM90 runs the CuTe-DSL kernel, SM100
-the Triton kernel.
-"""
-
 import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR

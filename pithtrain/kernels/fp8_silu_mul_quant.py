@@ -1,10 +1,3 @@
-"""
-SwiGLU silu(g) * u fused with the rowwise + K-major FP8 quantization of the grouped GEMM that
-consumes it (FP8 routed experts). SM90 runs the fused CuTe-DSL kernels, SM100 the unfused Triton
-sequence; both give the same FP8 bytes and scale values. SM90 returns both scales MN-major (see
-fp8_scale_layout), SM100 row-major.
-"""
-
 import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR

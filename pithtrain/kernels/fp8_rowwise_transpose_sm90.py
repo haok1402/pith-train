@@ -228,8 +228,8 @@ class SubBlock:
     def __init__(self, tidx: Int32, pid_row: Int32, pid_col: Int32, M: Int32, N: Int32) -> None:
         self.warp = tidx // 32
         self.lane = tidx % 32
-        self.col_group_idx = self.lane % 16  # 8-column group within the tile
-        self.row_group_idx = self.warp * 2 + self.lane // 16  # 8-row group within the tile
+        self.col_group_idx = self.lane % 16
+        self.row_group_idx = self.warp * 2 + self.lane // 16
         self.pid_row, self.pid_col = pid_row, pid_col
         self.row0 = pid_row * TILE + self.row_group_idx * 8
         self.col0 = pid_col * TILE + self.col_group_idx * 8
@@ -299,9 +299,6 @@ def reduce_row_amax(abs_rows: list) -> list:
 
 
 def store_row_scales(row_pair_amax: list, sub_block: SubBlock, tok_scale_base: Int64, M64: Int64) -> list:
-    """
-    Store the E8M0 scales of the sub-block's 8 rows and return their bit patterns.
-    """
     row_scale_bits = []
     for pair in range(4):
         row_scale_bits.append(e8m0_scale_bits(row_pair_amax[pair] << 16))
@@ -315,9 +312,6 @@ def store_row_scales(row_pair_amax: list, sub_block: SubBlock, tok_scale_base: I
 
 
 def store_tok_rows(rows: list, row_scale_bits: list, sub_block: SubBlock, tok_base: Int64, N64: Int64, is_row_aligned: bool) -> None:
-    """
-    Quantize the sub-block's rows with their row scales and store them into out_tok.
-    """
     row0, col0, rows_ok, cols_ok, full_cols_ok = sub_block.row0, sub_block.col0, sub_block.rows_ok, sub_block.cols_ok, sub_block.full_cols_ok
     for i in range(8):
         # 0x7F000000 - bits is the exact reciprocal of a power-of-2 scale
@@ -348,9 +342,6 @@ def reduce_col_amax(sub_block: SubBlock, s_red: Int32) -> list:
 
 
 def store_col_scales(col_amax: list, sub_block: SubBlock, t_scale_base: Int64, N64: Int64) -> list:
-    """
-    Store the E8M0 scales of the sub-block's 8 columns and return their bit patterns.
-    """
     col_scale_bits = []
     for k in range(4):
         col_scale_bits.append(e8m0_scale_bits(col_amax[k] << 16))
@@ -454,18 +445,11 @@ def compile_kernel(is_row_aligned: bool, m_align: int) -> Callable:
 
 
 def supports_rowwise_transpose(x: torch.Tensor) -> bool:
-    """
-    Whether the CuTe kernel covers x: non-empty, contiguous, bf16.
-    """
     M, N = x.shape
     return x.dtype is torch.bfloat16 and x.is_contiguous() and bool(M) and bool(N)
 
 
 def fp8_quant_grad_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    fp8_quant_grad with both scales MN-major; inputs supports_rowwise_transpose rejects
-    go to the Triton kernel.
-    """
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     M, N = x.shape
     if not supports_rowwise_transpose(x):

@@ -85,7 +85,6 @@ def collect_modules(base: Path) -> dict[str, Path]:
 
 MODULES = collect_modules(PKG)
 TEST_MODULES = collect_modules(ROOT / "tests")
-# Every Python file outside pithtrain/kernels/ that may import the kernel library.
 OUTSIDE_FILES = [
     p
     for base in ("pithtrain", "tests", "benchmarks", "tools", "examples")
@@ -192,9 +191,8 @@ def top_level_names(path: Path) -> set[str]:
 
 def defined_names(tree: ast.Module) -> set[str]:
     """
-    Return every name a module defines at any level: functions, classes, methods, assignment
-    targets (attributes such as self.x included), parameters and import aliases. Reads of other
-    code's attributes (a library's hooks) are not definitions.
+    Attributes count only where stored (self.x = ...), so reads of other code's attributes, such as
+    a library's hooks, are not definitions.
     """
     names: set[str] = set()
     for n in ast.walk(tree):
@@ -239,9 +237,6 @@ def is_type_checking(test: ast.expr) -> bool:
 
 
 def resolve_module(name: str) -> str:
-    """
-    Return the longest prefix of name that is a pithtrain module, else name itself.
-    """
     parts = name.split(".")
     for i in range(len(parts), 0, -1):
         cand = ".".join(parts[:i])
@@ -318,8 +313,6 @@ def find_violations() -> set[tuple[str, str, str]]:
     if init.exists() and init.read_text().strip():
         found.add(("empty-init", module_name_of(init), ""))
 
-    # The kernel library's interface: __all__ is exactly the imported names, each defined in the
-    # module it is imported from, nothing private, nothing else in __init__.py.
     if not EXPORTS:
         found.add(("exports-missing", "pithtrain.kernels", "imports"))
     if sorted(ALL_LIST) != sorted(ALL) or len(ALL_LIST) != len(set(ALL_LIST)):
@@ -343,7 +336,6 @@ def find_violations() -> set[tuple[str, str, str]]:
     if len(ALL) != sum(len(v) for v in EXPORTS.values()):
         found.add(("exports-duplicate", "pithtrain.kernels", ""))
 
-    # Outside kernels/: only "from pithtrain.kernels import <name in __all__>", no arch branches.
     for path in OUTSIDE_FILES:
         rel = str(path.relative_to(ROOT))
         for line, form, detail in kernel_imports(path):
@@ -357,7 +349,6 @@ def find_violations() -> set[tuple[str, str, str]]:
                 if name in ARCH_NAMES:
                     found.add(("arch-outside-kernels", rel, name))
 
-    # Every exported name is exercised by its feature's verifier, which imports only the library.
     kernel_tests = ROOT / "tests" / "kernels"
     for module, names in EXPORTS.items():
         test = kernel_tests / f"test_{feature_of(module)}.py"
@@ -389,7 +380,6 @@ def find_violations() -> set[tuple[str, str, str]]:
         layer, stem = layer_of(mod), stem_of(mod)
         targets = IMPORTS[mod]
 
-        # Naming: _smXX files live only in kernels/, and an _sm90 file has its _sm100 sibling.
         if is_smxx(mod) and layer != "kernels":
             found.add(("smxx-outside-kernels", mod, ""))
         if layer == "kernels" and stem.endswith("_sm90"):
@@ -453,15 +443,11 @@ def find_violations() -> set[tuple[str, str, str]]:
                 if mod in PICKERS and t != mod:
                     found.add(("picker-imports-picker", mod, t))
 
-    # Importing pithtrain.kernels never loads cutlass, QuACK or FA4 (which loads both): no module
-    # the package imports at module level, transitively, imports them at module level.
     for mod in sorted(eager_closure("pithtrain.kernels")):
         heavy = [t for t in top_level_imports(MODULES[mod]) if t.split(".")[0] in HEAVY]
         if heavy:
             found.add(("kernels-eager-heavy", mod, heavy[0]))
 
-    # Inside kernels/: a literal __all__ per module, no _names at any level, sibling imports only of
-    # names in the sibling's __all__.
     module_all: dict[str, set[str]] = {}
     for path in sorted(KERNELS.glob("*.py")):
         if path.name == "__init__.py":

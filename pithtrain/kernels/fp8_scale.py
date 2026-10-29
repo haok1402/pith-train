@@ -1,6 +1,5 @@
 """
-The E8M0 (power-of-2) FP8 scale every Triton quantization kernel computes, as a triton.jit device
-function. The SM90 CuTe-DSL kernels reproduce its SM90 branch bit for bit.
+The SM90 CuTe-DSL kernels reproduce the SM90 branch of compute_fp8_scale bit for bit.
 """
 
 import triton

@@ -101,11 +101,6 @@ class ThreadCoords:
 
 
 class Tile:
-    """
-    Where a 128 x 128 tile sits, and the first column of the thread's column vector in it with that
-    column's in-range predicate.
-    """
-
     def __init__(self, row_block_idx, col_block_idx, col_vec_idx, N: int) -> None:
         self.row_block_idx, self.col_block_idx = row_block_idx, col_block_idx
         self.row_start, self.col_start = row_block_idx * BLOCK, col_block_idx * BLOCK
@@ -176,9 +171,6 @@ class SiluMulQuant:
         self.process_tiles(self.input_bases(mDh, mG, mU), mOffs.iterator.toint(), outputs, M, mOffs.shape[0])
 
     def input_bases(self, mDh: cute.Tensor, mG: cute.Tensor, mU: cute.Tensor) -> list:
-        """
-        Addresses of the inputs in stage order: (g, u) forward, (dh, g, u) backward.
-        """
         inputs = [mG, mU]
         if cutlass.const_expr(self.backward):
             inputs = [mDh, mG, mU]
@@ -186,8 +178,7 @@ class SiluMulQuant:
 
     def tile_coords(self, tile_idx: Int32) -> tuple:
         """
-        Tile tile_idx -> (row block, column block); the column blocks of one row block are adjacent,
-        for read locality.
+        The column blocks of one row block get adjacent tile indices, for read locality.
         """
         return tile_idx // self.num_col_blocks, tile_idx % self.num_col_blocks
 
@@ -209,9 +200,6 @@ class SiluMulQuant:
 
     @cute.jit
     def process_tiles(self, input_bases: list, offs_base: Int64, outputs: list, M: Int32, G: Int32):
-        """
-        The CTA's share of the persistent tile loop.
-        """
         tidx, _, _ = cute.arch.thread_idx()
         bx, _, _ = cute.arch.block_idx()
         grid_size, _, _ = cute.arch.grid_dim()
@@ -238,9 +226,6 @@ class SiluMulQuant:
 
     @cute.jit
     def load_group_offsets(self, offs_base: Int64, s_offs: Int32, tidx: Int32, G: Int32):
-        """
-        Copy the G expert-group end offsets into shared memory, where every tile searches them.
-        """
         for i in cutlass.range((G + THREADS - 1) // THREADS, unroll=1):
             group_idx = i * THREADS + tidx
             if group_idx < G:
@@ -299,10 +284,6 @@ class SiluMulQuant:
 
     @cute.jit
     def quantize_output(self, words: list, output: Output, tile: Tile, thread: ThreadCoords, group_start: Int32, num_group_rows: Int64, smem: SharedBuffers):
-        """
-        Quantize one output's tile (words[k][j] as apply_swiglu packs them) rowwise and K-major, and
-        store both with their scales.
-        """
         abs_words = [[abs2(words[k][j]) for j in range(4)] for k in range(4)]
         self.reduce_col_amax(abs_words, thread, smem.s_col_amax)
         row_amax = self.reduce_row_amax(abs_words)
@@ -349,9 +330,6 @@ class SiluMulQuant:
 
     @cute.jit
     def quantize_rows(self, words: list, row_amax: list, output: Output, tile: Tile, thread: ThreadCoords):
-        """
-        Store the E8M0 scales of the tile's rows and the thread's rows quantized rowwise into tok.
-        """
         lane, col_vec_idx, row_group_idx = thread.lane, thread.col_vec_idx, thread.row_group_idx
         # lane col_vec_idx < 4 of each row group scales row row_group_idx * 4 + col_vec_idx
         own_row_amax = bf16_sel(Int32(col_vec_idx % 2), selp_args_last(Int32(col_vec_idx < 2), row_amax[0], row_amax[1]))
@@ -447,9 +425,6 @@ class SiluMulQuantGU(SiluMulQuant):
         self.process_tiles(self.input_bases(mDh, mG, mU), mOffs.iterator.toint(), outputs, M, mOffs.shape[0])
 
     def issue_stage(self, tile_idx: Int32, stage_addr: Int32, num_tiles: Int32, tidx: Int32, input_bases: list):
-        """
-        cp.async tile tile_idx (zero-filled when out of range); dh has row stride N, g / u 2N.
-        """
         N = self.N
         copy_ok = Int32(tile_idx < num_tiles)
         row_block_idx, col_block_idx = self.tile_coords(tile_idx)
@@ -466,9 +441,6 @@ COMPILED: dict = {}
 
 
 def get_kernel(N: int, backward: bool, device: torch.device) -> object:
-    """
-    Compiled kernel for (N, direction, device); M and the group count stay dynamic.
-    """
     key = ("silu_mul_quant", N, backward, device.index)
     fn = COMPILED.get(key)
     if fn is None:
@@ -484,9 +456,6 @@ def get_kernel(N: int, backward: bool, device: torch.device) -> object:
 
 
 def get_kernel_gu(N: int, backward: bool, device: torch.device) -> object:
-    """
-    Compiled gate_up kernel for (N, direction, device); M and the group count stay dynamic.
-    """
     key = ("silu_mul_quant_gu", N, backward, device.index)
     fn = COMPILED.get(key)
     if fn is None:
@@ -526,9 +495,6 @@ def silu_mul_quant_gu_fusable(N: int, M: int, grouped_mm_offs: torch.Tensor) -> 
 
 
 def fp8_silu_mul_fwd_sm90(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    fp8cast_rowwise_kmajor(silu_mul_fwd(g, u), grouped_mm_offs) without writing h.
-    """
     M, N = g.shape
     if M != 0 and N != 0 and not silu_mul_quant_fusable(N, grouped_mm_offs):
         return fp8cast_rowwise_kmajor_sm90(silu_mul_fwd(g, u), grouped_mm_offs)
@@ -540,9 +506,6 @@ def fp8_silu_mul_fwd_sm90(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: tor
 
 
 def fp8_silu_mul_bwd_sm90(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """
-    fp8cast_rowwise_kmajor of each gradient of silu_mul_bwd(dh, g, u) without writing them.
-    """
     M, N = g.shape
     if M == 0 or N == 0:
         return (alloc_rowwise_kmajor_outputs(M, N, g.device), alloc_rowwise_kmajor_outputs(M, N, g.device))
@@ -555,9 +518,6 @@ def fp8_silu_mul_bwd_sm90(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, gr
 
 
 def fp8_silu_mul_gu_fwd_sm90(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    fp8cast_rowwise_kmajor(silu_mul_fwd(gu[:, :N], gu[:, N:]), grouped_mm_offs) for gu (M, 2N).
-    """
     M, N = gu.shape[0], gu.shape[1] // 2
     if M == 0:
         return alloc_rowwise_kmajor_outputs(0, N, gu.device)
@@ -570,9 +530,6 @@ def fp8_silu_mul_gu_fwd_sm90(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) ->
 
 
 def fp8_silu_mul_gu_bwd_sm90(dh: torch.Tensor, gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    fp8cast_rowwise_kmajor(cat([dg, du], 1), grouped_mm_offs) of the SwiGLU gradients of gu (M, 2N).
-    """
     M, N = gu.shape[0], gu.shape[1] // 2
     if M == 0:
         return alloc_rowwise_kmajor_outputs(0, 2 * N, gu.device)

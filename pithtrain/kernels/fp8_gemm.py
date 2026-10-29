@@ -1,9 +1,4 @@
 """
-DeepGEMM FP8 GEMMs and the recipes built on them: dense (fp8_gemm_nt, fp8_gemm_fwd,
-fp8_gemm_bwd), m-grouped (fp8_grouped_gemm, fp8_group_indices) and k-grouped
-(k_grouped_fp8_gemm, fp8_grouped_wgrad_empty) GEMMs, plus the grouped-input quantization
-(fp8_quant_grouped). The architecture-specific entry points are chosen here.
-
 Every 1x128 activation scale is fp32 of logical shape (rows, ceil(K / 128)) with unspecified strides
 (MN-major on SM90, row-major on SM100); the GEMMs take either.
 """
@@ -24,8 +19,7 @@ __all__ = ["fp8_gemm_fwd", "fp8_gemm_bwd", "fp8_fused_experts_supported", "fp8_g
 
 def fp8_gemm_nt(a_fp8: torch.Tensor, a_scale: torch.Tensor, b_fp8: torch.Tensor, b_scale: torch.Tensor, m: int, n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     """
-    out = a @ b.T into a fresh (m, n) tensor of dtype on device, fp32 accumulation. dtype must be
-    bf16 (DeepGEMM's SM90 kernel rejects others).
+    out = a @ b.T, fresh, fp32 accumulation. dtype must be bf16 (DeepGEMM on SM90 rejects others).
 
     - a_fp8: e4m3 (m, K) row-major; a_scale: its 1x128 scale, fp32 (m, ceil(K / 128)), any strides.
     - b_fp8: e4m3 (n, K) row-major; b_scale: its 128x128 scale, fp32 (ceil(n / 128), ceil(K / 128))
@@ -73,9 +67,6 @@ def fp8_gemm_bwd(grad_2d: torch.Tensor, weight_t_fp8: torch.Tensor, scale_weight
 
 
 def m_grouped_fp8_gemm_nt(a, b, out, grouped_mm_offs, M, group_indices=None):
-    """
-    m-grouped FP8 GEMM NT into out; on SM90 group_indices is computed when None.
-    """
     match ARCH_MAJOR:
         case 9:
             if group_indices is None:
@@ -117,8 +108,7 @@ def pad_k_major_channels(x: tuple[torch.Tensor, torch.Tensor], ks: list, num_pad
 
 def k_grouped_runs_transposed(M: int, N: int) -> bool:
     """
-    Whether the SM90 k-grouped FP8 GEMM of an (M, N) output runs as the transposed product (see
-    k_grouped_call): an odd 128-block count on M and an even one on N.
+    Whether the SM90 k-grouped FP8 GEMM of an (M, N) output runs transposed (see k_grouped_call).
     """
     return -(-M // 128) % 2 == 1 and -(-N // 128) % 2 == 0
 
@@ -155,10 +145,10 @@ def k_grouped_call(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tensor, 
 
 def k_grouped_fp8_gemm_nt(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tensor, torch.Tensor], d: torch.Tensor, ks: list, ks_tensor: torch.Tensor) -> None:
     """
-    SM90 k-grouped FP8 GEMM NT accumulating into d, split into calls of at most K_GROUPED_MAX_ROWS
-    rows, each through k_grouped_call. Runs of whole groups are contiguous slices of the K-major
-    operands; a group longer than the limit is cut along k and accumulates chunk by chunk. Scale
-    slices keep the parent's MN-major strides, so DeepGEMM reads them as is.
+    Accumulates into d in calls of at most K_GROUPED_MAX_ROWS rows. Runs of whole groups are
+    contiguous slices of the K-major operands; a group longer than the limit is cut along k and
+    accumulates chunk by chunk. Scale slices keep the parent's MN-major strides, so DeepGEMM reads
+    them as is.
     """
     if sum(ks) <= K_GROUPED_MAX_ROWS:
         k_grouped_call(a, b, d, ks, ks_tensor)

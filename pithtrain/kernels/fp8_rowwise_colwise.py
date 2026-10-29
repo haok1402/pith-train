@@ -1,6 +1,6 @@
 """
-Fused rowwise + colwise FP8 quantization from one read of the input (Triton, run on both
-architectures). fp8_rowwise_kmajor_sm100 launches the same kernel with the K-major colwise output.
+fp8_rowwise_kmajor_sm100 also launches fp8cast_rowwise_colwise_kernel, with WRITE_KMAJOR for the
+K-major colwise output.
 """
 
 import torch
@@ -31,7 +31,7 @@ def quantize_row_blocks(x_abs, x_f32, BLOCK_ROWS: tl.constexpr, BLOCK_N: tl.cons
 @triton.jit
 def fp8cast_rowwise_colwise_kernel(x_ptr, out_tok_ptr, scale_tok_ptr, out_ch_ptr, scale_ch_ptr, M, N, stride_x_row, stride_x_col, stride_out_tok_row, scale_tok_cols, stride_out_ch_row, scale_ch_cols, block_to_group_ptr, cumsum_ptr, BLOCK_N: tl.constexpr, NATIVE_E8M0: tl.constexpr, WRITE_KMAJOR: tl.constexpr = False):
     """
-    One 128 x BLOCK_N tile per program: 1x128 rowwise and 128x1 colwise quantization. M % 128 == 0.
+    1x128 rowwise and 128x1 colwise quantization, M % 128 == 0.
 
     With WRITE_KMAJOR the colwise output is written K-major (each group's (K_g, N) block stored as
     (N, K_g), concatenated) with scales (N, M / 128); this needs block_to_group_ptr and cumsum_ptr

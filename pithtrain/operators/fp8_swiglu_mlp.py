@@ -22,9 +22,6 @@ __all__ = ["fp8_swiglu_mlp", "fusable"]
 
 
 def fusable(x: torch.Tensor) -> bool:
-    """
-    Whether the fused op takes x: non-empty, with a row count that is a multiple of 128.
-    """
     return x.numel() > 0 and x.flatten(0, -2).shape[0] % 128 == 0
 
 
@@ -97,9 +94,6 @@ def swiglu_mlp_bwd(
     wd_t: torch.Tensor,
     wd_t_scale: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Returns (dx, dw_gate, dw_up, dw_down), each as FP8Linear's backward computes it.
-    """
     (M, hidden), inter = dy.shape, g.shape[1]
     device, dtype = dy.device, dy.dtype
     dy_fp8, dy_scale, dy_t, dy_t_scale = fp8_quant_grad(dy)

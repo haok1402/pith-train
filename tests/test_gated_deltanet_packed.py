@@ -1,7 +1,3 @@
-"""
-Test that Gated DeltaNet on a packed row matches running each of its documents on its own.
-"""
-
 from dataclasses import dataclass
 from itertools import accumulate
 

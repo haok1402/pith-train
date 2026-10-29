@@ -1,13 +1,3 @@
-"""
-Verifies clamped_swiglu_fwd and clamped_swiglu_bwd, the gpt-oss activation, against PyTorch.
-
-Contract: for the interleaved gate_up (M, 2N), gate the even columns and up the odd ones, out =
-(uc + 1) * gc * sigmoid(alpha * gc) with gc = min(gate, limit) and uc = clamp(up, -limit, limit),
-computed in fp32 and rounded once to the input dtype. The backward returns the (M, 2N) interleaved
-gradient, zero where the clamp saturates (gate > limit, |up| > limit). Outputs must lie within one
-output-dtype ulp of the fp32 reference.
-"""
-
 import pytest
 import torch
 
@@ -44,9 +34,6 @@ def ref_bwd(grad_out, gate_up, alpha, limit):
 
 
 def assert_rounded(got, want32):
-    """
-    Assert got lies within one ulp of its dtype (1e-5 relative for fp32) of the fp32 want32.
-    """
     scale = want32.abs().max().item() if want32.numel() else 1.0
     if got.dtype == torch.float32:
         rtol, atol = 1e-5, 1e-6 * scale
@@ -79,9 +66,6 @@ def test_forward_backward(shape, dtype):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_matches_autograd(dtype):
-    """
-    clamped_swiglu_bwd matches autograd's float64 gradient of the clamped formula.
-    """
     gen = torch.Generator(device="cuda").manual_seed(1)
     gate_up = (torch.randn(256, 2 * 2880, generator=gen, device="cuda") * 4).to(dtype)
     grad_out = torch.randn(256, 2880, generator=gen, device="cuda").to(dtype)
@@ -96,14 +80,10 @@ def test_matches_autograd(dtype):
 
 
 def test_saturated_gradient_is_zero():
-    """
-    Outside the clamp the gradient is exactly zero (gate one-sided, up both sides), and the
-    saturated forward equals the forward at the limit, bit for bit.
-    """
     M, N = 8, 16
     gate = torch.linspace(-LIMIT - 4.0, LIMIT + 4.0, M * N, device="cuda").view(M, N)
     up = torch.linspace(LIMIT + 3.0, LIMIT + 5.0, M * N, device="cuda").view(M, N)
-    up[::2] = -up[::2]  # negative saturation on half the rows
+    up[::2] = -up[::2]
     for dtype in DTYPES:
         gate_up = torch.empty(M, 2 * N, device="cuda", dtype=dtype)
         gate_up[:, ::2], gate_up[:, 1::2] = gate.to(dtype), up.to(dtype)
@@ -121,9 +101,6 @@ def test_saturated_gradient_is_zero():
 
 
 def test_limit_boundary_is_active():
-    """
-    gate == limit and up == +/-limit are inside the clamp, so the gradient flows.
-    """
     gate_up = torch.tensor([[LIMIT, LIMIT, LIMIT, -LIMIT]], device="cuda", dtype=torch.float32)
     grad = clamped_swiglu_bwd(torch.ones(1, 2, device="cuda"), gate_up, ALPHA, LIMIT)
     assert torch.all(grad != 0)

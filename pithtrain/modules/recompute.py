@@ -47,7 +47,7 @@ def recompute_context(hidden_size: int):
 def norm_recompute(fn, hidden_size: int, *args):
     """
     Return fn(*args), recomputing its hidden-size RMSNorm outputs in backward instead of saving
-    them. Under FP8 it calls fn(*args) plainly. Call it inside the compiled region.
+    them. Call it inside the compiled region.
     """
     if training.fp8:
         return fn(*args)

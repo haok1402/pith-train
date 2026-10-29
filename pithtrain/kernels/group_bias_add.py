@@ -1,8 +1,3 @@
-"""
-In-place y += bias[group_indices] over grouped rows (the gpt-oss down-projection bias), as a Triton
-kernel. Both architectures run it.
-"""
-
 import torch
 import triton
 import triton.language as tl
@@ -24,10 +19,9 @@ def group_bias_add(y: torch.Tensor, bias: torch.Tensor, group_indices: torch.Ten
     """
     In place y[r] += bias[group_indices[r]] per row, without materializing bias[group_indices].
 
-    y is (M, H), bf16 (any float dtype); bias is (G, H); group_indices is integer (M,) with values
-    in [0, G). Each sum is computed in fp32 and rounded once to y's dtype, bit-identical to
-    y.copy_(y + bias[group_indices]). The kernel runs when y and bias share a dtype, are contiguous
-    and M is a multiple of 128; other inputs take that PyTorch expression. Deterministic.
+    y is (M, H) of any float dtype, bias (G, H), group_indices integer (M,) with values in [0, G).
+    Each sum is computed in fp32 and rounded once to y's dtype, bit-identical to the PyTorch
+    fallback y.copy_(y + bias[group_indices]). Deterministic.
     """
     M, H = y.shape
     if y.dtype != bias.dtype or M % 128 != 0 or not y.is_contiguous() or not bias.is_contiguous():

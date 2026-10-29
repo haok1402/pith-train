@@ -1,8 +1,3 @@
-"""
-Token movement around the MoE grouped GEMMs: the scatter of tokens into the expert-grouped padded
-layout, the padded index gather, and the per-row group ids of the FP8 grouped GEMM.
-"""
-
 from typing import Optional
 
 import torch
@@ -111,9 +106,8 @@ def scatter_for_grouped_gemm(
 
 def precompute_group_indices(grouped_mm_offs: torch.Tensor, M: int) -> Optional[torch.Tensor]:
     """
-    Group index of each of the M rows from the cumulative group ends grouped_mm_offs, computed
-    once for all grouped FP8 projections. None in BF16 training and wherever the FP8 grouped GEMM
-    takes no such hint.
+    Group index of each of the M rows, computed once for all grouped FP8 projections. None wherever
+    the FP8 grouped GEMM takes no such hint.
     """
     if training.fp8:
         return fp8_group_indices(grouped_mm_offs, M)

@@ -1,6 +1,4 @@
 """
-SM90 implementations of the bf16_expert_slots functions.
-
 The grouping is two launches with no host sync: a per-chunk expert histogram, then one CTA per chunk
 of slots that ranks its slots stably within their expert (warp match_any votes) and derives each
 expert's base row from all the chunk histograms, so CTAs never wait for each other. With expand_idx
@@ -297,10 +295,6 @@ class GatherSum:
 
     @cute.jit
     def sum_rows(self, mGrad, mOut, rows, row_oks, token_idx, token_ok, tidx) -> None:
-        """
-        Sum the given grad rows in fp32, in order, into the token's out row, in
-        16-byte vectors per thread.
-        """
         H, K = self.H, self.K
         num_vecs = H // 8
         grad_base, out_base = mGrad.iterator.toint(), mOut.iterator.toint()
@@ -321,10 +315,6 @@ class GatherSum:
 
 
 class SlotMaps(NamedTuple):
-    """
-    Index maps of one call; see bf16_expert_group_slots.
-    """
-
     cu_seqlens: torch.Tensor  # (G + 1,) int32
     a_idx: torch.Tensor  # (S,) int32
     row_of: torch.Tensor  # (S,) int32
@@ -460,10 +450,6 @@ ROW_THREADS, ROWS_PER_CTA = 128, 4
 
 
 class GatherRows:
-    """
-    out[i] = x[idx[i]] for bf16 rows, 16-byte vectors.
-    """
-
     def __init__(self, num_cols: int) -> None:
         assert num_cols % 8 == 0
         self.N = num_cols

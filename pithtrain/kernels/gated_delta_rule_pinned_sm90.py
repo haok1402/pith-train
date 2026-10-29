@@ -100,8 +100,7 @@ supported: list[bool] = []
 def pinned_launch_supported() -> bool:
     """
     Whether the pinned configs apply in this process: the recorded FLA and Triton versions, SM90,
-    and FLA kernels whose wrappers and parameter lists match the launches here. Computed once; a
-    constant to torch.compile.
+    and FLA kernels whose wrappers and parameter lists match the launches here.
     """
     if not supported:
         supported.append(check_supported())
@@ -121,9 +120,6 @@ def check_supported() -> bool:
 
 
 def chunk_cumsum(x: torch.Tensor, reverse: bool) -> torch.Tensor:
-    """
-    chunk_local_cumsum (scalar, fp32 out): scaled by 1/ln 2 forward, unscaled in reverse.
-    """
     B, T, H = x.shape
     out = torch.empty_like(x, dtype=torch.float)
     config = CONFIGS["cumsum_rev" if reverse else "cumsum_fwd"]
@@ -139,9 +135,6 @@ def recompute_w_u(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor, A: torch
 
 
 def compute_chunk_states(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    chunk_gated_delta_rule_fwd_h: per-chunk states h and the transformed values.
-    """
     B, T, H, K, HV, V = *k.shape, *u.shape[2:]
     h, v_new = k.new_empty(B, triton.cdiv(T, BT), HV, K, V), torch.empty_like(u)
     config = CONFIGS["fwd_h"]

@@ -45,9 +45,6 @@ def ld_v4(addr: Int64, pred: Int32, *, loc=None, ip=None) -> tuple:
 
 @dsl_user_op
 def ld_b32(addr: Int64, pred: Int32, other: Int32, *, loc=None, ip=None) -> Int32:
-    """
-    Predicated 4-byte global load returning other where pred == 0.
-    """
     return Int32(
         asm(
             T.i32(), [Int64(addr).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip), Int32(other).ir_value(loc=loc, ip=ip)],
@@ -81,7 +78,7 @@ def sts_b32(addr: Int32, value: Uint32, pred: Int32, *, loc=None, ip=None) -> No
 @dsl_user_op
 def max_u16x2(first: Uint32, second: Uint32, *, loc=None, ip=None) -> Uint32:
     """
-    Packed max of two halves; equals the bf16 max for non-negative (abs) values.
+    Equals the bf16 max for non-negative (abs) values.
     """
     return Uint32(asm(T.i32(), [Uint32(first).ir_value(loc=loc, ip=ip), Uint32(second).ir_value(loc=loc, ip=ip)], "max.u16x2 $0, $1, $2;", "=r,r,r"))
 
@@ -119,7 +116,7 @@ def red_add_shared(addr: Int32, value: Int32, pred: Int32, *, loc=None, ip=None)
 @dsl_user_op
 def ld_relaxed(addr: Int64, pred: Int32, *, loc=None, ip=None) -> Int32:
     """
-    Predicated gpu-scope relaxed 4-byte load (L2, never a stale L1 line); 0 where not pred.
+    Reads L2, never a stale L1 line; 0 where not pred.
     """
     return Int32(
         asm(
@@ -178,9 +175,6 @@ def unpack(struct_value, num_values: int, value_type, loc=None, ip=None) -> tupl
 
 @dsl_user_op
 def ld_b32_coherent(addr: Int64, pred: Int32, other: Int32, *, loc=None, ip=None) -> Int32:
-    """
-    Predicated coherent 4-byte global load; other when pred is 0.
-    """
     return Int32(asm_args_last(T.i32(), "{\n.reg .pred p;\nsetp.ne.b32 p, $2, 0;\nmov.b32 $0, $3;\n@p ld.global.b32 $0, [$1];\n}", "=r,l,r,r", [to_ir(addr, Int64, loc, ip), to_ir(pred, Int32, loc, ip), to_ir(other, Int32, loc, ip)]))
 
 
@@ -229,7 +223,7 @@ def lds_v4(addr: Int32, *, loc=None, ip=None) -> tuple:
 @dsl_user_op
 def cp_async16(dst: Int32, src: Int64, src_size: Int32, *, loc=None, ip=None) -> None:
     """
-    16-byte global->shared cp.async.cg; zero-fills when src_size is 0.
+    Zero-fills the 16 destination bytes when src_size is 0.
     """
     asm_args_last(T.i32(), "cp.async.cg.shared.global [$1], [$2], 16, $3;\nmov.b32 $0, 0;", "=r,r,l,r", [to_ir(dst, Int32, loc, ip), to_ir(src, Int64, loc, ip), to_ir(src_size, Int32, loc, ip)], side_effects=True)
 
@@ -246,9 +240,6 @@ def selp_args_last(pred: Int32, if_true: Uint32, if_false: Uint32, *, loc=None, 
 
 @dsl_user_op
 def bf16_sel(pred_hi: Int32, x: Uint32, *, loc=None, ip=None) -> Float32:
-    """
-    fp32 value of the high (pred_hi) or low BF16 half of x.
-    """
     return Float32(
         asm_args_last(
             T.f32(),
@@ -289,16 +280,13 @@ def pack_bf16(x_lo: Float32, x_hi: Float32, *, loc=None, ip=None) -> Uint32:
 
 @dsl_user_op
 def abs2(x: Uint32, *, loc=None, ip=None) -> Uint32:
-    """
-    Magnitude bits of two packed BF16.
-    """
     return Uint32(asm_args_last(T.i32(), "and.b32 $0, $1, 0x7FFF7FFF;", "=r,r", [to_ir(x, Uint32, loc, ip)]))
 
 
 @dsl_user_op
 def max2(first: Uint32, second: Uint32, *, loc=None, ip=None) -> Uint32:
     """
-    Lane-wise max of two packed BF16 magnitudes (NaN-ignoring, like Triton's max.f32).
+    NaN-ignoring, like Triton's max.f32.
     """
     return Uint32(asm_args_last(T.i32(), "max.bf16x2 $0, $1, $2;", "=r,r,r", [to_ir(first, Uint32, loc, ip), to_ir(second, Uint32, loc, ip)]))
 

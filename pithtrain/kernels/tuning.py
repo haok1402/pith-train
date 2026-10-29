@@ -31,7 +31,7 @@ __all__ = ["Tunable", "tune_kernels"]
 
 MIN_BUCKET, MAX_BUCKET = 3, 17
 """
-Row buckets: rows per group in [2^b, 2^(b+1)), from 2^3 = 8 to 2^17 = 131072 rows.
+Row buckets: bucket b holds rows per group in [2^b, 2^(b+1)).
 """
 
 BUCKET_SPREAD = 2
@@ -88,9 +88,6 @@ class Tunable:
         return installed
 
     def pick(self, key: tuple, rows: int):
-        """
-        The config of one launch with rows rows per group: once tuned, one table lookup.
-        """
         bucket = min(max(rows.bit_length() - 1, MIN_BUCKET), MAX_BUCKET)
         config = self.table.get((key, bucket))
         return config if config is not None else self.pick_untuned(key, bucket)
@@ -111,9 +108,6 @@ class Tunable:
 
 
 def gather(value: object) -> list:
-    """
-    Every rank's value in rank order (this process's alone when not distributed).
-    """
     if not (dist.is_available() and dist.is_initialized()):
         return [value]
     gathered = [None] * dist.get_world_size()
@@ -139,17 +133,10 @@ def cache_file() -> Path:
 
 
 def as_tuple(value):
-    """
-    A JSON list back as the tuple it was written from, nested lists included.
-    """
     return tuple(as_tuple(item) for item in value) if isinstance(value, list) else value
 
 
 def read_cache() -> list:
-    """
-    The cached entries [(name, family fingerprint, key, bucket, candidate index)], or [] when
-    there are none.
-    """
     try:
         return [(name, fingerprint, as_tuple(key), bucket, idx) for name, fingerprint, key, bucket, idx in json.loads(cache_file().read_text())]
     except (OSError, ValueError):
@@ -163,9 +150,6 @@ def write_cache(entries: list) -> None:
 
 
 def time_launch(launch: Callable, config) -> float:
-    """
-    Median microseconds of one launch, after WARMUP launches.
-    """
     for _ in range(WARMUP):
         launch(config)
     events = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(ITERS)]
@@ -179,16 +163,16 @@ def time_launch(launch: Callable, config) -> float:
 
 def same_results(outputs: tuple, reference: tuple) -> bool:
     """
-    Whether outputs match reference elementwise within 2^-6 of reference's largest magnitude, which
-    allows for a different accumulation order.
+    The tolerance, 2^-6 of the reference's largest magnitude, allows
+    for a different accumulation order.
     """
     return all(torch.allclose(out.float(), ref.float(), rtol=0, atol=2**-6 * max(ref.float().abs().max().item(), 1e-30)) for out, ref in zip(outputs, reference))
 
 
 def time_candidate(tunable: Tunable, key: tuple, bucket: int, config) -> float | None:
     """
-    Median microseconds of config at a bucket's size (1.5x its lower bound), or None when the inputs
-    would not fit, the config fails, or its results differ from the default's.
+    Times config at 1.5x the bucket's lower bound. None when the inputs would not fit, the config
+    fails, or its results differ from the default's.
     """
     launch = tunable.prepare(key, 3 << (bucket - 1))
     if launch is None:

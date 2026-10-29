@@ -19,12 +19,12 @@ def build_sorted_inputs(
     ks=None,
 ):
     """
-    Return (x, bias, group_ids, offs) with tokens sorted by group, as after dispatch. ks, when
-    given, fixes the per-group token counts (summing to M).
+    Tokens are sorted by group, as after dispatch. ks, when given, fixes the per-group token counts
+    (summing to M).
     """
     torch.manual_seed(0)
     if ks is None:
-        # Random load distribution that sums to M; groups may be empty.
+        # Groups may be empty.
         weights = torch.rand(E, device=device) + 0.1
         ks = (weights * (M / weights.sum())).round().to(torch.int64)
         ks[-1] = M - ks[:-1].sum()
@@ -43,9 +43,6 @@ def build_sorted_inputs(
 
 
 def fp32_ground_truth(x, bias, group_ids, grad_out):
-    """
-    Return (output, x.grad, bias.grad) under fp32 autograd.
-    """
     x32 = x.float().detach().requires_grad_()
     bias32 = bias.float().detach().requires_grad_()
     out = x32 + bias32[group_ids]
@@ -65,9 +62,6 @@ def fp32_ground_truth(x, bias, group_ids, grad_out):
     ],
 )
 def test_indexed_bias_add_forward_backward(M, H, E, dtype):
-    """
-    The output and x.grad match autograd exactly; bias.grad is close to an fp32 ground truth.
-    """
     device = "cuda"
     x, bias, group_ids, offs = build_sorted_inputs(M, H, E, dtype, device)
     grad_out = torch.randn(M, H, device=device, dtype=dtype)
@@ -94,8 +88,7 @@ def test_indexed_bias_add_forward_backward(M, H, E, dtype):
 
 def test_indexed_bias_add_more_accurate_than_bf16_reference():
     """
-    The kernel accumulates in fp32 while autograd uses bf16 atomic adds, so against an fp32 ground
-    truth the kernel is more than 5x more accurate.
+    The kernel accumulates in fp32 while autograd uses bf16 atomic adds.
     """
     device = "cuda"
     M, H, E = 4096, 5760, 8
@@ -141,7 +134,7 @@ def test_indexed_bias_add_handles_empty_groups():
 
 def test_indexed_bias_add_realistic_gpt_oss_shape():
     """
-    gpt-oss-20b expert sizes: 8 experts per rank, gate_up_proj width 5760, about 512 tokens each.
+    gpt-oss-20b: E is the experts per rank, H the gate_up_proj width.
     """
     device = "cuda"
     H, E = 5760, 8

@@ -188,9 +188,6 @@ def scatter_bias(acc, bias):
 
 
 def mint_gemm_class(epilogue, *, has_c=False, paired_acc=False, packed_c=False, add_to_output=False, has_bias=False) -> type:
-    """
-    The QuACK SM90 GEMM class with this epilogue (its operand kinds fixed here).
-    """
     kind_sig = (("c", "c"),) if has_c else (("bias", "row"),) if has_bias else ()
     return epilogue._mint(kind_sig, 9, paired_acc, packed_c, (), RoundingMode.RN, (), add_to_output)
 
@@ -344,16 +341,10 @@ kind correctly (tests/kernels/test_bf16_expert_gemm.py loads each in turn).
 
 
 def fake_matrix(dtype, divisibility: int = 8):
-    """
-    A fake row-major 2-D tensor of symbolic shape for cute.compile.
-    """
     return make_fake_tensor(dtype, (cute.sym_int(), cute.sym_int()), divisibility=divisibility, leading_dim=1)
 
 
 def fake_expert_tensor(dtype, divisibility: int = 8):
-    """
-    A fake (G, rows, cols) tensor of symbolic shape, last mode contiguous, for cute.compile.
-    """
     return make_fake_tensor(dtype, (cute.sym_int(), cute.sym_int(), cute.sym_int()), divisibility=divisibility, leading_dim=2)
 
 
@@ -363,10 +354,8 @@ def fake_index_vector():
 
 class GemmKind(NamedTuple):
     """
-    How one kind of GEMM is built: its entry class, its epilogues (lane order kept, swapped; an
-    epilogue that is a function takes the activation parameters alpha, limit), the keyword arguments
-    of mint_gemm_class, whether A is gathered, attributes set on the GEMM object, and the fake
-    arguments of the entry for cute.compile.
+    How one kind of GEMM is built. epilogues is (lane order kept, swapped), None where there is no
+    swapped variant; an epilogue that is a function takes the activation parameters alpha, limit.
     """
 
     entry: type
@@ -421,18 +410,14 @@ def default_config(key: tuple) -> Config:
 
 
 def gemm_config(kind: str, swapped: bool, N: int, K: int, G: int, act: tuple, rows: int) -> Config:
-    """
-    The config of one launch: tuned per (kind, lane order, N, K, local experts, activation) and
-    bucket of rows per expert, the default until the first tuning round.
-    """
     return TUNING.pick((kind, swapped, N, K, G, act), rows // max(G, 1))
 
 
 def prepare_launch(key: tuple, rows_per_expert: int) -> Callable | None:
     """
     launch(config) for synthetic inputs of this kind with rows_per_expert rows in every expert, laid
-    out as the exported functions pass them; it returns the outputs (the weight gradients zeroed
-    first, so each launch gives them afresh). None when a tensor would pass MAX_SYNTHETIC_BYTES.
+    out as the exported functions pass them; launch zeroes the accumulated weight gradients first so
+    each launch gives them afresh.
     """
     kind, swapped, N, K, G, act = key
     M, device = rows_per_expert * G, torch.device("cuda", torch.cuda.current_device())
@@ -481,7 +466,7 @@ TUNING = Tunable("bf16_expert_gemm", CANDIDATES, default_config, prepare_launch)
 
 def order_by_address(first: torch.Tensor, second: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, bool]:
     """
-    (lower, higher, first is the higher) by address; asserts both can be read as one paired operand.
+    Returns (lower, higher, whether first is the higher) by address.
     """
     assert first.dtype == second.dtype and first.shape == second.shape and first.stride() == second.stride()
     assert first.data_ptr() % 16 == 0 and second.data_ptr() % 16 == 0

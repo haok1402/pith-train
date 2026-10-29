@@ -1,8 +1,3 @@
-"""
-Picker of the fused rowwise + K-major colwise FP8 quantization (the SM90 grouped-GEMM input): the
-CuTe-DSL kernel on SM90, the Triton kernel on SM100.
-"""
-
 import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR

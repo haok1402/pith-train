@@ -68,9 +68,6 @@ def objective(
     model_outputs: Tuple[torch.Tensor, ...],
     objective_inputs: Tuple[torch.Tensor, ...],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Return the loss for backward and its detached copy for the caller.
-    """
     (output,) = model_outputs
     (target,) = objective_inputs
     loss = criterion(output, target)
@@ -86,9 +83,6 @@ def records_empty(model: DualPipeV) -> bool:
 
 
 def reference_step(chunks, model: DeepSeekV2Model):
-    """
-    Run the reference forward and backward over the micro-batches DualPipeV will see.
-    """
     outputs, losses = [], []
     for micro_x, micro_labels, cu_seqlens in chunks:
         micro_y = model.reference_forward(micro_x, cu_seqlens)
@@ -101,8 +95,8 @@ def reference_step(chunks, model: DeepSeekV2Model):
 
 def zigzag_shard(x: torch.Tensor, cp_rank: int, cp_size: int) -> torch.Tensor:
     """
-    Take this CP rank's zigzag pair of blocks along dim 1: of 2 * cp_size equal blocks, rank r
-    keeps blocks r and 2 * cp_size - r - 1, the layout the loader and forward_posemb use.
+    The CP zigzag layout of the loader and forward_posemb, restated here rather
+    than calling zigzag_spans.
     """
     if cp_size == 1:
         return x
@@ -113,9 +107,6 @@ def zigzag_shard(x: torch.Tensor, cp_rank: int, cp_size: int) -> torch.Tensor:
 
 
 def shard_layers(layers: nn.ModuleDict, local: nn.Module) -> nn.ModuleDict:
-    """
-    Return the reference layers a pipeline stage owns: the ids the stage model built for itself.
-    """
     return nn.ModuleDict({i: layers[i] for i in local.layers})
 
 
@@ -158,7 +149,8 @@ def shard_experts(model, ep_rank, ep_size):
 
 def canonical_state_dict(model: nn.Module, ep_rank: int) -> dict:
     """
-    Expand this EP rank's expert stacks under global indices, independently of checkpoint.unpack.
+    Written independently of checkpoint.unpack, so the export check does not reuse the
+    code it tests.
     """
     result = {}
     for name, value in model.state_dict().items():
@@ -359,7 +351,6 @@ def main(model_name: str):
         print("[INFO] Completed the reference step.", flush=True)
     torch.distributed.barrier()
 
-    # Shard the full modules whose weights and gradients will be used for checking.
     local_full_modules = []
 
     local_full_modules.append(ModelClass(config, phase=0))

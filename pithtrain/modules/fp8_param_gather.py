@@ -44,10 +44,6 @@ BLOCK = 128
 
 @dataclass
 class FP8ParamState:
-    """
-    The state of one weight gathered in FP8, shared by its two FSDP hooks and the precompute.
-    """
-
     module: nn.Module
     fsdp_param: FSDPParam
     shape: torch.Size
@@ -94,9 +90,6 @@ class FP8ParamState:
         module: nn.Module,
         mp_policy: Any,
     ) -> tuple[tuple[torch.Tensor, ...], None]:
-        """
-        FSDP's fsdp_pre_all_gather hook: hand FSDP the FP8 shard to gather.
-        """
         if self.shard_freed():
             self.cast_shard()
         assert self.fsdp_param._sharded_local_tensor._version == self.version, (
@@ -105,15 +98,9 @@ class FP8ParamState:
         return (self.fp8_shard,), None
 
     def shard_freed(self) -> bool:
-        """
-        Whether post_all_gather released the FP8 shard's storage.
-        """
         return self.fp8_shard is not None and self.fp8_shard.untyped_storage().size() == 0
 
     def cast_shard(self) -> None:
-        """
-        Cast the local fp32 shard into fp8_shard with the current amax grid.
-        """
         padded = self.fsdp_param.padded_sharded_param_size
         if self.shard_freed():
             self.fp8_shard.untyped_storage().resize_(self.fp8_shard.numel())
@@ -139,10 +126,9 @@ class FP8ParamState:
         out: Optional[torch.Tensor] = None,
     ) -> Optional[tuple[torch.Tensor, tuple[torch.Tensor, ...]]]:
         """
-        FSDP's fsdp_post_all_gather hook: pack the gathered FP8 weight and its transpose into the
-        packed buffer and return the bf16 view of it as the unsharded parameter. On the first call
-        (out is None) it allocates the buffer and registers weight_fp8 and weight_t_fp8 on the
-        module; later calls refill it in place and return None.
+        FSDP passes out=None only on the first all-gather, which allocates the packed buffer and
+        returns its bf16 view as the unsharded parameter; later calls refill it in
+        place and return None.
         """
         assert param_dtype == torch.bfloat16, param_dtype
         (gathered,) = all_gather_outputs
@@ -308,10 +294,6 @@ HOLDERS_KEY = "_fp8_param_holders"
 
 
 class RawParamHolder(nn.Module):
-    """
-    Stands in for an FP8 module: the gather registers the operand buffers on it.
-    """
-
     fp8_param_gather: bool = True
 
 

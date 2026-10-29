@@ -97,10 +97,6 @@ def quantize4_words(words: list, elem_picks: list, kind: str, rcp: Float32, *, l
 
 
 def global_ptr(base: cute.Pointer, offset: Int64, elem_bytes: int, dtype: type, align: int) -> cute.Pointer:
-    """
-    Global pointer offset elements (elem_bytes each) past base, as dtype, assumed
-    align-byte aligned.
-    """
     addr = base.toint() + offset * elem_bytes
     return cute.make_ptr(dtype, addr, cute.AddressSpace.gmem, assumed_align=align)
 
@@ -196,8 +192,7 @@ class RowwiseBlockwiseTranspose:
     @cute.jit
     def store_rowwise(self, x_words: cute.Tensor, row_amax: cute.Tensor, q_bytes: cute.Tensor, mQ: cute.Tensor, mS: cute.Tensor, sub_block: SubBlock) -> None:
         """
-        Quantize the register block by its row scales into tok and store the scales, lane
-        col_group_idx == i storing row i's.
+        Quantize the register block by its row scales into tok and store the row scales.
         """
         row0, col0, col_group_idx, k_tile_idx, M, K = sub_block.row0, sub_block.col0, sub_block.col_group_idx, sub_block.k_tile_idx, sub_block.M, sub_block.K
         VEC_K = self.vec_k
@@ -275,9 +270,6 @@ class RowwiseBlockwiseTranspose:
                                 cute.autovec_copy(src, dst)
 
     def quantize4(self, x_words: cute.Tensor, elems: list, rcp: Float32) -> Uint32:
-        """
-        Quantize the 4 register-block elements at flat indices elems.
-        """
         word_idxs: list = []
         elem_picks: list = []
         for elem_idx in elems:
@@ -341,9 +333,6 @@ def resolve(dtype: torch.dtype, M: int, K: int, x_row_stride: int, x_addr: int) 
 
 
 def fp8_quant_act_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    fp8_quant_act with the rowwise scale MN-major.
-    """
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     M, K = x.shape
     x_row_stride, x_col_stride = x.stride()

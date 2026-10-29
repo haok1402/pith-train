@@ -1,6 +1,5 @@
 """
-CuTe-DSL (SM90) kernel of fp8cast_rowwise_kmajor (contract in fp8_rowwise_kmajor), bit-identical to
-the Triton kernel, with both scales returned MN-major.
+Bit-identical to the Triton kernel in fp8_rowwise_kmajor_sm100; both scales are returned MN-major.
 """
 
 from typing import Callable
@@ -122,9 +121,8 @@ class RowwiseKmajor:
 
     def quantize_tile(self, rows, pid_row, pid_col, tidx, M, bases, s_red) -> None:
         """
-        Quantize the CTA's tile from the sub-block rows each thread loaded, and store both outputs
-        and their scales. M is the column stride of the MN-major rowwise scale and s_red the address
-        of RED_WORDS shared-memory words.
+        M is the column stride of the MN-major rowwise scale; s_red is the address of RED_WORDS
+        words of shared memory.
         """
         _, offs_base, tok_base, tok_scale_base, kmajor_base, kmajor_scale_base = bases
         sub_block = SubBlock(self.thread_coords(tidx), pid_row, pid_col, self.N)
@@ -149,9 +147,6 @@ class RowwiseKmajor:
         return cutlass.min(num_groups_before, G - 1)
 
     def find_group(self, offs_base, sub_block):
-        """
-        Start row and row count of the group that holds the tile.
-        """
         group_idx = self.find_group_idx(offs_base, sub_block.lane, sub_block.row_start)
         group_end, group_start = Int64(ld_b32(offs_base + Int64(group_idx) * 4, Int32(1), Int32(0))), Int64(ld_b32(offs_base + Int64(group_idx - 1) * 4, Int32(group_idx > 0), Int32(0)))
         return group_start, group_end - group_start
@@ -267,18 +262,10 @@ def allocate_outputs(x: torch.Tensor, M: int, N: int) -> tuple[torch.Tensor, tor
 
 
 def supports_rowwise_kmajor(x: torch.Tensor, grouped_mm_offs: torch.Tensor) -> bool:
-    """
-    Whether the CuTe kernel covers this input: contiguous, 16-byte aligned bf16 x with N % 8 == 0,
-    and non-empty contiguous int32 grouped_mm_offs.
-    """
     return not (x.dtype != torch.bfloat16 or x.shape[1] % 8 != 0 or not x.is_contiguous() or x.data_ptr() % 16 != 0 or grouped_mm_offs.dtype != torch.int32 or grouped_mm_offs.shape[0] == 0 or not grouped_mm_offs.is_contiguous())
 
 
 def fp8cast_rowwise_kmajor_sm90(x: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    fp8cast_rowwise_kmajor on SM90; both scales MN-major. Inputs supports_rowwise_kmajor rejects
-    take the Triton kernel, with its scales converted to the same layout.
-    """
     assert x.ndim == 2 and x.shape[0] % 128 == 0, f"Expected 2D tensor with M%128==0, got shape {x.shape}"
     M, N = x.shape
     if M == 0:

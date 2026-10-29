@@ -17,9 +17,9 @@ __all__ = ["cross_entropy_fwd_bwd"]
 @triton.jit
 def cross_entropy_fwd(logits_ptr, logits_row_stride, target_ptr, target_stride, loss_ptr, loss_stride, num_cols, num_non_ignored_ptr, ignore_index, BLOCK_SIZE: tl.constexpr):
     """
-    One program per row: an online softmax over the vocabulary (running max row_max, running sum of
-    exp exp_sum), then the row is overwritten with (softmax(x) - onehot(target)) / num_non_ignored
-    and its loss stored. An ignored row is zeroed with loss 0.
+    One program per row: an online softmax over the vocabulary, then the row is overwritten with
+    (softmax(x) - onehot(target)) / num_non_ignored and its loss stored. An ignored row is zeroed
+    with loss 0.
     """
     row_idx = tl.program_id(0).to(tl.int64)
     logits_ptr += row_idx * logits_row_stride

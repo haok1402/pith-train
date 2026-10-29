@@ -1,8 +1,3 @@
-"""
-Tests of F.grouped_mm, GroupedLinear and scatter_for_grouped_gemm against per-group matmuls, and
-of deferred weight gradients under WeightGradStore for GroupedLinear and GptOssExperts.
-"""
-
 from types import SimpleNamespace
 from typing import Tuple
 
@@ -19,10 +14,6 @@ def reference_grouped_linear_forward(
     weight: torch.Tensor,
     grouped_mm_offs: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Per-group x @ weight[g].T: x (M_total, K) packed by group, weight (num_groups, N, K),
-    grouped_mm_offs the cumulative group ends; returns (M_total, N).
-    """
     M_total, K = x.shape
     num_groups, N, K_w = weight.shape
     assert K == K_w
@@ -50,9 +41,6 @@ def reference_grouped_linear_backward(
     weight: torch.Tensor,
     grouped_mm_offs: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Return grad_input (M_total, K) and grad_weight (num_groups, N, K) of the reference forward.
-    """
     M_total, N = grad_output.shape
     num_groups, N_w, K = weight.shape
     assert N == N_w
@@ -86,7 +74,6 @@ def reference_grouped_linear_backward(
 
 def test_grouped_linear_forward():
     configs = [
-        # (name, num_groups, group_sizes, K, N)
         ("All groups non-empty", 8, [5, 3, 2, 4, 6, 1, 3, 2], 128, 256),
         ("Some empty groups", 8, [5, 0, 3, 0, 0, 2, 0, 1], 128, 256),
         ("Single group", 1, [10], 64, 128),
@@ -118,7 +105,6 @@ def test_grouped_linear_forward():
 
 def test_grouped_linear_backward():
     configs = [
-        # (name, num_groups, group_sizes, K, N)
         ("All groups non-empty", 8, [5, 3, 2, 4, 6, 1, 3, 2], 128, 256),
         ("Some empty groups", 8, [5, 0, 3, 0, 0, 2, 0, 1], 128, 256),
         ("Single group", 1, [10], 64, 128),
@@ -269,10 +255,6 @@ def test_edge_cases():
 
 
 def verify_scatter_result(sorted_tokens, expert_idxs, num_groups, out, reverse_idxs, offs):
-    """
-    Check that out[reverse_idxs] recovers sorted_tokens, that each expert group holds its own
-    tokens, and that every other row of the group is zero.
-    """
     recovered = out[reverse_idxs]
     assert torch.equal(recovered, sorted_tokens), (
         f"out[reverse_idxs] != sorted_tokens, max diff: "
@@ -305,7 +287,6 @@ def test_scatter_for_grouped_gemm():
     dtype = torch.float32
 
     configs = [
-        # (test_name, m, hidden_size, num_groups, padding_alignment)
         ("Basic", 64, 256, 8, 128),
         ("Large hidden", 32, 1024, 4, 128),
         ("No padding", 48, 128, 6, 1),
@@ -326,7 +307,6 @@ def test_scatter_for_grouped_gemm():
         assert offs_new.shape == (num_groups,), f"offs shape {offs_new.shape} != ({num_groups},)"
         assert offs_new.dtype == torch.int32
 
-        # Expected padded group sizes, computed from expert_idxs independently of the kernel.
         counts = torch.bincount(expert_idxs, minlength=num_groups).tolist()
         expected_ks = [
             (count + padding_alignment - 1) // padding_alignment * padding_alignment
@@ -432,7 +412,6 @@ def test_grouped_mm_over_allocated_input():
     dtype = torch.float32
 
     configs = [
-        # (test_name, num_groups, group_sizes, extra_rows, K, N)
         ("Small over-alloc", 4, [5, 3, 2, 4], 50, 128, 256),
         ("Large over-alloc", 8, [10, 5, 8, 3, 7, 2, 6, 4], 200, 128, 256),
         ("Some empty groups", 8, [5, 0, 3, 0, 0, 2, 0, 1], 100, 128, 256),
@@ -463,14 +442,10 @@ def test_grouped_mm_over_allocated_input():
 
 
 def test_scatter_then_grouped_mm_end_to_end():
-    """
-    scatter_for_grouped_gemm, then F.grouped_mm and the reverse gather, match a per-expert matmul.
-    """
     device = torch.device("cuda")
     dtype = torch.float32
 
     configs = [
-        # (test_name, m, hidden_size, num_groups, out_features)
         ("Basic", 64, 128, 8, 256),
         ("Large", 256, 256, 8, 512),
         ("Many experts", 128, 128, 32, 256),
@@ -502,10 +477,6 @@ def test_scatter_then_grouped_mm_end_to_end():
 
 
 def test_grouped_linear_weight_grad_store():
-    """
-    Under WeightGradStore, GroupedLinear keeps the input gradient on the critical path, defers the
-    weight gradient to pop() and matches the direct result.
-    """
     from pithtrain.contexts.weight_grad_store import WeightGradStore
 
     device = torch.device("cuda")
@@ -558,10 +529,6 @@ def test_grouped_linear_weight_grad_store():
 
 
 def test_gpt_oss_experts_weight_grad_store_matches_direct(monkeypatch):
-    """
-    GptOssExperts produces the same input, weight and bias gradients with WeightGradStore on and
-    off. Only the expert-weight wgrad is deferred; the bias gradients stay eager on both paths.
-    """
     from pithtrain.contexts.weight_grad_store import WeightGradStore
     from pithtrain.models.gpt_oss import GptOssExperts
 

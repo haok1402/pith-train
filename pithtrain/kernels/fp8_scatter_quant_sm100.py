@@ -1,8 +1,3 @@
-"""
-The unfused scatter_quant path: dedup expansion, the Triton scatter_by_expert and
-fp8cast_rowwise_kmajor_sm100 (row-major scales, rows in atomic_add order).
-"""
-
 from typing import Optional
 
 import torch

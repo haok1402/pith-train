@@ -49,9 +49,6 @@ def e8m0_scale(amax: torch.Tensor) -> torch.Tensor:
 
 
 def tiles(x: torch.Tensor) -> torch.Tensor:
-    """
-    Split a (G, N, K) tensor into zero-padded (G, R, 128, C, 128) fp32 tiles.
-    """
     G, N, K = x.shape
     R, C = cdiv(N, BLOCK), cdiv(K, BLOCK)
     x_pad = F.pad(x.float(), (0, C * BLOCK - K, 0, R * BLOCK - N))
@@ -314,7 +311,6 @@ def test_param_gather_pipeline(shape: tuple, n: int, kind: str) -> None:
     full_fp8, full_scale = ref_blockwise(as_3d(master.bfloat16()))
     full_fp8_t, full_scale_t = ref_blockwise(as_3d(master.bfloat16()).transpose(1, 2))
 
-    # Per-shard amax into a zeroed grid (only the tiles the shard touches), then MAX-reduce.
     amax = torch.zeros(G, R, C, device="cuda")
     for local, row_offset, group_offset in shards:
         shard_amax = torch.zeros(G, R, C, device="cuda")
@@ -329,7 +325,6 @@ def test_param_gather_pipeline(shape: tuple, n: int, kind: str) -> None:
     assert_f32_equal("scale", scale, full_scale)
     assert_f32_equal("scale_t", scale_t, full_scale_t)
 
-    # Each shard cast with the reduced grid; the gathered bytes are the full weight's FP8.
     parts = []
     for local, row_offset, group_offset in shards:
         out = torch.empty(local.shape, dtype=torch.float8_e4m3fn, device="cuda")
@@ -345,7 +340,6 @@ def test_param_gather_pipeline(shape: tuple, n: int, kind: str) -> None:
     packed_t = packed[numel:].view(torch.float8_e4m3fn).view(G, *full_fp8_t.shape[1:])
     assert_fp8_equal("packed fp8_t", packed_t, full_fp8_t)
 
-    # Bit-identical to the blockwise transpose of the bf16 weight.
     if len(shape) == 2:
         ref = fp8_quant_weight(master.bfloat16())
         ref = [t.unsqueeze(0) for t in ref]
@@ -358,9 +352,6 @@ def test_param_gather_pipeline(shape: tuple, n: int, kind: str) -> None:
 
 
 def test_shard_amax_rounds_to_bf16() -> None:
-    """
-    The amax and the cast see the bf16-rounded fp32 master.
-    """
     # 448 * (1 + 2**-12) has scale 2 in fp32 but rounds to 448 (scale 1) in bf16.
     weight = torch.full((1, 128, 128), 0.5, device="cuda")
     weight[0, 3, 5] = 448.0 * (1 + 2**-12)
@@ -488,7 +479,6 @@ def test_multi_launch_param_gather() -> None:
         ref_fp8, ref_scale = ref_blockwise(as_3d(master.bfloat16()))
         assert_f32_equal(f"scale {shape}", scale, ref_scale)
         assert_f32_equal(f"scale_t {shape}", scale_t, ref_scale.transpose(1, 2))
-        # The shards cast with the reduced grid gather to the full weight's FP8.
         parts = []
         for rank in range(RANKS):
             local, row_offset, group_offset = per_rank[rank][GROUP.index(shape)]

@@ -1,9 +1,6 @@
 """
-Verifier of silu_mul_fwd and silu_mul_bwd against plain PyTorch.
-
-Contract: elementwise silu(gate) * up and its gradient for contiguous same-shape, same-dtype
-tensors, computed in fp32 and rounded once to the input dtype. The kernel's sigmoid may differ
-from torch's by fp32 ulps, so outputs must lie within one output-dtype ulp of the fp32 reference.
+The kernels compute in fp32 and round once to the input dtype. Their sigmoid may differ from torch's
+by fp32 ulps, so outputs must lie within one output-dtype ulp of the fp32 reference.
 """
 
 import pytest
@@ -66,7 +63,6 @@ def run(gate, up, grad_out):
     scale_g = (grad_out.float() * up.float()).abs().max().item() if dg.numel() else 1.0
     assert_rounded(dg, want_g, max(scale_g, 1e-30))
     assert_rounded(du, want_u, want_u.abs().max().item() if du.numel() else 1.0)
-    # The closed form also matches float64 autograd of torch's own silu.
     if gate.numel() and gate.dtype != torch.float16:
         g64 = gate.double().requires_grad_()
         u64 = up.double().requires_grad_()
@@ -132,9 +128,6 @@ def test_large_and_negative(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_float16_moderate_range(dtype):
-    """
-    Values that stay finite in fp16.
-    """
     gen = torch.Generator(device="cuda").manual_seed(3)
     gate = (torch.randn(1000, 1000, generator=gen, device="cuda") * 8).to(dtype)
     up = (torch.randn(1000, 1000, generator=gen, device="cuda") * 50).to(dtype)

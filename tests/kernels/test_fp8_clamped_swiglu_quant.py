@@ -1,7 +1,4 @@
 """
-Verifies the fp8_clamped_swiglu_quant feature (fp8_clamped_swiglu_rowwise,
-fp8_clamped_swiglu_kmajor, fp8_clamped_swiglu_bwd) against PyTorch.
-
 Contract: gpt-oss's clamped SwiGLU of gate_up + bias[group] (gate at even and up at odd columns; the
 bf16 bias added in fp32 and rounded to bf16), rounded to bf16 as clamped_swiglu_fwd /
 clamped_swiglu_bwd round it, then quantized as fp8_quant_grouped does on SM90: rowwise 1x128
@@ -93,7 +90,7 @@ def quantize_grouped_ref(x: torch.Tensor, offs: torch.Tensor) -> tuple[torch.Ten
 
 def assert_bytes(got: torch.Tensor, ref: torch.Tensor, name: str) -> None:
     """
-    Same e4m3 bytes; a NaN may carry either sign.
+    A NaN may carry either sign.
     """
     got = got.view(torch.uint8)
     nan = (ref & 0x7F) == 0x7F
@@ -154,9 +151,6 @@ def group_ids(offs: torch.Tensor, M: int) -> torch.Tensor:
 
 
 def biased_ref(gate_up: torch.Tensor, bias: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
-    """
-    gate_up + bias[group of each row], one fp32 add rounded to bf16.
-    """
     return (gate_up.float() + bias.float()[group_ids(offs, gate_up.shape[0])]).to(torch.bfloat16)
 
 
@@ -178,9 +172,6 @@ def to_f32(v: float) -> float:
 
 
 def check_fwd_activation(x: torch.Tensor, h: torch.Tensor) -> None:
-    """
-    Assert the plain clamped_swiglu_fwd output h of the biased x against float64.
-    """
     alpha, limit = to_f32(ALPHA), to_f32(LIMIT)
     gate, up = x[:, 0::2].double(), x[:, 1::2].double()
     gc, uc = gate.clamp(max=limit), up.clamp(-limit, limit)
@@ -189,9 +180,6 @@ def check_fwd_activation(x: torch.Tensor, h: torch.Tensor) -> None:
 
 
 def check_bwd_activation(dh: torch.Tensor, x: torch.Tensor, dx: torch.Tensor) -> None:
-    """
-    Assert the plain clamped_swiglu_bwd output dx (interleaved) against float64.
-    """
     alpha, limit = to_f32(ALPHA), to_f32(LIMIT)
     dh64, gate, up = dh.double(), x[:, 0::2].double(), x[:, 1::2].double()
     gc, uc = gate.clamp(max=limit), up.clamp(-limit, limit)
@@ -238,9 +226,6 @@ def check_bias_grad(got: torch.Tensor, dgu: torch.Tensor, offs: torch.Tensor, bi
 
 
 def make_offs(M: int, G: int, gen: torch.Generator) -> torch.Tensor:
-    """
-    Random 128-aligned cumulative group ends (some groups empty), the last one M.
-    """
     blocks = M // BLOCK
     cuts = torch.sort(torch.randint(0, blocks + 1, (G - 1,), generator=gen)).values
     ends = torch.cat([cuts, torch.tensor([blocks])]) * BLOCK
@@ -253,7 +238,7 @@ def make_inputs(M: int, N: int, G: int, seed: int):
     gu[torch.rand(M, 2 * N, generator=gen) < 0.01] *= 100  # outliers past the clamp
     gu[torch.rand(M, 2 * N, generator=gen) < 0.01] = 0
     if M >= 256:
-        gu[128:256] = 0  # an all-zero row block
+        gu[128:256] = 0
     gu[:, 0:16:2] = -gu[:, 0:16:2].abs()  # negative gates
     bias = torch.randn(G, 2 * N, generator=gen)
     dh = torch.randn(M, N, generator=gen)

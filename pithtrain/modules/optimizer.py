@@ -129,9 +129,7 @@ def orthogonalized_updates(params, updates, steps: int = 5, chunk_size: int | No
 
 class Muon(torch.optim.Optimizer):
     """
-    Muon for the 2-D (and stacked 3-D expert) hidden weights: each step applies SGD momentum, the
-    scaled Newton-Schulz orthogonalization and decoupled weight decay. Keeps one fp32
-    momentum_buffer per parameter. Collective when the parameters are sharded.
+    Collective when the parameters are sharded. Keeps one fp32 momentum_buffer per parameter.
     """
 
     def __init__(self, params, lr: float = 0.02, momentum: float = 0.95, weight_decay: float = 0.1):
@@ -165,8 +163,7 @@ class Muon(torch.optim.Optimizer):
 
     def compute_update(self, param, beta):
         """
-        Update the fp32 momentum buffer of the local shard and return the Nesterov update to
-        orthogonalize, in fp32.
+        Returns the Nesterov momentum update, in fp32.
         """
         state = self.state[param]
         if len(state) == 0:
@@ -178,8 +175,7 @@ class Muon(torch.optim.Optimizer):
 
     def apply_update(self, param, orth, lr, weight_decay):
         """
-        Apply decoupled weight decay and the full update orth to param in place, taking param's
-        shard of orth when param is a DTensor.
+        orth is the full, unsharded update; a DTensor param takes its own shard of it.
         """
         if isinstance(param, DTensor):
             replicated = [Replicate()] * param.device_mesh.ndim
@@ -191,9 +187,6 @@ class Muon(torch.optim.Optimizer):
 
 
 def local_grads(model: torch.nn.Module) -> list[torch.Tensor]:
-    """
-    The local shard of every parameter gradient, in model.parameters() order.
-    """
     grads = []
     for param in model.parameters():
         if param.grad is None:
@@ -206,8 +199,7 @@ def local_grads(model: torch.nn.Module) -> list[torch.Tensor]:
 @torch.no_grad()
 def scale_grads_(grads: list[torch.Tensor], scale: torch.Tensor) -> None:
     """
-    Multiply every gradient in place by the 0-d tensor scale, with one foreach launch per device
-    and dtype. Bit-identical to grad.mul_(scale) on each.
+    scale is a 0-d tensor. Bit-identical to grad.mul_(scale) on each gradient.
     """
     groups: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
     for grad in grads:

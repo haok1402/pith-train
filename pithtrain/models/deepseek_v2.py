@@ -385,8 +385,8 @@ class DeepSeekV2DecoderLayer(nn.Module):
 
     def keeps_stage3_input(self) -> bool:
         """
-        Whether forward_stage3 keeps gathered_tokens for the backward (the BF16 CuTe experts read
-        them again in their weight gradient), so the pipeline must not free them.
+        The BF16 CuTe experts read gathered_tokens again in their weight gradient, so the pipeline
+        must not free them.
         """
         return (
             not training.fp8 and hasattr(self.mlp, "experts") and self.mlp.experts.uses_bf16_cute()

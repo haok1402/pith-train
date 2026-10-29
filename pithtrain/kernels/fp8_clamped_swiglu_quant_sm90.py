@@ -271,17 +271,9 @@ class ClampedSwiGLUQuant:
         cute.arch.cp_async_wait_group(0)
 
     def coords(self, tidx):
-        """
-        Thread index, lane, warp, column vector index and row group index of thread tidx.
-        """
         return tidx, tidx % 32, tidx // 32, tidx % 16, tidx // 16
 
     def allocate_smem(self):
-        """
-        Shared-memory addresses: the cp.async stages, the transposed FP8 tile, the per-warp
-        column amaxes, the column reciprocals, the group offset table and (backward) the
-        per-warp column sums.
-        """
         smem = cutlass.memory.SmemAllocator()
         s_stages = smem.allocate(self.stages * self.stage_bytes, byte_alignment=128).toint()
         s_tile_t = smem.allocate(BLOCK * BLOCK, byte_alignment=128).toint()
@@ -294,9 +286,6 @@ class ClampedSwiGLUQuant:
         return s_stages, s_tile_t, s_col_amax, s_col_rcp, s_offs, s_col_sum
 
     def locate_tile(self, tile_idx: Int32) -> tuple:
-        """
-        Tile tile_idx -> (row block, column block); the column blocks of a row block are adjacent.
-        """
         return tile_idx // self.num_col_blocks, tile_idx % self.num_col_blocks
 
     def load_stage(self, tile_idx: Int32, stage_addr: Int32, num_tiles: Int32, tidx: Int32, dh_base, gate_up_base):
@@ -525,8 +514,7 @@ compiled: dict = {}
 
 def get_kernel(N: int, backward: bool, alpha: float, limit: float, device: torch.device, KP: int, rowwise: bool = True, kmajor: bool = True):
     """
-    Compiled kernel for (N, direction, alpha, limit, KP, rowwise, kmajor, device); M and the group
-    count stay dynamic.
+    M and the group count stay dynamic (symbolic in the compile), so one compile serves every batch.
     """
     key = ("clamped_swiglu_quant", N, backward, alpha, limit, device.index, STAGES[backward], KP, rowwise, kmajor)
     fn = compiled.get(key)
@@ -561,22 +549,16 @@ def allocate_outputs(M: int, N: int, device: torch.device, KP: int | None = None
 
 
 def clamped_swiglu_quant_fusable(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor) -> bool:
-    """
-    Inputs the fused kernel handles; others take the (bit-identical) unfused path.
-    """
     N = gate_up.shape[1] // 2
     return (gate_up.dtype == torch.bfloat16 and gate_up.is_contiguous() and gate_up.data_ptr() % 16 == 0 and bias.dtype == torch.bfloat16 and bias.is_contiguous() and bias.data_ptr() % 16 == 0 and N % VEC == 0 and grouped_mm_offs.dtype == torch.int32 and grouped_mm_offs.is_contiguous() and 0 < grouped_mm_offs.shape[0] <= G_CAP)
 
 
 def clamped_swiglu_quant_fwd_sm90(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    (tok_fp8, tok_scale, kmajor_fp8, kmajor_scale) of h = clamped_swiglu(gate_up + bias[group],
-    alpha, limit), both scales MN-major.
-
     grouped_mm_offs is int32 (G,) cumulative row counts, multiples of 128, last entry M. If set
-    (fused path only), kmajor_channels >= N lays the K-major pair out for that many channels:
-    group g's block is (kmajor_channels, rows of g) and the scale (kmajor_channels, M / 128);
-    channels >= N are left unwritten.
+    (fused path only), kmajor_channels >= N lays the K-major pair out for that many channels: group
+    g's block is (kmajor_channels, rows of g) and the scale (kmajor_channels, M / 128); channels >=
+    N are left unwritten.
     """
     assert gate_up.ndim == 2 and gate_up.shape[1] % 2 == 0 and gate_up.shape[0] % BLOCK == 0
     M, N = gate_up.shape[0], gate_up.shape[1] // 2
@@ -594,9 +576,6 @@ def clamped_swiglu_quant_fwd_sm90(gate_up: torch.Tensor, bias: torch.Tensor, gro
 
 
 def fp8_clamped_swiglu_rowwise_sm90(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Only the rowwise pair of clamped_swiglu_quant_fwd_sm90.
-    """
     M, N = gate_up.shape[0], gate_up.shape[1] // 2
     if M == 0 or N == 0 or not clamped_swiglu_quant_fusable(gate_up, bias, grouped_mm_offs):
         return clamped_swiglu_quant_fwd_sm90(gate_up, bias, grouped_mm_offs, alpha, limit)[:2]
@@ -608,9 +587,6 @@ def fp8_clamped_swiglu_rowwise_sm90(gate_up: torch.Tensor, bias: torch.Tensor, g
 
 
 def fp8_clamped_swiglu_kmajor_sm90(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Only the K-major pair of clamped_swiglu_quant_fwd_sm90.
-    """
     M, N = gate_up.shape[0], gate_up.shape[1] // 2
     if M == 0 or N == 0 or not clamped_swiglu_quant_fusable(gate_up, bias, grouped_mm_offs):
         return clamped_swiglu_quant_fwd_sm90(gate_up, bias, grouped_mm_offs, alpha, limit, kmajor_channels)[2:]
@@ -624,10 +600,6 @@ def fp8_clamped_swiglu_kmajor_sm90(gate_up: torch.Tensor, bias: torch.Tensor, gr
 
 
 def fp8_clamped_swiglu_bwd_sm90(dh: torch.Tensor, gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
-    """
-    (grad_gate_up_quant, bias_grad): fp8cast_rowwise_kmajor of the bf16 (M, 2N) input gradient and
-    the (G, 2N) bias gradient; kmajor_channels as in clamped_swiglu_quant_fwd_sm90, for 2N channels.
-    """
     M, N = gate_up.shape[0], gate_up.shape[1] // 2
     assert dh.shape == (M, N), (dh.shape, gate_up.shape)
     G = grouped_mm_offs.shape[0]
