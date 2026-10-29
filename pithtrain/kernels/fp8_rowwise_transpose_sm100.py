@@ -30,7 +30,7 @@ def fp8cast_rowwise_transpose_kernel(x_ptr, out_tok_ptr, scale_tok_ptr, out_t_pt
     tile_mask = (row_offs[:, None] < M) & (col_offs[None, :] < N)
     x = tl.load(x_ptrs, mask=tile_mask, other=0.0)
     x_abs = tl.abs(x)
-    # 1x128 row blocks: one row of the reshaped tile per block, so a reduction along it is the block amax
+    # one row of the reshaped tile per 1x128 block, so a reduction along it is the block amax
     block_amax = tl.max(tl.reshape(x_abs, BLOCK_ROWS * BLOCKS_PER_ROW, BLOCK_ROWS), axis=1)
     tok_scale, tok_rcp = compute_fp8_scale(block_amax, NATIVE_E8M0)
     # widened to fp32 only after the amax, which keeps the original instruction order (and speed)

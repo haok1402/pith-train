@@ -119,8 +119,7 @@ class ExecutionCtx:
 
 def comm_all_to_all(ctx: ExecutionCtx, send_tensor: torch.Tensor, output_splits: List[int], input_splits: List[int]):  # fmt: skip
     """
-    Start an all-to-all over the EP group on ctx.comm_stream and return (output, work), as
-    direct_all_to_all under torch.cuda.stream(ctx.comm_stream) would.
+    Start all_to_all_async over the EP group on ctx.comm_stream and return (output, work).
     """
     stream = ctx.comm_stream
     # Two direct stream switches instead of a torch.cuda.stream context, which costs more host time.
@@ -154,9 +153,6 @@ class Stage1Record:
 
 
 def stage1_f(ctx: ExecutionCtx, layer: LayerProtocol, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor], cu_seqlens: Optional[torch.Tensor] = None):  # fmt: skip
-    """
-    Run the layer's stage 1 and return (record, dispatch_tokens, residual, routing).
-    """
     nvtx.range_push("layer%02d.stage1_f" % layer.idx)
     record = Stage1Record()
 
@@ -730,7 +726,6 @@ def layer_backward(
 
     run_backward(stage1_record.outs, (dispatch_tokens_grad, residual_grad, topk_weight_grad))
     if stage1_is_merged:
-        # Grads landed on the previous layer's stage5.args, which reads them itself.
         input_grads = None
     else:
         input_grads = stage1_record.args.next_hidden_states.grad

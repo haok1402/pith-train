@@ -10,7 +10,8 @@ are bit-identical to the unfused sequence: the bias add is one fp32 add rounded 
 activation replays the Triton clamped_swiglu kernels' PTX. Both scales come back MN-major.
 
 Only N % 8 == 0 with 1 to 1024 groups and a bf16 bias runs fused; anything else takes the unfused
-sequence (the fp8_clamped_swiglu_quant_sm100 helpers and fp8cast_rowwise_kmajor_sm90).
+sequence (the fp8_clamped_swiglu_quant_sm100 helpers, clamped_swiglu_fwd and
+fp8cast_rowwise_kmajor_sm90).
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ BLOCK = 128  # rows per quantization group and output columns per CTA tile
 THREADS = 512
 VEC = 8  # output columns per thread
 G_CAP = 1024  # expert groups the shared-memory offset table holds
-STAGES = {False: 3, True: 2}  # cp.async tiles in flight per CTA, by direction (backward)
+STAGES = {False: 3, True: 2}  # cp.async tiles in flight per CTA, keyed by backward
 
 
 def f32(x: float) -> float:
@@ -90,7 +91,7 @@ def lds_v2(addr: Int32, *, loc=None, ip=None) -> tuple:
 #             grad_g  = g <= L ? grad_gc : 0;   grad_u = -L <= u <= L ? grad_uc : 0
 def sigmoid_ptx(x: str) -> str:
     """
-    PTX computing s = sigmoid(-(-x)) of the fp32 register x (uses t, s).
+    PTX computing s = sigmoid(x) of the fp32 register x (uses t, s).
     """
     return (
         f"mul.rn.f32 t, {x}, 0fBFB8AA3B;\n"
@@ -185,7 +186,7 @@ class TileThread:
 class ClampedSwiGLUQuant:
     """
     Persistent kernel (one 512-thread CTA per SM over 128 x 128 output tiles), compiled per (N,
-    backward, alpha, limit).
+    backward, alpha, limit, KP, rowwise, kmajor).
 
     N is the SwiGLU output width (gate_up has 2N columns). The quantized output is h (M, N) in
     forward and d(gate_up) (M, 2N) in backward. Thread t owns output columns col_vec_idx * 8 ..
@@ -443,8 +444,8 @@ class ClampedSwiGLUQuant:
 
     def quantize_rows(self, out_words, row_pair_amax, tile, mTok: cute.Tensor, mTokScale: cute.Tensor, M):
         """
-        Store the rowwise scales, lane col_vec_idx < 4 of each row group owning row row_group_idx *
-        4 + col_vec_idx, and the thread's 4 rows quantized by them.
+        Store the rowwise scales and the thread's 4 rows quantized by them; the thread with
+        col_vec_idx = c < 4 stores the scale of row row_group_idx * 4 + c.
         """
         lane, col_vec_idx, row_group_idx, row_start = tile.lane, tile.col_vec_idx, tile.row_group_idx, tile.row_start
         row_amax = bf16_sel(Int32(col_vec_idx % 2), selp_args_last(Int32(col_vec_idx < 2), row_pair_amax[0], row_pair_amax[1]))
@@ -462,9 +463,8 @@ class ClampedSwiGLUQuant:
     @cute.jit
     def store_col_scales(self, tile, s_col_amax, s_col_sum, s_col_rcp, mKmajorScale: cute.Tensor, mPartials: cute.Tensor):
         """
-        Thread c < 128 reduces column c of the tile over the warps' partials, stores its E8M0
-        scale (and in backward its bias-gradient partial sum) and leaves the scale's
-        reciprocal in s_col_rcp.
+        Thread c < 128 reduces column c of the tile over the warps' partials, stores its E8M0 scale
+        (and in backward its bias-gradient partial sum) and leaves the reciprocal in s_col_rcp.
         """
         tidx = tile.tidx
         if tidx < BLOCK:
@@ -525,7 +525,8 @@ compiled: dict = {}
 
 def get_kernel(N: int, backward: bool, alpha: float, limit: float, device: torch.device, KP: int, rowwise: bool = True, kmajor: bool = True):
     """
-    Compiled kernel for (N, direction, alpha, limit, device); M and the group count stay dynamic.
+    Compiled kernel for (N, direction, alpha, limit, KP, rowwise, kmajor, device); M and the group
+    count stay dynamic.
     """
     key = ("clamped_swiglu_quant", N, backward, alpha, limit, device.index, STAGES[backward], KP, rowwise, kmajor)
     fn = compiled.get(key)
@@ -574,8 +575,8 @@ def clamped_swiglu_quant_fwd_sm90(gate_up: torch.Tensor, bias: torch.Tensor, gro
 
     grouped_mm_offs is int32 (G,) cumulative row counts, multiples of 128, last entry M. If set
     (fused path only), kmajor_channels >= N lays the K-major pair out for that many channels:
-    group g's block is (kmajor_channels, k_g) and the scale (kmajor_channels, M / 128); channels
-    >= N are left unwritten.
+    group g's block is (kmajor_channels, rows of g) and the scale (kmajor_channels, M / 128);
+    channels >= N are left unwritten.
     """
     assert gate_up.ndim == 2 and gate_up.shape[1] % 2 == 0 and gate_up.shape[0] % BLOCK == 0
     M, N = gate_up.shape[0], gate_up.shape[1] // 2

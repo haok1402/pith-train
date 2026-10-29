@@ -35,7 +35,7 @@ def cross_entropy(
 ) -> torch.Tensor:
     """
     Mean cross-entropy of logits inp (N, V) against target (N,), as a float32 scalar; targets equal
-    to ignore_index are left out. Computes in fp32 and overwrites inp in place with its gradient,
-    in inp's dtype.
+    to ignore_index are left out. Computes in fp32 and, when inp is row-contiguous, overwrites it in
+    place with its gradient, in inp's dtype.
     """
     return CrossEntropy.apply(inp, target, ignore_index)

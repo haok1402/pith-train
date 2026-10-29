@@ -22,8 +22,7 @@ def group_bias_add_kernel(y_ptr, bias_ptr, group_idx_ptr, H, BLOCK_M: tl.constex
 
 def group_bias_add_(y: torch.Tensor, bias: torch.Tensor, group_indices: torch.Tensor) -> None:
     """
-    In place y[r] += bias[group_indices[r]] for every row, without materializing
-    bias[group_indices]. Returns None.
+    In place y[r] += bias[group_indices[r]] per row, without materializing bias[group_indices].
 
     y is (M, H), bf16 (any float dtype); bias is (G, H); group_indices is integer (M,) with values
     in [0, G). Each sum is computed in fp32 and rounded once to y's dtype, bit-identical to

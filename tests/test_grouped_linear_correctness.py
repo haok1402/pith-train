@@ -1,5 +1,6 @@
 """
-Tests of F.grouped_mm, GroupedLinear and scatter_for_grouped_gemm against per-group matmuls.
+Tests of F.grouped_mm, GroupedLinear and scatter_for_grouped_gemm against per-group matmuls, and
+of deferred weight gradients under WeightGradStore for GroupedLinear and GptOssExperts.
 """
 
 from types import SimpleNamespace
@@ -19,8 +20,8 @@ def reference_grouped_linear_forward(
     grouped_mm_offs: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Return the (M_total, N) output of x (M_total, K) packed by group times weight (num_groups, N,
-    K) transposed, where grouped_mm_offs holds the cumulative group sizes.
+    Per-group x @ weight[g].T: x (M_total, K) packed by group, weight (num_groups, N, K),
+    grouped_mm_offs the cumulative group ends; returns (M_total, N).
     """
     M_total, K = x.shape
     num_groups, N, K_w = weight.shape
@@ -325,8 +326,7 @@ def test_scatter_for_grouped_gemm():
         assert offs_new.shape == (num_groups,), f"offs shape {offs_new.shape} != ({num_groups},)"
         assert offs_new.dtype == torch.int32
 
-        # The result is narrowed to the sum of per-expert padded token counts, derived here from
-        # the input assignments independently of the kernel.
+        # Expected padded group sizes, computed from expert_idxs independently of the kernel.
         counts = torch.bincount(expert_idxs, minlength=num_groups).tolist()
         expected_ks = [
             (count + padding_alignment - 1) // padding_alignment * padding_alignment
@@ -344,7 +344,6 @@ def test_scatter_for_grouped_gemm():
             f"actual={offs_new.tolist()}, expected={expected_offs.tolist()}"
         )
         m_padded = sum(expected_ks)
-        # Retain the tail check if a future implementation returns extra rows.
         if out_new.shape[0] > m_padded:
             tail = out_new[m_padded:]
             assert torch.all(tail == 0), (
@@ -638,8 +637,8 @@ def test_gpt_oss_experts_weight_grad_store_matches_direct(monkeypatch):
             f"input grad mismatch, max diff {in_diff}"
         )
 
-        # Bias gradients come from autograd's scatter-add; CUDA index_add_ is non-deterministic,
-        # so allow 5% slack on bf16 accumulation.
+        # Both paths compute the bias gradients with indexed_bias_add's segment sum; the 5% slack
+        # covers bf16 rounding only.
         for param_ref, param_def, name in [
             (experts_ref.gate_up_proj_bias, experts_def.gate_up_proj_bias, "gate_up_proj_bias"),
             (experts_ref.down_proj_bias, experts_def.down_proj_bias, "down_proj_bias"),

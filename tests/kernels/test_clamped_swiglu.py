@@ -1,11 +1,11 @@
 """
 Verifies clamped_swiglu_fwd and clamped_swiglu_bwd, the gpt-oss activation, against PyTorch.
 
-Contract: for the interleaved gate_up (M, 2N), gate the even columns and up the odd ones,
-out = (uc + 1) * gc * sigmoid(alpha * gc) with gc = min(gate, limit) and
-uc = clamp(up, -limit, limit), computed in fp32 and rounded once to the input dtype. The backward
-returns the (M, 2N) interleaved gradient, zero where the clamp saturates (gate > limit,
-|up| > limit). Outputs must lie within one output-dtype ulp of the fp32 reference.
+Contract: for the interleaved gate_up (M, 2N), gate the even columns and up the odd ones, out =
+(uc + 1) * gc * sigmoid(alpha * gc) with gc = min(gate, limit) and uc = clamp(up, -limit, limit),
+computed in fp32 and rounded once to the input dtype. The backward returns the (M, 2N) interleaved
+gradient, zero where the clamp saturates (gate > limit, |up| > limit). Outputs must lie within one
+output-dtype ulp of the fp32 reference.
 """
 
 import pytest
@@ -29,9 +29,6 @@ def ref_fwd(gate_up, alpha, limit):
 
 
 def ref_bwd(grad_out, gate_up, alpha, limit):
-    """
-    The closed-form interleaved (M, 2N) gradient in fp32, zero where the clamp saturates.
-    """
     grad_out_f32 = grad_out.float()
     gate, up = gate_up.float()[:, ::2], gate_up.float()[:, 1::2]
     gc = gate.clamp(max=limit)
@@ -83,7 +80,7 @@ def test_forward_backward(shape, dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_matches_autograd(dtype):
     """
-    The closed-form gradient is autograd's float64 gradient of the clamped formula.
+    clamped_swiglu_bwd matches autograd's float64 gradient of the clamped formula.
     """
     gen = torch.Generator(device="cuda").manual_seed(1)
     gate_up = (torch.randn(256, 2 * 2880, generator=gen, device="cuda") * 4).to(dtype)
@@ -115,7 +112,6 @@ def test_saturated_gradient_is_zero():
         gate_f32 = gate_up[:, ::2].float()
         assert torch.all(grad[:, ::2][gate_f32 > LIMIT] == 0)
         assert torch.all(grad[:, 1::2] == 0)  # every |up| > LIMIT
-        # out(gate > L, up) == out(L, up) and out(gate, |up| > L) == out(gate, sign * L).
         clamped = gate_up.clone()
         clamped[:, ::2] = gate_up[:, ::2].clamp(max=LIMIT)
         clamped[:, 1::2] = gate_up[:, 1::2].clamp(min=-LIMIT, max=LIMIT)

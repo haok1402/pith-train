@@ -58,9 +58,6 @@ def test_meta_device(mn: int, sf_k: int) -> None:
 
 @pytest.mark.parametrize("M,K", MK)
 def test_matches_rowwise_blockwise_transpose(M: int, K: int) -> None:
-    """
-    The x_scale of fp8cast_rowwise_blockwise_transpose is what act_scale_like describes.
-    """
     x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     _, x_scale, _, _ = fp8cast_rowwise_blockwise_transpose(x)
     fake = act_scale_like(M, (K + BLOCK - 1) // BLOCK, x.device)

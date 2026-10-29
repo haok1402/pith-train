@@ -129,8 +129,9 @@ varlen_fwd.register_autograd(varlen_backward, setup_context=varlen_setup_context
 
 def flash_attn_varlen_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens: torch.Tensor, max_seqlen: int, softmax_scale: float, causal: bool = False, window_size: Tuple[Optional[int], Optional[int]] = (None, None), learnable_sink: Optional[torch.Tensor] = None) -> torch.Tensor:  # fmt: skip
     """
-    flash_attn_func over packed documents: q, k and v are (T, H, D) with document boundaries
-    cu_seqlens (int32, [0, ..., T]) and max_seqlen an upper bound on the document length.
+    flash_attn_func over packed documents: q (T, H, D), k (T, H_kv, D) and v (T, H_kv, D_v),
+    returning (T, H, D_v); cu_seqlens (int32, [0, ..., T]) marks document boundaries and max_seqlen
+    bounds the document length.
     """
     o, _ = varlen_fwd(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, softmax_scale, causal, window_size[0], window_size[1], learnable_sink)  # fmt: skip
     return o

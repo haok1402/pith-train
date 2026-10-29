@@ -15,8 +15,9 @@ pinned_buffers: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
 
 def get_pinned_buffer(name: str, numel: int, dtype: torch.dtype) -> torch.Tensor:
     """
-    A cached pinned CPU buffer of numel elements, keyed by name; the same tensor on every call.
-    Cached because freeing a pinned tensor costs a cudaEventRecordWithFlags in PyTorch's allocator.
+    A cached pinned CPU buffer of numel elements, keyed by (name, dtype, numel): the same tensor on
+    every call with the same arguments. Cached because freeing a pinned tensor costs a
+    cudaEventRecordWithFlags in PyTorch's allocator.
     """
     key = (name, dtype, numel)
     buf = pinned_buffers.get(key)

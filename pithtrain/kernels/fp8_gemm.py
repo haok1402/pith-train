@@ -260,8 +260,7 @@ def fp8_fused_experts_supported() -> bool:
 
 def quantize_grouped_input(input: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    The FP8 operands of a grouped-GEMM input from one read of it: (x_fp8,
-    x_scale, x_ch_fp8, x_ch_scale).
+    FP8 operands of a grouped-GEMM input from one read: (x_fp8, x_scale, x_ch_fp8, x_ch_scale).
 
     - input: bf16 (M, K) contiguous, rows grouped by expert, each group padded to a multiple of 128
       rows; grouped_mm_offs: int32 cumulative group ends (last = M).

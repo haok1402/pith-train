@@ -66,7 +66,7 @@ def fp32_ground_truth(x, bias, group_ids, grad_out):
 )
 def test_indexed_bias_add_forward_backward(M, H, E, dtype):
     """
-    The output and x.grad match autograd exactly; bias.grad is within bf16 tolerance of fp32.
+    The output and x.grad match autograd exactly; bias.grad is close to an fp32 ground truth.
     """
     device = "cuda"
     x, bias, group_ids, offs = build_sorted_inputs(M, H, E, dtype, device)
@@ -86,7 +86,7 @@ def test_indexed_bias_add_forward_backward(M, H, E, dtype):
 
     torch.testing.assert_close(x_cu.grad, x_ref.grad, atol=0.0, rtol=0.0)
 
-    # The tolerance covers the bf16 atomic round-off of PyTorch's path.
+    # The tolerance covers rounding the fp32 segment sum once to the bias dtype.
     _, _, bias_grad_gt = fp32_ground_truth(x, bias, group_ids, grad_out)
     atol, rtol = (5e-1, 5e-2) if dtype == torch.bfloat16 else (1e-1, 1e-2)
     torch.testing.assert_close(bias_cu.grad.float(), bias_grad_gt, atol=atol, rtol=rtol)

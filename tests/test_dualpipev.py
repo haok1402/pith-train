@@ -218,8 +218,7 @@ def apply_fsdp(model, dtype):
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage3")
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage5")
         fully_shard(model[i], mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp_policy)
-    # Plain-sum reduction, as in modules.training.apply_fsdp. Both classes then hold the
-    # gradient summed over their own replica group, which equals the reference gradient.
+    # Plain-sum reduction, as in modules.training.apply_fsdp.
     for module in model.modules():
         if isinstance(module, FSDPModule):
             module.set_gradient_divide_factor(1.0)
@@ -300,8 +299,7 @@ def main(model_name: str):
     # [r * num_chunks, (r + 1) * num_chunks). dp alone splits the data; the expert rank decides
     # only which experts a rank hosts.
     #
-    # Two steps run so the shapes agreed for one step cannot leak into the next: under ragged the
-    # second step uses different sequence lengths.
+    # Two steps run so the shapes agreed for one step cannot leak into the next.
     num_global_chunks = dp_size * num_chunks
     label_scale = 10.0  # scaled up so MSE grads on small bias terms clear the bf16 noise floor
 

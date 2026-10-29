@@ -102,8 +102,8 @@ class ThreadCoords:
 
 class Tile:
     """
-    Where a 128 x 128 tile sits, and the first column of the thread's column vector in it with
-    its in-range predicate.
+    Where a 128 x 128 tile sits, and the first column of the thread's column vector in it with that
+    column's in-range predicate.
     """
 
     def __init__(self, row_block_idx, col_block_idx, col_vec_idx, N: int) -> None:
@@ -117,10 +117,10 @@ class Tile:
 
 class Output:
     """
-    Where one quantized output goes: tok (num_rows, num_channels) with its MN-major rowwise
-    scale, and the K-major copy with its MN-major per-channel scale. The output's own channels
-    start at channel_offset and its column blocks at col_block_offset (non-zero only for du in
-    the fused gate_up gradient).
+    Where one quantized output goes: tok (num_rows, num_channels) with its MN-major rowwise scale,
+    and the K-major copy with its MN-major per-channel scale. The output's own channels start at
+    channel_offset and its column blocks at col_block_offset (non-zero only for du in the
+    fused gate_up gradient).
     """
 
     def __init__(self, tensors: tuple, num_rows, num_channels: int, channel_offset: int, col_block_offset: int) -> None:
@@ -146,13 +146,11 @@ class SharedBuffers:
 
 class SiluMulQuant:
     """
-    Persistent kernel (one 512-thread CTA per SM over 128 x 128 tiles), compiled per (N, backward).
-
-    Inputs are staged into shared memory with cp.async, stages tiles ahead. Every thread
-    reads back only the 16-byte chunks it copied itself, so the staging needs no barrier,
-    only cp.async.wait_group. Thread t owns columns (t % 16) * 8 .. (t % 16) * 8 + 7 and rows
-    (t // 16) * 4 .. (t // 16) * 4 + 3 of the tile (ThreadCoords). A tile's 128 rows lie
-    inside one expert group.
+    Persistent kernel (one 512-thread CTA per SM over 128 x 128 tiles), compiled per (N, backward,
+    device). Inputs are staged into shared memory with cp.async, STAGES tiles ahead. Every thread
+    reads back only the 16-byte chunks it copied itself, so the staging needs no barrier, only
+    cp.async.wait_group. Each thread owns a 4-row x 8-column block of the tile (ThreadCoords). A
+    tile's 128 rows lie inside one expert group.
     """
 
     def __init__(self, N: int, backward: bool, num_ctas: int):
@@ -188,7 +186,7 @@ class SiluMulQuant:
 
     def tile_coords(self, tile_idx: Int32) -> tuple:
         """
-        Tile tile_idx -> (row block, column block); column blocks of a row block are adjacent
+        Tile tile_idx -> (row block, column block); the column blocks of one row block are adjacent,
         for read locality.
         """
         return tile_idx // self.num_col_blocks, tile_idx % self.num_col_blocks
@@ -253,7 +251,7 @@ class SiluMulQuant:
     @cute.jit
     def load_stage(self, stage_addr: Int32, tidx: Int32) -> list:
         """
-        The thread's words of a staged tile: stage_words[input_idx][k] holds the 8 bf16 of
+        The thread's words of a staged tile: stage_words[input_idx][k] holds the 8 bf16 values of
         its row k.
         """
         stage_words = [[None] * 4 for _ in range(self.num_inputs)]
@@ -334,9 +332,9 @@ class SiluMulQuant:
     @cute.jit
     def reduce_row_amax(self, abs_words: list) -> list:
         """
-        Amax of the thread's 4 rows over the whole tile, as packed bf16 bit patterns:
-        row_amax[pair] packs rows 2 * pair and 2 * pair + 1, reduced over the 16 lanes of the row
-        group by butterfly.
+        Amax of the thread's 4 rows over the whole tile as packed bf16 bit patterns, reduced by
+        butterfly over the 16 lanes of the row group: row_amax[pair] packs rows 2 * pair and 2 *
+        pair + 1.
         """
         row_amax_halves = [max2(max2(abs_words[k][0], abs_words[k][1]), max2(abs_words[k][2], abs_words[k][3])) for k in range(4)]
         row_amax = [None] * 2
@@ -408,8 +406,8 @@ class SiluMulQuant:
     def store_kmajor(self, output: Output, tile: Tile, tidx: Int32, group_start: Int32, num_group_rows: Int64, s_kmajor: Int32):
         """
         Store the transposed tile into the K-major output, whose group block is (num_channels,
-        num_group_rows) at group_start * num_channels: 8 threads per column, 128 contiguous
-        bytes per column.
+        num_group_rows) at group_start * num_channels, 8 threads writing the 128 contiguous bytes
+        of each column.
         """
         kmajor_tile_base = output.kmajor_base + Int64(group_start) * output.num_channels + Int64(tile.row_start - group_start)
         for i in cutlass.range_constexpr(BLOCK * BLOCK // 16 // THREADS):
@@ -558,7 +556,7 @@ def silu_mul_bwd_quant_sm90(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, 
 
 def silu_mul_quant_gu_fwd_sm90(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    fp8cast_rowwise_kmajor(silu_mul_fwd(gu[:, :N], gu[:, N:]), offs) for gu (M, 2N).
+    fp8cast_rowwise_kmajor(silu_mul_fwd(gu[:, :N], gu[:, N:]), grouped_mm_offs) for gu (M, 2N).
     """
     M, N = gu.shape[0], gu.shape[1] // 2
     if M == 0:
@@ -573,7 +571,7 @@ def silu_mul_quant_gu_fwd_sm90(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) 
 
 def silu_mul_bwd_quant_gu_sm90(dh: torch.Tensor, gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    fp8cast_rowwise_kmajor(cat([dg, du], 1), offs) of the SwiGLU gradients of gu (M, 2N).
+    fp8cast_rowwise_kmajor(cat([dg, du], 1), grouped_mm_offs) of the SwiGLU gradients of gu (M, 2N).
     """
     M, N = gu.shape[0], gu.shape[1] // 2
     if M == 0:

@@ -3,8 +3,8 @@ CuTe-DSL (SM90) rowwise FP8 quantization of x and of x.T from one read of x, bit
 Triton kernel in fp8_rowwise_transpose_sm100.
 
 One CTA (256 threads) per 128x128 tile; each thread owns an 8x8 block. The transposed tile goes
-through bank-swizzled smem so every warp writes whole 128-byte rows of x.T: storing it straight from
-registers (16 rows per warp instruction) was much slower.
+through bank-swizzled smem so every warp writes whole 128-byte rows of x.T, where a store straight
+from registers would scatter each warp instruction over 16 rows.
 """
 
 from typing import Callable
@@ -187,9 +187,6 @@ def asm_u32(ptx: str, constraints: str, args: list) -> Uint32:
 
 
 def asm_words(ptx: str, constraints: str, args: list, num_words: int) -> list:
-    """
-    Run ptx without side effects and return its num_words 32-bit outputs.
-    """
     packed = llvm.inline_asm(llvm.StructType.get_literal([T.i32()] * num_words), args, ptx, constraints, has_side_effects=False, is_align_stack=False)
     return [Uint32(llvm.extractvalue(T.i32(), packed, [i])) for i in range(num_words)]
 
@@ -414,9 +411,6 @@ def store_transposed(sub_block: SubBlock, s_tile: Int32, t_base: Int64, M64: Int
 
 @cute.kernel
 def rowwise_transpose_kernel(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, is_row_aligned: cutlass.Constexpr[bool], m_align: cutlass.Constexpr[int]) -> None:
-    """
-    One 128x128 tile per CTA.
-    """
     M, N = mX.shape[0], mX.shape[1]
     tidx, _, _ = cute.arch.thread_idx()
     pid_col, pid_row, _ = cute.arch.block_idx()
@@ -431,7 +425,7 @@ def rowwise_transpose_kernel(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: c
     abs_rows = [[rows[i][k] & Uint32(0x7FFF7FFF) for k in range(4)] for i in range(8)]
     share_col_amax(abs_rows, sub_block, s_red)
     cute.arch.barrier()
-    # independent of the smem round trip above, so it overlaps the barrier wait
+    # needs only registers and warp shuffles; the barrier above is for reduce_col_amax's s_red reads
     row_pair_amax = reduce_row_amax(abs_rows)
     row_scale_bits = store_row_scales(row_pair_amax, sub_block, tok_scale_base, M64)
     store_tok_rows(rows, row_scale_bits, sub_block, tok_base, N64, is_row_aligned)

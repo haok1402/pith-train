@@ -2,8 +2,7 @@
 FP8 routed experts as single autograd nodes, with the activation fused into the FP8 quantization
 of its neighbours, and the fused expert input that feeds them.
 
-- fp8_swiglu_experts: separate gate, up and down FP8GroupedLinear weights (DeepSeek-V2-Lite,
-  Qwen3).
+- fp8_swiglu_experts: separate gate, up and down weights (DeepSeek-V2-Lite, Qwen3).
 - fp8_swiglu_gate_up_experts: one fused (G, 2I, H) gate_up weight (Qwen3.5).
 - fp8_clamped_swiglu_experts: gpt-oss's raw biased, interleaved gate_up and down parameters and
   its clamped SwiGLU.
@@ -53,7 +52,7 @@ class FP8SwiGLUExpertsFunc(torch.autograd.Function):
     """
     down_proj(silu(gate_proj(x)) * up_proj(x)) for FP8 experts with separate gate, up and down
     weights, as one autograd node. The SwiGLU output h and its gradients are produced directly in
-    FP8, never in bf16. Equal to FP8GroupedLinear, silu_mul and FP8GroupedLinear run in turn.
+    FP8, never in bf16.
     """
 
     @staticmethod
@@ -191,9 +190,9 @@ class FP8ScatterQuantFunc(torch.autograd.Function):
     Received tokens to the quantized grouped expert input in one pass: the dedup expansion, the
     scatter by expert and the FP8 quantization, without writing the bf16 expert input.
 
-    Returns a zero-storage (M, N) stand-in for that bf16 input, which only carries its gradient
-    back to the received tokens, followed by scatter_for_grouped_gemm's outputs with the bf16
-    tokens replaced by the quantized tuple. Rows are in token order within each expert.
+    Returns a zero-storage (M, N) stand-in for that bf16 input, which only carries its gradient back
+    to the received tokens, then reverse_shuffle_idxs, grouped_mm_offs, ks_tensor, ks and the
+    quantized tuple, all as scatter_quant returns them, row placement within an expert included.
     """
 
     @staticmethod
@@ -494,8 +493,8 @@ def fp8_clamped_swiglu_experts(
     main_grads: tuple[torch.Tensor | None, torch.Tensor | None] = (None, None),
 ) -> torch.Tensor:
     """
-    down(clamped_swiglu(gate_up(x) + b_gate_up)) + b_down through FP8ClampedSwiGLUExpertsFunc.
-    quantized_gate_up and quantized_down are the (fp8, scale, fp8_t, scale_t) quantized weights.
+    down(clamped_swiglu(gate_up(x) + b_gate_up)) + b_down. quantized_gate_up and quantized_down are
+    the (fp8, scale, fp8_t, scale_t) quantized weights.
     """
     return FP8ClampedSwiGLUExpertsFunc.apply(
         x, w_gate_up, b_gate_up, w_down, b_down, grouped_mm_offs, ks, ks_tensor, group_indices,

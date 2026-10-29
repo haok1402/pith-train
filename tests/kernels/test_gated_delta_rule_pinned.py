@@ -142,7 +142,6 @@ def test_not_supported_off_the_geometry() -> None:
 
 
 CASES = [
-    # (S, H, gate, resets)
     (64, 16, "model", ()),
     (100, 16, "mild", ()),
     (256, 32, "model", ()),
@@ -188,8 +187,8 @@ def test_comparison_is_sensitive() -> None:
     assert calc_diff(o, ref) > 1e-4
 
 
-# The launch configs FLA's autotuner picks on H200 at this geometry (FLA 0.5.2, Triton 3.7.1),
-# which the pinned launches use. FLA is restricted to them so both sides run the same kernels.
+# The launch configs FLA's autotuner picks on H200 at this geometry (FLA 0.5.2, Triton 3.7.1), which
+# the pinned launches use. FLA is restricted to them so both sides run the same kernels.
 RECORDED = {
     "cumsum": dict(num_warps=1, num_stages=3),
     "kkt_solve": dict(BK=64, num_warps=1, num_stages=3),
@@ -295,8 +294,8 @@ def test_bit_exact_against_fla(monkeypatch: pytest.MonkeyPatch, S: int, resets, 
 
 def test_fla_config_drift_detected(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    Another launch config on FLA's side (dqkwg's num_warps) changes the gate gradient, so the
-    exact comparison detects config drift.
+    Another launch config on FLA's side (dqkwg's num_warps) changes the gate gradient, so the exact
+    comparison detects config drift.
     """
     configs = dict(RECORDED, dqkwg=dict(RECORDED["dqkwg"], num_warps=2))
     pin_fla(monkeypatch, configs)

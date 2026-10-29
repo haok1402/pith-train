@@ -75,7 +75,6 @@ def quant4_e4m3(x0: Float32, x1: Float32, x2: Float32, x3: Float32, r: tuple, *,
     )
 
 
-# fp32 constants of compute_fp8_scale as hex bit patterns, for the integer-compare form below.
 AMAX_MIN_BITS = f32_hex(1e-4)
 FP8_MAX_RCP_BITS = f32_hex(1.0 / 448.0)
 

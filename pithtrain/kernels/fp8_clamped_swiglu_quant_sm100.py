@@ -17,8 +17,7 @@ BLOCK = 128
 
 def find_row_groups(grouped_mm_offs: torch.Tensor, M: int) -> torch.Tensor:
     """
-    The group of each of the M rows, int64 (M,); rows past the last group end count to
-    the last group.
+    The group of each of the M rows, int64 (M,); rows past the last group end take the last group.
     """
     row_idx = torch.arange(M, device=grouped_mm_offs.device, dtype=torch.int64)
     group_ends = grouped_mm_offs.to(torch.int64)
@@ -26,26 +25,18 @@ def find_row_groups(grouped_mm_offs: torch.Tensor, M: int) -> torch.Tensor:
 
 
 def biased_gate_up(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor) -> torch.Tensor:
-    """
-    gate_up + bias[group of each row].
-    """
     return gate_up + bias[find_row_groups(grouped_mm_offs, gate_up.shape[0])]
 
 
 def clamped_swiglu_bwd_biased(dh: torch.Tensor, gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
     """
-    bf16 d(gate_up) from clamped_swiglu_bwd at the biased gate_up, dh cast to its dtype
-    as autograd does.
+    bf16 d(gate_up) of clamped_swiglu_bwd at gate_up + bias, dh cast to its dtype as autograd does.
     """
     x = biased_gate_up(gate_up, bias, grouped_mm_offs)
     return clamped_swiglu_bwd(dh.to(x.dtype), x, alpha, limit)
 
 
 def clamped_swiglu_quant_fwd_sm100(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, kmajor_channels: int | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    fp8cast_rowwise_kmajor_sm100(clamped_swiglu(gate_up + bias[group],
-    alpha, limit), grouped_mm_offs).
-    """
     M, N = gate_up.shape[0], gate_up.shape[1] // 2
     if M == 0 or N == 0:
         return kmajor_empty_outputs(M, N, gate_up.device)

@@ -49,8 +49,8 @@ WARMUP, ITERS = 3, 10
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache/pithtrain/tuning"
 """
-Where tuned choices are kept unless PITHTRAIN_TUNING_DIR says otherwise: a directory every node of
-the cluster sees (the home directory), so tuning is paid once per setup, not once per launch.
+Where tuned choices are kept unless PITHTRAIN_TUNING_DIR is set: the home directory, which every
+node sees, so tuning is paid once per setup.
 """
 
 TUNABLES: dict[str, "Tunable"] = {}
@@ -67,7 +67,7 @@ class Tunable:
 
     def __init__(self, name: str, candidates: tuple, default: Callable, prepare: Callable) -> None:
         self.name, self.candidates, self.default, self.prepare = name, candidates, default, prepare
-        self.table: dict[tuple, object] = {}  # (key, bucket) -> config, filled by each bucket's first pick
+        self.table: dict[tuple, object] = {}  # (key, bucket) -> config, cached by pick_untuned once the key has installed choices
         self.installed: dict[tuple, dict] = {}  # key -> {bucket: config} of the tuned or cached choices
         self.seen: dict[tuple, set] = {}  # key -> buckets pick() was asked for on this rank
         self.fingerprint = hashlib.sha256((repr(candidates) + inspect.getsource(inspect.getmodule(prepare))).encode()).hexdigest()[:16]
@@ -179,8 +179,8 @@ def time_launch(launch: Callable, config) -> float:
 
 def same_results(outputs: tuple, reference: tuple) -> bool:
     """
-    Whether outputs match reference up to accumulation order: within 2^-6 of reference's
-    largest magnitude, elementwise.
+    Whether outputs match reference elementwise within 2^-6 of reference's largest magnitude, which
+    allows for a different accumulation order.
     """
     return all(torch.allclose(out.float(), ref.float(), rtol=0, atol=2**-6 * max(ref.float().abs().max().item(), 1e-30)) for out, ref in zip(outputs, reference))
 
@@ -205,13 +205,11 @@ def time_candidate(tunable: Tunable, key: tuple, bucket: int, config) -> float |
 def tune_kernels() -> dict:
     """
     Install this setup's cached choices, then tune every key any rank has used that they lack. Call
-    on every rank at the same points: before the first training step (installs the cache, so that
-    step runs the cached choices) and after it (tunes what it used and the cache lacked). Rank 0
-    reads the cache for every rank; each rank times its share of the (key, candidate) tasks; every
-    rank installs the same pooled choice (per key and bucket the fastest candidate, unless the
-    default is within MARGIN), rank 0 adds it to the cache, every rank compiles the configs it will
-    launch, and all ranks check they installed the same choices, which also lines them up so the
-    next step starts together. Returns {(name, key, bucket): (config, default)} of this call.
+    on every rank before the first training step and after it. Per key and bucket the fastest
+    candidate is installed unless the default is within MARGIN, and rank 0 adds it to the cache;
+    every rank then compiles the configs it will launch and checks that all ranks installed the same
+    choices, which also lines them up so the next step starts together. Returns {(name, key,
+    bucket): (config, default)} of this call.
     """
     rank, world_size = (dist.get_rank(), dist.get_world_size()) if dist.is_available() and dist.is_initialized() else (0, 1)
     if not CACHED:  # the first call reads the cache: rank 0's read, the same on every rank

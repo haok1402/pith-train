@@ -113,7 +113,8 @@ def min_chunks(pp_size: int) -> int:
 class Microbatch:
     """
     One micro-batch of work for DualPipeV.step. Every pipeline rank gets the same list, so each
-    sizes its receive buffers without a broadcast; only the first rank reads the tensors.
+    sizes its receive buffers and reads cu_seqlens without a broadcast; only the first rank uses the
+    values of model_inputs and objective_inputs.
     """
 
     model_inputs: Tuple[torch.Tensor, ...]
@@ -219,7 +220,6 @@ class DualPipeV(nn.Module):
         device = distributed.device
         hidden = self.module[0].hidden_size
 
-        # One shape per micro-batch, so a ragged step sizes each receive buffer correctly.
         self.p2p_shapes = []
         for microbatch in microbatches:
             first_input, *_ = microbatch.model_inputs
@@ -361,9 +361,8 @@ class DualPipeV(nn.Module):
         nvtx.range_push(
             f"forward chunk {chunk_id0} (phase{phase0}) backward chunk {chunk_id1} (phase{phase1})"
         )
-        # This runs one micro-batch's forward against another's backward, and the backward drives
-        # the saved autograd graph without re-entering model code, so the forward's is the one to
-        # publish: nothing in the backward half can read it.
+        # Publish the forward's micro-batch: the backward half replays the saved autograd graph
+        # without re-entering model code, so nothing there reads it.
         training.current_microbatch = chunk_id0
         outputs0, loss0, objective_output0, input_grads1 = overlapped_forward_backward(
             module0,
@@ -434,7 +433,6 @@ class DualPipeV(nn.Module):
 
         self.commit_and_wait_comm()
 
-        # WeightGradStore runs its groups in the order the backward chunks flushed them.
         nvtx.range_push("weight chunk")
         WeightGradStore.pop()
         nvtx.range_pop()
@@ -449,7 +447,8 @@ class DualPipeV(nn.Module):
 
     def append_irecv(self, src: int, chunk_id: int) -> List[torch.Tensor]:
         """
-        Post a receive for one activation, sized by the shape agreed for that micro-batch.
+        Queue a receive from pipeline rank src for each tensor of micro-batch chunk_id, sized by its
+        recorded shape; commit_and_wait_comm posts them.
         """
         tensors = [
             torch.empty(
@@ -556,8 +555,8 @@ class DualPipeV(nn.Module):
     def run_step(self, microbatches: List[Microbatch], objective: Optional[Callable]) -> List[Any]:
         self.forward_only = not torch.is_grad_enabled()
 
-        # ZeRO-1 for the step: no resharding or gradient sync after backward, and no root
-        # post-backward callback per backward; the end of step() runs both once.
+        # ZeRO-1 for the step: no resharding, gradient sync or root post-backward callback after
+        # each backward; the end of step() runs all three once.
         for module in self.module:
             if isinstance(module, FSDPModule):
                 module.set_is_last_backward(False)
@@ -755,8 +754,8 @@ def overlapped_forward_backward(
 
     for layer_idx in range(num_layers):
         if layer_idx != 0:
-            # Merged layers set outs without args at the next layer, and args without outs
-            # at the previous one; unmerged layers set both.
+            # Merged boundary: stage1.outs without stage1.args on the next layer, stage5.args
+            # without stage5.outs on the previous one; unmerged boundaries set all four.
             stage1_record = chunk_record1.layers[-layer_idx].stage1
             use_merged = stage1_record.outs is not None and stage1_record.args is None
 
@@ -797,8 +796,6 @@ def overlapped_forward_backward(
             # Fuse module0's stage 5 of the previous layer with stage 1 of this one, except at the
             # first and last boundaries when module0 has the extra layer.
             if len(module0_layers) <= len(module1.layers) or (layer_idx - 1 > 0 and layer_idx < num_layers - 1):  # fmt: skip
-                # stage5.args goes on the previous layer with outs left None, stage1.outs on
-                # the next layer with args left None -- that is the merged marker.
                 prev_layer, next_layer = module0_layers[layer_idx - 1], module0_layers[layer_idx]
                 stage5_args, stage1_outs, dispatch_tokens, residual, routing = stage5_stage1_f(
                     ctx,

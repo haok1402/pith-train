@@ -107,5 +107,5 @@ __all__.append("chunk_gdr_fwd_pinned")
 __all__.append("gated_delta_rule_pinned_supported")
 
 
-# Launch-config tuning (once, after the first training step)
+# Launch-config tuning
 __all__.append("tune_kernels")

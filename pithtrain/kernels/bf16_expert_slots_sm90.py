@@ -3,9 +3,9 @@ SM90 implementations of the bf16_expert_slots functions.
 
 The grouping is two launches with no host sync: a per-chunk expert histogram, then one CTA per chunk
 of slots that ranks its slots stably within their expert (warp match_any votes) and derives each
-expert's base row from all the chunk histograms, so CTAs never wait for each other. For the
-gather-sum it also fills, per token, a bitmask of its local experts and its grouped row in each,
-which the gather-sum walks in expert order.
+expert's base row from all the chunk histograms, so CTAs never wait for each other. With expand_idx
+it also fills, per token, a bitmask of its local experts and its grouped row in each, which the
+gather-sum walks in expert order.
 """
 
 from typing import NamedTuple
@@ -84,9 +84,8 @@ class ThreadSlots:
 
 class GroupSlots:
     """
-    Grouping launch, one CTA per CHUNK slots. Each CTA sums the chunk histograms: all of them
-    give every expert's first row, those below its chunk the chunk's base within each expert. CTA
-    0 writes cu_seqlens.
+    Grouping launch, one CTA per CHUNK slots. Each CTA sums the chunk histograms: all of them give
+    every expert's first row, those below its chunk the chunk's base within each expert.
     """
 
     def __init__(self, num_groups: int, has_expand: bool) -> None:
@@ -182,7 +181,7 @@ class GroupSlots:
             peers = match_any(expert_idx)
             num_lower_peers = cute.arch.popc(peers & lt_mask)
             num_peers = cute.arch.popc(peers)
-            safe_expert_idx = expert_idx * slot_ok  # safe index for invalid lanes (their stores/loads are masked)
+            safe_expert_idx = expert_idx * slot_ok  # invalid lanes hold -1; 0 keeps their unmasked shared loads in bounds
             sts_b32(s_warp_count + (warp * G + safe_expert_idx) * 4, Uint32(num_peers), slot_ok & Int32(num_lower_peers == 0))
             cute.arch.sync_threads()
             self.scan_warp_counts(tidx, s_run, s_warp_count, s_warp_base)
@@ -299,8 +298,8 @@ class GatherSum:
     @cute.jit
     def sum_rows(self, mGrad, mOut, rows, row_oks, token_idx, token_ok, tidx) -> None:
         """
-        Sum the given grad rows in fp32, in order, into the token's out row, 16-byte
-        vectors per thread.
+        Sum the given grad rows in fp32, in order, into the token's out row, in
+        16-byte vectors per thread.
         """
         H, K = self.H, self.K
         num_vecs = H // 8

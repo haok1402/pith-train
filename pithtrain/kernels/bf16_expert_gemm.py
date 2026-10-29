@@ -86,8 +86,8 @@ def bf16_expert_wgrad_gate_up(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a_idx):
     In place, returns None: mg_gate[g] += dg_g^T @ x[a_idx]_g and mg_up[g] += du_g^T @ x[a_idx]_g
     over the grouped rows of each expert, accumulated in fp32 onto the existing values.
 
-    - x, a_idx, cu: as in bf16_expert_gated_forward. dpre, dpre_swapped: as
-      returned by bf16_expert_dgated_backward.
+    - x, a_idx, cu: as in bf16_expert_gated_forward. dpre, dpre_swapped: as returned by
+      bf16_expert_dgated_backward.
     - mg_gate, mg_up: fp32 (G, I, H) with the same strides, 16-byte aligned and a nonzero multiple
       of 16 bytes apart, in either address order.
 

@@ -88,7 +88,7 @@ def supports_group_indices(grouped_mm_offs: torch.Tensor, M: int) -> bool:
 
 def group_indices(grouped_mm_offs: torch.Tensor, M: int) -> torch.Tensor:
     """
-    (M,) int32 group id of every row, from the inclusive group ends grouped_mm_offs.
+    (M,) int32 group id of every row, from the cumulative group ends grouped_mm_offs.
     """
     G = grouped_mm_offs.shape[0]
     out = torch.empty(M, dtype=torch.int32, device=grouped_mm_offs.device)

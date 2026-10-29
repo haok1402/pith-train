@@ -114,8 +114,8 @@ def fp8_grouped_wgrad(
     """
     Weight gradient of an FP8 grouped linear from the per-channel FP8 (data, scale) pairs that
     quantize_grouped_input gives for grad_output (grad_ch) and input (input_ch). With an fp32
-    weight.main_grad the GEMM accumulates into it; otherwise the (G, N, K) result of the given
-    shape is added into weight.grad in bf16. Deferred to DualPipeV's W phase when
+    weight.main_grad the GEMM accumulates into it; otherwise the (G, N, K) result of the given shape
+    is added into weight.grad in bf16. Deferred to DualPipeV's W phase when
     WeightGradStore is enabled.
     """
     main_grad = getattr(weight, "main_grad", None)

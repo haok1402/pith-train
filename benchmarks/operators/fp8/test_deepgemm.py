@@ -40,9 +40,6 @@ except ImportError:
 if HAS_TE:
     _TE_FP8_RECIPE = MXFP8BlockScaling()
 
-# ---------------------------------------------------------------------------
-# Non-grouped workloads
-# ---------------------------------------------------------------------------
 # M values x (N, K) pairs from DeepGEMM generators.py enumerate_normal
 M_VALUES = [128, 2048, 4096, 8192]
 NK_PAIRS = [
@@ -60,9 +57,6 @@ NORMAL_WORKLOADS: List[NormalWorkload] = [
     (m, n, k) for m, (n, k) in itertools.product(M_VALUES, NK_PAIRS)
 ]
 
-# ---------------------------------------------------------------------------
-# Grouped workloads
-# ---------------------------------------------------------------------------
 GROUP_SHAPES = [(4, 8192), (8, 4096), (16, 2048), (32, 1024)]  # (num_groups, m_per_group)
 GROUP_NK_PAIRS = [
     (6144, 7168),
@@ -79,9 +73,6 @@ GROUP_WORKLOADS: List[GroupWorkload] = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Non-grouped benchmarks
-# ---------------------------------------------------------------------------
 def bench_normal_fwd(M: int, N: int, K: int) -> Metrics:
     torch.manual_seed(42)
     x = torch.randn((M, K), dtype=torch.bfloat16, device="cuda")
@@ -187,18 +178,17 @@ def bench_normal_bwd(M: int, N: int, K: int) -> Metrics:
     return Metrics(ref_time, fp8_time, flops, io_bytes, te_ms=te_time)
 
 
-# ---------------------------------------------------------------------------
-# Grouped benchmarks
-# ---------------------------------------------------------------------------
 def _make_group_indices(grouped_mm_offs: torch.Tensor, M: int):
-    """Per-row group indices where the m-grouped GEMM takes them (Hopper); None elsewhere."""
     return m_grouped_group_indices(grouped_mm_offs, M)
 
 
 def _make_grouped_inputs(
     num_groups: int, m_per_group: int, K: int
 ) -> Tuple[torch.Tensor, torch.Tensor, list, torch.Tensor, int, torch.Tensor | None]:
-    """Create scattered input and grouped_mm_offs (outside timed region)."""
+    """
+    Scatter random tokens to random groups. Return the scattered tokens, grouped_mm_offs, ks,
+    ks_tensor, their row count and the group-index hint (None where the GEMM takes none).
+    """
     m = num_groups * m_per_group
     tokens = torch.randn((m, K), dtype=torch.bfloat16, device="cuda")
     expert_idxs = torch.randint(0, num_groups, (m,), device="cuda")
@@ -330,9 +320,6 @@ def bench_grouped_bwd(num_groups: int, m_per_group: int, N: int, K: int) -> Metr
     return Metrics(ref_time, fp8_time, flops, io_bytes, te_ms=te_time)
 
 
-# ---------------------------------------------------------------------------
-# Output formatting
-# ---------------------------------------------------------------------------
 def _format_table(
     title: str,
     dim_labels: str,
@@ -399,7 +386,6 @@ def main() -> None:
 
     te_tag = " vs TE FP8" if HAS_TE else ""
 
-    # --- Non-grouped ---
     normal_rows = []
     for M, N, K in NORMAL_WORKLOADS:
         fwd = bench_normal_fwd(M, N, K)
@@ -416,7 +402,6 @@ def main() -> None:
         )
     )
 
-    # --- Grouped ---
     grouped_rows = []
     for num_groups, m_per_group, N, K in GROUP_WORKLOADS:
         fwd = bench_grouped_fwd(num_groups, m_per_group, N, K)

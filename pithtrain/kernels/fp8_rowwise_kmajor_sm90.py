@@ -110,9 +110,6 @@ class RowwiseKmajor:
         self.quantize_tile(rows, pid_row, pid_col, tidx, mX.shape[0], bases, s_red.iterator.toint())
 
     def thread_coords(self, tidx):
-        """
-        Lane, warp, column vector index and row block index of thread tidx.
-        """
         lane, warp = tidx % 32, tidx // 32
         col_vec_idx, row_block_idx = lane % 8 + 8 * (warp % 2), lane // 8 + 4 * (warp // 2)
         return lane, warp, col_vec_idx, row_block_idx
@@ -209,12 +206,12 @@ class RowwiseKmajor:
 
     def store_scales(self, row_amax, col_amax, tok_scale_base, kmajor_scale_base, M, sub_block):
         """
-        Store the E8M0 scales of the tile's rows and columns, one lane per (warp, row) and (warp,
-        column), and return the reciprocals of the scales of this thread's 8 rows and 8 columns.
+        Store the E8M0 scales of the tile's 128 rows and 128 columns, each from one lane, and return
+        the reciprocals of the scales of this thread's 8 rows and 8 columns.
         """
         # this lane scales row row_block_idx * 8 + warp_col_vec_idx (half warp_col_vec_idx % 2 of
         # row_amax[warp_col_vec_idx // 2]) and columns warp_row_block_idx and warp_row_block_idx + 4
-        # of its column vector, and the shuffles hand each thread the reciprocals of its rows and columns
+        # of its column vector; shuffles then hand each thread the reciprocals it needs
         row_amax_pair = selp(Int32(sub_block.warp_col_vec_idx < 4), selp(Int32(sub_block.warp_col_vec_idx < 2), row_amax[0], row_amax[1]), selp(Int32(sub_block.warp_col_vec_idx < 6), row_amax[2], row_amax[3]))
         row_scale, row_rcp_lane = e8m0_scale_bf16x2(row_amax_pair, Int32(sub_block.warp_col_vec_idx % 2))
         col_scale_lo, col_rcp_lo = e8m0_scale_bf16x2(selp(Int32(sub_block.warp_row_block_idx < 2), col_amax[0], col_amax[1]), Int32(sub_block.warp_row_block_idx % 2))

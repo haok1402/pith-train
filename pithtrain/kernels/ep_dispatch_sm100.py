@@ -72,8 +72,8 @@ def reduce_and_prefix_sum_kernel(
     tokens_per_ep_rank_ptr,  # [EP_SIZE] int64
     expert_starts_ptr,  # [NUM_EXPERTS] int64
     rank_starts_ptr,  # [EP_SIZE] int64
-    dedup_counters_ptr,  # [EP_SIZE] int64 (zeroed)
-    sort_counters_ptr,  # [NUM_EXPERTS] int64 (zeroed)
+    dedup_counters_ptr,  # [EP_SIZE] int64, output, zeroed here for kernel 3
+    sort_counters_ptr,  # [NUM_EXPERTS] int64, output, zeroed here for kernel 3
     send_meta_ptr,  # [EP_SIZE * (EXPERTS_PER_RANK + 1)] int64
     NUM_CTAS: tl.constexpr,
     NE_PADDED: tl.constexpr,
@@ -134,8 +134,8 @@ def dedup_scatter_expand_kernel(
 ):
     """
     Pass 1 places each token once per visited rank in dispatch_token_idxs and records its position
-    in dedup_local_pos; pass 2 counting-sorts the slots by expert into idxs and looks up
-    expand_idx from dedup_local_pos.
+    in dedup_local_pos; pass 2 counting-sorts the slots by expert into idxs and looks up expand_idx
+    from dedup_local_pos.
     """
     pid = tl.program_id(0)
     tok_start = pid * BLOCK_M

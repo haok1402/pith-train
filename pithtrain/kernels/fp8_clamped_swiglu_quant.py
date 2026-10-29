@@ -2,10 +2,10 @@
 Picker of gpt-oss's biased clamped SwiGLU fused with the rowwise + K-major FP8 quantization of its
 consumers (and, in backward, the gate_up bias gradient).
 
-SM90 runs the fused CuTe-DSL kernels, other architectures the unfused Triton sequence. FP8 bytes
-and scale values are identical; the SM90 kernels return both scales MN-major, the SM100 path
-row-major. padded is honoured by the fused SM90 kernels only. These are fused FP8 expert ops,
-used where fp8_fused_experts_supported().
+SM90 runs the fused CuTe-DSL kernels, SM100 the unfused Triton sequence. FP8 bytes and scale values
+are identical; the SM90 kernels return both scales MN-major, the SM100 path row-major. padded is
+honoured by the fused SM90 kernels only. These are fused FP8 expert ops, used where
+fp8_fused_experts_supported().
 """
 
 import torch
@@ -64,11 +64,11 @@ def clamped_swiglu_quant_kmajor(gate_up: torch.Tensor, bias: torch.Tensor, group
     The per-channel (K-major) pair (h_ch, h_ch_scale) of the same h as clamped_swiglu_quant_rowwise,
     the k-grouped wgrad operand, in quantize_grouped_input's SM90 K-major layout (N channels).
 
-    With padded, the fused SM90 kernel lays it out with N rounded up to a multiple of 256
-    channels, which k_grouped_fp8_gemm takes without a copy; the extra channels are left
-    unwritten. Inputs the fused kernel does not cover (N % 8 != 0, more than 1024 groups, a
-    non-bf16 bias) and SM100 return N channels; the scale's row count is the channel count either
-    way. Scale strides are unspecified. Deterministic.
+    With padded, the fused SM90 kernel lays it out with N rounded up to a multiple of 256 channels,
+    which k_grouped_fp8_gemm takes without a copy; the extra channels are left unwritten. Inputs the
+    fused kernel does not cover (N % 8 != 0, more than 1024 groups, a non-bf16 bias) and SM100
+    return N channels; the scale's row count is the channel count either way. Scale strides are
+    unspecified. Deterministic.
     """
     kmajor_channels = k_grouped_safe_size(gate_up.shape[1] // 2) if padded else None
     match ARCH_MAJOR:
@@ -84,8 +84,7 @@ def clamped_swiglu_quant_kmajor(gate_up: torch.Tensor, bias: torch.Tensor, group
 
 def clamped_swiglu_bwd_quant(dh: torch.Tensor, gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float, padded: bool = False) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
     """
-    Backward of gpt-oss's biased clamped SwiGLU with its consumers'
-    quantization: (dgu_quant, d_bias).
+    Backward of the biased clamped SwiGLU and its consumers' quantization: (dgu_quant, d_bias).
 
     dh is bf16 (M, N), the gradient of h; gate_up is the saved bf16 (M, 2N) pre-bias GEMM output;
     bias is (G, 2N). dgu_quant is quantize_grouped_input (SM90 K-major layout) of the bf16 gradient

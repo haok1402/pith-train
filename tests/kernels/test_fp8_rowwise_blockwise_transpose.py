@@ -46,8 +46,7 @@ def ref_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 def ref_blockwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    128x128 blockwise quantization of a 2D tensor: (q (N, K), scale (ceil(N / 128),
-    ceil(K / 128))).
+    128x128 blockwise quantization: (q (N, K), scale (ceil(N / 128), ceil(K / 128))).
     """
     N, K = x.shape
     num_nblocks, num_kblocks = (N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
@@ -142,9 +141,6 @@ def test_special_values(M: int, K: int) -> None:
 
 
 def test_strided_rows() -> None:
-    """
-    A row-strided view (a slice of a wider buffer).
-    """
     torch.manual_seed(1)
     base = torch.randn(1000, 2304, device="cuda", dtype=torch.bfloat16)
     check(base[:, :2048])

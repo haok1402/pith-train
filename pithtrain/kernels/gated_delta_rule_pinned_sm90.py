@@ -80,7 +80,7 @@ def launch(name: str, grid: tuple, **kwargs) -> None:
         key_positions[name] = tensor_positions, value_positions
     tensor_positions, value_positions = key_positions[name]
     device = args[tensor_positions[0]].device.index
-    # A float scalar keys on its type only (None, e.g. an absent scale, is a constexpr).
+    # None (e.g. an absent scale) is a constexpr, so it keys on its value.
     key = (name, device, kwargs["num_warps"], kwargs["num_stages"], *(float if args[i].__class__ is float else args[i] for i in value_positions), *((args[i].dtype, args[i].data_ptr() & 15) for i in tensor_positions))
     fn = compiled.get(key)
     if fn is None:
@@ -109,9 +109,6 @@ def pinned_launch_supported() -> bool:
 
 
 def check_supported() -> bool:
-    """
-    The uncached check behind pinned_launch_supported.
-    """
     if fla.__version__ != VERSIONS["fla"] or triton.__version__ != VERSIONS["triton"]:
         return False
     if ARCH_MAJOR != 9:
@@ -135,9 +132,6 @@ def chunk_cumsum(x: torch.Tensor, reverse: bool) -> torch.Tensor:
 
 
 def recompute_w_u(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    recompute_w_u_fwd.
-    """
     B, T, H, K, HV, V = *k.shape, *v.shape[2:]
     w, u = k.new_empty(B, T, HV, K), torch.empty_like(v)
     launch("w_u", (triton.cdiv(T, BT), B * HV), k=k, v=v, beta=beta, w=w, u=u, A=A, g=g, cu_seqlens=None, chunk_indices=None, T=T, H=H, HV=HV, K=K, V=V, BT=BT, BK=64, BV=64, USE_G=True, IS_VARLEN=False, **CONFIGS["w_u"])
@@ -232,7 +226,7 @@ def gated_delta_rule_pinned_supported(q: torch.Tensor, k: torch.Tensor, v: torch
     """
     Whether chunk_gdr_fwd_pinned / chunk_gdr_bwd_pinned apply to this call: the recorded geometry
     (pinned_shapes) on SM90 with the recorded FLA and Triton versions (pinned_launch_supported).
-    Otherwise the caller uses FLA's autotuned entry points. Constant per geometry, so torch.compile
-    evaluates it rather than tracing into it.
+    Otherwise the caller uses FLA's autotuned entry points. Constant per geometry: torch.compile
+    guards on the shape and dtype checks and treats pinned_launch_supported as a constant.
     """
     return pinned_shapes(q, k, v, g, beta) and pinned_launch_supported()

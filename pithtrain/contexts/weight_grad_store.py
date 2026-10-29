@@ -2,8 +2,7 @@
 Deferred weight gradients for zero-bubble pipeline scheduling.
 
 Expert layers whose backward defers its weight-gradient GEMMs put them here as closures, and
-DualPipeV runs them in its W phase. Unlike the other contexts this is per-step state that the
-pipeline drives, not a value set once at startup.
+DualPipeV runs them in its W phase.
 
 WeightGradStore is derived from dualpipe/utils.py in DeepSeek's DualPipe project
 (https://github.com/deepseek-ai/DualPipe), licensed under the MIT License. Copyright (c) 2025

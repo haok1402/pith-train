@@ -1,13 +1,8 @@
 """
-Verifies memoized_launch against calling entry() directly: replaying entry() through a recorded
-host-side launch plan returns the same outputs.
-
-Contract: memoized_launch(kind, inputs, scalars, entry) returns what entry() returns for these
-inputs on the first call of a signature, on the recording call and on every replayed call, with
-fresh inputs each time. entry is any callable returning a tuple of tensors, and inputs names the
-tensors it reads, inputs["q"] included. With FA4's entry, as the flash_attn_v4 operator calls it,
-the replayed outputs equal FA4's own (forward bit for bit, backward up to FA4's atomic
-accumulation order) and match plain attention in PyTorch.
+Verifies memoized_launch against calling entry() directly: on the first call of a signature, on
+the recording call and on every replayed call, with fresh inputs, it returns what entry() returns.
+With FA4's entry, as the flash_attn_v4 operator calls it, the outputs equal FA4's own (forward bit
+for bit, backward up to FA4's atomic accumulation order) and match plain attention in PyTorch.
 """
 
 import importlib.metadata
@@ -256,8 +251,8 @@ def test_back_to_back_calls_own_their_buffers():
 
 def test_unseen_signature_calls_entry():
     """
-    The first call of a signature runs entry itself (it may compile), as does the recording call;
-    a changed shape or scalar is a new signature.
+    The first call of a signature runs entry itself (it may compile); a changed shape or scalar is
+    a new signature.
     """
     q, k, v, do, learnable_sink, scale, causal, window = make("qwen3-gqa", 2)
     q2, k2, v2 = (t[:, :640].contiguous() for t in (q, k, v))

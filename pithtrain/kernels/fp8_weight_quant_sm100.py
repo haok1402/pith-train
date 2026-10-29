@@ -142,10 +142,10 @@ BLOCK = 128
 @triton.jit
 def fp8_shard_tile_kernel(x_ptr, amax_ptr, out_ptr, row_offset, local_rows, K, tile_row_start, amax_group_offset, amax_stride_g, amax_cols, CAST: tl.constexpr, NATIVE_E8M0: tl.constexpr):
     """
-    One 128x128 tile (global rows [tile_row_idx * 128, tile_row_idx * 128 + 128) of local
-    expert pid(2)) of a row shard holding global rows [row_offset, row_offset + local_rows).
-    CAST False writes the amax of the shard's rows in the tile to the grid; CAST True casts
-    them with the reduced grid.
+    One 128x128 tile (global rows [tile_row_idx * 128, tile_row_idx * 128 + 128) of local expert
+    pid(2)) of a row shard holding global rows [row_offset, row_offset + local_rows). CAST False
+    writes the amax of the shard's rows in the tile to the grid; CAST True casts them with the
+    reduced amax grid.
     """
     BLOCK: tl.constexpr = 128
     pid_row, pid_col, pid_g = tl.program_id(0), tl.program_id(1), tl.program_id(2)

@@ -57,10 +57,9 @@ PIPELINE_STAGE_MODELS = (DeepSeekV2Model, GptOssModel, Qwen3MoeModel, Qwen35MoeM
 
 def is_muon_param(name: str, param: torch.Tensor) -> bool:
     """
-    True if Muon should optimize param, False if it belongs to AdamW instead.
-
-    Muon takes the 2D hidden weights and the stacked 3D expert weights. AdamW takes the rest: 1D
-    norms, biases and sinks, embeddings, LM head, MoE gate and router, and stacked expert biases.
+    True if Muon should optimize param: the 2D hidden weights and the stacked 3D expert weights.
+    AdamW takes the rest: 1D norms, biases and sinks, embeddings, LM head, MoE gate and router, and
+    stacked expert biases.
     """
     if param.ndim < 2:
         return False
@@ -255,12 +254,14 @@ class TrainingCfg(SlottedDefault):
 def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02, seed: int = 0) -> None:
     """
     Initialize this rank's V-chunks (an nn.Sequential of two models) in place, before FSDP shards
-    them. Every 2D or 3D weight draws from N(0, init_std), except o_proj and down_proj, which use
-    N(0, init_std / sqrt(2 * num_layers)) with num_layers of the full model. 1D parameters stay
-    as they are.
+    them. Every parameter of 2 or more dims draws from N(0, init_std), except o_proj and down_proj,
+    which use N(0, init_std / sqrt(2 * num_layers)) with num_layers of the full model. 1D parameters
+    stay as they are.
 
-    Each weight, and each routed expert in it, draws from a stream keyed by its name in the full
-    model and its global expert index, so every parallel layout starts from the same weights.
+    Each parameter draws from a stream keyed by its name in the full model, and each routed expert
+    of a 3D stacked expert weight from one keyed also by its global expert index, so every parallel
+    layout starts from the same weights. The 2D stacked expert biases of gpt-oss draw as one tensor,
+    so they differ across EP sizes.
     """
     output_std = init_std / math.sqrt(2.0 * num_layers)
     for chunk_name, param in model.named_parameters():
@@ -414,7 +415,8 @@ def setup_model(
     local_seq_len = cfg.sequence_length // cp_size
 
     if cfg.moe_load_balance_coef > 0:
-        # Reuses the flat dp x cp mesh apply_fsdp built, so this adds no communicator.
+        # With hsdp_replica 1 this reuses the flat dp x cp mesh apply_fsdp built,
+        # adding no communicator.
         lb_group = distributed.attn_mesh["dp", "cp"]._flatten().get_group()
         for i in range(2):
             for layer in modules[i].layers.values():

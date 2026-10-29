@@ -1,6 +1,6 @@
 """
 Triton scatter of MoE tokens into the expert-grouped, zero-padded layout of a grouped GEMM
-(scatter_by_expert). Rows within an expert land in atomic_add order. Both architectures run it.
+(scatter_by_expert). Both architectures run it.
 """
 
 from typing import Optional
@@ -126,7 +126,7 @@ def scatter_for_grouped_gemm_kernel(
         pad_start, pad_end = split_rows(num_pad_rows, num_group_tokens, pos_in_group)
         zero_rows(output_tokens_ptr, group_start.to(tl.int64) + num_group_tokens, pad_start, pad_end, dst_row_stride, hidden_size, zero_dtype, BLOCK_H, NUM_H_BLOCKS)
 
-    # rows [actual_M, M_rounded) of the allocation, split among all programs
+    # rows [last_group_end, M_rounded) of the allocation, split among all programs
     last_group_end = tl.load(grouped_mm_offs_ptr + num_groups - 1).to(tl.int64)
     M_rounded = ((last_group_end + GEMM_ALLOC_ALIGNMENT - 1) // GEMM_ALLOC_ALIGNMENT * GEMM_ALLOC_ALIGNMENT)
     num_tail_rows = M_rounded - last_group_end
@@ -197,7 +197,7 @@ def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num
     num_ctas = min(triton.cdiv(num_tokens, BLOCK), 32)
     compute_group_offsets_kernel[(num_ctas,)](expert_idxs, device_group_counts, grouped_mm_offs, ks_tensor, completion_counter, num_tokens, num_ctas, PADDING_ALIGNMENT=padding_alignment, NUM_GROUPS=num_groups, BLOCK=BLOCK)
 
-    # ks_tensor is final after the prep kernel: its copy to the host overlaps the scatter kernel
+    # ks_tensor is final after the prep kernel
     copy_stream, copy_event = get_copy_stream_and_event(device)
     copy_event.record()
 

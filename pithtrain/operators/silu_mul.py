@@ -27,6 +27,6 @@ class SiLUMulFunc(torch.autograd.Function):
 
 def silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """
-    Element-wise silu(gate) * up of two tensors of the same shape and dtype, in that dtype.
+    Element-wise silu(gate) * up of contiguous tensors of the same shape and dtype, in that dtype.
     """
     return SiLUMulFunc.apply(gate, up)

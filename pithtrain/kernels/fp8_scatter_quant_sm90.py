@@ -224,8 +224,7 @@ class Prep:
     @cute.jit
     def store_ranks(self, inv_base, rank_base, T, src_rows, token_idxs, token_oks, safe_expert_idxs, chunk_ranks, s_lower_count) -> None:
         """
-        Store each token slot's rank within its expert and the inverse map inv[g * T + rank]
-        = source row.
+        Store each slot's rank within its expert and the inverse map inv[g * T + rank] = source row.
         """
         for i in cutlass.range_constexpr(PREP_CHUNK // PREP_THREADS):
             rank = Int32(lds_b32(s_lower_count + safe_expert_idxs[i] * 4)) + chunk_ranks[i]
@@ -417,7 +416,7 @@ def scatter_quant_sm90(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_gr
     grouped_mm_offs, ks_tensor, group_token_counts = meta[:G], meta[G : 2 * G], meta[2 * G : 3 * G]
     rank, inv = meta[3 * G : 3 * G + T], meta[3 * G + T :]
     reverse_shuffle_idxs, x_fp8 = torch.empty(T, dtype=torch.int64, device=device), torch.empty((M_alloc, N), dtype=torch.float8_e4m3fn, device=device)
-    # the kernel addresses the MN-major rowwise scale with the device-side M, so it fits the upper bound too
+    # the kernel strides this scale by the device-side M <= M_alloc, so the M_alloc buffer holds it
     x_scale = mn_major_scale(M_alloc, num_col_tiles, device)
     x_ch_fp8 = torch.empty(M_alloc * N, dtype=torch.float8_e4m3fn, device=device)
     x_ch_scale = mn_major_scale(N, M_alloc // TILE, device)

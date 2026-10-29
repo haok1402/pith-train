@@ -34,8 +34,8 @@ fp8: bool
 """
 Whether layers are built for FP8 compute, False for BF16.
 
-This and the two class bindings below are read from module constructors and kernels that hold no
-configuration object, so they live here rather than being passed down.
+This and the two class bindings below are read by models and operators that hold no configuration
+object, so they live here rather than being passed down.
 """
 
 
@@ -66,10 +66,8 @@ One learning-rate scheduler per optimizer, in the same order.
 
 current_microbatch: int | None = None
 """
-Index into the micro-batch list of the step in flight, or None outside a step.
-
-Routing replay reads it to find which micro-batch a gate call belongs to, which the model cannot
-tell from the layer alone: DualPipeV interleaves a rank's two chunks across micro-batches. It is
-set before each forward only, which suffices because the backward replays the saved graph without
-re-entering module code.
+Index into the micro-batch list of the step in flight, or None outside a step, for code that cannot
+tell the micro-batch from the layer alone: DualPipeV interleaves a rank's two chunks across
+micro-batches. It is set before each forward only, which suffices because the backward replays the
+saved graph without re-entering module code.
 """

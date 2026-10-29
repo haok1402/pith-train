@@ -31,7 +31,6 @@ class ClampedSwiGLUFunc(torch.autograd.Function):
 
 def clamped_swiglu(gate_up: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
     """
-    Clamped SwiGLU of gate_up (M, 2N), gate in the even columns and up in the odd ones, returning
-    (M, N) in gate_up's dtype.
+    Clamped SwiGLU of contiguous gate_up (M, 2N), returning (M, N) in gate_up's dtype.
     """
     return ClampedSwiGLUFunc.apply(gate_up, alpha, limit)

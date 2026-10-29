@@ -29,8 +29,8 @@ def check(y, bias, group_indices):
     assert torch.equal(y, want)
 
 
-# Hidden sizes: gpt-oss-20b 2880 (the caller), the other models' 2048, and one that is not a
-# multiple of the 256-column block.
+# Hidden sizes: gpt-oss-20b 2880 (the caller, not a multiple of the 256-column block), the other
+# models' 2048, a narrow 100 and a wide 4096.
 @pytest.mark.parametrize("H", [2880, 2048, 100, 4096])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
@@ -45,7 +45,7 @@ def test_ragged_groups(H, dtype, index_dtype):
 
 def test_gpt_oss_experts():
     """
-    32 local experts (EP1), random routing padded to 128 rows per expert.
+    32 local experts (EP1), random routing padded to a multiple of 128 rows per expert.
     """
     gen = torch.Generator(device="cuda").manual_seed(1)
     raw = torch.randint(0, 400, (32,), generator=gen, device="cuda")
@@ -73,9 +73,6 @@ def test_large_negative_and_zero():
 def test_empty():
     y = torch.empty(0, 2880, device="cuda", dtype=torch.bfloat16)
     check(y, torch.randn(4, 2880, device="cuda").to(torch.bfloat16), group_ids([0, 0, 0, 0]))
-
-
-# Fallback inputs: they go through PyTorch, with the same result.
 
 
 def test_rows_not_multiple_of_128():

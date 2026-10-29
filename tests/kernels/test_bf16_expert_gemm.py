@@ -206,7 +206,7 @@ def test_swiglu_forward_backward(case, layout):
     ref[slot_of.long()], ref_abs[slot_of.long()] = y_ref, y_abs
     assert_within(out, ref, ref_abs, "down")
 
-    # dy read by slot_of, dpre in the weights' address order, h re-emitted bit for bit
+    # dy read by slot_of, dpre in the weights' address order
     dy = torch.randn(M, H, **BF16)
     dpre, h2, swapped = bf16_expert_dgated_backward(dy, wd, pre, cu, slot_of, wg, wu)
     assert swapped == (wu.data_ptr() < wg.data_ptr()) == (layout == "swapped")

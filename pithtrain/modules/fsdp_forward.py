@@ -78,9 +78,6 @@ def scan_tree(x: Any, dtype: torch.dtype | None, grads: list) -> int:
 
 
 def scan_call(args: tuple, kwargs: dict, dtype: torch.dtype | None, grads: list) -> int:
-    """
-    scan_tree over a call's arguments: args, then the kwargs values.
-    """
     flags = scan_tree(args, dtype, grads)
     for value in kwargs.values():
         flags |= scan_tree(value, dtype, grads)
@@ -122,9 +119,6 @@ def backward_state_call_ok(state: Any) -> bool:
 
 
 def forward_cast_dtype(state: Any) -> torch.dtype | None:
-    """
-    The dtype FSDP casts forward inputs to, or None when it does not cast them.
-    """
     policy = state._mp_policy
     return policy.param_dtype if policy.cast_forward_inputs else None
 
@@ -148,8 +142,8 @@ register_post_backward_apply = super(torch.autograd.Function, RegisterPostBackwa
 
 def repeat_call_ok(state: Any) -> bool:
     """
-    Whether a call may take the lean path: every precondition under which FSDP's full pre- and
-    post-forward reduce to the side effects the lean path performs holds.
+    Whether a call may take the lean path: FSDP's full pre- and post-forward would reduce to the
+    side effects the lean path performs.
     """
     if not torch.is_grad_enabled() or torch.compiler.is_compiling() or is_bw():
         return False
@@ -252,8 +246,8 @@ PER_CALL_DISABLE_CODE = _dynamo_disable(lambda: None).__code__
 
 def lean_post_backward(post_backward):
     """
-    Wrap FSDPParamGroup.post_backward so that a backward that reduces nothing runs FSDP's own body
-    without its debug log and profiler ranges. A backward that reduces runs FSDP's own.
+    Wrap FSDPParamGroup.post_backward so that a backward that reduces nothing skips FSDP's debug log
+    and profiler ranges; one that reduces runs FSDP's own.
     """
 
     @functools.wraps(post_backward)

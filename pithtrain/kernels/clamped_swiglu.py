@@ -1,7 +1,6 @@
 """
-gpt-oss's clamped SwiGLU, (up_clamped + 1) * gate_clamped * sigmoid(alpha * gate_clamped) with
-gate_clamped = min(gate, limit) and up_clamped = clamp(up, -limit, limit), forward and backward
-Triton kernels over an interleaved gate_up (M, 2N). Both architectures run them.
+gpt-oss's clamped SwiGLU (see clamped_swiglu_fwd), forward and backward Triton kernels over an
+interleaved gate_up (M, 2N). Both architectures run them.
 """
 
 from __future__ import annotations
@@ -33,7 +32,6 @@ def clamped_swiglu_fwd_kernel(gate_up_ptr, out_ptr, num_elements, alpha, limit, 
 
 @triton.jit
 def clamped_swiglu_bwd_kernel(grad_out_ptr, gate_up_ptr, grad_gate_up_ptr, num_elements, alpha, limit, BLOCK_SIZE: tl.constexpr):
-    # A saturated clamp passes no gradient; the boundary itself does, as torch.clamp.
     block_start = tl.program_id(0).to(tl.int64) * BLOCK_SIZE
     elem_offs = block_start + tl.arange(0, BLOCK_SIZE)
     elem_mask = elem_offs < num_elements

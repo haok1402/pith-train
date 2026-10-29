@@ -5,7 +5,7 @@ input, so there is no fallback.
 
 One CTA of 1024 / R threads per 128x128 tile, R = 8 (large grids) or 4 (small grids); each thread
 owns R consecutive rows of 16 columns, so the transposed store needs no smem transpose: it writes
-each column's R rows as one R-byte vector.
+each column's R rows as vectors of up to R bytes.
 """
 
 from typing import Callable
@@ -35,8 +35,8 @@ def asm_u32(operands: list, ptx: str, constraints: str, loc=None, ip=None) -> Ui
 
 # The register block is kept as packed 32-bit words of the input dtype (bf16 / f16: two elements
 # per word, low half first; f32: one). Every helper widens to fp32 only inside its own asm block,
-# so LLVM cannot hoist the widening and keep an fp32 copy of the block live: that copy doubled the
-# register footprint, and forcing fewer registers made ptxas spill.
+# so LLVM cannot hoist the widening and keep an fp32 copy of the block live, which would double the
+# register footprint, or make ptxas spill under a register cap.
 
 
 @dsl_user_op
@@ -98,8 +98,8 @@ def quantize4_words(words: list, elem_picks: list, kind: str, rcp: Float32, *, l
 
 def global_ptr(base: cute.Pointer, offset: Int64, elem_bytes: int, dtype: type, align: int) -> cute.Pointer:
     """
-    Global pointer offset elements (of elem_bytes bytes) past base, as dtype,
-    asserted align-byte aligned.
+    Global pointer offset elements (elem_bytes each) past base, as dtype, assumed
+    align-byte aligned.
     """
     addr = base.toint() + offset * elem_bytes
     return cute.make_ptr(dtype, addr, cute.AddressSpace.gmem, assumed_align=align)
@@ -113,7 +113,7 @@ class SubBlock:
     def __init__(self, tidx, m_tile_idx, k_tile_idx, M, K, rows: int) -> None:
         self.tidx, self.m_tile_idx, self.k_tile_idx, self.M, self.K = tidx, m_tile_idx, k_tile_idx, M, K
         self.warp, self.lane = tidx // 32, tidx % 32
-        # each warp covers 4 x rows rows and 8 x 16 columns; lane l takes row group l // 8, column group l % 8
+        # each warp covers 4 x rows rows and 8 x 16 columns
         self.row_group_idx, self.col_group_idx = self.lane // 8, self.lane % 8
         self.row0, self.col0 = m_tile_idx * BLOCK + self.warp * (4 * rows) + self.row_group_idx * rows, k_tile_idx * BLOCK + self.col_group_idx * 8
 
@@ -352,7 +352,7 @@ def fp8cast_rowwise_blockwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Ten
         x = x.contiguous().as_strided((M, K), (K, 1))
         x_row_stride = K
     dtype = x.dtype
-    # Host cost matters (hundreds of calls per step): resolve once per (dtype, shape, row stride, pointer alignment).
+    # Host cost matters (hundreds of calls per step), so resolve once per key.
     key = (dtype, M, K, x_row_stride, x.data_ptr() & 15)
     entry = DISPATCH.get(key)
     if entry is None:

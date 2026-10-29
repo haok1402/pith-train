@@ -40,7 +40,7 @@ def segment_tile(offs_padded_ptr, G, BLOCK_M: tl.constexpr, BLOCK_G: tl.constexp
     """
     Groups are cut into BLOCK_M-row tiles from their own start, numbered consecutively across
     groups. Returns (tiles before each group, tiles per group, group starts, group ends) as BLOCK_G
-    vectors (zero past G).
+    vectors; past G a lane has no tiles and zero bounds, and its tiles-before is the total count.
     """
     group_offs = tl.arange(0, BLOCK_G)
     group_starts, group_ends = tl.load(offs_padded_ptr + group_offs, mask=group_offs < G, other=0), tl.load(offs_padded_ptr + group_offs + 1, mask=group_offs < G, other=0)
@@ -94,9 +94,9 @@ def segment_tile_reduce_kernel(partials_ptr, offs_padded_ptr, out_ptr, G, H: tl.
 
 def segment_sum_along_rows(x: torch.Tensor, grouped_mm_offs: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     """
-    Per-group column sums of rows already sorted by group (the bias gradient of x +
-    bias[group_ids]): a new (G, H) tensor of out_dtype, row g the sum of rows [offs[g - 1], offs[g])
-    of x (offs[-1] = 0).
+    Per-group column sums of rows already sorted by group (the bias gradient when x is the gradient
+    of y = z + bias[group_ids]): a new (G, H) tensor of out_dtype, row g the sum of rows
+    [offs[g - 1], offs[g]) of x, with the start 0 for g = 0.
 
     - x: (M, H) contiguous, any float dtype; not modified.
     - grouped_mm_offs: integer (G,) non-decreasing cumulative group ends; ends past M are clamped to
@@ -137,7 +137,8 @@ def segment_sum_along_rows(x: torch.Tensor, grouped_mm_offs: torch.Tensor, out_d
 @triton.jit
 def block_segment_sum_kernel(partials_ptr, offs_ptr, out_ptr, H, BLOCK_H: tl.constexpr):
     """
-    out[group_idx] = sum of the 128-row-block partials of expert group_idx, in row order (fp32).
+    out[group_idx] = the 128-row-block partials of expert group_idx added in row order in fp32, then
+    cast to the dtype of out.
     """
     group_idx = tl.program_id(0)
     h_offs = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)

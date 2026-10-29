@@ -2,8 +2,8 @@
 CuTe-DSL (SM90) kernels of the fp8_weight_quant feature, bit-identical to the Triton ones in
 fp8_weight_quant_sm100: the blockwise transposes, the FP8 parameter all-gather kernels, and
 one-launch variants of the shard amax and the scales over a fixed list of tensors. The picker does
-not use the blockwise transposes: their callers run inside torch.compile regions, which cannot
-trace the CuTe-DSL launchers.
+not use the blockwise transposes: their callers run inside torch.compile regions, which cannot trace
+the CuTe-DSL launchers.
 
 Numerics follow compute_fp8_scale (SM90 branch) exactly. The tile amax is an integer max over the
 magnitude bits (|x| of finite non-negative floats orders like its bit pattern), so a NaN orders
@@ -173,7 +173,8 @@ def load_rows(x_base: Int64, row0: Int32, col0: Int32, num_rows: Int32, K: Int32
     Load the thread's 8x8 block, rows row0 + i valid when 0 <= row0 + i < num_rows.
 
     x_base addresses element (0, 0) of a row-major (rows, K) matrix. Returns 8 rows of words: four
-    bf16x2 words per row for 2-byte (or bf16-rounded) data, eight fp32 words per row otherwise.
+    bf16x2 words per row for 2-byte (or bf16-rounded) data, eight fp32 words for 4-byte data, two
+    words of four bytes for 1-byte data.
     """
     rows = []
     for i in cutlass.range_constexpr(8):
@@ -428,7 +429,8 @@ def compile_blockwise(dtype: torch.dtype, mode: str, is_batched: bool):
 
 def store_mode(num_tiles: int, N: int, K: int, *tensors: torch.Tensor) -> str:
     """
-    Store path for the blockwise kernels: the widest the shape and pointers allow.
+    Store path for the blockwise kernels: the widest the shape and pointers allow, smem only from
+    SMEM_MIN_TILES tiles up.
     """
     if any(tensor.data_ptr() % 16 for tensor in tensors):
         mode = "scalar"
@@ -775,8 +777,8 @@ def find_table_row(table_base: Int64, num_rows: Int32, cta_idx: Int32, row_words
 class ShardAmaxMulti:
     """
     Shard amax over n shards. The table holds two rows per shard: (shard, amax, local_rows, K,
-    row_offset, first tile row, element offset of group_offset in the grid, first CTA) and (R, C,
-    column tiles, tile rows, 0, 0, 0, 0).
+    row_offset, first tile row, element offset of group_offset in the grid, first CTA) and (amax
+    rows, amax columns, column tiles, tile rows, 0, 0, 0, 0).
     """
 
     @cute.jit
@@ -846,8 +848,8 @@ class FP8ShardAmaxGroup:
 
 class ScalesMulti:
     """
-    Scales over n grids. The table holds one row per grid: (amax, scale, scale_t, R, C, CTAs per
-    group, 0, first CTA).
+    Scales over n grids. The table holds one row per grid: (amax, scale, scale_t, amax rows, amax
+    columns, CTAs per group, 0, first CTA).
     """
 
     @cute.jit

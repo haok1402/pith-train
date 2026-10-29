@@ -1,7 +1,7 @@
 """
 Picker of the expert-parallel dispatch index math: the sender-side dedup / counting-sort metadata
 (fused_dedup_prepare_dispatch) and the receiver-side expert and expand indices
-(expert_and_expand_idx). SM90 runs the CuTe-DSL kernels of ep_dispatch_sm90, other GPUs the Triton
+(expert_and_expand_idx). SM90 runs the CuTe-DSL kernels of ep_dispatch_sm90, SM100 the Triton
 kernels of ep_dispatch_sm100.
 """
 

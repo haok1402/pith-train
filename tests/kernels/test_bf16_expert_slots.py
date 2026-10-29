@@ -8,10 +8,10 @@ bit for bit.
   a token repeated once per local expert it chose), with empty experts, expand_idx None or not,
   0 slots and 0 tokens, for 8 / 16 / 32 / 64 local experts.
 - bf16_expert_gather_sum: each token's grouped rows summed in fp32 in ascending expert order and
-  rounded once to bf16, bit for bit.
-- bf16_expert_gather_rows: x[idx] bit for bit (the no-expand input gradient dx[row_of]).
-- expert_slot_segment_sum: per-segment fp32 row sums, bit for bit with PyTorch summing 256-row
-  chunks in row order and then the chunk partials in order, the order the contract fixes.
+  rounded once to bf16.
+- bf16_expert_gather_rows: x[idx] (the no-expand input gradient dx[row_of]).
+- expert_slot_segment_sum: per-segment fp32 row sums, 256-row chunks summed in row order and then
+  the chunk sums in order, as the contract fixes.
 """
 
 import pytest
@@ -34,8 +34,8 @@ pytestmark = pytest.mark.skipif(
 def ep_routing(G: int, ep: int, tokens_per_sender: int, k: int, empty=(), seed=0):
     """
     (expert_idxs, expand_idx, T): per sender, each token picks 1..k of the G local experts (none
-    of empty), slots sender-major and expert-minor. expand_idx indexes the concatenated
-    deduplicated tokens of all senders.
+    of empty), slots sender-major and expert-minor. expand_idx indexes the concatenated deduplicated
+    tokens of all senders.
     """
     gen = torch.Generator().manual_seed(seed)
     allowed = torch.tensor([expert for expert in range(G) if expert not in empty])

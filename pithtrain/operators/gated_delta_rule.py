@@ -38,8 +38,7 @@ CHUNK_SIZE = 64  # FLA's chunk size (BT)
 def cp_state(group_name: Optional[str], seq_len: int) -> Tuple:
     """
     FLA's context-parallel context and chunk indices for this rank, or (None, None) without a
-    group. Cached because build_cp_context reaches host memory; the result depends only on the
-    group and the local sequence length.
+    group. Cached because build_cp_context reaches host memory.
     """
     if group_name is None:
         return None, None
@@ -58,7 +57,7 @@ def gdr_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, 
     cp_context, chunk_indices = cp_state(cp_group_name, q.shape[1])
     g_out, o, A, _, initial_state, _ = chunk_gated_delta_rule_fwd(q=q, k=k, v=v, g=g, beta=beta, scale=q.shape[-1] ** -0.5, initial_state=None, output_final_state=False, cu_seqlens=None if cp_context is None else cp_context.cu_seqlens, cp_context=cp_context, chunk_indices=chunk_indices, state_v_first=False, use_gate_in_kernel=False, A_log=None, dt_bias=None)  # fmt: skip
     # Under CP initial_state is the merged predecessor state; the backward recomputes h from it
-    # rather than paying a second all-gather. It stays absent on the dense path.
+    # rather than paying a second all-gather. Without CP it is None.
     return o.to(q.dtype), g_out, A, [] if initial_state is None else [initial_state]
 
 
@@ -132,8 +131,8 @@ def dense_bwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cum: torch.Te
     """
     chunk_gated_delta_rule_bwd, dense: (dq, dk, dv, dg, dbeta), dg with respect to the raw gate.
     With grouped value heads, dq and dk are per value head, shaped like the expands q and k came in
-    as; autograd's backward of the expand sums them over each group, rounding as a
-    repeat_interleave of q and k would.
+    as; autograd's backward of the expand sums them over each group, rounding as a repeat_interleave
+    of q and k would.
     """
     dq, dk, dv, dg, dbeta = chunk_gdr_bwd_pinned(select_key_heads(q), select_key_heads(k), v, g_cum, beta, A, do)  # fmt: skip
     return dq.view(q.shape), dk.view(k.shape), dv, dg, dbeta

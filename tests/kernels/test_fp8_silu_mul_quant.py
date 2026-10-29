@@ -6,13 +6,10 @@ Contract: the SwiGLU silu(g) * u (or its two gradients), rounded to bf16 as the 
 silu_mul_fwd and silu_mul_bwd round it, then quantized as quantize_grouped_input does on SM90:
 rowwise 1x128 FP8 plus the per-channel FP8 laid out K-major per group.
 
-The kernels' sigmoid uses ex2.approx, which PyTorch cannot reproduce bit for bit. So the test
-checks two things instead:
-
-- the FP8 bytes and scale values equal, exactly, a PyTorch quantization of the bf16 output of the
-  plain kernels silu_mul_fwd and silu_mul_bwd, and
-- those bf16 activations are within one bf16 rounding (plus fp32 noise) of a float64 PyTorch
-  evaluation of the same formula.
+The kernels' sigmoid uses ex2.approx, which PyTorch cannot reproduce bit for bit, so the test checks
+that the FP8 bytes and scale values equal, exactly, a PyTorch quantization of the bf16 output of
+silu_mul_fwd and silu_mul_bwd, and that this output is within one bf16 rounding (plus fp32 noise) of
+a float64 PyTorch evaluation of the same formula.
 
 Recipe: per 128-element block, amax = max |x| ignoring NaN, scale = 2^ceil(log2(max(amax, 1e-4) /
 448)) and fp8 = e4m3_satfinite(x * (1 / scale)), rounded to nearest even.
@@ -251,7 +248,7 @@ def test_silu_mul_bwd_quant_gu(groups: str, N: int, kind: str) -> None:
 
 def test_exhaustive_bf16_gate() -> None:
     """
-    Check every finite BF16 gate value against several up / dh scales, on all four entry points.
+    Check every finite BF16 gate value against several up scales, on all four entry points.
     """
     bits = torch.arange(0, 1 << 16, device="cuda", dtype=torch.int32).to(torch.int16)
     g_all = bits.view(torch.bfloat16)

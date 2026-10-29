@@ -1,14 +1,7 @@
 """
-Verifier of segment_sum_along_rows against plain PyTorch.
-
-Contract: the rows of x (M, H) are sorted by group; group g spans rows [offs[g-1], offs[g]), with
-offs[-1] = 0 and offsets past M clamped to M. The result (G, H) holds each group's column sums,
-accumulated in fp32 and cast to out_dtype. The summation order is fixed (128-row tiles from the
-group's start, tile sums added in row order) whatever the number of groups, so the result is
-deterministic and a group's sum does not depend on the other groups.
-
-The tests check run-to-run equality, equality with the same group summed alone (which exercises
-the kernel's other internal path), and closeness to a float64 sum.
+Verifier of segment_sum_along_rows against plain PyTorch: run-to-run equality, equality with each
+group summed alone (which takes the kernel's other internal path when the full call has many
+groups), closeness to a float64 sum, and the documented summation order.
 """
 
 import pytest
@@ -104,7 +97,7 @@ def test_all_empty_and_trailing_padding():
             assert torch.all(got == 0)
         else:
             assert torch.all(got[1] == 0)  # rows 100..255 belong to no group
-    # Offsets past M are clamped out of the reduction: group 1 is rows 128..255.
+    # An offset past M is clamped to M: group 1 is rows 128..255.
     offs = torch.tensor([128, 512], device="cuda", dtype=torch.int32)
     got = segment_sum_along_rows(x, offs, torch.float32)
     assert ((got.double() - reference(x, offs)).abs() <= tolerance(x, offs)).all()

@@ -1,7 +1,7 @@
 """
 Picker of scatter_quant, the MoE stage-3 FP8 input: dedup expansion, scatter by expert and K-major
-FP8 quantization in one pass. SM90 runs the fused CuTe-DSL kernels (fp8_scatter_quant_sm90), other
-architectures the unfused Triton path (fp8_scatter_quant_sm100).
+FP8 quantization in one pass. SM90 runs the fused CuTe-DSL kernels (fp8_scatter_quant_sm90), SM100
+the unfused Triton path (fp8_scatter_quant_sm100).
 """
 
 from typing import Optional
@@ -23,9 +23,9 @@ def scatter_quant(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups:
       local expert (< num_groups) of each token slot. expand_idx: int64 (m,), the row of gathered
       of each slot, or None for the identity (then m_src must equal m, else ValueError). Inputs
       are not modified.
-    - padding_alignment must be 128. group_counts: the true per-expert slot counts on the
-      host, if known; it avoids the device-to-host copy (and host sync) of the padded sizes
-      and must match expert_idxs.
+    - padding_alignment must be 128. group_counts: the true per-expert slot counts on the host, if
+      known; it must match expert_idxs and saves the device-to-host copy (and host sync) of the
+      padded group sizes.
     - The 4-tuple is quantize_grouped_input's SM90 K-major layout over the M = sum(ks) grouped rows
       (each group padded with zero rows to a multiple of 128). reverse_shuffle_idxs: int64 (m,), the
       grouped row of each slot. grouped_mm_offs: int32 (G,) cumulative padded group ends. ks: host

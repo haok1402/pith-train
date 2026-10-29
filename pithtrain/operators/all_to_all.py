@@ -54,8 +54,8 @@ def all_to_all_async(
     group: torch.distributed.ProcessGroup,
 ) -> Tuple[torch.Tensor, torch.distributed.Work]:
     """
-    Async all-to-all of x on the current stream, returning (output, work). The caller waits on work
-    before reading output. The arguments are those of torch.distributed.all_to_all_single.
+    Async all-to-all of x, returning (output, work). The caller waits on work before reading output.
+    The split sizes and group are those of torch.distributed.all_to_all_single.
     """
     valid_size = sum(output_split_sizes)
     # NCCL reads x by these splits; a mismatch would read past the tensor.

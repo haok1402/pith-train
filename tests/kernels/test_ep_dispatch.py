@@ -256,9 +256,6 @@ def test_dispatch_stability_is_enforced() -> None:
     assert buckets(swapped, counts) == buckets(ref["idxs"], counts)
 
 
-# Inputs the H200's CuTe kernel does not cover take the atomic-placement fallback.
-
-
 def test_dispatch_fallback_int32_ids() -> None:
     for ep, epr, k in ((4, 32, 8), (8, 8, 6), (1, 64, 6)):
         topk_ids = routing(4133, k, ep * epr, epr, seed=2).int()
@@ -280,8 +277,8 @@ def test_dispatch_fallback_many_bins() -> None:
 
 def expand_reference(meta: torch.Tensor, received_expand_idx: torch.Tensor, ep: int, epr: int):
     """
-    Each slot's local expert, and its sender-local expand_idx plus the dedup tokens of the
-    preceding senders; slots are sender-major and expert-minor.
+    Each slot's local expert, and its sender-local expand_idx plus the dedup tokens of the preceding
+    senders; slots are sender-major and expert-minor.
     """
     meta_rows = meta.view(ep, epr + 1)
     segment_sizes = meta_rows[:, :epr].reshape(-1)
@@ -362,10 +359,10 @@ def test_expert_and_expand_idx_fallback_strided() -> None:
 @pytest.mark.parametrize("ep", [2, 4, 8])
 def test_dispatch_round_trip(ne: int, k: int, ep: int) -> None:
     """
-    ep_size senders with their own routing (ragged token counts, one empty): each receiver
-    gathers the senders' send_meta rows and expand_idx segments for it, as the operator's
-    all-to-alls do, and every received slot must name its sender's token (through the
-    concatenated dedup chunks and the global expand_idx) and that token's expert.
+    ep_size senders with their own routing (ragged token counts, one empty): each receiver gathers
+    the senders' send_meta rows and expand_idx segments for it, as the operator's all-to-alls do,
+    and every received slot must name its sender's token (through the concatenated dedup chunks and
+    the global expand_idx) and that token's expert.
     """
     epr = ne // ep
     tokens_per_sender = [0 if sender == 1 else 37 + 1000 * sender for sender in range(ep)]
@@ -403,7 +400,7 @@ SIM_CONFIGS = [
     (256, 8, 128, 16),
     (10, 4, 8, 2),
     (32, 1, 8, 4),  # k=1: no dedup
-    (32, 4, 8, 2),  # many experts per rank
+    (32, 4, 8, 2),
     (2, 2, 4, 2),  # tiny
     (1, 2, 8, 4),  # single token
     (2048, 8, 128, 2),  # Qwen3-30B-A3B: many experts, few EP ranks
@@ -477,8 +474,7 @@ def test_expert_and_expand_idx_sim(
     ms: int, k: int, num_experts: int, ep_size: int, seed: int
 ) -> None:
     """
-    Random received counts: each slot's local expert (slots sender-major, expert-minor) and its
-    expand_idx plus the dedup counts of the preceding senders.
+    Random received counts and expand_idx, checked against expand_reference.
     """
     torch.manual_seed(seed)
     epr = num_experts // ep_size

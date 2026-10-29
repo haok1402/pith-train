@@ -47,10 +47,10 @@ __all__ = ["Qwen35MoeGatedDeltaNet", "Qwen35MoeModel", "Qwen35MoeTopKRouter"]
 
 def pipeline_layer_sizes(num_layers: int, stage_count: int) -> list[int]:
     """
-    Layers per pipeline stage for Qwen3.5: the even split, with one layer moved off the last stage
-    (norm, lm_head over a 248k vocabulary and the loss, all on pipeline rank 0) onto the middle
-    stage, which the last pipeline rank holds. Pipeline rank 0 holds the first and the last stage,
-    so it gives up one layer while the two stages of every rank still differ by at most one.
+    Layers per pipeline stage for Qwen3.5: the even split, with one layer moved from the last stage
+    (norm, lm_head over a 248k vocabulary and the loss, on pipeline rank 0) to the middle stage (on
+    the last pipeline rank). The move applies only with at least 4 stages and only if the two
+    stages of every rank still differ by at most one layer.
     """
     sizes = layer_sizes(num_layers, stage_count)
     if stage_count < 4:
@@ -199,8 +199,8 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         mixed_qkv = self.in_proj_qkv(hidden_states, quantized_hidden)
         z = self.in_proj_z(hidden_states, quantized_hidden).reshape(B, S, -1, self.head_v_dim)
         b, a = self.in_proj_b(hidden_states), self.in_proj_a(hidden_states)
-        # Causal depthwise conv + SiLU, truncated back to S (padding=kernel_size-1). The prepended
-        # state displaces the zeros conv1d would pad with, shifting the valid window by offset.
+        # Under CP, the tokens prepended from the previous rank replace the conv's zero padding, so
+        # the valid output starts at offset.
         offset = 0
         if distributed.cp_size > 1:
             offset = self.conv_kernel_size - 1
@@ -208,8 +208,8 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         if cu_seqlens is None:
             query, key, value = self.conv_qkv(mixed_qkv, offset)
         else:
-            # Mask taps crossing document boundaries. Round after SiLU to match Inductor's
-            # fused conv/SiLU; an intermediate bf16 cast makes eager and compiled results differ.
+            # Mask taps crossing document boundaries. Round after SiLU to match Inductor's fused
+            # conv/SiLU; an intermediate bf16 cast makes eager and compiled results differ.
             kernel_size, positions = self.conv_kernel_size, document_positions(cu_seqlens, S)
             padded, conv_weight = F.pad(mixed_qkv.transpose(1, 2).float(), (kernel_size - 1, 0)), self.conv1d.weight.float()  # fmt: skip
             conv_out = sum(padded[..., i : i + S] * conv_weight[..., i] * (positions >= kernel_size - 1 - i) for i in range(kernel_size))  # fmt: skip
@@ -218,8 +218,8 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         # .float() on A_log guards against -inf when loaded in low precision.
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
         if cu_seqlens is not None:
-            # exp(-128) underflows fp32 to zero, resetting state at document boundaries.
-            # A finite gate avoids FLA's inf-inf; its magnitude preserves chunk-cumsum precision.
+            # exp(-128) underflows fp32 to zero, resetting state at document boundaries. A finite
+            # gate avoids FLA's inf-inf; its magnitude preserves chunk-cumsum precision.
             g = torch.where(positions[:, None] == 0, -128.0, g)
         if distributed.cp_size > 1:
             core_attn_out = gated_delta_rule(query, key, value, g, beta, distributed.cp_group)

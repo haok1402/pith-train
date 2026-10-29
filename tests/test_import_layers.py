@@ -21,10 +21,10 @@ library's interface, over pithtrain/, tests/, benchmarks/, tools/ and examples/:
 - importing pithtrain.kernels loads neither cutlass, QuACK nor FA4: no module it imports at module
   level, transitively, imports them at module level;
 - kernels/ imports only third-party code and other kernels/ modules; contexts/ imports nothing
-  from pithtrain at runtime; operators/ imports only kernels/, contexts/ and sibling operators;
-  pipeline/, models/ and tasks/ import only what the layering allows (models import pipeline/ for
-  layer_partition and model_forward, a package-level 2-cycle that is acyclic per module because
-  pipeline/ imports only models/interface.py);
+  from pithtrain at runtime; operators/ imports only kernels/, contexts/, sibling operators and
+  models/interface.py; pipeline/, models/ and modules/ import only what the layering allows (models
+  import pipeline/ for layer_partition and model_forward, a package-level 2-cycle that is acyclic
+  per module because pipeline/ imports only models/interface.py);
 - _sm90 / _sm100 files exist only in kernels/, and every _sm90 file has its _sm100 sibling unless
   it is SM90-only or a shared SM90 helper;
 - no _sm100 file imports an _sm90 file or a picker, an _sm90 file imports another feature's _smXX
@@ -34,7 +34,8 @@ library's interface, over pithtrain/, tests/, benchmarks/, tools/ and examples/:
 - the modules/ files the models import do not import the models back;
 - the module import graph of pithtrain/ has no cycle.
 
-Imports inside functions count; imports under "if TYPE_CHECKING:" do not.
+Imports inside functions count; imports under "if TYPE_CHECKING:" count only in the checks of
+imports of pithtrain.kernels.
 """
 
 from __future__ import annotations
@@ -135,8 +136,8 @@ HEAVY = {"cutlass", "quack", "flash_attn"}
 
 def top_level_imports(path: Path) -> list[str]:
     """
-    Return the modules path imports at module level (not inside a function), resolved to
-    pithtrain modules where they are one.
+    Return the modules path imports in its top-level statements (not inside a function, if or try),
+    resolved to pithtrain modules where they are one.
     """
     out: list[str] = []
     for node in ast.parse(path.read_text()).body:
@@ -459,8 +460,8 @@ def find_violations() -> set[tuple[str, str, str]]:
         if heavy:
             found.add(("kernels-eager-heavy", mod, heavy[0]))
 
-    # Inside kernels/: a literal __all__ per module, no module-level _names, sibling imports only
-    # of names in the sibling's __all__.
+    # Inside kernels/: a literal __all__ per module, no _names at any level, sibling imports only of
+    # names in the sibling's __all__.
     module_all: dict[str, set[str]] = {}
     for path in sorted(KERNELS.glob("*.py")):
         if path.name == "__init__.py":
@@ -532,7 +533,7 @@ def find_violations() -> set[tuple[str, str, str]]:
 
 def find_cycles() -> list[list[str]]:
     """
-    Return one representative per strongly connected component of more than one module.
+    Return each strongly connected component of more than one module (an import cycle), sorted.
     """
     index: dict[str, int] = {}
     low: dict[str, int] = {}

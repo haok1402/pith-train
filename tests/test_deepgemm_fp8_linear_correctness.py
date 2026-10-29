@@ -48,9 +48,6 @@ def copy_weights(src, dst):
     [(128, 256), (256, 128), (512, 512), (256, 1024)],
 )
 def test_fp8_linear_forward(in_features, out_features):
-    """
-    FP8Linear forward output is close to BF16 Linear.
-    """
     from pithtrain.operators.linear import FP8Linear
 
     bf16_linear = nn.Linear(in_features, out_features, bias=False).cuda().to(torch.bfloat16)
@@ -67,9 +64,6 @@ def test_fp8_linear_forward(in_features, out_features):
 
 
 def test_fp8_linear_forward_with_bias():
-    """
-    FP8Linear forward with bias is close to BF16 Linear.
-    """
     from pithtrain.operators.linear import FP8Linear
 
     bf16_linear = nn.Linear(128, 256, bias=True).cuda().to(torch.bfloat16)
@@ -86,9 +80,6 @@ def test_fp8_linear_forward_with_bias():
 
 
 def test_fp8_linear_backward_input_grad():
-    """
-    FP8Linear input gradients are close to BF16.
-    """
     from pithtrain.operators.linear import FP8Linear
 
     in_features, out_features = 256, 512
@@ -109,9 +100,6 @@ def test_fp8_linear_backward_input_grad():
 
 
 def test_fp8_linear_backward_weight_grad():
-    """
-    FP8Linear weight gradients are close to BF16.
-    """
     from pithtrain.operators.linear import FP8Linear
 
     in_features, out_features = 256, 512
@@ -136,9 +124,6 @@ def test_fp8_linear_backward_weight_grad():
     [(4, 128, 256), (8, 256, 512), (2, 256, 128)],
 )
 def test_fp8_grouped_linear_forward(num_groups, in_features, out_features):
-    """
-    FP8GroupedLinear forward output is close to BF16 GroupedLinear.
-    """
     from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
     from pithtrain.operators.token_scatter import scatter_for_grouped_gemm
 
@@ -167,9 +152,6 @@ def test_fp8_grouped_linear_forward(num_groups, in_features, out_features):
 
 
 def test_fp8_grouped_linear_backward():
-    """
-    FP8GroupedLinear input and weight gradients are close to BF16.
-    """
     from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
     from pithtrain.operators.token_scatter import scatter_for_grouped_gemm
 

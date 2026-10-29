@@ -1,6 +1,5 @@
 """
-Rowwise FP8 quantization of x plus 128x128 blockwise FP8 quantization of x.T from one read of x:
-SM90 runs the CuTe-DSL kernel, SM100 the Triton kernel.
+Picker of fp8cast_rowwise_blockwise_transpose: the CuTe-DSL kernel on SM90, Triton on SM100.
 """
 
 import torch

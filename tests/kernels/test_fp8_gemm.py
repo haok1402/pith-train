@@ -405,8 +405,7 @@ def check_kgrouped(d: torch.Tensor, ks: list[int], N: int, K: int, **pad) -> Non
             assert torch.equal(d[group], d0[group]), f"empty group {group} changed"
             continue
         prod = ref_a[group] @ ref_b[group].T
-        # tolerance, not bit equality: DeepGEMM's reduce-add into fp32 d accumulates at its own
-        # precision
+        # a tolerance: DeepGEMM's reduce-add into fp32 d accumulates at its own precision
         assert calc_diff(d[group] - d0[group], prod) < 1e-3, group
 
 
@@ -454,7 +453,7 @@ KGROUPED_CASES = [
     ([128, 66048, 0, 256], 256, 128, None, None),
     # deadlock guard (odd first-operand block count)
     ([512, 256, 384, 128], 2880, 2880, None, None),  # gpt-oss down: both odd, pads a
-    ([256, 128, 640], 2880, 1024, None, None),  # odd M, even N: transposed product
+    ([256, 128, 640], 2880, 1024, None, None),  # odd N blocks, even K blocks: transposed product
     ([384, 128], 5760, 2880, None, None),  # gpt-oss gate_up: pads a
     ([1024, 0, 512, 256], 1408, 2048, None, None),  # deepseek-v2-lite (11 blocks), empty group
     ([256, 384], 2048, 1408, None, None),
@@ -536,7 +535,6 @@ def test_act_weight_gemm_and_dgrad_wgrad(M: int, K: int, N: int) -> None:
     x_q, x_ref_scale = ref_rowwise(x)
     ref = dq_rowwise(x_q, x_ref_scale) @ dq_blockwise(w_fp8, w_scale).T
     assert calc_diff(out, ref) < 1e-3
-    # the transposed activation is the 128x128 blockwise FP8 of x.T
     xt_q, xt_ref_scale = ref_blockwise(x.T)
     assert_fp8_equal(xt_fp8, xt_q, "input_t_fp8")
     assert_scale_equal(xt_scale, xt_ref_scale, "scale_input_t")

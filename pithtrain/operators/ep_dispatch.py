@@ -1,8 +1,7 @@
 """
-Expert-parallel dispatch: from the router's top-k to the deduplicated tokens to send and the
-routing metadata of stages 3-5 (RoutingInfo). prepare_dispatch_issue and PendingDispatch.finish
-split it in two, so that independent GPU work can be enqueued while the metadata is copied
-to the host.
+Expert-parallel dispatch: from the router's top-k to the deduplicated tokens to send and the routing
+metadata of stages 3-5 (RoutingInfo). prepare_dispatch_issue and PendingDispatch.finish split it in
+two, so that independent GPU work can be enqueued while the metadata is copied to the host.
 """
 
 from dataclasses import dataclass
@@ -18,8 +17,8 @@ from pithtrain.operators.token_scatter import padded_index_gather
 
 __all__ = ["PendingDispatch", "prepare_dispatch", "prepare_dispatch_issue"]
 
-# At most one deferred dispatch is outstanding per process: its metadata lands in the single
-# pinned buffer below, which the next issue would overwrite.
+# At most one deferred dispatch is outstanding per process: its metadata lands in the single pinned
+# buffer below, which the next issue would overwrite.
 outstanding_dispatches: list["PendingDispatch"] = []
 
 
@@ -35,8 +34,8 @@ def pinned_meta_buffer(numel: int, dtype: torch.dtype) -> torch.Tensor:
 @dataclass(slots=True, eq=False)
 class PendingDispatch:
     """
-    A dispatch whose device work has been issued; finish() waits for its metadata to reach the
-    host and completes it. Only one may be outstanding at a time.
+    A dispatch whose device work has been issued; finish() waits for its metadata to reach the host
+    and completes it. Only one may be outstanding at a time.
     """
 
     hidden_states: torch.Tensor
@@ -110,8 +109,8 @@ def prepare_dispatch_issue(
     ep_group: dist.ProcessGroup,
 ) -> PendingDispatch:
     """
-    Issue the device side of an expert-parallel dispatch (ep_size > 1) on the current stream
-    without blocking the host. Returns a PendingDispatch whose finish() completes the dispatch.
+    Issue the device side of an expert-parallel dispatch (ep_size > 1) on the current stream without
+    blocking the host. Returns a PendingDispatch whose finish() completes the dispatch.
     """
     assert ep_size > 1
     assert not outstanding_dispatches, "a deferred dispatch is still outstanding"

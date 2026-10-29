@@ -75,7 +75,7 @@ def get_global_batch(
 
     The samples depend only on step and dp_rank, and each sample holds this rank's zigzag CP
     blocks. Every pipeline rank builds the same list, so DualPipeV needs no broadcast of shapes;
-    only pipeline rank 0 reads the tensors.
+    only pipeline rank 0 feeds the tensors to the model.
     """
     micro_batch_size = cfg.training.micro_batch_size
     global_batch_size = cfg.training.global_batch_size
@@ -87,7 +87,7 @@ def get_global_batch(
     local_batch_size = global_batch_size // dp_size
     start0 = step * global_batch_size + dp_rank * micro_batch_size
 
-    # Two blocks per rank under zigzag CP; at cp_size 1 they are one contiguous read.
+    # Two blocks per rank under zigzag CP; at cp_size 1 they are adjacent and cover the sequence.
     front, back = zigzag_spans(distributed.cp_rank, distributed.cp_size, sequence_length)
     block = len(front)
     local_seq_len = 2 * block
@@ -108,7 +108,6 @@ def get_global_batch(
     local_tokens = local_tokens.to(device, non_blocking=True)
     local_labels = local_labels.to(device, non_blocking=True)
 
-    # Rows are micro-batch major, so consecutive slices of micro_batch_size rows are micro-batches.
     return [
         Microbatch(
             model_inputs=(local_tokens[i : i + micro_batch_size],),
@@ -176,7 +175,7 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     # One detached loss per micro-batch on pipeline rank 0, an empty list on the other ranks.
     objective_outputs = model.step(microbatches, objective)
 
-    # Every rank holds the same labels, so each counts the same total for the gradient scale.
+    # Every pipeline rank holds the same labels, so all stages count the same total for the scale.
     counted = 0
     for microbatch in microbatches:
         (labels,) = microbatch.objective_inputs

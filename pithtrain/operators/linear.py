@@ -169,9 +169,9 @@ fp8_linear_fwd_prequantized.register_autograd(
 
 class FP8Linear(nn.Linear):
     """
-    Drop-in nn.Linear replacement with FP8 GEMMs. The bf16 weight is quantized once per pipeline
-    step and reused by every micro-batch of it; with fp8_param_gather set, the weight arrives
-    from the all-gather already quantized.
+    Drop-in nn.Linear replacement with FP8 GEMMs. Outside torch.compile, the bf16 weight is
+    quantized once per step and reused by every micro-batch of it; with fp8_param_gather set, the
+    weight arrives from the all-gather already quantized.
     """
 
     fp8_param_gather: bool = False

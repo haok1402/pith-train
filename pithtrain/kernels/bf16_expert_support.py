@@ -47,7 +47,6 @@ def bf16_experts_supported(num_groups: int | None = None) -> bool:
     """
     Whether BF16 routed experts with num_groups local experts (any count when None) can use the
     fused bf16_expert_* kernels in this process: needs SM90, quack-kernels exactly QUACK_VERSION,
-    and at most MAX_GROUPS (64) local experts. Warns once when the GPU or the QuACK version rules it
-    out. Returns False off SM90.
+    and at most MAX_GROUPS local experts. Warns once when the GPU or the QuACK version rules it out.
     """
     return runtime_supported() and (num_groups is None or num_groups <= MAX_GROUPS)

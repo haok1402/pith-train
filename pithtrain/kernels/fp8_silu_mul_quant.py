@@ -1,8 +1,8 @@
 """
 SwiGLU silu(g) * u fused with the rowwise + K-major FP8 quantization of the grouped GEMM that
-consumes it (FP8 routed experts). SM90 runs the fused CuTe-DSL kernels, other architectures the
-unfused Triton sequence; both give the same FP8 bytes and scale values. SM90 returns both scales
-MN-major (see fp8_scale_layout), SM100 row-major.
+consumes it (FP8 routed experts). SM90 runs the fused CuTe-DSL kernels, SM100 the unfused Triton
+sequence; both give the same FP8 bytes and scale values. SM90 returns both scales MN-major (see
+fp8_scale_layout), SM100 row-major.
 """
 
 import torch
@@ -56,9 +56,9 @@ def silu_mul_bwd_quant(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, group
     Backward of silu_mul_quant_fwd: (dg_quant, du_quant), each the 4-tuple of quantize_grouped_input
     of one gradient of silu_mul_bwd(dh, g, u), without writing the bf16 gradients.
 
-    dh, g, u: bf16 (M, N), contiguous, same shape; dh the gradient of h, g / u the saved
-    forward inputs. grouped_mm_offs, layout and SM100 behaviour as in silu_mul_quant_fwd.
-    Inputs are not modified. Deterministic.
+    dh, g, u: bf16 (M, N), contiguous, same shape; dh the gradient of h, g / u the saved forward
+    inputs. grouped_mm_offs, layout and SM100 behaviour as in silu_mul_quant_fwd. Inputs are
+    not modified. Deterministic.
     """
     check_operands([dh, g, u], grouped_mm_offs)
     match ARCH_MAJOR:
@@ -74,10 +74,9 @@ def silu_mul_bwd_quant(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, group
 
 def silu_mul_quant_gu_fwd(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    silu_mul_quant_fwd of the halves of a fused gate_up output: g = gu[:, :N] and u = gu[:,
-    N:] (concatenated, not interleaved). gu: bf16 (M, 2N) contiguous, not modified. Returns
-    the 4-tuple for the (M, N) h, the same as silu_mul_quant_fwd(gu[:, :N].contiguous(),
-    gu[:, N:].contiguous(), grouped_mm_offs).
+    silu_mul_quant_fwd(gu[:, :N].contiguous(), gu[:, N:].contiguous(), grouped_mm_offs) of a fused
+    gate_up output gu: bf16 (M, 2N) contiguous, halves concatenated (not interleaved), not modified.
+    Returns the 4-tuple for the (M, N) h.
     """
     check_gate_up(gu, grouped_mm_offs)
     match ARCH_MAJOR:

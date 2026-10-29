@@ -1,9 +1,9 @@
 """
 Dense FP8 SwiGLU MLP of DeepSeek-V2 (shared experts and dense layers) as one custom op, so it runs
 inside the compiled stage 1. It quantizes x once for gate_proj and up_proj, and its backward
-quantizes the SwiGLU gradients straight from dh without writing them in BF16. Every GEMM operand
-is bit-identical to the unfused FP8Linear -> silu_mul -> FP8Linear path. Rows must be a multiple
-of 128; other shapes take the unfused path.
+quantizes the SwiGLU gradients straight from dh without writing them in BF16. Every GEMM operand is
+bit-identical to the unfused FP8Linear -> silu_mul -> FP8Linear path. Rows must be a multiple of
+128; other shapes take the unfused path.
 """
 
 from typing import Tuple
@@ -50,9 +50,9 @@ def swiglu_mlp_fwd(
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
     """
-    Returns (y, g, u, x_t, x_t_scale, h_t, h_t_scale): the output, and for the backward the gate
-    and up activations and the transposed FP8 x and h. Each projection passes its BF16 weight
-    (only so it gets a gradient) and FP8Linear's quantized-weight tuple (fp8, scale, t, t_scale).
+    Returns (y, g, u, x_t, x_t_scale, h_t, h_t_scale): the output, and for the backward the gate and
+    up activations and the transposed FP8 x and h. Each projection passes its BF16 weight (only so
+    it gets a gradient) and FP8Linear's quantized-weight tuple (fp8, scale, t, t_scale).
     """
     M, inter, hidden = x.shape[0], wg_fp8.shape[0], wd_fp8.shape[0]
     x_fp8, x_scale, x_t, x_t_scale = fp8cast_rowwise_blockwise_transpose(x)
@@ -147,8 +147,7 @@ swiglu_mlp_fwd.register_autograd(swiglu_mlp_backward, setup_context=swiglu_mlp_s
 
 def fp8_swiglu_mlp(gate_proj, up_proj, down_proj, x: torch.Tensor) -> torch.Tensor:
     """
-    down_proj(silu(gate_proj(x)) * up_proj(x)) over FP8Linear layers without bias, for an x
-    that fusable accepts.
+    down_proj(silu(gate_proj(x)) * up_proj(x)) over bias-free FP8Linear layers; x must pass fusable.
     """
     x_2d = x.flatten(0, -2)
     weights = (gate_proj.weight, up_proj.weight, down_proj.weight)

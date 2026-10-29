@@ -162,7 +162,7 @@ class FP8ParamState:
         for output in self.fsdp_param.all_gather_outputs:
             free_storage(output)
         # FSDP copied the FP8 shard into its all-gather buffer, so it is dead until the next
-        # precompute recasts it.
+        # pre_all_gather recasts it.
         free_storage(self.fp8_shard)
         if out is not None:
             return None

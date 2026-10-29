@@ -2,15 +2,13 @@
 Verifies the fp8_clamped_swiglu_quant feature (clamped_swiglu_quant_rowwise,
 clamped_swiglu_quant_kmajor, clamped_swiglu_bwd_quant) against PyTorch.
 
-Contract: gpt-oss's clamped SwiGLU of gate_up + bias[group], the bias added in fp32 and rounded to
-bf16 (gate_up interleaved, gate at even and up at odd columns), rounded to bf16 as the plain
-clamped_swiglu_fwd / clamped_swiglu_bwd round it, then quantized as quantize_grouped_input does on
-SM90: rowwise 1x128, plus per-channel FP8 K-major per group. padded=True lays the K-major pair out
-with ceil(C / 256) * 256 channels (C = N forward, 2N backward) where the fused kernel runs, and C
-where the input takes the unfused fallback. The extra channels are unwritten, and
-k_grouped_fp8_gemm gives the same product with either layout. The bias is bf16. The backward also
-returns the per-group bias gradient: fp32 sums of each 128-row block of the bf16 gradient, added
-in block order and rounded once to the bias dtype.
+Contract: gpt-oss's clamped SwiGLU of gate_up + bias[group] (gate at even and up at odd columns; the
+bf16 bias added in fp32 and rounded to bf16), rounded to bf16 as clamped_swiglu_fwd /
+clamped_swiglu_bwd round it, then quantized as quantize_grouped_input does on SM90: rowwise 1x128
+plus per-channel FP8 K-major per group. With padded=True the K-major pair has ceil(C / 256) * 256
+channels (C = N forward, 2N backward) where the fused kernel runs and C on the unfused fallback; the
+extra channels are unwritten. The backward also returns the per-group bias gradient: fp32 sums of
+each 128-row block of the bf16 gradient, added in block order and rounded once to the bias dtype.
 
 Reference: the kernels' sigmoid (Triton's 1 / (1 + ex2.approx(...))) cannot be reproduced bit for
 bit in PyTorch. So the FP8 bytes and scale values must equal exactly a PyTorch quantization of the
@@ -130,9 +128,9 @@ def padded_channels(c: int) -> int:
 
 def assert_kmajor(got: tuple, ref: tuple, offs: torch.Tensor, K: int, padded: bool = False) -> None:
     """
-    Assert the K-major pair got, laid out with K channels (or, when padded, K or
-    padded_channels(K) as the scale's row count says), equals the unpadded ref exactly in its
-    first K channels. Extra channels are unspecified.
+    Assert the K-major pair got, laid out with K channels (or, when padded, K or padded_channels(K)
+    as the scale's row count says), equals the unpadded ref exactly in its first K channels. Extra
+    channels are unspecified.
     """
     fp8, scale = got
     KP = scale.shape[0] if scale.ndim == 2 else K

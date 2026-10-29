@@ -83,8 +83,8 @@ class MicroBatchLoadBalanceLoss:
 
 class GlobalBatchLoadBalanceLoss:
     """
-    Global-batch load-balance loss (https://arxiv.org/abs/2501.11873): f_i counts the tokens of
-    expert i summed over process_group and over the micro-batches of the step, which reset()
+    Global-batch load-balance loss (https://arxiv.org/abs/2501.11873): f_i is the fraction of tokens
+    routed to expert i over process_group and over the micro-batches of the step, which reset()
     clears. Call init_buffers before the first forward; the counts live in preallocated tensors
     updated in place, so __call__ compiles.
     """
@@ -103,9 +103,6 @@ class GlobalBatchLoadBalanceLoss:
         self.total_tokens: Optional[torch.Tensor] = None
 
     def init_buffers(self, num_experts: int, device: torch.device) -> None:
-        """
-        Allocate the accumulation buffers once. Must be called before __call__.
-        """
         if self.count_buffer is None:
             # float32 to match the dtype of scores, a softmax output.
             self.count_buffer = torch.zeros(num_experts, dtype=torch.float32, device=device)
@@ -123,8 +120,7 @@ class GlobalBatchLoadBalanceLoss:
         tokens_per_expert = expert_token_counts(topk_idx.reshape(-1), num_experts)
         tokens_per_expert = tokens_per_expert.to(scores.dtype)
 
-        # A functional collective keeps the compiled gate fullgraph-traceable; counts carry no
-        # gradient.
+        # A functional collective keeps the gate fullgraph-traceable; counts need no gradient.
         if self.process_group is not None:
             tokens_per_expert = funcol.all_reduce(tokens_per_expert, "sum", self.process_group)
 
@@ -161,8 +157,7 @@ class SequenceLevelLoadBalanceLoss:
         self.cp_size = cp_group.size() if cp_group is not None else 1
 
     def all_reduce_expert_counts(self, tokens_per_expert: torch.Tensor) -> torch.Tensor:
-        # A functional collective keeps the compiled gate fullgraph-traceable; counts carry no
-        # gradient.
+        # A functional collective keeps the gate fullgraph-traceable; counts need no gradient.
         if self.cp_size > 1:
             tokens_per_expert = funcol.all_reduce(tokens_per_expert, "sum", self.cp_group)
         return tokens_per_expert

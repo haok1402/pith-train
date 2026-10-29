@@ -500,8 +500,8 @@ class GptOssModel(nn.Module):
         if stage_index == stage_count - 1:
             self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.lm_head = BF16Linear(config.hidden_size, config.vocab_size, bias=False)
-        # The edge cost is that of FP8 layers; BF16 layers cost more next to the same edges (and
-        # hold more memory), so BF16 keeps the even partition.
+        # EDGE_LAYER_COST is in units of FP8 layers; next to slower BF16 layers the edges weigh less
+        # (and BF16 holds more memory), so BF16 keeps the even partition.
         self.layers = nn.ModuleDict(
             {
                 str(i): GptOssDecoderLayer(config, i)

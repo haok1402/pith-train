@@ -17,7 +17,7 @@ the output are in this zigzag layout; the caller permutes the sequence.
 At step s, rank r holds the K and V of rank kv = (r - s) mod cp_size, and exactly one of three
 flash calls covers the step:
 
-    step == 0     (kv == r)   flash(q,            k,            v,            causal=True)
+    s == 0        (kv == r)   flash(q,            k,            v,            causal=True)
     1 <= s <= r   (kv <  r)   flash(q,            k[:, :block], v[:, :block], causal=False)
     s >  r        (kv >  r)   flash(q[:, block:], k,            v,            causal=False)
 
@@ -623,12 +623,12 @@ def ring_attention_varlen_func(
     cp_group: ProcessGroup,
 ) -> torch.Tensor:
     """
-    Causal zigzag ring attention over a packed sequence, block-diagonal by document. q
-    (S_local, Hq, D), k and v (S_local, Hkv, D or Dv) hold this rank's tokens in the order
-    zigzag_varlen_index gives; k and v must be contiguous. cu_seqlens holds the int32 document
-    boundaries of the whole packed sequence, every document a multiple of 2 * cp_size tokens long,
-    so S_local == cu_seqlens[-1] // cp_size. cp_group has at least two ranks. Returns the output
-    (S_local, Hq, Dv) in q.dtype, in the same layout.
+    Causal zigzag ring attention over a packed sequence, block-diagonal by document. q (S_local, Hq,
+    D), k and v (S_local, Hkv, D or Dv) hold this rank's tokens in the order zigzag_varlen_index
+    gives; k and v must be contiguous. cu_seqlens holds the int32 document boundaries of the whole
+    packed sequence, every document a multiple of 2 * cp_size tokens long, so S_local ==
+    cu_seqlens[-1] // cp_size. cp_group has at least two ranks. Returns the output (S_local, Hq, Dv)
+    in q.dtype, in the same layout.
     """
     out, _ = zigzag_ring_varlen_fwd(q, k, v, cu_seqlens, sm_scale, cp_group.group_name)
     return out
@@ -1124,12 +1124,12 @@ def mla_ring_attention_func(
     """
     Causal zigzag ring attention for MLA across the cp_group ranks (at least two), rotating the
     compressed latent. In the zigzag layout, with RoPE already applied: q_nope (B, S_local, H,
-    qk_nope_head_dim), q_pe (B, S_local, H, qk_rope_head_dim), normed_kv (B, S_local,
-    kv_lora_rank) after kv_a_layernorm, and k_pe (B, S_local, 1, qk_rope_head_dim); normed_kv and
-    k_pe must be contiguous. kv_b_weight is the full (H * (qk_nope_head_dim + v_head_dim),
-    kv_lora_rank) bf16 weight, which receives the gradient. With kv_b_quant, the quantized kv_b
-    weight (weight_fp8, scale_weight, weight_t_fp8, scale_weight_t), the decompression runs in
-    FP8. Returns the output (B, S_local, H, v_head_dim) in q_nope's dtype, in the same layout.
+    qk_nope_head_dim), q_pe (B, S_local, H, qk_rope_head_dim), normed_kv (B, S_local, kv_lora_rank)
+    after kv_a_layernorm, and k_pe (B, S_local, 1, qk_rope_head_dim); normed_kv and k_pe must be
+    contiguous. kv_b_weight is the full (H * (qk_nope_head_dim + v_head_dim), kv_lora_rank) bf16
+    weight, which receives the gradient. With kv_b_quant, the quantized kv_b weight (weight_fp8,
+    scale_weight, weight_t_fp8, scale_weight_t), the decompression runs in FP8. Returns the output
+    (B, S_local, H, v_head_dim) in q_nope's dtype, in the same layout.
     """
     use_fp8 = kv_b_quant is not None
     weight_fp8, scale_weight, weight_t_fp8, scale_weight_t = (

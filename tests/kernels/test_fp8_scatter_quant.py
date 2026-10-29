@@ -2,9 +2,9 @@
 Verifier of scatter_quant (feature fp8_scatter_quant) against plain PyTorch.
 
 Contract: expand the deduplicated rows (gathered[expand_idx]), scatter the tokens into per-expert
-groups padded with zero rows to a multiple of 128, and quantize the result as
-quantize_grouped_input does on SM90 (rowwise 1x128 plus the per-channel FP8 K-major per group).
-Returns (quantized 4-tuple, grouped_mm_offs, reverse_shuffle_idxs, ks, ks_tensor).
+groups padded with zero rows to a multiple of 128, and quantize the result as quantize_grouped_input
+does on SM90 (rowwise 1x128 plus the per-channel FP8 K-major per group). Returns (quantized 4-tuple,
+reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor).
 
 Row placement within a group is the kernel's choice, so reverse_shuffle_idxs only has to be a valid
 placement: each token inside its expert's rows, all rows distinct. The reference scatters the
@@ -12,8 +12,8 @@ tokens through it into a zero bf16 matrix and quantizes that in PyTorch; every q
 padding rows included (zero bytes), must match exactly. On SM90 the placement is also checked to
 keep token order within each expert.
 
-Recipe: per 128-element block, scale = 2^ceil(log2(max(amax, 1e-4) / 448)) and fp8 =
-e4m3_satfinite(x * (1 / scale)), rounded to nearest even.
+Recipe: per 128-element block, scale = 2^ceil(log2(max(amax, 1e-4) / 448)), at least 2^-126, and
+fp8 = e4m3_satfinite(x * (1 / scale)), rounded to nearest even.
 """
 
 import pytest
@@ -204,7 +204,7 @@ def test_scatter_quant(sizes: list[int], host_counts: bool, dedup: int) -> None:
 @pytest.mark.parametrize(
     "sizes,N",
     [
-        ([4096] * 16, 2048),  # M = 65536
+        ([4096] * 16, 2048),
         ([8192, 0, 0, 0, 8192, 0, 0, 16384], 2048),
         (RAGGED, 768),
         (RAGGED, 2880),  # gpt-oss hidden
@@ -231,7 +231,8 @@ def test_scatter_quant_identity(host_counts: bool) -> None:
 
 def test_scatter_quant_n_not_multiple_of_8() -> None:
     """
-    With N % 8 != 0 the placement may differ; outputs are checked through reverse_shuffle_idxs.
+    N % 8 != 0 takes the unfused path, whose row placement is not stable, so
+    check_stable is skipped.
     """
     sizes, G, N = RAGGED, len(RAGGED), 100
     expert_idxs, expand, m_src = make_routing(sizes, 2, True, 9)

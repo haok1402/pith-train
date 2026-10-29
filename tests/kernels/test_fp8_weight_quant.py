@@ -460,7 +460,6 @@ def test_multi_launch_param_gather() -> None:
         )
         assert launch is not None and callable(launch), "H200 must have a one-launch amax"
         launch()
-        # Each grid equals the per-tensor kernel's.
         for (local, row_offset, group_offset), amax, shape in zip(shards, amaxes, GROUP):
             single = torch.zeros_like(amax)
             fp8_shard_amax(local, single, row_offset, group_offset)

@@ -18,11 +18,11 @@ def fp8cast_rowwise_kmajor(x: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tu
     cumulative group ends (no leading zero, last entry M), each a multiple of 128.
 
     Returns (tok_fp8, tok_scale, kmajor_fp8, kmajor_scale):
-    - tok_fp8 float8_e4m3fn (M, N) and tok_scale float32 (M, ceil(N / 128)): 1x128 blocks
-      along each row.
+    - tok_fp8 float8_e4m3fn (M, N) and tok_scale float32 (M, ceil(N / 128)): 1x128
+      blocks along each row.
     - kmajor_fp8 float8_e4m3fn (M * N,) and kmajor_scale float32 (N, M / 128): 128x1 blocks down
-      each column within a group; group g is stored as its (N, K_g) row-major block starting at
-      offs[g - 1] * N.
+      each column within a group; group g, with K_g rows, is stored as its (N, K_g) row-major block
+      starting at grouped_mm_offs[g - 1] * N (0 for g = 0).
 
     FP8 bytes and scale values are the same on both architectures, the scale strides are not: SM90
     returns both scales MN-major (see fp8_scale_layout), the layout DeepGEMM's SM90 GEMMs read

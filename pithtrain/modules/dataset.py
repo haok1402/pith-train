@@ -3,8 +3,7 @@ Memory-mapped token datasets for distributed training.
 
 Only the pages a sample touches are read. Global rank 0 writes the sequence offsets and the
 shuffled indices to offsets.npy and indices.npy in the corpus directory at startup, and every rank
-maps them after a barrier. The shuffle runs on the GPU, so the shuffled index array must fit in
-GPU memory.
+maps them after a barrier. The shuffle runs on the GPU, so the index array must fit in GPU memory.
 """
 
 import os

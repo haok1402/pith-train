@@ -333,8 +333,7 @@ class Config(NamedTuple):
 
 DEFAULT_CONFIG = Config(128, 192, 2, True)
 """
-The config of every launch until tune_kernels() has run: the same on every rank and every shape; the
-candidate that is fastest most often across kinds and sizes.
+The candidate that is fastest most often across kinds and sizes; every launch runs it until tuned.
 """
 
 CANDIDATES = (Config(128, 128, 2, True), Config(128, 192, 1, True), Config(128, 192, 2, False), Config(128, 192, 2, True), Config(128, 256, 1, False), Config(128, 256, 2, False), Config(256, 192, 1, False), Config(256, 192, 2, False))
@@ -353,8 +352,7 @@ def fake_matrix(dtype, divisibility: int = 8):
 
 def fake_expert_tensor(dtype, divisibility: int = 8):
     """
-    A fake (G, rows, cols) tensor of symbolic shape, contiguous along its last
-    mode, for cute.compile.
+    A fake (G, rows, cols) tensor of symbolic shape, last mode contiguous, for cute.compile.
     """
     return make_fake_tensor(dtype, (cute.sym_int(), cute.sym_int(), cute.sym_int()), divisibility=divisibility, leading_dim=2)
 
@@ -387,7 +385,6 @@ KINDS = {
     "wgrad_down": GemmKind(WgradDown, (plain, None), dict(add_to_output=True), True, {}, lambda: (fake_matrix(BFloat16), fake_matrix(BFloat16), fake_expert_tensor(Float32, 4), fake_index_vector(), fake_index_vector())),
     "down_scatter": GemmKind(DownScatter, (scatter, None), {}, False, {}, lambda: (fake_matrix(BFloat16), fake_expert_tensor(BFloat16), fake_matrix(BFloat16), fake_index_vector(), fake_index_vector())),
     "down_bias_scatter": GemmKind(DownBiasScatter, (scatter_bias, None), dict(has_bias=True), False, {}, lambda: (fake_matrix(BFloat16), fake_expert_tensor(BFloat16), fake_matrix(BFloat16, 4), fake_matrix(BFloat16), fake_index_vector(), fake_index_vector())),
-    # gpt-oss: epilogues built per activation (alpha, limit)
     "gated_oai": GemmKind(GatedFwdBias, (make_gated_oai, None), dict(paired_acc=True, has_bias=True), True, {}, lambda: (fake_matrix(BFloat16), fake_expert_tensor(BFloat16), fake_expert_tensor(BFloat16), fake_matrix(BFloat16, 4), fake_matrix(BFloat16), fake_matrix(BFloat16), fake_index_vector(), fake_index_vector())),
     "dgated_oai": GemmKind(Dgated, (make_dgated_oai, None), dict(has_c=True, packed_c=True), True, dict(cd_packed="n", implicit_dtype=BFloat16, b_transposed=True), lambda: (fake_matrix(BFloat16), fake_expert_tensor(BFloat16), fake_matrix(BFloat16), fake_matrix(BFloat16), fake_matrix(BFloat16), fake_index_vector(), fake_index_vector())),
 }
@@ -396,9 +393,6 @@ compiled: dict = {}
 
 
 def compile_gemm(kind: str, swapped: bool, config: Config, device: torch.device, act: tuple = ()) -> Callable:
-    """
-    The compiled GEMM of this kind, lane order, tile config, device and activation, cached.
-    """
     key = (kind, swapped, config, device.index, act)
     fn = compiled.get(key)
     if fn is None:
@@ -487,8 +481,7 @@ TUNING = Tunable("bf16_expert_gemm", CANDIDATES, default_config, prepare_launch)
 
 def order_by_address(first: torch.Tensor, second: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, bool]:
     """
-    (lower, higher, first is the higher) by address; asserts the two can be read as
-    one paired operand.
+    (lower, higher, first is the higher) by address; asserts both can be read as one paired operand.
     """
     assert first.dtype == second.dtype and first.shape == second.shape and first.stride() == second.stride()
     assert first.data_ptr() % 16 == 0 and second.data_ptr() % 16 == 0

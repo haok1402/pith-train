@@ -29,10 +29,8 @@ class MLPProtocol(Protocol): ...
 
 class LayerProtocol(Protocol):
     """
-    Protocol for a DualPipeV-compatible decoder layer.
-
-    Each layer is split into five stages so the pipeline scheduler can interleave different
-    micro-batches and overlap the compute of one with the communication of another.
+    A DualPipeV decoder layer, split into five stages so the pipeline scheduler can overlap the
+    compute of one micro-batch with the communication of another.
 
     - Stage 1: pre-dispatch compute.
     - Stage 2: dispatch all-to-all.

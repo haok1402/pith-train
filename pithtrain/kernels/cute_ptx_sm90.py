@@ -29,8 +29,8 @@ def asm(res_type, args, ptx: str, constraints: str, side_effects: bool = False):
 @dsl_user_op
 def ld_v4(addr: Int64, pred: Int32, *, loc=None, ip=None) -> tuple:
     """
-    16-byte global load; zeros where pred == 0. A plain L1-allocating ld.global, which is faster
-    here than the .nc no-allocate path.
+    16-byte global load; zeros where pred == 0. A plain ld.global, which is faster here than the
+    .nc read-only path.
     """
     struct_type = llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()])
     words = asm(
@@ -93,9 +93,6 @@ def prmt(word_lo: Uint32, word_hi: Uint32, selector: int, *, loc=None, ip=None) 
 
 @dsl_user_op
 def selp(pred: Int32, if_true: Uint32, if_false: Uint32, *, loc=None, ip=None) -> Uint32:
-    """
-    pred ? if_true : if_false.
-    """
     return Uint32(asm(T.i32(), [Int32(pred).ir_value(loc=loc, ip=ip), Uint32(if_true).ir_value(loc=loc, ip=ip), Uint32(if_false).ir_value(loc=loc, ip=ip)], "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $1, 0;\n\tselp.b32 $0, $2, $3, p;\n\t}", "=r,r,r,r"))
 
 
@@ -244,9 +241,6 @@ def lds_b32_pred(addr: Int32, pred: Int32, other: Int32, *, loc=None, ip=None) -
 
 @dsl_user_op
 def selp_args_last(pred: Int32, if_true: Uint32, if_false: Uint32, *, loc=None, ip=None) -> Uint32:
-    """
-    pred ? if_true : if_false.
-    """
     return Uint32(asm_args_last(T.i32(), "{\n.reg .pred p;\nsetp.ne.b32 p, $1, 0;\nselp.b32 $0, $2, $3, p;\n}", "=r,r,r,r", [to_ir(pred, Int32, loc, ip), to_ir(if_true, Uint32, loc, ip), to_ir(if_false, Uint32, loc, ip)]))
 
 

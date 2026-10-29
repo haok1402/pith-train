@@ -88,8 +88,8 @@ def fp8cast_rowwise_colwise_kernel(x_ptr, out_tok_ptr, scale_tok_ptr, out_ch_ptr
 
 def fp8cast_rowwise_colwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Rowwise and colwise FP8 quantization of x from one read. x is bf16 or fp32 (M, N) with M %
-    128 == 0.
+    Rowwise and colwise FP8 quantization of x from one read. x is bf16 or fp32 (M, N) with
+    M % 128 == 0.
 
     Returns (tok_fp8, tok_scale, ch_fp8, ch_scale): tok_fp8 float8_e4m3fn (M, N) with 1x128 row
     blocks and tok_scale float32 (M, ceil(N / 128)); ch_fp8 float8_e4m3fn (M, N) with 128x1 column

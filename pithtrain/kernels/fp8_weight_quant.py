@@ -20,13 +20,11 @@ __all__ = ["fp8_pack_transpose", "fp8_scales", "fp8_scales_multi", "fp8_shard_am
 
 def fp8cast_blockwise_transpose(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    128x128 blockwise FP8 of a weight and of its transpose from one read: (w_fp8, w_scale, wt_fp8,
-    wt_scale).
+    128x128 blockwise FP8 of a weight and its transpose from one read.
 
-    x is 2-D (N, K) bf16 (or fp32), any N and K (a partial tile is quantized over its valid
-    elements), unit stride along K (rows may be strided; a transposed view is not supported). w_fp8
-    is e4m3 (N, K), w_scale fp32 (ceil(N / 128), ceil(K / 128)); wt_fp8 is e4m3 (K, N), exactly
-    w_fp8.T, and wt_scale is w_scale.T. All outputs are fresh and contiguous.
+    x is 2-D (N, K) bf16 (or fp32), any N, K and strides (a partial tile is quantized over its valid
+    elements). w_fp8 is e4m3 (N, K), w_scale fp32 (ceil(N / 128), ceil(K / 128)); wt_fp8 is e4m3
+    (K, N), exactly w_fp8.T, and wt_scale is w_scale.T. All outputs are fresh and contiguous.
     """
     return fp8cast_blockwise_transpose_sm100(x)
 
@@ -34,9 +32,9 @@ def fp8cast_blockwise_transpose(x: torch.Tensor) -> tuple[torch.Tensor, torch.Te
 def fp8cast_blockwise_transpose_batched(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     fp8cast_blockwise_transpose of each expert of a grouped weight x, 3-D (G, N, K) bf16 (or fp32),
-    unit stride along K. Returns w_fp8 e4m3 (G, N, K), w_scale fp32 (G, ceil(N / 128),
-    ceil(K / 128)), wt_fp8 e4m3 (G, K, N) and wt_scale fp32 (G, ceil(K / 128), ceil(N / 128)),
-    all contiguous. Tiles never straddle experts.
+    any strides. Returns w_fp8 e4m3 (G, N, K), w_scale fp32 (G, ceil(N / 128), ceil(K / 128)),
+    wt_fp8 e4m3 (G, K, N) and wt_scale fp32 (G, ceil(K / 128), ceil(N / 128)), all contiguous.
+    Tiles never straddle experts.
     """
     return fp8cast_blockwise_transpose_batched_sm100(x)
 
@@ -47,11 +45,11 @@ def fp8_shard_amax(shard: torch.Tensor, amax: torch.Tensor, row_offset: int, gro
     shared amax grid.
 
     shard is fp32 (g_local, local_rows, K) contiguous: rows [row_offset, row_offset + local_rows) of
-    experts [group_offset, group_offset + g_local) (a 2-D weight is G = 1). amax is fp32 (G, ceil(N
-    / 128), ceil(K / 128)) with contiguous rows. Each tile the shard touches is overwritten with
-    max(|bf16(x)|) over the shard's elements in it; other entries are left alone. Zero the grid
-    first; a MAX all-reduce over the shards then gives the amax of the whole bf16 weight. NaN inputs
-    are out of contract.
+    experts [group_offset, group_offset + g_local) (a 2-D weight is G = 1). amax is fp32
+    (G, ceil(N / 128), ceil(K / 128)) with contiguous rows. Each tile the shard touches is
+    overwritten with max(|bf16(x)|) over the shard's elements in it; other entries are left alone.
+    Zero the grid first; a MAX all-reduce over the shards then gives the amax of the whole bf16
+    weight. NaN inputs are out of contract.
     """
     match ARCH_MAJOR:
         case 9:
@@ -101,9 +99,9 @@ def fp8_scales(amax: torch.Tensor, scale: torch.Tensor, scale_t: torch.Tensor) -
 
 def fp8_pack_transpose(x: torch.Tensor, out: torch.Tensor) -> None:
     """
-    In place: x, a one-byte-element (G, N, K) contiguous tensor, and its per-expert transpose (G, K,
-    N), written back to back into out, a contiguous one-byte-element buffer of at least 2
-    * x.numel() elements.
+    In place: x, a one-byte-element (G, N, K) contiguous tensor, and its per-expert transpose
+    (G, K, N), written back to back into out, a contiguous one-byte-element buffer of at least
+    2 * x.numel() elements.
     """
     match ARCH_MAJOR:
         case 9:
@@ -121,8 +119,7 @@ def fp8_shard_amax_multi(shards: Sequence[torch.Tensor], amaxes: Sequence[torch.
     A callable that runs fp8_shard_amax for every (shard, amax, row_offset, group_offset) of the
     lists in one launch, or None on SM100, where the caller loops over fp8_shard_amax itself.
 
-    It records the tensors' addresses: build it once, and it stays valid only while none of
-    them is reallocated.
+    It records the tensors' addresses, so it stays valid only while none of them is reallocated.
     """
     match ARCH_MAJOR:
         case 9:
@@ -136,8 +133,8 @@ def fp8_shard_amax_multi(shards: Sequence[torch.Tensor], amaxes: Sequence[torch.
 
 def fp8_scales_multi(amaxes: Sequence[torch.Tensor], scales: Sequence[torch.Tensor], scales_t: Sequence[torch.Tensor]) -> Optional[Any]:
     """
-    A callable that runs fp8_scales for every (amax, scale, scale_t) of the lists in one
-    launch, or None on SM100, where the caller loops over fp8_scales itself. Same address
+    A callable that runs fp8_scales for every (amax, scale, scale_t) of the lists in one launch,
+    or None on SM100, where the caller loops over fp8_scales itself. Same address
     caveat as fp8_shard_amax_multi.
     """
     match ARCH_MAJOR:

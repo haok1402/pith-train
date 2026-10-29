@@ -122,7 +122,7 @@ class DispatchIndex:
         smem = cutlass.memory.SmemAllocator()
         s_counts = smem.allocate(num_bins * 4, byte_alignment=16).toint()  # chunk histogram, then totals
         s_starts = smem.allocate(num_bins * 4, byte_alignment=16).toint()  # exclusive starts of the totals
-        s_next_pos = smem.allocate(num_bins * 4, byte_alignment=16).toint()  # next free position per bin
+        s_next_pos = smem.allocate(num_bins * 4, byte_alignment=16).toint()
         s_lane_masks = smem.allocate(num_bins * WARPS * 4, byte_alignment=16).toint()
         s_scan = smem.allocate(2 * THREADS * 4, byte_alignment=16).toint()
         buffers = IndexBuffers(mOut.iterator.toint(), num_slots, mHist.iterator.toint(), s_counts, s_starts, s_next_pos, s_lane_masks, s_scan)
@@ -134,7 +134,7 @@ class DispatchIndex:
             self.store_counts(mCounts, buffers, tidx, M)
         lt_mask = lanemask_lt()
         lane_bit = Uint32(1) << Uint32(lane)
-        rank_bins_start = Int32(lds_b32(s_starts + self.num_experts * 4))  # start of the EP-rank bins in the scan
+        rank_bins_start = Int32(lds_b32(s_starts + self.num_experts * 4))
         for chunk_idx in cutlass.range(cta_idx, num_chunks, num_ctas, unroll=1):
             self.load_chunk_bases(buffers, tidx, chunk_idx)
             expert_ids, first_visits, tokens_ok, token_idxs = self.load_ids(mTopk, chunk_idx, tidx)
@@ -374,8 +374,7 @@ class ExpertAndExpandIdx:
     @cute.jit
     def scan_segments(self, meta_base, s_seg_starts, s_dedup_starts, s_scan, tidx) -> None:
         """
-        Scan the segment sizes of recv_meta into starts, and sum each sender's
-        predecessors' dedup counts.
+        Scan recv_meta's segment sizes into starts and sum each sender's predecessors' dedup counts.
         """
         ep_size, experts_per_rank, num_segments = self.ep_size, self.experts_per_rank, self.num_segments
         for j in cutlass.range_constexpr((num_segments + THREADS - 1) // THREADS):
