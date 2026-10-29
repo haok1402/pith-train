@@ -1,8 +1,7 @@
 """
 CuTe-DSL (SM90) kernels of the fp8_weight_quant feature, bit-identical to the Triton ones in
-fp8_weight_quant_sm100: the blockwise transposes (not wired into the picker; tests and benchmarks
-call them directly), the FP8 parameter all-gather kernels, and one-launch variants of the shard amax
-and the scales over a fixed list of tensors.
+fp8_weight_quant_sm100: the blockwise transposes, the FP8 parameter all-gather kernels, and
+one-launch variants of the shard amax and the scales over a fixed list of tensors.
 
 Numerics follow compute_fp8_scale (SM90 branch) exactly. The tile amax is an integer max over the
 magnitude bits (|x| of finite non-negative floats orders like its bit pattern), so a NaN orders
@@ -452,6 +451,8 @@ def fp8cast_blockwise_transpose_sm90(x: torch.Tensor) -> tuple[torch.Tensor, tor
     scale = torch.empty((num_row_tiles, num_col_tiles), dtype=torch.float32, device=device)
     out_t = torch.empty((K, M), dtype=torch.float8_e4m3fn, device=device)
     scale_t = torch.empty((num_col_tiles, num_row_tiles), dtype=torch.float32, device=device)
+    if M == 0 or K == 0:
+        return out, scale, out_t, scale_t
     if x.stride(0) != K:
         x = x.contiguous()
     fn = compile_blockwise(x.dtype, store_mode(num_row_tiles * num_col_tiles, M, K, x, out, out_t), False)

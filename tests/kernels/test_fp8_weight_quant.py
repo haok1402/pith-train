@@ -225,6 +225,16 @@ def test_blockwise_transpose_batched_fp32_and_zeros() -> None:
     check_blockwise_transpose_batched(torch.zeros(4, 128, 256, device="cuda", dtype=torch.bfloat16))
 
 
+def test_blockwise_transpose_empty() -> None:
+    for shape in [(0, 256), (256, 0)]:
+        x = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
+        w_fp8, w_scale, wt_fp8, wt_scale = fp8cast_blockwise_transpose(x)
+        N, K = shape
+        assert w_fp8.shape == (N, K) and wt_fp8.shape == (K, N)
+        assert w_scale.shape == (cdiv(N, BLOCK), cdiv(K, BLOCK))
+        assert wt_scale.shape == (cdiv(K, BLOCK), cdiv(N, BLOCK))
+
+
 def test_blockwise_transpose_batched_empty() -> None:
     for shape in [(0, 256, 128), (2, 0, 128), (2, 128, 0)]:
         x = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
