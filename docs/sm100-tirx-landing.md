@@ -112,3 +112,42 @@ the same results.
   the CUDA programming model only guarantees for cooperative launches. It holds on B200 as used in
   training; compute preemption (a debugger, MPS time-slicing, compute-sanitizer) can stall the
   waiting CTAs until the preempted ones resume, and a platform that never resumes them would hang.
+
+## First B200 run of pith-train's SM100 tests (2026-11-02)
+
+This branch's code (bf9d16f, apache-tvm 0.27.0.post1, tvm-ffi 0.1.14.post0, tirx-kernels 0.1.2.post1)
+on a catalyst B200 (GPU 5, picked empty at launch and pinned by UUID), torch 2.14.0+cu132, FA4
+4.0.0b28, quack 0.6.5. DeepGEMM does not build against torch 2.14 there, so a stand-in `deep_gemm`
+that raises when called was on the path. The same suites on haok/tirx-standalone-sm100 (the port to
+tvm_tirx) gave identical results, test for test.
+
+| suite | result |
+|---|---|
+| `tests/kernels` (all but `test_flash_attn_memoize.py`) | 1744 passed, 27 failed, 20 skipped (11.0 min) |
+| `tests/operators`, `tests/test_*.py`, `tests/kernels/test_flash_attn_memoize.py` | 135 passed, 18 failed, 27 skipped |
+
+Every failure:
+
+- **DeepGEMM stand-in (environment), 29:** `tests/kernels/test_fp8_gemm.py` (21, the `fp8_gemm_nt` /
+  k-grouped DeepGEMM paths), `tests/test_deepgemm_fp8_linear_correctness.py` (7),
+  `tests/test_muon_fp8.py::test_muon_step_on_fp8_gradients` (1): `RuntimeError: deep_gemm.fp8_fp4_gemm_nt:
+  DeepGEMM is not installed in this check environment`.
+- **Test bug, 3:** `tests/kernels/test_cross_entropy.py::test_small_gradient_entries_relative[{5003,32000,
+  151936}-float16]`: `assert 0 > ((64 * 5003) // 20)` (179 and 0 for the others): fp16 gradients of
+  these rows are below fp16's normal range, so the relative window is empty. The fp16 case is dropped
+  (89bfb25); the bf16 / fp32 cases pass, so the fp32 fix of 0ace1e8 holds on the B200.
+- **Test bug, 2:** `tests/kernels/test_log_prob.py::test_masked_logits[{bfloat16,float32}]`:
+  `assert not grad[:, ::2].any()`: rows 6 and 8 kept random targets on masked columns, whose gradient is
+  legitimately nonzero (-0.44 and -1.06, matching the reference). Fixed (8559996); passes on the B200.
+- **Reference convention, 11:** `tests/kernels/test_clamped_swiglu.py::test_matches_autograd[bfloat16]`
+  (1370 of 1474560 elements, max abs diff 28.5) and `tests/test_clamped_swiglu.py::
+  test_clamped_swiglu_forward_backward[*]` (10): every mismatching element has gate == 7.0 or
+  up == +-7.0 exactly. torch 2.14's clamp backward is 0 at the boundary; the kernels (the SM90 Triton
+  kernel and this SM100 kernel alike) pass the gradient there. pith-train pins torch < 2.14, so this
+  needs a check on the pinned torch; the kernel was left as it is.
+
+The review fixes that had only been CPU-checked ran here: cross_entropy's fp32 gradient pass
+(0ace1e8) and N = 0 (36c98b7) via `test_cross_entropy.py` (all but the fp16 case above pass,
+`test_no_rows` included), segment_sum's per-stream tag scratch (0dc39aa) via `test_segment_sum.py`, and
+ep_dispatch's workspace eviction (20a2aef) via `test_ep_dispatch.py`, all passing. Multi-GPU tests
+(torchrun DualPipeV, FSDP / Muon multi-rank cases) skip with one visible GPU.
