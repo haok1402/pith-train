@@ -43,6 +43,42 @@ class DistributedCfg(SlottedDefault):
     combine. Non-expert layers are unaffected.
     """
 
+    ep_backend: str = "all-to-all"
+    """
+    How MoE tokens reach their experts across the EP group.
+
+    "all-to-all": the NCCL all-to-all path with per-rank deduplication (operators/ep_dispatch.py).
+    "hybrid-ep": DeepEP's HybridEP in blocking, dropless mode (operators/hybrid_ep.py): TMA over
+    NVLink, permute fused into the dispatch, router weights applied before a summing combine.
+    """
+
+    hybrid_ep_num_sms: int = 0
+    """
+    SMs each HybridEP dispatch and combine kernel occupies; 0 keeps HybridEP's default.
+    """
+
+    hybrid_ep_permute_blocks: int = 0
+    """
+    Blocks of HybridEP's permute and unpermute kernels; 0 keeps HybridEP's default (16 per SM).
+    """
+
+    hybrid_ep_custom_allgather: bool = False
+    """
+    Gather the routing with HybridEP's intra-node all-gather kernel instead of NCCL's.
+    """
+
+    hybrid_ep_mode: str = "permute"
+    """
+    "permute": HybridEP permutes the received rows into one per (token, local expert).
+    "dedup": one row per (token, rank), read by the fused BF16 experts through expand_idx.
+    """
+
+    hybrid_ep_sync_late: bool = False
+    """
+    Issue the routing all-gather and scan in stage 2 and wait for their counts only when stage 3
+    needs the rows, instead of HybridEP's blocking sync inside stage 2. Dropless either way.
+    """
+
     timeout: timedelta = timedelta(minutes=15)
     """
     Timeout of every collective, passed to init_process_group.
@@ -159,6 +195,18 @@ def setup_device_mesh(cfg: DistributedCfg, device_id: int) -> None:
 
     distributed.ep_size, distributed.ep_rank = ep_size, expt_mesh.get_local_rank("ep")
     distributed.ep_group = expt_mesh.get_group("ep")
+    if cfg.ep_backend not in ("all-to-all", "hybrid-ep"):
+        raise ValueError(f"unknown ep_backend {cfg.ep_backend!r}")
+    distributed.ep_backend = cfg.ep_backend if ep_size > 1 else "all-to-all"
+    if distributed.ep_backend == "hybrid-ep":
+        from pithtrain.operators import hybrid_ep
+
+        hybrid_ep.num_sms = cfg.hybrid_ep_num_sms
+        if cfg.hybrid_ep_mode not in ("permute", "dedup"):
+            raise ValueError(f"unknown hybrid_ep_mode {cfg.hybrid_ep_mode!r}")
+        hybrid_ep.mode, hybrid_ep.sync_late = cfg.hybrid_ep_mode, cfg.hybrid_ep_sync_late
+        hybrid_ep.permute_blocks = cfg.hybrid_ep_permute_blocks
+        hybrid_ep.custom_allgather = cfg.hybrid_ep_custom_allgather
 
     # No dp process group: FSDP reduces over a mesh. Only the attention dp decides what a rank
     # loads, so only it is published.

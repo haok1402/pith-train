@@ -625,6 +625,9 @@ def entry() -> None:
     parser.add_argument("--ep-size", type=int, required=True)
     parser.add_argument("--cp-size", type=int, default=1)
     parser.add_argument("--model", type=str, choices=models, required=True)
+    parser.add_argument("--ep-backend", type=str, default="all-to-all")
+    parser.add_argument("--hybrid-ep-mode", type=str, default="permute")
+    parser.add_argument("--hybrid-ep-sync-late", action="store_true")
     parsed = parser.parse_args()
 
     cfg = SimpleNamespace()
@@ -632,6 +635,9 @@ def entry() -> None:
     cfg.distributed.pipeline_parallel_size = parsed.pp_size
     cfg.distributed.expert_parallel_size = parsed.ep_size
     cfg.distributed.context_parallel_size = parsed.cp_size
+    cfg.distributed.ep_backend = parsed.ep_backend
+    cfg.distributed.hybrid_ep_mode = parsed.hybrid_ep_mode
+    cfg.distributed.hybrid_ep_sync_late = parsed.hybrid_ep_sync_late
 
     setup_distributed(cfg)
     main(parsed.model)

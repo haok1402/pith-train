@@ -386,6 +386,9 @@ def setup_model(
         ModelClass = Qwen35MoeModel
     else:
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")
+    if distributed.ep_backend == "hybrid-ep" and module_config.model_type != "qwen3_moe":
+        # Fail at setup, before the weights load; prepare_dispatch also guards the forward.
+        raise NotImplementedError(f"ep_backend='hybrid-ep' supports qwen3_moe only, not {module_config.model_type}")  # fmt: skip
 
     modules.append(ModelClass(module_config, phase=0))
     modules.append(ModelClass(module_config, phase=1))

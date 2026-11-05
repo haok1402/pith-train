@@ -46,6 +46,7 @@ from pithtrain.pipeline.execution import (
     stage1_stage5_b,
     stage2_b,
     stage2_f,
+    stage2_topk_weight_grad,
     stage3_b,
     stage3_f,
     stage3_w,
@@ -826,6 +827,8 @@ def overlapped_forward_backward(
             routing.dispatch_splits if routing is not None else None,
         )
         chunk_record0.layers[layer_idx0].stage2.splits = record.splits
+        # With HybridEP dispatch_tokens is stage 1's normed output itself; the compiled stage-1
+        # graph does not save it (memory snapshots: the all-to-all path drops it), so it is freed too.
         if routing is not None and ctx.fwd_comm_work is not None:
             ctx.fwd_comm_deferred_free.append(dispatch_tokens)  # freed after Stage 3 waits
 
@@ -833,6 +836,7 @@ def overlapped_forward_backward(
         dispatch_tokens_grad = stage2_b(
             ctx, module1_layers[-layer_idx - 1], record, (gathered_tokens_grad,)
         )
+        topk_weight_grad = stage2_topk_weight_grad(record, topk_weight_grad)
 
         stage3_w(module1_layers[-layer_idx - 1])
 
@@ -843,6 +847,7 @@ def overlapped_forward_backward(
             routing.expert_idxs if routing is not None else None,
             routing.expand_idx if routing is not None else None,
             routing.expert_counts if routing is not None else None,
+            routing.hybrid_ep if routing is not None else None,
         )
         chunk_record0.layers[layer_idx0].stage3.args = record.args
         chunk_record0.layers[layer_idx0].stage3.outs = record.outs

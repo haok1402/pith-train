@@ -31,6 +31,13 @@ from pithtrain.contexts import distributed
 from pithtrain.contexts.weight_grad_store import WeightGradStore
 from pithtrain.models.interface import AllToAllSplits, LayerProtocol, ModelProtocol, RoutingInfo
 from pithtrain.operators.all_to_all import all_to_all_async, direct_all_to_all
+from pithtrain.operators.hybrid_ep import (
+    HybridEPState,
+    hybrid_ep_combine,
+    hybrid_ep_combine_backward,
+    hybrid_ep_dispatch,
+    hybrid_ep_dispatch_backward,
+)
 
 __all__ = [
     "ChunkRecord",
@@ -48,6 +55,7 @@ __all__ = [
     "stage1_b",
     "stage1_f",
     "stage1_stage5_b",
+    "stage2_topk_weight_grad",
     "stage2_b",
     "stage2_f",
     "stage3_b",
@@ -170,7 +178,10 @@ def stage1_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage1Record, grad
 
 @dataclass(slots=True)
 class Stage2Record:
-    splits: Optional[AllToAllSplits] = None
+    splits: Optional[AllToAllSplits | HybridEPState] = None
+    """
+    The all-to-all splits, or with ep_backend "hybrid-ep" the layer's HybridEPState.
+    """
 
 
 def stage2_f(ctx: ExecutionCtx, layer: LayerProtocol, dispatch_tokens: torch.Tensor, dispatch_splits: Optional[AllToAllSplits]):  # fmt: skip
@@ -181,7 +192,9 @@ def stage2_f(ctx: ExecutionCtx, layer: LayerProtocol, dispatch_tokens: torch.Ten
 
     dispatch_tokens = dispatch_tokens.detach()
     record.splits = dispatch_splits
-    if dispatch_splits is not None:
+    if isinstance(dispatch_splits, HybridEPState):
+        gathered_tokens, ctx.fwd_comm_work = hybrid_ep_dispatch(dispatch_splits, dispatch_tokens, ctx.fwd_event)  # fmt: skip
+    elif dispatch_splits is not None:
         gathered_tokens, ctx.fwd_comm_work = comm_all_to_all(ctx, dispatch_tokens, dispatch_splits.output_splits, dispatch_splits.input_splits)  # fmt: skip
     else:
         gathered_tokens, ctx.fwd_comm_work = dispatch_tokens, None
@@ -195,7 +208,9 @@ def stage2_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage2Record, grad
 
     ctx.comm_stream.wait_event(ctx.bwd_event)
 
-    if record.splits is not None:
+    if isinstance(record.splits, HybridEPState):
+        dispatch_tokens_grad, ctx.bwd_comm_work = hybrid_ep_dispatch_backward(record.splits, grad_tensors[0], ctx.bwd_event)  # fmt: skip
+    elif record.splits is not None:
         dispatch_tokens_grad, ctx.bwd_comm_work = comm_all_to_all(ctx, grad_tensors[0], record.splits.input_splits, record.splits.output_splits)  # fmt: skip
     else:
         dispatch_tokens_grad = grad_tensors[0]
@@ -207,6 +222,11 @@ def stage2_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage2Record, grad
 
 class Stage3Args(NamedTuple):
     gathered_tokens: torch.Tensor
+    probs: Optional[torch.Tensor] = None
+    """
+    HybridEP only: the received router weights, one per row, applied in stage 3.
+    """
+    hybrid: Optional[HybridEPState] = None
 
 
 class Stage3Outs(NamedTuple):
@@ -230,18 +250,26 @@ def layer_keeps_stage3_input(layer: LayerProtocol) -> bool:
     return keeps is not None and keeps()
 
 
-def stage3_f(ctx: ExecutionCtx, layer: LayerProtocol, gathered_tokens: torch.Tensor, expert_idxs: Optional[torch.Tensor], expand_idx: Optional[torch.Tensor] = None, expert_counts: Optional[list[int]] = None):  # fmt: skip
+def stage3_f(ctx: ExecutionCtx, layer: LayerProtocol, gathered_tokens: torch.Tensor, expert_idxs: Optional[torch.Tensor], expand_idx: Optional[torch.Tensor] = None, expert_counts: Optional[list[int]] = None, hybrid: Optional[HybridEPState] = None):  # fmt: skip
     nvtx.range_push("layer%02d.stage3_f" % layer.idx)
     record = Stage3Record()
 
-    gathered_tokens = gathered_tokens.detach().requires_grad_()
-    record.args = Stage3Args(gathered_tokens)
-
-    if ctx.fwd_comm_work is not None:
+    if hybrid is not None:
+        # HybridEP's received rows exist only once its dispatch, launched in stage 2, has run.
         ctx.fwd_comm_work.wait()
-    drain_deferred_free(ctx)
-
-    moe_outs = layer.forward_stage3(gathered_tokens, expert_idxs, expand_idx, expert_counts)
+        drain_deferred_free(ctx)
+        gathered_tokens = hybrid.recv_tokens.detach().requires_grad_()
+        probs = hybrid.recv_probs.detach().requires_grad_()
+        record.args = Stage3Args(gathered_tokens, probs, hybrid)
+        moe_outs = layer.forward_stage3_hybrid_ep(gathered_tokens, probs, hybrid)
+        hybrid.recv_tokens = None
+    else:
+        gathered_tokens = gathered_tokens.detach().requires_grad_()
+        record.args = Stage3Args(gathered_tokens)
+        if ctx.fwd_comm_work is not None:
+            ctx.fwd_comm_work.wait()
+        drain_deferred_free(ctx)
+        moe_outs = layer.forward_stage3(gathered_tokens, expert_idxs, expand_idx, expert_counts)
     record.outs = Stage3Outs(moe_outs)
     # The backward needs only the grad of gathered_tokens, so free its values: only with EP, where
     # it does not share storage with dispatch_tokens, and when stage 3 did not save it.
@@ -263,6 +291,8 @@ def stage3_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage3Record, grad
     WeightGradStore.enabled = True
     run_backward(record.outs, grad_tensors)
     WeightGradStore.enabled = False
+    if record.args.hybrid is not None:
+        record.args.hybrid.probs_grad = record.args.probs.grad
 
     ctx.comp_stream.record_event(ctx.bwd_event)
 
@@ -286,7 +316,7 @@ def stage3_w(layer: LayerProtocol):
 
 @dataclass(slots=True)
 class Stage4Record:
-    splits: Optional[AllToAllSplits] = None
+    splits: Optional[AllToAllSplits | HybridEPState] = None
 
 
 def stage4_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, combine_splits: Optional[AllToAllSplits]):  # fmt: skip
@@ -297,7 +327,9 @@ def stage4_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, co
     ctx.comm_stream.wait_event(ctx.fwd_event)
 
     record.splits = combine_splits
-    if combine_splits is not None:
+    if isinstance(combine_splits, HybridEPState):
+        moe_outs, ctx.fwd_comm_work = hybrid_ep_combine(combine_splits, moe_outs, ctx.fwd_event)
+    elif combine_splits is not None:
         moe_outs, ctx.fwd_comm_work = comm_all_to_all(ctx, moe_outs, combine_splits.input_splits, combine_splits.output_splits)  # fmt: skip
     else:
         ctx.fwd_comm_work = None
@@ -311,7 +343,9 @@ def stage4_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage4Record, grad
 
     ctx.comm_stream.wait_event(ctx.bwd_event)
 
-    if record.splits is not None:
+    if isinstance(record.splits, HybridEPState):
+        moe_outs_grad, ctx.bwd_comm_work = hybrid_ep_combine_backward(record.splits, grad_tensors[0], ctx.bwd_event)  # fmt: skip
+    elif record.splits is not None:
         moe_outs_grad, ctx.bwd_comm_work = comm_all_to_all(ctx, grad_tensors[0], record.splits.output_splits, record.splits.input_splits)  # fmt: skip
     else:
         moe_outs_grad = grad_tensors[0]
@@ -319,6 +353,33 @@ def stage4_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage4Record, grad
 
     nvtx.range_pop()
     return moe_outs_grad
+
+
+def routing_topk_weight(routing: Optional[RoutingInfo]) -> Optional[torch.Tensor]:
+    """
+    The router weights stage 5 applies: none with HybridEP, whose stage 3 already applied them.
+    """
+    if routing is None or routing.hybrid_ep is not None:
+        return None
+    return routing.topk_weight
+
+
+def free_hybrid_ep_combine_output(routing: Optional[RoutingInfo], moe_outs: torch.Tensor) -> None:
+    """
+    With HybridEP, stage 5 only adds the combined output to the residual, which saves nothing, so
+    its (tokens, hidden) values are dead once stage 5's forward is enqueued; only its grad is read.
+    """
+    if routing is not None and routing.hybrid_ep is not None:
+        moe_outs.untyped_storage().resize_(0)
+
+
+def stage2_topk_weight_grad(record: Stage2Record, topk_weight_grad: Optional[torch.Tensor]):
+    """
+    With HybridEP the router weights' gradient comes from the dispatch backward, not stage 5.
+    """
+    if isinstance(record.splits, HybridEPState):
+        return record.splits.topk_weight_grad
+    return topk_weight_grad
 
 
 class Stage5Args(NamedTuple):
@@ -342,7 +403,7 @@ def stage5_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, ro
     record = Stage5Record()
 
     moe_outs = moe_outs.detach().requires_grad_()
-    topk_weight = routing.topk_weight if routing is not None else None
+    topk_weight = routing_topk_weight(routing)
     topk_weight = topk_weight.detach().requires_grad_() if topk_weight is not None else None
     residual = residual.detach().requires_grad_()
     record.args = Stage5Args(moe_outs, topk_weight, residual)
@@ -353,6 +414,7 @@ def stage5_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, ro
 
     moe_local_idxs = routing.moe_local_idxs if routing is not None else None
     hidden_states = layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
+    free_hybrid_ep_combine_output(routing, moe_outs)
     record.outs = Stage5Outs(hidden_states)
 
     nvtx.range_pop()
@@ -376,7 +438,7 @@ def stage5_stage1_f(ctx: ExecutionCtx, prev_layer: LayerProtocol, next_layer: La
     nvtx.range_push("layer%02d_stage5_f_layer%02d_stage1_f" % (prev_layer.idx, next_layer.idx))
 
     moe_outs = moe_outs.detach().requires_grad_()
-    topk_weight = routing.topk_weight if routing is not None else None
+    topk_weight = routing_topk_weight(routing)
     topk_weight = topk_weight.detach().requires_grad_() if topk_weight is not None else None
     residual = residual.detach().requires_grad_()
     stage5_args = Stage5Args(moe_outs, topk_weight, residual)
@@ -392,6 +454,7 @@ def stage5_stage1_f(ctx: ExecutionCtx, prev_layer: LayerProtocol, next_layer: La
     else:
         hidden_states = prev_layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
         dispatch_tokens, next_residual, next_routing = next_layer.forward_stage1(hidden_states, rotary_posemb, cu_seqlens)  # fmt: skip
+    free_hybrid_ep_combine_output(routing, moe_outs)
     ctx.comp_stream.record_event(ctx.fwd_event)
 
     next_topk_weight = next_routing.topk_weight if next_routing is not None else None
@@ -506,12 +569,20 @@ def clear_layer_records(layer: LayerRecord) -> None:
 
 
 def layer_forward_dispatch(dispatch_tokens: torch.Tensor, dispatch_splits: Optional[AllToAllSplits]):  # fmt: skip
+    if isinstance(dispatch_splits, HybridEPState):
+        _, work = hybrid_ep_dispatch(dispatch_splits, dispatch_tokens)
+        work.wait()
+        return dispatch_splits.recv_tokens
     if dispatch_splits is None:
         return dispatch_tokens
     return direct_all_to_all(dispatch_tokens, dispatch_splits.output_splits, dispatch_splits.input_splits, distributed.ep_group)  # fmt: skip
 
 
 def layer_forward_combine(outs: torch.Tensor, combine_splits: Optional[AllToAllSplits]):
+    if isinstance(combine_splits, HybridEPState):
+        output, work = hybrid_ep_combine(combine_splits, outs)
+        output.comm_work = work
+        return output
     if combine_splits is None:
         return outs
     return direct_all_to_all(outs, combine_splits.input_splits, combine_splits.output_splits, distributed.ep_group)  # fmt: skip
@@ -550,7 +621,9 @@ def layer_forward(
     nvtx.range_push("layer%02d.stage3_f" % layer.idx)
     record = Stage3Record()
     gathered_tokens = gathered_tokens.detach().requires_grad_()
-    record.args = Stage3Args(gathered_tokens)
+    hybrid = routing.hybrid_ep if has_experts else None
+    probs = hybrid.recv_probs.detach().requires_grad_() if hybrid is not None else None
+    record.args = Stage3Args(gathered_tokens, probs, hybrid)
 
     if fwd_comm_work is not None:
         fwd_comm_work.wait()
@@ -559,7 +632,11 @@ def layer_forward(
     if has_experts and fwd_comm_work is not None:
         dispatch_tokens.untyped_storage().resize_(0)
 
-    moe_outs = layer.forward_stage3(gathered_tokens, routing.expert_idxs if has_experts else None, routing.expand_idx if has_experts else None, routing.expert_counts if has_experts else None)  # fmt: skip
+    if hybrid is not None:
+        moe_outs = layer.forward_stage3_hybrid_ep(gathered_tokens, probs, hybrid)
+        hybrid.recv_tokens = None
+    else:
+        moe_outs = layer.forward_stage3(gathered_tokens, routing.expert_idxs if has_experts else None, routing.expand_idx if has_experts else None, routing.expert_counts if has_experts else None)  # fmt: skip
 
     record.outs = Stage3Outs(moe_outs)
     # The backward needs only the grad of gathered_tokens, so free its values: only with EP, where
@@ -581,7 +658,7 @@ def layer_forward(
     nvtx.range_push("layer%02d.stage5_f" % layer.idx)
     record = Stage5Record()
     moe_outs = moe_outs.detach().requires_grad_()
-    topk_weight = routing.topk_weight if has_experts else None
+    topk_weight = routing_topk_weight(routing)
     topk_weight = topk_weight.detach().requires_grad_() if topk_weight is not None else None
     residual = residual.detach().requires_grad_()
     record.args = Stage5Args(moe_outs, topk_weight, residual)
@@ -593,6 +670,7 @@ def layer_forward(
         layer_record.stage3.outs.moe_outs.untyped_storage().resize_(0)
     moe_local_idxs = routing.moe_local_idxs if has_experts else None
     hidden_states = layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
+    free_hybrid_ep_combine_output(routing, moe_outs)
 
     record.outs = Stage5Outs(hidden_states)
     layer_record.stage5 = record
@@ -626,7 +704,9 @@ def layer_backward(
 
     nvtx.range_push("layer%02d.stage4_b" % layer.idx)
     record = layer_record.stage4
-    if record.splits is not None:
+    if isinstance(record.splits, HybridEPState):
+        moe_outs_grad, bwd_comm_work = hybrid_ep_combine_backward(record.splits, moe_outs_grad)
+    elif record.splits is not None:
         moe_outs_grad = direct_all_to_all(moe_outs_grad, record.splits.output_splits, record.splits.input_splits, distributed.ep_group)  # fmt: skip
         bwd_comm_work = moe_outs_grad.comm_work
         moe_outs_grad.comm_work = None
@@ -642,11 +722,15 @@ def layer_backward(
 
     run_backward(record.outs, (moe_outs_grad,))
     gathered_tokens_grad = record.args.gathered_tokens.grad
+    if record.args.hybrid is not None:
+        record.args.hybrid.probs_grad = record.args.probs.grad
     nvtx.range_pop()
 
     nvtx.range_push("layer%02d.stage2_b" % layer.idx)
     record = layer_record.stage2
-    if record.splits is not None:
+    if isinstance(record.splits, HybridEPState):
+        dispatch_tokens_grad, bwd_comm_work = hybrid_ep_dispatch_backward(record.splits, gathered_tokens_grad)  # fmt: skip
+    elif record.splits is not None:
         dispatch_tokens_grad = direct_all_to_all(gathered_tokens_grad, record.splits.input_splits, record.splits.output_splits, distributed.ep_group)  # fmt: skip
         bwd_comm_work = dispatch_tokens_grad.comm_work
         dispatch_tokens_grad.comm_work = None
@@ -658,6 +742,7 @@ def layer_backward(
     nvtx.range_push("layer%02d.stage1_b" % layer.idx)
     if bwd_comm_work is not None:
         bwd_comm_work.wait()
+    topk_weight_grad = stage2_topk_weight_grad(record, topk_weight_grad)
 
     run_backward(stage1_record.outs, (dispatch_tokens_grad, residual_grad, topk_weight_grad))
     if stage1_is_merged:

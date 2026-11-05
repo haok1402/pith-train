@@ -22,6 +22,9 @@ CP_SIZE="${CP_SIZE:-1}"
 MAIN_ARGS=()
 MAIN_ARGS+=(--pp-size "$PP_SIZE" --ep-size "$EP_SIZE" --cp-size "$CP_SIZE")
 MAIN_ARGS+=(--model "$MODEL")
+# EP backend, e.g. EP_BACKEND=hybrid-ep HYBRID_EP_MODE=dedup HYBRID_EP_SYNC_LATE=1.
+MAIN_ARGS+=(--ep-backend "${EP_BACKEND:-all-to-all}" --hybrid-ep-mode "${HYBRID_EP_MODE:-permute}")
+[ "${HYBRID_EP_SYNC_LATE:-0}" = 1 ] && MAIN_ARGS+=(--hybrid-ep-sync-late)
 
 SCRIPT=tests/test_dualpipev.py
 TAG=$(basename "$(dirname "$MODEL")")

@@ -25,6 +25,7 @@ from pithtrain.operators.cp_sequence import zigzag_spans, zigzag_varlen_index
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
 from pithtrain.operators.fp8_experts import fp8_scatter_quant, fp8_swiglu_experts
+from pithtrain.operators.hybrid_ep import HybridEPState, hybrid_ep_dispatch_issue, weight_rows
 from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.ring_attention import ring_attention_func, ring_attention_varlen_func
 from pithtrain.operators.silu_mul import silu_mul
@@ -320,6 +321,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, RoutingInfo | None]:
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
+        if distributed.ep_backend == "hybrid-ep":
+            # Stage 2 dispatches the hidden states themselves; nothing to prepare on the host.
+            state = HybridEPState(topk_idx.contiguous(), topk_weight, self.mlp.num_experts, self.mlp.experts_per_rank)  # fmt: skip
+            routing = RoutingInfo(topk_weight, topk_idx.view(-1), dispatch_splits=state, combine_splits=state, hybrid_ep=state)  # fmt: skip
+            # sync_late: start the routing all-gather and scan now, before the pipeline enqueues
+            # the other micro-batch's stage-3 backward; stage 2 waits for their counts.
+            hybrid_ep_dispatch_issue(state, hidden_states)
+            return hidden_states.view(-1, hidden_states.shape[-1]), residual, routing
         dispatch_tokens, routing = prepare_dispatch(hidden_states, topk_idx, topk_weight, self.mlp.num_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)  # fmt: skip
         return dispatch_tokens, residual, routing
 
@@ -352,6 +361,32 @@ class Qwen3MoeDecoderLayer(nn.Module):
         outs = self.mlp.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
         return padded_index_gather(outs, reverse_shuffle_idxs)
 
+    def forward_stage3_hybrid_ep(
+        self, tokens: torch.Tensor, probs: torch.Tensor, state: HybridEPState
+    ) -> torch.Tensor:
+        """
+        Stage 3 on HybridEP's received rows, returned weighted by each slot's router weight (fp32
+        product, rounded once) so that the combine's sum is the MoE output. Permute mode: tokens
+        are expert-major slots. Dedup mode: tokens are one row per (token, rank), read through
+        state.expand_idx by the fused BF16 experts like the all-to-all path. The per-expert counts
+        stay on the device; the row counts are known on the host.
+        """
+        G = self.mlp.experts_per_rank
+        if state.expand_idx is not None:
+            assert self.keeps_stage3_input(), "HybridEP dedup mode needs the fused BF16 experts"
+            outs = self.mlp.experts.forward_from_tokens(tokens, state.expert_idxs, state.expand_idx, None)[0]  # fmt: skip
+            return weight_rows(outs, probs)
+        P = tokens.shape[0]
+        groups = torch.arange(G, device=tokens.device)
+        expert_idxs = torch.repeat_interleave(groups, state.tokens_per_expert.long(), output_size=P)
+        if self.keeps_stage3_input():
+            outs = self.mlp.experts.forward_from_tokens(tokens, expert_idxs, None, None)[0]
+        else:
+            output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = scatter_for_grouped_gemm(tokens, expert_idxs, G, group_counts=state.tokens_per_expert_host)  # fmt: skip
+            outs = self.mlp.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
+            outs = padded_index_gather(outs, reverse_shuffle_idxs)
+        return weight_rows(outs, probs)
+
     @torch.compile(fullgraph=True, options={"cpp_wrapper": True, **stage_compile_options()})
     def forward_stage5(
         self,
@@ -369,6 +404,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
         topk_weight: torch.Tensor | None,
         residual: torch.Tensor,
     ):
+        if topk_weight is None:
+            # HybridEP: the combine already summed the weighted expert outputs per token.
+            return residual + moe_outs.view(*residual.shape)
         if distributed.ep_size == 1:
             weighted = moe_outs.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)
             return residual + weighted.sum(dim=1).to(moe_outs.dtype).view(*residual.shape)

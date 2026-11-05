@@ -8,6 +8,7 @@ dependencies = [
     "apache-tvm-ffi==0.1.15.post2",
     "apache-tvm-tirx==0.1.0a6",
     "deep-gemm",
+    "deep-ep==1.2.1+10d4dd7",
     "flash-attn-4[cu13]==4.0.0b28",
     "quack-kernels==0.6.5",
     "tirx-kernels",
@@ -38,12 +39,27 @@ explicit = true
 deep-gemm = { git = "https://github.com/deepseek-ai/DeepGEMM", rev = "559d79fb6994a58b8a15b4b93bf13ccc16edf247" }
 tirx-kernels = { git = "https://github.com/mlc-ai/TIRx-kernels", rev = "716d8a3cfc8cb5810f79f2515a39d400c1264340" }  # the tvm_tirx tirx-lite API (PyPI 0.1.2.post1 is the apache-tvm one)
 torch = { index = "torch-cu130" }
+# DeepEP's hybrid-ep branch at the commit Megatron's dev image builds (HybridEPBuffer).
+deep-ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "10d4dd7377d5bce900fbb4b80cce863764892b95" }
+
+[[tool.uv.dependency-metadata]]
+name = "deep-ep"
+version = "1.2.1+10d4dd7"
+requires-dist = ["pynvml"]
 
 [tool.uv.extra-build-dependencies]
 deep-gemm = ["torch>=2.13.0,<2.14", "packaging", "setuptools", "wheel"]
+deep-ep = [{ requirement = "torch", match-runtime = true }, "ninja", "packaging", "setuptools", "wheel"]
 
 [tool.uv.extra-build-variables]
 deep-gemm = { DG_FORCE_BUILD = "1", DG_USE_LOCAL_VERSION = "0" }
+# The nodes ship only the CUDA 13.2 toolkit; torch is cu130. Same major version, so the extension
+# links against torch's CUDA 13.0 runtime under CUDA minor-version compatibility (driver 595 runs
+# 13.2). HybridEP also JIT-compiles its kernels with this nvcc at run time (CUDA_HOME).
+# HYBRID_EP_MULTINODE=1 builds the inter-node DOCA GPUNetIO backend (DOCA ships in DeepEP's NCCL
+# submodule; the verbs headers are rdma-core's under /usr, present on the GPU nodes only, so build
+# there). The build serves single-node runs as well.
+deep-ep = { CUDA_HOME = "/usr/local/cuda-13.2", TORCH_CUDA_ARCH_LIST = "9.0;10.0", HYBRID_EP_MULTINODE = "1", RDMA_CORE_HOME = "/usr", CPLUS_INCLUDE_PATH = "/usr/local/cuda-13.2/include/cccl", MAX_JOBS = "64" }
 
 [tool.mypy]
 follow_imports = "skip"

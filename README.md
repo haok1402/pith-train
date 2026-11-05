@@ -71,6 +71,18 @@ Convert a training checkpoint to standard Hugging Face format for evaluation or 
 
 For hardware requirements, supported models, scaling and multi-node runs, troubleshooting, etc., see the [User Guide](docs/user-guide.md).
 
+## HybridEP Backend
+
+MoE tokens reach their experts through NCCL all-to-all by default. As an opt-in alternative, PithTrain can dispatch and combine them with DeepEP's [HybridEP](https://github.com/deepseek-ai/DeepEP/blob/hybrid-ep/docs/README_Hybrid-EP.md), which moves each token once per destination rank with TMA over NVLink, and over RDMA across nodes. It is supported for Qwen3 MoE models.
+
+```python
+cfg.distributed.ep_backend = "hybrid-ep"    # default "all-to-all"
+cfg.distributed.hybrid_ep_mode = "permute"  # or "dedup": one row per (token, rank), less memory, slower
+cfg.distributed.hybrid_ep_sync_late = False # True: issue the routing scan in stage 1, wait in stage 2
+```
+
+HybridEP runs in blocking, dropless mode: every buffer is sized from the exact routing counts, so no token is ever dropped. DeepEP is built from source by the same `uv sync`, with the inter-node backend enabled. Build on a GPU node, where the CUDA toolkit and the InfiniBand verbs headers are available. On one node of 8 H200 with Qwen3-30B-A3B, it is about 2x faster per dispatch and combine but only about 1-2% faster end to end, since DualPipeV already hides most of the all-to-all. See [`docs/hybrid-ep-results.md`](docs/hybrid-ep-results.md) for the measurements.
+
 ## Architecture
 
 <p align="center">

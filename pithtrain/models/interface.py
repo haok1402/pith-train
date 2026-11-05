@@ -1,4 +1,4 @@
-from typing import Dict, List, NamedTuple, Optional, Protocol, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Protocol, Tuple
 
 import torch
 
@@ -21,6 +21,12 @@ class RoutingInfo(NamedTuple):
     """
     Rows routed to each local expert, on the host, when dispatch already knows them; lets stage 3
     size its grouped GEMMs without another device-to-host sync.
+    """
+    hybrid_ep: Optional[Any] = None
+    """
+    With ep_backend "hybrid-ep", the HybridEPState of this dispatch (operators/hybrid_ep.py):
+    stages 2 and 4 run HybridEP instead of the all-to-alls, stage 3 receives expert-major rows
+    and applies the router weights, and stage 5 only adds the residual.
     """
 
 

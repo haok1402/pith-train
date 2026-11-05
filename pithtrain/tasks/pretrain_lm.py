@@ -27,6 +27,8 @@ from pithtrain.modules.optimizer import clip_grad_norm, local_grads, scale_grads
 from pithtrain.modules.training import TrainingCfg, setup_training
 from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.cross_entropy import cross_entropy
+from pithtrain.operators.ep_dispatch import EPLoadStats
+from pithtrain.operators.hybrid_ep import hybrid_ep_drop_check
 from pithtrain.pipeline import Microbatch
 
 __all__ = [
@@ -204,6 +206,23 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     peak_gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
     peak_gpu_mem = torch.tensor(peak_gpu_mem, device=device)
     torch.distributed.all_reduce(peak_gpu_mem, op=torch.distributed.ReduceOp.MAX)
+    # Reserved by the caching allocator, and used on the device in all (HybridEP's buffers and
+    # NCCL's live outside the allocator), so headroom compares fairly across EP backends.
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    mem_stats = [torch.cuda.max_memory_reserved() / 1024**3, (total_bytes - free_bytes) / 1024**3]
+    mem_stats = torch.tensor(mem_stats, device=device)
+    torch.distributed.all_reduce(mem_stats, op=torch.distributed.ReduceOp.MAX)
+    peak_reserved, device_used = mem_stats.tolist()
+    hybrid_ep_stats = hybrid_ep_drop_check() if distributed.ep_backend == "hybrid-ep" else None
+    # Expert-side load: rows each EP rank received over the step, max over mean across ranks.
+    ep_imbalance = None
+    if distributed.ep_size > 1:
+        rows = torch.tensor([float(EPLoadStats.rows)], device=device)
+        EPLoadStats.rows = 0
+        gathered = [torch.empty_like(rows) for _ in range(distributed.world_size)]
+        torch.distributed.all_gather(gathered, rows)
+        rows = torch.cat(gathered)
+        ep_imbalance = (rows.max() / rows.mean().clamp_min(1)).item()
 
     # The tracked values include the coefficient; dividing it out logs E * dot(f, p), where 1.0
     # is perfect balance (the Megatron-LM convention).
@@ -231,6 +250,12 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         statements.append("gradient-norm %.4f" % gradient_norm.item())
         statements.append("tokens-per-second %s" % format(tokens_per_second, ",.0f"))
         statements.append("peak-gpu-memory %.2f GB" % peak_gpu_mem)
+        statements.append("peak-reserved %.2f GB" % peak_reserved)
+        if ep_imbalance is not None:
+            statements.append("ep-recv-imbalance %.3f" % ep_imbalance)
+        statements.append("device-used %.2f GB" % device_used)
+        if hybrid_ep_stats is not None:
+            statements.append("hybrid-ep rows %d/%d (dropless by construction: fusion off) slot-order-violations %d" % (hybrid_ep_stats["rows_received"], hybrid_ep_stats["rows_expected"], hybrid_ep_stats["slot_order_violation"]))  # fmt: skip
         logger.info(" | ".join(statements))
         activate_wandb(cfg)
         if logging.wandb is not None:
@@ -244,6 +269,16 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
             metrics["infra/tokens-per-second"] = tokens_per_second
             metrics["infra/peak-gpu-memory"] = peak_gpu_mem
             metrics["infra/step-time"] = elapsed
+            metrics["infra/peak-gpu-memory-reserved"] = peak_reserved
+            metrics["infra/device-memory-used"] = device_used
+            if ep_imbalance is not None:
+                metrics["infra/ep-recv-imbalance"] = ep_imbalance
+            if hybrid_ep_stats is not None:
+                metrics["infra/hybrid-ep-dropped-rows"] = hybrid_ep_stats["dropped"]
+                metrics["infra/hybrid-ep-overflow"] = hybrid_ep_stats["overflow"]
+                metrics["infra/hybrid-ep-slot-order-violation"] = hybrid_ep_stats[
+                    "slot_order_violation"
+                ]
             wandb.log(metrics)
 
     completed = step + 1

@@ -83,6 +83,11 @@ cp_size: int
 Context-parallel degree, set by DistributedCfg.context_parallel_size.
 """
 
+ep_backend: str = "all-to-all"
+"""
+The EP dispatch and combine backend, "all-to-all" or "hybrid-ep" (DistributedCfg.ep_backend).
+"""
+
 ep_rank: int
 """
 Index within the EP group, naming the contiguous block of experts this rank hosts.

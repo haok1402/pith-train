@@ -10,12 +10,23 @@ from functools import lru_cache
 import torch
 import torch.distributed as dist
 
+from pithtrain.contexts import distributed
 from pithtrain.kernels import ep_dispatch_recv_idx, ep_dispatch_send_idx
 from pithtrain.models.interface import AllToAllSplits, RoutingInfo
 from pithtrain.operators.all_to_all import all_to_all_sync
 from pithtrain.operators.token_scatter import padded_index_gather
 
-__all__ = ["PendingDispatch", "prepare_dispatch", "prepare_dispatch_issue"]
+__all__ = ["EPLoadStats", "PendingDispatch", "prepare_dispatch", "prepare_dispatch_issue"]
+
+
+class EPLoadStats:
+    """
+    (token, local expert) rows this rank received in forward dispatches since the last read, from
+    counts the host already has (both EP backends), for the per-step load-imbalance metric.
+    """
+
+    rows: int = 0
+
 
 # At most one deferred dispatch is outstanding per process: its metadata lands in the single pinned
 # buffer below, which the next issue would overwrite.
@@ -64,6 +75,7 @@ class PendingDispatch:
         expert_counts = [
             sum(recv_counts[expert::stride][:ep_size]) for expert in range(experts_per_rank)
         ]
+        EPLoadStats.rows += sum(expert_counts)
 
         # One entry per received token slot: the senders decide the row count, not this rank.
         expand_idx = self.expand_idx
@@ -147,6 +159,10 @@ def prepare_dispatch(
     With ep_size > 1 a token sent to several experts on one EP rank is sent once, and expand_idx
     restores the copies on the receiver.
     """
+    if ep_size > 1 and distributed.ep_backend != "all-to-all":
+        # Only models that build a HybridEPState (Qwen3MoE) support the hybrid-ep backend; the
+        # others would silently fall back to the all-to-all path.
+        raise NotImplementedError(f"ep_backend={distributed.ep_backend!r} is not supported by this model; use all-to-all")  # fmt: skip
     k = topk_ids.shape[1]
     expert_idxs = topk_ids.view(-1)
 
