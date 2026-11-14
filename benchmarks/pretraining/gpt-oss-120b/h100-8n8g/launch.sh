@@ -15,3 +15,7 @@ srun ${SRUN_ARGS[@]} --output logging/$STEP.log $STEP.py
 
 STEP=benchmarks/pretraining/gpt-oss-120b/h100-8n8g/pp8-dp1-cp1-ep8-seq2048-bf16
 srun ${SRUN_ARGS[@]} --output logging/$STEP.log $STEP.sh
+
+# The same model without pipeline parallelism, at ZeRO-3 for both parameter classes.
+STEP=benchmarks/pretraining/gpt-oss-120b/h100-8n8g/pp1-dp8-cp1-ep8-seq2048-bf16-zero3
+srun ${SRUN_ARGS[@]} --output logging/$STEP.log $STEP.sh
