@@ -160,6 +160,9 @@ class DualPipeV(nn.Module):
 
         self.forward_only = False
         self.guard_skip = GuardSkip()
+        for module in self.module:
+            if isinstance(module, FSDPModule):
+                module.set_manual_backward_finalization(True)
         self.reset_states()
 
     def ensure_chunk_records_allocated(self, num_chunks: int) -> None:
@@ -544,17 +547,17 @@ class DualPipeV(nn.Module):
     def run_step(self, microbatches: List[Microbatch], objective: Optional[Callable]) -> List[Any]:
         self.forward_only = not torch.is_grad_enabled()
 
-        # ZeRO-1 for the step: no resharding, gradient sync or root post-backward callback after
-        # each backward; the end of step() runs all three once.
+        # No resharding, gradient sync or root post-backward callback after each backward; the end
+        # of step() finalizes backward once. FSDP2 would queue its root callback in every backward
+        # pass, each a walk over all groups, so the callback is marked queued for the whole step,
+        # with the finalization mode FSDP2 records when it queues it.
         for module in self.module:
             if isinstance(module, FSDPModule):
-                module.set_is_last_backward(False)
                 module.set_reshard_after_backward(False)
                 module.set_requires_gradient_sync(False)
-                if not self.forward_only:
-                    state_ctx = fully_shard.state(module)._state_ctx
-                    assert hasattr(state_ctx, "post_backward_final_callback_queued")
-                    state_ctx.post_backward_final_callback_queued = True
+                state_ctx = fully_shard.state(module)._state_ctx
+                state_ctx.post_backward_final_callback_queued = True
+                state_ctx.manual_backward_finalization_active = True
 
         pp_rank, pp_size = distributed.pp_rank, distributed.pp_size
 
@@ -652,8 +655,9 @@ class DualPipeV(nn.Module):
         # Release FP8 weight caches so the memory is available for optimizer.step().
         FP8WeightCacheControl.clear(*self.module)
 
-        # End of the ZeRO-1 step: reduce-scatter each group's fp32 gradients once, reshard its
-        # weights, and run the root callback skipped above.
+        # End of the step: run the root callback deferred above, which marks every group with
+        # gradients still to reduce, then finalize_backward reduce-scatters them, reshards the
+        # weights and waits for all reductions of the step.
         for module in self.module:
             if not isinstance(module, FSDPModule):
                 continue
@@ -661,19 +665,15 @@ class DualPipeV(nn.Module):
             # buffers then come from the compute stream's allocator pool, which the pipeline has
             # just emptied, instead of a reduce-scatter pool per root that stays reserved (and
             # unusable by the pipeline) through the whole next step.
-            comm_ctx = fully_shard.state(module)._comm_ctx
+            fsdp_state = fully_shard.state(module)
+            comm_ctx = fsdp_state._comm_ctx
+            reduce_scatter_stream = comm_ctx.reduce_scatter_stream
             comm_ctx.reduce_scatter_stream = torch.cuda.current_stream()
-            module.set_is_last_backward(True)
             module.set_reshard_after_backward(True)
             module.set_requires_gradient_sync(True)
-            fsdp_state = fully_shard.state(module)
-            for state in fsdp_state._state_ctx.all_states:
-                if state._fsdp_param_group:
-                    state._fsdp_param_group.post_backward()
-            # The callback reads the finalization mode FSDP records when it queues the callback
-            # itself, which the skip above bypasses: automatic, as without the skip.
-            fsdp_state._state_ctx.manual_backward_finalization_active = False
             fsdp_state._root_post_backward_final_callback()
+            module.finalize_backward()
+            comm_ctx.reduce_scatter_stream = reduce_scatter_stream
 
         return objective_outputs
 
