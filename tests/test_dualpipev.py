@@ -24,6 +24,7 @@ from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel, Qwen35MoeTopKRouter
 from pithtrain.modules.checkpoint import iter_canonical_parameters
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
+from pithtrain.modules.fsdp_sharding import install_sharding_stages
 from pithtrain.modules.wgrad_accumulation import (
     install_raw_main_grad,
     install_side_grads,
@@ -419,22 +420,28 @@ def main(model_name: str):
         shard_experts(local_full_modules[0], ep_rank=ep_rank, ep_size=ep_size)
         shard_experts(local_full_modules[1], ep_rank=ep_rank, ep_size=ep_size)
 
-    local_modules = []
+    def build_local_modules(attn_stage: int, expert_stage: int) -> nn.Sequential:
+        modules = nn.Sequential(ModelClass(config, phase=0), ModelClass(config, phase=1))
+        modules.to(dtype=dtype)
+        modules[0].load_state_dict(local_full_modules[0].state_dict())
+        modules[1].load_state_dict(local_full_modules[1].state_dict())
+        modules.zero_grad()
+        apply_fsdp(modules, dtype)
+        install_wgrad_accumulation(modules)
+        install_raw_main_grad(modules)
+        install_side_grads(modules)
+        install_sharding_stages(modules, attn_stage, expert_stage)
+        return modules
 
-    local_modules.append(ModelClass(config, phase=0))
-    local_modules.append(ModelClass(config, phase=1))
-
-    local_modules = nn.Sequential(*local_modules)
-    local_modules.to(dtype=dtype)
-    local_modules[0].load_state_dict(local_full_modules[0].state_dict())
-    local_modules[1].load_state_dict(local_full_modules[1].state_dict())
-    local_modules.zero_grad()
-    apply_fsdp(local_modules, dtype)
-    install_wgrad_accumulation(local_modules)
-    install_raw_main_grad(local_modules)
-    install_side_grads(local_modules)
-
+    # SHARDING_STAGES="attn,expert" sets DistributedCfg.attn_sharding_stage and
+    # expert_sharding_stage. Other than at 1,1, a copy at 1,1 runs the same steps as a baseline.
+    stages = tuple(int(stage) for stage in os.environ.get("SHARDING_STAGES", "1,1").split(","))
+    local_modules = build_local_modules(*stages)
     dualpipev_model = DualPipeV(local_modules)
+    baseline_modules = build_local_modules(1, 1) if stages != (1, 1) else None
+    baseline_model = DualPipeV(baseline_modules) if baseline_modules is not None else None
+    if distributed.rank == 0:
+        print("[INFO] Sharding stages (attn, expert): %s." % (stages,), flush=True)
 
     def shard(x: torch.Tensor, cu_seqlens: torch.Tensor | None) -> torch.Tensor:
         # A packed sample is sharded one document at a time; cu_seqlens stays the whole sample's.
@@ -465,6 +472,8 @@ def main(model_name: str):
             offset = step_index * num_global_chunks + dp_rank * num_chunks
             for module in local_modules:
                 install_router_replay(module, micro_batch_size, offset, local_chunks)
+            for module in baseline_modules if baseline_modules is not None else ():
+                install_router_replay(module, micro_batch_size, offset, local_chunks)
 
         if distributed.rank == 0:
             print("[INFO] Running DualPipeV step %d." % step_index, flush=True)
@@ -476,6 +485,18 @@ def main(model_name: str):
         assert records_empty(dualpipev_model), "a forward-only step kept activations"
         objective_outputs = dualpipev_model.step(microbatches, objective)
         assert records_empty(dualpipev_model), "a training step kept activations"
+        if baseline_model is not None:
+            baseline_outputs = baseline_model.step(microbatches, objective)
+            if pp_rank == 0:
+                # The forward is the same at every stage; only the bf16 scatter-add of stage 5 is
+                # order-dependent.
+                loss, baseline_loss = torch.stack(objective_outputs), torch.stack(baseline_outputs)
+                print(
+                    "[INFO] rank-%d, step %d, loss - baseline loss: max |%.3e|"
+                    % (distributed.rank, step_index, (loss - baseline_loss).abs().max().item()),
+                    flush=True,
+                )
+                torch.testing.assert_close(loss, baseline_loss, rtol=1e-3, atol=1e-3)
 
         if distributed.rank == 0:
             print("[INFO] Completed DualPipeV step %d." % step_index, flush=True)
@@ -581,6 +602,32 @@ def main(model_name: str):
                     param_ref.grad.flatten()[:5],
                 )
             )
+    assert not failed
+
+    if baseline_modules is not None:
+        # Same shards, same micro-batches: the stages differ only in the order of the fp32 sums
+        # (per micro-batch reduce-scatter, then the sum over micro-batches), far below eps.
+        stage_eps, largest_stage_diff = 1e-4, 0.0
+        for (param_name, param), param_base in zip(local_modules.named_parameters(), baseline_modules.parameters()):  # fmt: skip
+            assert (param.grad is None) == (param_base.grad is None), param_name
+            if param.grad is None:
+                continue
+            grad, grad_base = param.grad.to_local(), param_base.grad.to_local()
+            if not (grad.any() or grad_base.any()):
+                continue
+            diff = calculate_difference(grad, grad_base)
+            largest_stage_diff = max(largest_stage_diff, diff)
+            if diff > stage_eps:
+                failed = True
+                print(
+                    "[ERROR] rank-%d, Parameter %s grad differs from stage 1,1: diff=%.3e"
+                    % (distributed.rank, param_name, diff)
+                )
+        print(
+            "[INFO] rank-%d, largest grad diff from stage 1,1 = %.3e"
+            % (distributed.rank, largest_stage_diff),
+            flush=True,
+        )
     assert not failed
 
     for rank in range(distributed.world_size):
