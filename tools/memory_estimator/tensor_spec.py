@@ -83,6 +83,8 @@ class MemorySnapshot:
     comm_buffers: MemoryBucket = field(default_factory=lambda: MemoryBucket("comm_buffers"))
     weight_grad_store: MemoryBucket = field(default_factory=lambda: MemoryBucket("wgrad_store"))
     pp_transfer_buffers: MemoryBucket = field(default_factory=lambda: MemoryBucket("pp_transfer"))
+    # bf16 unsharded weights gathered around their use; None unless a class is at sharding stage 3
+    params_gathered: MemoryBucket | None = None
 
     # Overhead
     non_pytorch_bytes: int = 0  # CUDA context + NCCL communicators + torch.compile codegen
@@ -111,6 +113,8 @@ class MemorySnapshot:
         total += self.comm_buffers.total_bytes
         total += self.weight_grad_store.total_bytes
         total += self.pp_transfer_buffers.total_bytes
+        if self.params_gathered is not None:
+            total += self.params_gathered.total_bytes
         return total
 
     @property

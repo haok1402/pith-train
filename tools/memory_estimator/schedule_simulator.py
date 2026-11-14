@@ -5,10 +5,33 @@ Replays the exact scheduling algorithm from DualPipeV.step() (dualpipev.py:482-5
 tracking live activations, gradients, communication buffers, and deferred weight
 gradient storage at each event boundary. Produces a timeline of MemorySnapshots
 with the peak high-water mark identified.
+
+FSDP sharding stages are modeled per parameter class (attention: everything outside the routed
+experts; experts: the routed expert weights), each with its own stage:
+
+- Stage 1: the unsharded weights of both modules are resident for the whole step, and a module's
+  unsharded fp32 gradients exist from its first backward to the end of the step.
+- Stage 2: each FSDP unit's fp32 main_grad is reduce-scattered and freed after the unit's
+  backward, so the unsharded gradient that is live is that of the largest unit of the module in
+  backward. A routed-expert backward deferred to the zero-bubble W phase keeps the expert
+  main_grads of every layer of its module until its weight_chunk. A module's fp32 sharded
+  gradients exist from its first backward to the optimizer step, and an event that reduces a class
+  holds one reduce-scatter input buffer, the fp32 gradient of the class's largest unit.
+- Stage 3: gradients as at stage 2. The bf16 unsharded weights of each module active at an event
+  (both modules in an overlapped forward/backward, none during a weight_chunk) are its two largest
+  decoder-layer units, the one running and one prefetched, plus its embed_tokens, norm and lm_head.
+
+Approximations: every event stands for a whole pass over a module, so stages 2 and 3 count the
+largest unit (or two largest decoder-layer units) of the module rather than the unit running at
+the memory peak within the pass, and the embedding and head units for the whole pass rather than
+only while in use. A module's sharded gradients appear at its first backward even when the first
+reduce of its experts waits for a W phase. A class whose shard world is 1 keeps its unsharded
+weights resident at stage 3.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 
 from .activation_profile import ActivationEstimator, TokenCounts
@@ -76,6 +99,30 @@ class ScheduleSimulator:
         self._optimizer = profile.compute_optimizer_states()
         self._grad_buckets = [profile.compute_gradient_bucket(i) for i in range(2)]
 
+        # Sharding stages 2 and 3, per module and class (False: attention, True: experts).
+        classes = (False, True)
+        self._stage = {c: profile.sharding_stage(c) for c in classes}
+        units = [profile.compute_shard_units(i) for i in range(2)]
+        self._unit_max = [
+            {c: max((u.numel for u in units[i] if u.expert == c), default=0) for c in classes}
+            for i in range(2)
+        ]
+        self._class_numel = [
+            {c: sum(u.numel for u in units[i] if u.expert == c) for c in classes} for i in range(2)
+        ]
+        self._gathered_numel = [{c: 0 for c in classes} for _ in range(2)]
+        for i in range(2):
+            for c in classes:
+                if not profile.gathers_per_layer(c):
+                    continue
+                layers = sorted(u.numel for u in units[i] if u.expert == c and u.decoder_layer)
+                edges = sum(u.numel for u in units[i] if u.expert == c and not u.decoder_layer)
+                self._gathered_numel[i][c] = sum(layers[-2:]) + edges
+        self._rs_numel = {c: max(self._unit_max[i][c] for i in range(2)) for c in classes}
+        self._sharded_grads = [
+            {c: profile.compute_sharded_gradient_bucket(i, c) for c in classes} for i in range(2)
+        ]
+
         # Precompute per-chunk costs
         self._wgrad_bytes = [
             activation_est.compute_wgrad_store_bytes_per_chunk(i) for i in range(2)
@@ -104,6 +151,8 @@ class ScheduleSimulator:
         wgrad_store_bytes = 0
         # PP transfer buffers: detached tensors at last PP rank
         pp_transfers: set[int] = set()  # chunk_ids with live transfers
+        # Modules of the backward chunks whose expert weight gradients wait for a weight_chunk
+        pending_wgrad: deque[int] = deque()
 
         # Forward chunk counters
         fwd_chunk_id = [0, 0]
@@ -116,7 +165,20 @@ class ScheduleSimulator:
             """Phase 0 -> module 0, phase 1 -> module 1."""
             return phase
 
-        def _snapshot(event_name: str) -> None:
+        def _snapshot(
+            event_name: str,
+            active: tuple[int, ...] = (),
+            bwd_module: int | None = None,
+            reduced: tuple[bool, ...] = (),
+            wgrad_module: int | None = None,
+        ) -> None:
+            """
+            Record the memory of one event.
+
+            active are the modules running forward or backward, bwd_module the one in backward,
+            reduced the parameter classes reduce-scattered at this event and wgrad_module the
+            module whose deferred weight gradients a weight_chunk is computing.
+            """
             nonlocal prev_total
             snap = MemorySnapshot(event_name=event_name)
             snap.fragmentation_factor = self.frag_factor
@@ -141,13 +203,45 @@ class ScheduleSimulator:
             grad_bucket = MemoryBucket("gradients")
             for mod_idx in sorted(grads_allocated):
                 for spec in self._grad_buckets[mod_idx].specs:
-                    grad_bucket.specs.append(spec)
+                    if self._stage[".mlp.experts." in spec.name] == 1:
+                        grad_bucket.specs.append(spec)
+            for c in (False, True):
+                if self._stage[c] == 1:
+                    continue
+                name = "experts" if c else "attn"
+                # Modules whose fp32 main_grads of the class are all live, waiting for a W phase
+                whole = set(pending_wgrad) if c else set()
+                if c and wgrad_module is not None:
+                    whole.add(wgrad_module)
+                for mod_idx in sorted(whole):
+                    numel = self._class_numel[mod_idx][c]
+                    grad_bucket.add(f"main_grad(m[{mod_idx}].{name}, deferred)", (numel,), "fp32")
+                if bwd_module is not None and bwd_module not in whole:
+                    numel = self._unit_max[bwd_module][c]
+                    grad_bucket.add(f"main_grad(m[{bwd_module}].{name}, unit)", (numel,), "fp32")
+                for mod_idx in sorted(grads_allocated):
+                    grad_bucket.specs.extend(self._sharded_grads[mod_idx][c].specs)
             snap.gradients = grad_bucket
 
             # Comm buffers
             comm_bucket = MemoryBucket("comm_buffers")
             comm_bucket.add("p2p_recv_buffers", (self._comm_bytes,), "int8")
+            for c in reduced:
+                if self._stage[c] > 1 and self._rs_numel[c] > 0:
+                    name = "experts" if c else "attn"
+                    comm_bucket.add(f"reduce_scatter_input({name})", (self._rs_numel[c],), "fp32")
             snap.comm_buffers = comm_bucket
+
+            # Gathered params
+            if any(n > 0 for numels in self._gathered_numel for n in numels.values()):
+                gathered_bucket = MemoryBucket("params_gathered")
+                for mod_idx in sorted(active):
+                    for c in (False, True):
+                        numel = self._gathered_numel[mod_idx][c]
+                        if numel > 0:
+                            name = f"m[{mod_idx}].{'experts' if c else 'attn'} gathered units"
+                            gathered_bucket.add(name, (numel,), "bf16")
+                snap.params_gathered = gathered_bucket
 
             # WeightGradStore
             wgrad_bucket = MemoryBucket("wgrad_store")
@@ -183,7 +277,7 @@ class ScheduleSimulator:
             if self.is_last_pp_rank and phase == 0:
                 pp_transfers.add(chunk_id)
 
-            _snapshot(f"{event_prefix} fwd(p{phase}) c{chunk_id}")
+            _snapshot(f"{event_prefix} fwd(p{phase}) c{chunk_id}", active=(mod_idx,))
 
         def backward_chunk(phase: int, enable_zb: bool, event_prefix: str) -> None:
             nonlocal wgrad_store_bytes
@@ -204,12 +298,18 @@ class ScheduleSimulator:
 
             if enable_zb:
                 wgrad_store_bytes += self._wgrad_bytes[mod_idx]
+                pending_wgrad.append(mod_idx)
 
             # Consume PP transfer if this is phase 1 at last rank
             if self.is_last_pp_rank and phase == 1:
                 pp_transfers.discard(chunk_id)
 
-            _snapshot(f"{event_prefix} bwd(p{phase},zb={enable_zb}) c{chunk_id}")
+            _snapshot(
+                f"{event_prefix} bwd(p{phase},zb={enable_zb}) c{chunk_id}",
+                active=(mod_idx,),
+                bwd_module=mod_idx,
+                reduced=(False,) if enable_zb else (False, True),
+            )
 
         def forward_backward_chunk(phase0: int, phase1: int, event_prefix: str) -> None:
             """
@@ -247,7 +347,12 @@ class ScheduleSimulator:
                 pp_transfers.discard(bwd_cid)
 
             # Snapshot with both sets alive (peak of overlap)
-            _snapshot(f"{event_prefix} fwd_bwd(p{phase0},p{phase1}) fc{fwd_cid}/bc{bwd_cid}")
+            _snapshot(
+                f"{event_prefix} fwd_bwd(p{phase0},p{phase1}) fc{fwd_cid}/bc{bwd_cid}",
+                active=(mod_idx0, mod_idx1),
+                bwd_module=mod_idx1,
+                reduced=(False, True),
+            )
 
             # Now free backward activations (post-overlap)
             live_acts.pop(bwd_key, None)
@@ -261,7 +366,9 @@ class ScheduleSimulator:
                 # Each pop frees one chunk's worth of wgrad from whichever module
                 # We use a simple approximation: free the average of both modules
                 wgrad_store_bytes = max(0, wgrad_store_bytes - max(self._wgrad_bytes))
-            _snapshot(f"{event_prefix} weight_chunk")
+            wgrad_module = pending_wgrad.popleft() if pending_wgrad else None
+            reduced = (True,) if wgrad_module is not None else ()
+            _snapshot(f"{event_prefix} weight_chunk", reduced=reduced, wgrad_module=wgrad_module)
 
         # === Static baseline ===
         _snapshot("static_baseline")

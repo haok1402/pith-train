@@ -74,6 +74,9 @@ def print_summary(
         _format_bytes_line("WeightGradStore deferred tensors", snap.weight_grad_store.total_bytes)
     )
     print(_format_bytes_line("PP transfer buffers", snap.pp_transfer_buffers.total_bytes))
+    if snap.params_gathered is not None:
+        gathered = snap.params_gathered.total_bytes
+        print(_format_bytes_line("Gathered params (sharding stage 3)", gathered))
     print(f"  {_bar(58)}")
     print(_format_bytes_line("Total dynamic at peak", snap.dynamic_bytes))
     print()
@@ -219,6 +222,13 @@ def print_detail(result: ScheduleResult) -> None:
         for spec in snap.pp_transfer_buffers.specs:
             print(f"    {spec.name}")
 
+    # Gathered params (sharding stage 3)
+    if snap.params_gathered is not None and snap.params_gathered.total_bytes > 0:
+        print()
+        print(f"--- Gathered Params ({format_bytes(snap.params_gathered.total_bytes)}) ---")
+        for spec in snap.params_gathered.specs:
+            print(f"    {spec.name:<55s} {spec.dtype:<5s} {format_bytes(spec.bytes):>10s}")
+
     print()
 
 
@@ -305,6 +315,8 @@ def print_suggestions(result: ScheduleResult, gpu_memory_gb: float) -> None:
         ("PP transfer buffers", snap.pp_transfer_buffers.total_bytes),
         ("Fragmentation overhead", snap.fragmentation_bytes),
     ]
+    if snap.params_gathered is not None:
+        components.append(("Gathered params (stage 3)", snap.params_gathered.total_bytes))
     components.sort(key=lambda x: x[1], reverse=True)
 
     print()

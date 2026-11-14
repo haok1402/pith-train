@@ -39,16 +39,24 @@ class ModelConfig:
             cfg = json.load(f)
         hidden_size = cfg["hidden_size"]
         num_attention_heads = cfg["num_attention_heads"]
+        model_type = cfg.get("model_type", "qwen3_moe")
+        intermediate_size = cfg.get("intermediate_size", 4 * hidden_size)
+        # gpt-oss names its expert count num_local_experts and sizes its experts by
+        # intermediate_size.
+        num_experts = cfg.get("num_experts", cfg.get("n_routed_experts"))
+        if num_experts is None:
+            num_experts = cfg.get("num_local_experts", 0)
+        moe_intermediate_size = intermediate_size if model_type == "gpt_oss" else 0
         return ModelConfig(
-            model_type=cfg.get("model_type", "qwen3_moe"),
+            model_type=model_type,
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             num_key_value_heads=cfg.get("num_key_value_heads", num_attention_heads),
             head_dim=cfg.get("head_dim", hidden_size // num_attention_heads),
-            intermediate_size=cfg.get("intermediate_size", 4 * hidden_size),
-            num_experts=cfg.get("num_experts", cfg.get("n_routed_experts", 0)),
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
             num_experts_per_tok=cfg.get("num_experts_per_tok", 0),
-            moe_intermediate_size=cfg.get("moe_intermediate_size", 0),
+            moe_intermediate_size=cfg.get("moe_intermediate_size", moe_intermediate_size),
             num_hidden_layers=cfg["num_hidden_layers"],
             vocab_size=cfg["vocab_size"],
             rms_norm_eps=cfg.get("rms_norm_eps", 1e-6),
@@ -65,6 +73,10 @@ class ParallelismConfig:
     dp_size is the attention data-parallel degree, how many ways the global batch is split. It
     and cp_size factor the ranks of one pipeline stage; ep_size re-factors the same ranks against
     expt_dp_size.
+
+    attn_sharding_stage and expert_sharding_stage are the FSDP sharding stages (ZeRO-1/2/3) of
+    DistributedCfg: the first covers every parameter outside the routed experts, sharded over the
+    dp x cp group, the second the routed expert weights, sharded over the expert-dp group.
     """
 
     pp_size: int
@@ -75,8 +87,13 @@ class ParallelismConfig:
     global_batch_size: int
     sequence_length: int
     fp8_training: str = "disabled"
+    attn_sharding_stage: int = 1
+    expert_sharding_stage: int = 1
 
     def __post_init__(self) -> None:
+        for name in ("attn_sharding_stage", "expert_sharding_stage"):
+            if getattr(self, name) not in (1, 2, 3):
+                raise ValueError(f"{name} must be 1, 2 or 3, got {getattr(self, name)}")
         if self.stage_size % self.ep_size != 0:
             raise ValueError(
                 f"dp_size * cp_size ({self.stage_size}) must be divisible by "
@@ -141,6 +158,26 @@ def layer_is_moe(
     return True
 
 
+@dataclass(slots=True)
+class ShardUnit:
+    """
+    One FSDP unit of a module: the parameters that gather, reduce and free together.
+
+    apply_fsdp shards each decoder layer's routed experts as one unit (expert=True), the rest of
+    the layer as another, and embed_tokens, the final norm and lm_head as one unit each
+    (decoder_layer=False).
+    """
+
+    name: str
+    expert: bool
+    decoder_layer: bool
+    specs: list[TensorSpec]
+
+    @property
+    def numel(self) -> int:
+        return sum(spec.numel for spec in self.specs)
+
+
 class ModelMemoryProfile:
     """Computes static parameter and optimizer memory for a given rank."""
 
@@ -195,14 +232,23 @@ class ModelMemoryProfile:
         hd = cfg.head_dim
 
         specs: list[TensorSpec] = []
+        gpt_oss = cfg.model_type == "gpt_oss"
 
         # Attention parameters
         specs.append(TensorSpec(f"{prefix}.self_attn.q_proj.weight", (nheads * hd, H), "bf16"))
         specs.append(TensorSpec(f"{prefix}.self_attn.k_proj.weight", (nkv * hd, H), "bf16"))
         specs.append(TensorSpec(f"{prefix}.self_attn.v_proj.weight", (nkv * hd, H), "bf16"))
         specs.append(TensorSpec(f"{prefix}.self_attn.o_proj.weight", (H, nheads * hd), "bf16"))
-        specs.append(TensorSpec(f"{prefix}.self_attn.q_norm.weight", (hd,), "bf16"))
-        specs.append(TensorSpec(f"{prefix}.self_attn.k_norm.weight", (hd,), "bf16"))
+        if gpt_oss:
+            # gpt-oss: biased projections and per-head attention sinks, no q/k norms
+            specs.append(TensorSpec(f"{prefix}.self_attn.q_proj.bias", (nheads * hd,), "bf16"))
+            specs.append(TensorSpec(f"{prefix}.self_attn.k_proj.bias", (nkv * hd,), "bf16"))
+            specs.append(TensorSpec(f"{prefix}.self_attn.v_proj.bias", (nkv * hd,), "bf16"))
+            specs.append(TensorSpec(f"{prefix}.self_attn.o_proj.bias", (H,), "bf16"))
+            specs.append(TensorSpec(f"{prefix}.self_attn.sinks", (nheads,), "bf16"))
+        else:
+            specs.append(TensorSpec(f"{prefix}.self_attn.q_norm.weight", (hd,), "bf16"))
+            specs.append(TensorSpec(f"{prefix}.self_attn.k_norm.weight", (hd,), "bf16"))
 
         # Layer norms
         specs.append(TensorSpec(f"{prefix}.input_layernorm.weight", (H,), "bf16"))
@@ -215,7 +261,19 @@ class ModelMemoryProfile:
             cfg.decoder_sparse_step,
             cfg.mlp_only_layers,
         )
-        if is_moe:
+        if is_moe and gpt_oss:
+            E_local = self.experts_per_rank
+            inter = cfg.moe_intermediate_size
+            E = cfg.num_experts
+            # GptOssTopKRouter and GptOssExperts: fused gate_up and down weights with biases
+            specs.append(TensorSpec(f"{prefix}.mlp.router.weight", (E, H), "bf16"))
+            specs.append(TensorSpec(f"{prefix}.mlp.router.bias", (E,), "bf16"))
+            experts = f"{prefix}.mlp.experts"
+            specs.append(TensorSpec(f"{experts}.gate_up_proj", (E_local, 2 * inter, H), "bf16"))
+            specs.append(TensorSpec(f"{experts}.gate_up_proj_bias", (E_local, 2 * inter), "bf16"))
+            specs.append(TensorSpec(f"{experts}.down_proj", (E_local, H, inter), "bf16"))
+            specs.append(TensorSpec(f"{experts}.down_proj_bias", (E_local, H), "bf16"))
+        elif is_moe:
             E_local = self.experts_per_rank
             moe_inter = cfg.moe_intermediate_size
             # Gate
@@ -253,6 +311,23 @@ class ModelMemoryProfile:
     def _is_expert_param(self, spec: TensorSpec) -> bool:
         return ".mlp.experts." in spec.name
 
+    def sharding_stage(self, expert: bool) -> int:
+        """
+        FSDP sharding stage of a parameter class: the routed experts or everything else.
+        """
+        pcfg = self.parallel_cfg
+        return pcfg.expert_sharding_stage if expert else pcfg.attn_sharding_stage
+
+    def gathers_per_layer(self, expert: bool) -> bool:
+        """
+        Whether a parameter class keeps its bf16 unsharded weights only around their use.
+
+        Stage 3 frees a unit's unsharded weights after each forward and backward. A shard world
+        of 1 holds the full parameter as its shard, so its weights stay resident as at stage 1.
+        """
+        world = self.parallel_cfg.expt_dp_size if expert else self.parallel_cfg.stage_size
+        return self.sharding_stage(expert) == 3 and world > 1
+
     def _fsdp_shard_world(self, spec: TensorSpec) -> int:
         """
         FSDP shard world size for a parameter: the size of the replica group it lives in.
@@ -269,12 +344,43 @@ class ModelMemoryProfile:
         # FSDP shards the flattened parameter; each rank holds ceil(numel / world)
         return (spec.numel + shard_world - 1) // shard_world
 
+    def compute_shard_units(self, module_idx: int) -> list[ShardUnit]:
+        """
+        Enumerate the FSDP units of one module, in execution order, with their bf16 parameters.
+        """
+        layers = self.module0_layers if module_idx == 0 else self.module1_layers
+        has_embed = self.module0_has_embed if module_idx == 0 else self.module1_has_embed
+        has_head = self.module0_has_head if module_idx == 0 else self.module1_has_head
+        cfg = self.model_cfg
+        H = cfg.hidden_size
+        m = f"m[{module_idx}]"
+
+        units: list[ShardUnit] = []
+        if has_embed:
+            spec = TensorSpec(f"{m}.embed_tokens.weight", (cfg.vocab_size, H), "bf16")
+            units.append(ShardUnit(f"{m}.embed_tokens", False, False, [spec]))
+        for layer_idx in layers:
+            prefix = f"{m}.layer.{layer_idx}"
+            specs = self._layer_params(layer_idx, prefix)
+            attn = [spec for spec in specs if not self._is_expert_param(spec)]
+            experts = [spec for spec in specs if self._is_expert_param(spec)]
+            units.append(ShardUnit(prefix, False, True, attn))
+            if experts:
+                units.append(ShardUnit(f"{prefix}.mlp.experts", True, True, experts))
+        if has_head:
+            norm = TensorSpec(f"{m}.norm.weight", (H,), "bf16")
+            units.append(ShardUnit(f"{m}.norm", False, False, [norm]))
+            lm_head = TensorSpec(f"{m}.lm_head.weight", (cfg.vocab_size, H), "bf16")
+            units.append(ShardUnit(f"{m}.lm_head", False, False, [lm_head]))
+        return units
+
     def compute_module_params(self, module_idx: int) -> MemoryBucket:
         """
         Compute unsharded parameter memory for one module.
 
         During the DualPipeV pipeline step, FSDP layers have reshard_after_forward=False,
-        so the full unsharded parameters are in memory.
+        so the full unsharded parameters are in memory. A parameter class at sharding stage 3
+        (see gathers_per_layer) is left out: the simulator counts its gathered layers per event.
         """
         layers = self.module0_layers if module_idx == 0 else self.module1_layers
         stage_id = self.module0_stage if module_idx == 0 else self.module1_stage
@@ -286,15 +392,20 @@ class ModelMemoryProfile:
         cfg = self.model_cfg
         H = cfg.hidden_size
 
-        if has_embed:
+        attn_resident = not self.gathers_per_layer(expert=False)
+        expert_resident = not self.gathers_per_layer(expert=True)
+
+        if has_embed and attn_resident:
             bucket.add(f"module[{module_idx}].embed_tokens.weight", (cfg.vocab_size, H), "bf16")
 
         for layer_idx in layers:
             prefix = f"module[{module_idx}].layer.{layer_idx}"
             for spec in self._layer_params(layer_idx, prefix):
-                bucket.specs.append(spec)
+                resident = expert_resident if self._is_expert_param(spec) else attn_resident
+                if resident:
+                    bucket.specs.append(spec)
 
-        if has_head:
+        if has_head and attn_resident:
             bucket.add(f"module[{module_idx}].norm.weight", (H,), "bf16")
             bucket.add(f"module[{module_idx}].lm_head.weight", (cfg.vocab_size, H), "bf16")
 
@@ -407,7 +518,9 @@ class ModelMemoryProfile:
         Compute the gradient memory for one module (all layers).
 
         During the pipeline step with FSDP's set_requires_gradient_sync(False),
-        gradients accumulate on the full unsharded parameter in bf16.
+        gradients accumulate on the full unsharded parameter in fp32: the fp32 main_grad of the
+        linear and raw expert weights, and a .grad whose grad_dtype FSDP2 sets to the fp32
+        reduce dtype for the rest.
         """
         layers = self.module0_layers if module_idx == 0 else self.module1_layers
         has_embed = self.module0_has_embed if module_idx == 0 else self.module1_has_embed
@@ -419,17 +532,34 @@ class ModelMemoryProfile:
         H = cfg.hidden_size
 
         if has_embed:
-            bucket.add(f"grad(m[{module_idx}].embed_tokens.weight)", (cfg.vocab_size, H), "bf16")
+            bucket.add(f"grad(m[{module_idx}].embed_tokens.weight)", (cfg.vocab_size, H), "fp32")
 
         for layer_idx in layers:
             prefix = f"grad(m[{module_idx}].layer.{layer_idx})"
             for spec in self._layer_params(layer_idx, prefix):
-                bucket.add(spec.name, spec.shape, spec.dtype)
+                bucket.add(spec.name, spec.shape, "fp32")
 
         if has_head:
-            bucket.add(f"grad(m[{module_idx}].norm.weight)", (H,), "bf16")
-            bucket.add(f"grad(m[{module_idx}].lm_head.weight)", (cfg.vocab_size, H), "bf16")
+            bucket.add(f"grad(m[{module_idx}].norm.weight)", (H,), "fp32")
+            bucket.add(f"grad(m[{module_idx}].lm_head.weight)", (cfg.vocab_size, H), "fp32")
 
+        return bucket
+
+    def compute_sharded_gradient_bucket(self, module_idx: int, expert: bool) -> MemoryBucket:
+        """
+        Compute the fp32 sharded gradients of one parameter class of one module.
+
+        At sharding stages 2 and 3 each reduce-scatter accumulates into a gradient of
+        ceil(numel / shard world) fp32 elements per parameter, which lives until the optimizer
+        step. At stage 1 the single reduce-scatter runs after the pipeline step, so the simulator
+        does not count it there.
+        """
+        bucket = MemoryBucket(f"module[{module_idx}] sharded gradients")
+        for unit in self.compute_shard_units(module_idx):
+            if unit.expert != expert:
+                continue
+            for spec in unit.specs:
+                bucket.add(f"grad_shard({spec.name})", (self._fsdp_shard_size(spec),), "fp32")
         return bucket
 
     def get_module_layer_count(self, module_idx: int) -> int:

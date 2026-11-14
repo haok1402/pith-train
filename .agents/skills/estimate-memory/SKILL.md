@@ -37,6 +37,8 @@ Extract these parameters from the user's message. If any required parameters are
 | PP rank | `--pp-rank` | -1 (scan all) | -1 finds worst case automatically. |
 | EP imbalance | `--ep-imbalance` | 1.0 | Increase for skewed expert routing. |
 | Fragmentation | `--fragmentation` | 0.10 | CUDA allocator overhead. |
+| Attention sharding stage | `--attn-sharding-stage` | 1 | FSDP ZeRO stage (1, 2 or 3) of every parameter outside the routed experts (`DistributedCfg.attn_sharding_stage`). |
+| Expert sharding stage | `--expert-sharding-stage` | 1 | FSDP ZeRO stage (1, 2 or 3) of the routed expert weights (`DistributedCfg.expert_sharding_stage`). |
 
 ### CP accuracy caveat
 

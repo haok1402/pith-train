@@ -15,6 +15,8 @@ Options:
     --pp-rank N       Show a specific PP rank (default: show worst-case)
     --ep-imbalance    EP token imbalance factor (default 1.0 = uniform)
     --fragmentation   CUDA allocator overhead factor (default 0.10)
+    --attn-sharding-stage    FSDP sharding stage (ZeRO-1/2/3) of the non-expert params (default 1)
+    --expert-sharding-stage  FSDP sharding stage (ZeRO-1/2/3) of the routed experts (default 1)
 """
 
 from __future__ import annotations
@@ -132,6 +134,10 @@ def run_estimate(
         f"Parallelism: pp={pp} | attn dp={dp} cp={cp} | expt dp={expt_dp} ep={ep} | "
         f"{total_gpus} GPUs | pp_rank={pp_rank}"
     )
+    attn_stage = parallel_cfg.attn_sharding_stage
+    expert_stage = parallel_cfg.expert_sharding_stage
+    if (attn_stage, expert_stage) != (1, 1):
+        parallel_desc += f" | sharding stage attn={attn_stage} expt={expert_stage}"
 
     mbs = parallel_cfg.micro_batch_size
     gbs = parallel_cfg.global_batch_size
@@ -203,6 +209,20 @@ def main():
         default=0.10,
         help="CUDA allocator fragmentation overhead (default: 0.10 = 10%%)",
     )
+    parser.add_argument(
+        "--attn-sharding-stage",
+        type=int,
+        default=1,
+        choices=[1, 2, 3],
+        help="FSDP sharding stage (ZeRO-1/2/3) of every parameter outside the routed experts",
+    )
+    parser.add_argument(
+        "--expert-sharding-stage",
+        type=int,
+        default=1,
+        choices=[1, 2, 3],
+        help="FSDP sharding stage (ZeRO-1/2/3) of the routed expert weights",
+    )
     parser.add_argument("--detail", action="store_true", help="Show detailed breakdown at peak")
     parser.add_argument("--timeline", action="store_true", help="Show full schedule timeline")
     parser.add_argument(
@@ -251,6 +271,8 @@ def main():
         global_batch_size=args.global_batch_size,
         sequence_length=args.sequence_length,
         fp8_training=args.fp8_training,
+        attn_sharding_stage=args.attn_sharding_stage,
+        expert_sharding_stage=args.expert_sharding_stage,
     )
 
     # Validate num_chunks. dp alone splits the batch; ep shards experts, not data.
