@@ -22,6 +22,7 @@ Suites:
 import argparse
 import json
 import os
+import socket
 import sys
 import time
 import traceback
@@ -268,21 +269,42 @@ def append_jsonl(path: Path, rec: dict) -> None:
         f.write(json.dumps(rec) + "\n")
 
 
-def done_keys(path: Path) -> set:
-    """
-    Keys already measured, or already found to OOM, so a rerun moves on to the next workload.
-    """
-    keys = set()
+def load_records(path: Path) -> list[dict]:
+    recs = []
     for file in [path, *path.parent.glob(path.stem + ".oom.rank*.jsonl")]:
         if not file.exists():
             continue
         for line in file.read_text().splitlines():
             try:
-                r = json.loads(line)
-                keys.add((r["schedule"], r["workload"]))
+                recs.append(json.loads(line))
             except Exception:
                 pass
-    return keys
+    return recs
+
+
+def pending_runs(recs: list[dict], workloads: list[dict], schedules: list[str]) -> list[tuple]:
+    """
+    (workload, schedule) pairs still to run, workload-major, so both schedules of a workload run
+    back to back in one step on one node. A workload is done when every schedule has a measurement
+    on one common host, or has been found to OOM (memory does not depend on the node). Otherwise
+    every schedule of it that did not OOM runs again here, so its comparison stays on one node.
+    """
+    runs = []
+    for wl in workloads:
+        ok_hosts = {sched: set() for sched in schedules}
+        oom = {sched: False for sched in schedules}
+        for r in recs:
+            if r.get("workload") != wl["name"] or r.get("schedule") not in ok_hosts:
+                continue
+            if r.get("status") == "ok" and r.get("host"):
+                ok_hosts[r["schedule"]].add(r["host"])
+            elif r.get("status") == "oom":
+                oom[r["schedule"]] = True
+        hosts = set().union(*ok_hosts.values()) or {None}
+        if any(all(oom[x] or h in ok_hosts[x] for x in schedules) for h in hosts):
+            continue
+        runs.extend((wl, sched) for sched in schedules if not oom[sched])
+    return runs
 
 
 def main():
@@ -366,21 +388,22 @@ def main():
     src = TokenSource(cfg.dataset)
     tune_kernels()
     static_alloc = all_max(torch.cuda.memory_allocated() / 2**30)
-    done = done_keys(out) if rank == 0 else set()
-    obj = [done]
-    dist.broadcast_object_list(obj, src=0)
-    done = obj[0]
+    host = socket.gethostname()
+    if args.suite == "check":
+        runs = [(wl, sched) for sched in schedules for wl in workloads]
+    else:
+        obj = [pending_runs(load_records(out), workloads, schedules) if rank == 0 else None]
+        dist.broadcast_object_list(obj, src=0)
+        runs = obj[0]
     capture = 0
     tuned = False
 
-    for schedule in schedules:
+    for wl, schedule in runs:
         training.model.sequential_at_pp1 = schedule == "sequential"
-        for wl in workloads:
+        if True:
             key = (schedule, wl["name"])
-            if args.suite != "check" and key in done:
-                continue
             torch.cuda.empty_cache()
-            base = dict(schedule=schedule, workload=wl["name"], M=wl["M"], static_alloc_gib=static_alloc)  # fmt: skip
+            base = dict(schedule=schedule, workload=wl["name"], M=wl["M"], static_alloc_gib=static_alloc, host=host)  # fmt: skip
             if wl["kind"] == "packed":
                 lens = wl["lengths"]
                 base["lengths"] = lens
