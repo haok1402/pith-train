@@ -138,7 +138,9 @@ class DualPipeV(nn.Module):
     full-size gradients, and each FSDP group reduce-scatters its gradients once at the end.
     """
 
-    def __init__(self, modules: Tuple[nn.Module, nn.Module]) -> None:
+    def __init__(
+        self, modules: Tuple[nn.Module, nn.Module], sequential_at_pp1: bool = False
+    ) -> None:
         super().__init__()
 
         device = torch.device(torch.cuda.current_device())
@@ -153,6 +155,12 @@ class DualPipeV(nn.Module):
         self.is_last_pp_rank = pp_rank == pp_size - 1
 
         self.comm_stream = torch.cuda.Stream(device=device)
+
+        # Experimental: at pp_size 1, run each micro-batch as F0 F1 B1 B0 with no forward-backward
+        # pairing instead of the overlapped DualPipeV schedule. Read at every step, so it may be
+        # toggled between steps.
+        assert not sequential_at_pp1 or pp_size == 1, "sequential_at_pp1 requires pp_size == 1"
+        self.sequential_at_pp1 = sequential_at_pp1
 
         self.num_chunks_allocated = 0
         self.chunk_records: Tuple[List[ChunkRecord], List[ChunkRecord]] = ([], [])
@@ -556,7 +564,7 @@ class DualPipeV(nn.Module):
                     assert hasattr(state_ctx, "post_backward_final_callback_queued")
                     state_ctx.post_backward_final_callback_queued = True
 
-        pp_rank, pp_size = distributed.pp_rank, distributed.pp_size
+        pp_size = distributed.pp_size
 
         if self.is_first_pp_rank:
             assert objective is not None, (
@@ -574,6 +582,63 @@ class DualPipeV(nn.Module):
             self.input_chunks = ([tuple(microbatch.model_inputs) for microbatch in microbatches], [])  # fmt: skip
             self.objective_inputs = [microbatch.objective_inputs for microbatch in microbatches]
             self.objective = objective
+
+        if pp_size == 1 and self.sequential_at_pp1:
+            self.run_sequential_schedule(num_chunks)
+        else:
+            self.run_dualpipev_schedule(num_chunks)
+
+        self.commit_and_wait_comm()
+
+        objective_outputs = self.objective_output_chunks
+
+        self.reset_states()
+
+        # Release FP8 weight caches so the memory is available for optimizer.step().
+        FP8WeightCacheControl.clear(*self.module)
+
+        # End of the ZeRO-1 step: fold the bf16 gradients into the fp32 buffers, reduce-scatter
+        # each group once, reshard its weights, and run the root callback skipped above.
+        for module in self.module:
+            if not isinstance(module, FSDPModule):
+                continue
+            # Nothing overlaps the end-of-step reduce, so run its copies on the compute stream:
+            # buffers then come from the compute stream's allocator pool, which the pipeline has
+            # just emptied, instead of a reduce-scatter pool per root that stays reserved (and
+            # unusable by the pipeline) through the whole next step.
+            comm_ctx = fully_shard.state(module)._comm_ctx
+            comm_ctx.reduce_scatter_stream = torch.cuda.current_stream()
+            module.set_is_last_backward(True)
+            module.set_reshard_after_backward(True)
+            module.set_requires_gradient_sync(True)
+            fsdp_state = fully_shard.state(module)
+            for state in fsdp_state._state_ctx.all_states:
+                if state._fsdp_param_group:
+                    for fsdp_param in state._fsdp_param_group.fsdp_params:
+                        if hasattr(fsdp_param, "_unsharded_param"):
+                            fsdp_param.accumulate_unsharded_grad_if_needed()
+                            fsdp_param.to_accumulated_grad_if_needed()
+                    state._fsdp_param_group.post_backward()
+            fsdp_state._root_post_backward_final_callback()
+
+        return objective_outputs
+
+    def run_sequential_schedule(self, num_chunks: int) -> None:
+        """
+        The experimental pp_size 1 schedule: each micro-batch runs F0 F1 B1 B0 in turn, so no
+        all-to-all hides behind another micro-batch's compute and only one micro-batch's
+        activations are live at a time. Every send and receive is a no-op at pp_size 1.
+        """
+        assert distributed.pp_size == 1
+        for _ in range(num_chunks):
+            self.forward_chunk(0)
+            self.forward_chunk(1)
+            self.backward_chunk(1)
+            self.backward_chunk(0)
+        assert WeightGradStore.funcs_queue.empty()
+
+    def run_dualpipev_schedule(self, num_chunks: int) -> None:
+        pp_rank, pp_size = distributed.pp_rank, distributed.pp_size
 
         # Step 1: nF0
         step_1 = (pp_size - pp_rank - 1) * 2
@@ -642,41 +707,6 @@ class DualPipeV(nn.Module):
         for i in range(step_8):
             self.weight_chunk()
         assert WeightGradStore.funcs_queue.empty()
-
-        self.commit_and_wait_comm()
-
-        objective_outputs = self.objective_output_chunks
-
-        self.reset_states()
-
-        # Release FP8 weight caches so the memory is available for optimizer.step().
-        FP8WeightCacheControl.clear(*self.module)
-
-        # End of the ZeRO-1 step: fold the bf16 gradients into the fp32 buffers, reduce-scatter
-        # each group once, reshard its weights, and run the root callback skipped above.
-        for module in self.module:
-            if not isinstance(module, FSDPModule):
-                continue
-            # Nothing overlaps the end-of-step reduce, so run its copies on the compute stream:
-            # buffers then come from the compute stream's allocator pool, which the pipeline has
-            # just emptied, instead of a reduce-scatter pool per root that stays reserved (and
-            # unusable by the pipeline) through the whole next step.
-            comm_ctx = fully_shard.state(module)._comm_ctx
-            comm_ctx.reduce_scatter_stream = torch.cuda.current_stream()
-            module.set_is_last_backward(True)
-            module.set_reshard_after_backward(True)
-            module.set_requires_gradient_sync(True)
-            fsdp_state = fully_shard.state(module)
-            for state in fsdp_state._state_ctx.all_states:
-                if state._fsdp_param_group:
-                    for fsdp_param in state._fsdp_param_group.fsdp_params:
-                        if hasattr(fsdp_param, "_unsharded_param"):
-                            fsdp_param.accumulate_unsharded_grad_if_needed()
-                            fsdp_param.to_accumulated_grad_if_needed()
-                    state._fsdp_param_group.post_backward()
-            fsdp_state._root_post_backward_final_callback()
-
-        return objective_outputs
 
 
 def overlapped_forward_backward(

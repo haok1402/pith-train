@@ -210,6 +210,13 @@ class TrainingCfg(SlottedDefault):
     does for its MoE benchmarks. For throughput measurement only; wrong for real training.
     """
 
+    pp1_sequential_schedule: bool = False
+    """
+    Experimental, pipeline_parallel_size 1 only: run each micro-batch as forward chunk 0, forward
+    chunk 1, backward chunk 1, backward chunk 0, with no forward-backward pairing, instead of the
+    overlapped DualPipeV schedule. ZeRO-1 data parallelism is unchanged.
+    """
+
     fp8: bool = False
     """
     Train the linear layers in FP8 through DeepGEMM with 128-element block scaling; False is BF16.
@@ -426,7 +433,7 @@ def setup_model(
             if hasattr(module, "router_replay"):
                 module.router_replay = force_balance(module.num_experts)
 
-    training.model = DualPipeV(modules)
+    training.model = DualPipeV(modules, sequential_at_pp1=cfg.pp1_sequential_schedule)
 
 
 offloaded_state: list[tuple[torch.UntypedStorage, torch.Tensor]] = []
