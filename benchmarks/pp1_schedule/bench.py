@@ -33,7 +33,7 @@ import torch
 import torch.distributed as dist
 
 from pithtrain.contexts import distributed, training
-from pithtrain.kernels import tune_kernels
+from pithtrain.kernels import cross_entropy_fwd_bwd, tune_kernels
 from pithtrain.modules.distributed import setup_distributed
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import setup_logging
@@ -44,7 +44,7 @@ from pithtrain.modules.training import (
     setup_training,
 )
 from pithtrain.pipeline import Microbatch
-from pithtrain.tasks.pretrain_lm import PretrainLMCfg, objective
+from pithtrain.tasks.pretrain_lm import PretrainLMCfg
 
 MODELS = {
     "deepseek-v2-lite": "deepseek-v2",
@@ -124,6 +124,47 @@ def make_packed(src: TokenSource, length: int, offset: int, rng: np.random.Gener
         labels[0, end - 1] = -100
     cu_seqlens = torch.tensor(bounds, dtype=torch.int32)
     return tokens, labels, cu_seqlens
+
+
+class ChunkedCrossEntropy(torch.autograd.Function):
+    """
+    The token-summed loss of pretrain_lm.objective through the same fused kernel, run on row slices.
+    The SM90 kernel indexes the flattened (N * V) logits with int32, so a micro-batch of more than
+    (2^31 - 1) / V tokens (20,971 for DeepSeek-V2-Lite, 14,134 for Qwen3) fails there. Each slice is
+    row-contiguous, so the kernel still overwrites the logits with their gradient in place and no
+    memory is added; a micro-batch within the bound runs as one slice, as pretrain_lm does.
+    """
+
+    @staticmethod
+    def forward(ctx, inp, target, ignore_index):
+        rows = (2**31 - 1) // inp.shape[1]
+        total = inp.new_zeros((), dtype=torch.float32)
+        for begin in range(0, inp.shape[0], rows):
+            end = min(begin + rows, inp.shape[0])
+            mean, grad = cross_entropy_fwd_bwd(inp[begin:end], target[begin:end], ignore_index)
+            count = (target[begin:end] != ignore_index).sum().clamp_min(1)
+            # The kernel's gradient is of the slice mean; scale it to the gradient of the sum.
+            grad.mul_(count.to(grad.dtype))
+            total = total + mean * count
+        ctx.save_for_backward(inp.detach())
+        return total
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (inp,) = ctx.saved_tensors
+        inp.mul_(grad_output.to(inp.dtype))
+        return inp, None, None
+
+
+def objective(model_outputs, objective_inputs):
+    """
+    pretrain_lm.objective with the cross-entropy split by ChunkedCrossEntropy.
+    """
+    (logits,) = model_outputs
+    (labels,) = objective_inputs
+    logits = logits.view(-1, logits.size(-1))
+    loss = ChunkedCrossEntropy.apply(logits, labels.view(-1), -100)
+    return loss, loss.detach()
 
 
 def build_microbatches(src, workload: dict, step: int) -> list[Microbatch]:
@@ -228,9 +269,14 @@ def append_jsonl(path: Path, rec: dict) -> None:
 
 
 def done_keys(path: Path) -> set:
+    """
+    Keys already measured, or already found to OOM, so a rerun moves on to the next workload.
+    """
     keys = set()
-    if path.exists():
-        for line in path.read_text().splitlines():
+    for file in [path, *path.parent.glob(path.stem + ".oom.rank*.jsonl")]:
+        if not file.exists():
+            continue
+        for line in file.read_text().splitlines():
             try:
                 r = json.loads(line)
                 keys.add((r["schedule"], r["workload"]))
@@ -381,6 +427,7 @@ def main():
                     torch.cuda.cudart().cudaProfilerStop()
                     capture += 1
                     rec["capture"] = capture
+                    rec["nsys_prefix"] = os.environ.get("PP1_NSYS_PREFIX")
                     rec["nsys_step_time"] = r["step_time"]
                 record(rec)
             except torch.OutOfMemoryError as e:

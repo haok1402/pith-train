@@ -2,7 +2,9 @@
 # Run one bench.py (or check_pretrain.py) process on this node, optionally under nsys.
 # usage: launch.sh [--nsys <report-prefix>] <script.py> <args...>
 set -euo pipefail
-export OMP_NUM_THREADS=8
+export OMP_NUM_THREADS=4
+# Keep CPU use small: other agents benchmark on these nodes.
+export TORCHINDUCTOR_COMPILE_THREADS=4 MAX_JOBS=4
 export PYTHONUNBUFFERED=1
 source .venv/bin/activate
 
