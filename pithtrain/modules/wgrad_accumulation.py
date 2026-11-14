@@ -2,15 +2,15 @@
 Weight-gradient accumulation into a layer-owned fp32 buffer.
 
 BF16Linear, GroupedLinear and FP8GroupedLinear add their weight gradient straight into the fp32
-main_grad buffer instead of writing a bf16 .grad that FSDP2 then adds into its own fp32 buffer. It
-also keeps the sum across micro-batches in fp32 under DualPipeV, where FSDP2 would otherwise add
-most micro-batches together in bf16. setup_model enables it for every run, BF16 or FP8.
+main_grad buffer instead of writing a bf16 gradient per micro-batch that autograd then adds into
+FSDP2's fp32 .grad: the GEMM accumulates in fp32, so no micro-batch's gradient is rounded to bf16
+and no bf16 temporary is allocated. setup_model enables it for every run, BF16 or FP8.
 
 install_wgrad_accumulation connects these layers to FSDP2 after fully_shard by extending two methods
 of each parameter group:
 - pre_backward allocates and zeroes main_grad at the first backward of the step.
-- post_backward, when the group reduces, hands main_grad to FSDP2 as the accumulated gradient of the
-  parameter and releases its memory once FSDP2 has copied it into the reduce-scatter input.
+- post_backward, when the group reduces, hands main_grad to FSDP2 as the gradient of the parameter
+  and releases its memory once FSDP2 has copied it into the reduce-scatter input.
 
 main_grad keeps the same tensor object across steps, so compiled graphs that take it as an input
 stay valid. Without install, main_grad is None and the layer behaves like its torch.nn version.
@@ -92,18 +92,15 @@ def _attach_main_grads(group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch
         if not group.reduce_grads:
             orig_post_backward(*args)
             return
-        # FSDP2 reduces a group in one dtype, so move the bf16 gradients into fp32 first.
-        for fsdp_param in group.fsdp_params:
-            if hasattr(fsdp_param, "_unsharded_param"):
-                fsdp_param.accumulate_unsharded_grad_if_needed()
-                fsdp_param.to_accumulated_grad_if_needed()
         # Keep any gradient the weight got outside its layer, e.g. kv_b_proj in MLA ring attention.
         for fsdp_param, main_grad in pairs:
             if main_grad.untyped_storage().size() > 0:
-                if fsdp_param.unsharded_accumulated_grad is not None:
-                    main_grad.add_(fsdp_param.unsharded_accumulated_grad)
+                param = fsdp_param.unsharded_param
+                if param.grad is not None:
+                    main_grad.add_(param.grad)
                 # A transposed main_grad is made contiguous once per step for the reduce-scatter.
-                fsdp_param.unsharded_accumulated_grad = main_grad.contiguous()
+                # The parameter's grad_dtype is fp32 (the reduce dtype) or None, so it takes fp32.
+                param.grad = main_grad.contiguous()
         orig_post_backward(*args)
         # FSDP2 has copied main_grad into the reduce-scatter input on this stream.
         for _, main_grad in pairs:
