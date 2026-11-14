@@ -1,9 +1,10 @@
 """
 FSDP2 forward methods with a lean path for the repeated calls of a step.
 
-FSDP's register_fsdp_forward_method runs its full pre- and post-forward around every call. Under
-reshard_after_forward=False the parameters stay unsharded from a group's first call of the step to
-the end-of-step reduce, so from the second call on most of that work is host-side overhead.
+FSDP's register_fsdp_forward_method runs its full pre- and post-forward around every call. At
+sharding stage 1 the parameters stay unsharded from a group's first call of the step to the
+end-of-step reduce, so from the second call on most of that work is host-side overhead; at stage 3
+(modules/fsdp_sharding.py) a resharded group takes the full path, which all-gathers it.
 
 register_fsdp_forward_method here takes FSDP's full path whenever a precondition fails (a group
 not unsharded or with an all-gather in flight, a pending forward root, forward prefetching, an
@@ -108,7 +109,8 @@ def backward_state_call_ok(state: Any) -> bool:
     Whether a call to a module in PRE_BACKWARD needs only the input cast.
     """
     # The pipeline defers FSDP's root post-backward callback to the end of the step, so a module
-    # stays in PRE_BACKWARD after its first backward and FSDP takes its checkpointing branch.
+    # stays in PRE_BACKWARD after its first backward and FSDP takes its checkpointing branch; a
+    # module at sharding stage 2 or 3 is held there for the whole step.
     if torch.compiler.is_compiling() or state._mp_policy.output_dtype is not None:
         return False
     return all(group.is_unsharded for group in state._fsdp_param_groups)

@@ -25,6 +25,7 @@ import torch.cuda.nvtx as nvtx
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import FSDPModule, fully_shard
+from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
 
 from pithtrain.contexts import distributed, training
 from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
@@ -134,8 +135,10 @@ class DualPipeV(nn.Module):
     V-shaped bidirectional pipeline scheduler over the two model chunks of this rank, from the
     DeepSeek-V3 Technical Report (https://arxiv.org/abs/2412.19437).
 
-    Data parallelism is ZeRO-1: during a step every rank holds the full weights and accumulates
-    full-size gradients, and each FSDP group reduce-scatters its gradients once at the end.
+    Data parallelism follows each FSDP group's sharding stage (modules/fsdp_sharding.py). At stage 1,
+    the default, every rank holds the group's full weights and accumulates its full-size gradients
+    during a step, and the group reduce-scatters once at the end; at stages 2 and 3 the group is
+    reduce-scattered after each micro-batch's backward through each layer.
     """
 
     def __init__(self, modules: Tuple[nn.Module, nn.Module]) -> None:
@@ -558,6 +561,11 @@ class DualPipeV(nn.Module):
                 state_ctx = fully_shard.state(module)._state_ctx
                 state_ctx.post_backward_final_callback_queued = True
                 state_ctx.manual_backward_finalization_active = True
+        # Groups at sharding stage 2 or 3 stay in PRE_BACKWARD for the step, where FSDP2 only
+        # all-gathers on demand; fsdp_sharding reduces and reshards them per layer.
+        for module in self.module.modules():
+            if getattr(module, "sharding_stage", 1) > 1:
+                fully_shard.state(module)._training_state = TrainingState.PRE_BACKWARD
 
         pp_rank, pp_size = distributed.pp_rank, distributed.pp_size
 
@@ -656,15 +664,16 @@ class DualPipeV(nn.Module):
         FP8WeightCacheControl.clear(*self.module)
 
         # End of the step: run the root callback deferred above, which marks every group with
-        # gradients still to reduce, then finalize_backward reduce-scatters them, reshards the
-        # weights and waits for all reductions of the step.
+        # gradients still to reduce, then finalize_backward reduce-scatters those (every group at
+        # stage 1), reshards the rest and waits for all reductions of the step.
         for module in self.module:
             if not isinstance(module, FSDPModule):
                 continue
             # Nothing overlaps the end-of-step reduce, so run its copies on the compute stream:
             # buffers then come from the compute stream's allocator pool, which the pipeline has
             # just emptied, instead of a reduce-scatter pool per root that stays reserved (and
-            # unusable by the pipeline) through the whole next step.
+            # unusable by the pipeline) through the whole next step. The per-layer reduces of
+            # stages 2 and 3 keep FSDP2's own stream, which overlaps them with the pipeline.
             fsdp_state = fully_shard.state(module)
             comm_ctx = fsdp_state._comm_ctx
             reduce_scatter_stream = comm_ctx.reduce_scatter_stream

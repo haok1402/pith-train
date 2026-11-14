@@ -28,6 +28,7 @@ from pithtrain.modules.fp8_param_gather import (
     install_raw_fp8_param_gather,
 )
 from pithtrain.modules.fsdp_forward import install_lean_hooks, register_fsdp_forward_method
+from pithtrain.modules.fsdp_sharding import install_sharding_stages
 from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
 from pithtrain.modules.optimizer import Muon
 from pithtrain.modules.wgrad_accumulation import (
@@ -400,6 +401,7 @@ def setup_model(
     install_wgrad_accumulation(modules)
     install_raw_main_grad(modules)  # gpt-oss raw expert weights; no-op elsewhere
     install_side_grads(modules)  # after the main_grad installs: its post_backward runs first
+    install_sharding_stages(modules, distributed_cfg.attn_sharding_stage, distributed_cfg.expert_sharding_stage)  # fmt: skip
 
     # The two V-chunks build identical read-only rotary caches; share one to save memory.
     if hasattr(modules[0], "rotary_emb") and hasattr(modules[1], "rotary_emb"):

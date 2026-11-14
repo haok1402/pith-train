@@ -78,7 +78,8 @@ class LayerProtocol(Protocol):
     ) -> torch.Tensor:
         """
         Stage 5, after the combine: weight the expert outputs by the router weights, sum them per
-        token and add the residual from stage 1.
+        token and add the residual from stage 1. Reads no parameters: at sharding stage 3 a layer's
+        weights are resharded after stage 3 (modules/fsdp_sharding.py).
         """
 
 

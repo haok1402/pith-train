@@ -58,6 +58,23 @@ class DistributedCfg(SlottedDefault):
     for a cheaper gradient reduction.
     """
 
+    attn_sharding_stage: int = 1
+    """
+    ZeRO stage of the attention parameters, meaning everything outside the routed experts.
+
+    1: every rank holds the full weights and full fp32 gradients through a step, and FSDP
+    reduce-scatters once at its end. 2: the gradients of each layer are reduce-scattered after
+    every micro-batch's backward through it, and its full-size gradient freed. 3: as 2, and the
+    weights of each layer are also resharded after its forward and backward and all-gathered again
+    for the next use. See modules/fsdp_sharding.py.
+    """
+
+    expert_sharding_stage: int = 1
+    """
+    ZeRO stage of the routed expert weights, as attn_sharding_stage. The experts are already split
+    by expert parallelism and shard over the smaller expert dp group, so the right stage can differ.
+    """
+
 
 def setup_torch_runtime() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True

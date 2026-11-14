@@ -49,6 +49,8 @@ pytest tests/kernels/test_fp8_gemm.py::test_name -v
 
 # Multi-GPU integration test — boots DualPipeV with FSDP, ~4 GPUs, pp=2 ep=2
 bash tests/test_dualpipev.sh
+# ... at FSDP sharding stages attn=3 expert=2, also checked against a stage 1,1 copy
+SHARDING_STAGES=3,2 PP_SIZE=1 bash tests/test_dualpipev.sh
 ```
 
 ### Benchmarks
@@ -106,7 +108,7 @@ Key files:
 
 **MoE parallel folding** ([arXiv:2504.14960](https://arxiv.org/abs/2504.14960) section 3.2): attention and the experts get independent parallelism over the same ranks. `setup_device_mesh` builds two device meshes, `attn_mesh` as `(pp, dp, cp)` and `expt_mesh` as `(pp, dp, ep)`, which factor the `world_size // pp` ranks of one pipeline stage two different ways, so `dp * cp == ep * expt_dp == world_size // pp`. PP is the one axis the two views share, and it stays outermost in each. PP/CP/EP are configured through `DistributedCfg`; both DP degrees are derived.
 
-Properties worth remembering: `cp` and `ep` each need only divide the stage size, not each other, so EP may span CP; both the CP group and the EP group are contiguous rank blocks, so each stays on NVLink independently; and **`dp_rank` alone decides which data a rank loads**, while `ep_rank` names only the experts a rank hosts. FSDP shards the expert parameters (the routed expert weights) over `expt_mesh["dp"]` and the attention parameters (everything else) over the flattened `attn_mesh["dp", "cp"]`, with a plain-sum gradient reduction on both, so the single divide by the global token count in the training step is the only normalization. `DistributedCfg.hsdp_replica` above 1 splits both of those groups into that many replicas, sharding within one and all-reducing across them. A process group is published only for axes that a collective runs over directly (`pp`, `cp`, `ep`); both `dp` axes reduce through FSDP, which takes a mesh.
+Properties worth remembering: `cp` and `ep` each need only divide the stage size, not each other, so EP may span CP; both the CP group and the EP group are contiguous rank blocks, so each stays on NVLink independently; and **`dp_rank` alone decides which data a rank loads**, while `ep_rank` names only the experts a rank hosts. FSDP shards the expert parameters (the routed expert weights) over `expt_mesh["dp"]` and the attention parameters (everything else) over the flattened `attn_mesh["dp", "cp"]`, with a plain-sum gradient reduction on both, so the single divide by the global token count in the training step is the only normalization. `DistributedCfg.hsdp_replica` above 1 splits both of those groups into that many replicas, sharding within one and all-reducing across them. `DistributedCfg.attn_sharding_stage` and `expert_sharding_stage` set the ZeRO stage of each class (1, the default: full weights and gradients through the step and one reduce-scatter at its end; 2: per-layer reduce-scatter per micro-batch; 3: also per-layer resharding), driven per layer by `pithtrain/modules/fsdp_sharding.py` above stage 1. A process group is published only for axes that a collective runs over directly (`pp`, `cp`, `ep`); both `dp` axes reduce through FSDP, which takes a mesh.
 
 `setup_default_process_group` also installs a fail-fast excepthook and passes `DistributedCfg.timeout` (default 15 min) as the collective timeout, so a failed rank does not make peers wait. Both belong to creating the world, so a process that inherits one from its host keeps whatever that host chose.
 
@@ -205,7 +207,7 @@ Bit-exactness contracts: each `_sm90` kernel produces exactly the FP8 bytes and 
 
 `PretrainLMCfg` composes `DistributedCfg`, `TrainingCfg` and `LoggingCfg`, plus a `dataset` path of its own. `launch(cfg)` calls `setup_logging`, `setup_distributed` and `setup_training` in turn, each of which populates its runtime context (see Runtime Contexts below). The corpus and the step counter are neither context nor shared config: only a task that reads a corpus has any use for them, so `setup_dataset` lives in `pretrain_lm.py`, returns the dataset, and `launch` owns it alongside the step counter.
 
-The FSDP2 hooks that are neither ops nor kernels live in `pithtrain/modules/`: `fsdp_forward.py` (lean forward hooks), `fp8_param_gather.py` (FP8 parameter all-gather, including gpt-oss's raw expert weights) and `wgrad_accumulation.py` (fp32 main_grad accumulation of the weight gradients, and of raw expert parameters).
+The FSDP2 hooks that are neither ops nor kernels live in `pithtrain/modules/`: `fsdp_forward.py` (lean forward hooks), `fp8_param_gather.py` (FP8 parameter all-gather, including gpt-oss's raw expert weights), `wgrad_accumulation.py` (fp32 main_grad accumulation of the weight gradients, and of raw expert parameters) and `fsdp_sharding.py` (ZeRO-2/3: per-layer reduce, reshard and prefetch).
 
 ### Task Module Convention (`pithtrain/tasks/`)
 

@@ -8,7 +8,8 @@ and no bf16 temporary is allocated. setup_model enables it for every run, BF16 o
 
 install_wgrad_accumulation connects these layers to FSDP2 after fully_shard by extending two methods
 of each parameter group:
-- pre_backward allocates and zeroes main_grad at the first backward of the step.
+- pre_backward allocates and zeroes main_grad at the first backward after it was released: once
+  per step at sharding stage 1, once per layer and micro-batch at stages 2 and 3 (fsdp_sharding).
 - post_backward, when the group reduces, hands main_grad to FSDP2 as the gradient of the parameter
   and releases its memory once FSDP2 has copied it into the reduce-scatter input.
 
@@ -106,7 +107,7 @@ def _attach_main_grads(group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch
                 param = fsdp_param.unsharded_param
                 if param.grad is not None:
                     main_grad.add_(param.grad)
-                # A transposed main_grad is made contiguous once per step for the reduce-scatter.
+                # A transposed main_grad is made contiguous once per reduce-scatter.
                 # The parameter's grad_dtype is fp32 (the reduce dtype) or None, so it takes fp32.
                 param.grad = main_grad.contiguous()
         orig_post_backward(*args)
