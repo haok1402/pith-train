@@ -193,8 +193,9 @@ def halo_backward(
     d_local[:, :, block - h : block] += front_tail_grad
     if back_tail_grad is not None:
         d_local[:, :, S - h :] += back_tail_grad
-    d_local = d_local.to(q.dtype)
-    return dq.view_as(q), d_local[0], d_local[1], grad_sink_or_empty(grad_sink, q)
+    # Separate copies: custom-op outputs must not alias one another.
+    dk, dv = (d_local[i].to(q.dtype, copy=True) for i in range(2))
+    return dq.view_as(q), dk, dv, grad_sink_or_empty(grad_sink, q)
 
 
 @torch.library.custom_op("pithtrain::sliding_window_halo_fwd", mutates_args=())
@@ -388,8 +389,8 @@ def gather_backward(
     d_gathered.index_put_((src_rank, zeros + 1, src_index), torch.where(mask, dv, 0).float(), accumulate=True)  # fmt: skip
     d_local = d_gathered.new_empty(d_gathered.shape[1:])
     reduce_scatter_tensor(d_local, d_gathered, group=group)
-    d_local = d_local.to(q.dtype)
-    return dq, d_local[0], d_local[1], grad_sink_or_empty(grad_sink, q)
+    dk, dv = (d_local[i].to(q.dtype, copy=True) for i in range(2))
+    return dq, dk, dv, grad_sink_or_empty(grad_sink, q)
 
 
 @torch.library.custom_op("pithtrain::sliding_window_gather_fwd", mutates_args=())
