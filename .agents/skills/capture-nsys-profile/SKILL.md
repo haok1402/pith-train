@@ -11,7 +11,7 @@ Capture a single-step Nsight Systems (`.nsys-rep`) trace of PithTrain training, 
 
 - **Python environment**: activate `.venv` in the repo root (`source .venv/bin/activate`).
 - **Nsight Systems CLI**: `nsys --version` must work on every compute node.
-- **Hardware**: enough GPUs to satisfy `world_size >= PP * CP * EP` (with at least `DP >= 1`). See Step 2.
+- **Hardware**: a world size that `PP` divides, with `CP` and `EP` each dividing the stage size `world_size / PP` (MoE parallel folding: attention factors a stage as `dp x cp`, the experts as `expt_dp x ep`, so `CP` and `EP` need not divide each other). See Step 2.
 - **Benchmark inputs set up**: the **setup-benchmark-inputs** skill has run for the target model (produces the tokenized corpus and DCP checkpoint capture loads).
 
 ## Step 1: Choose parallelism
@@ -28,12 +28,13 @@ If the user is vague ("just profile DeepSeek-V2-Lite"), ask for PP and EP before
 
 ## Step 2: Determine node count
 
-Target DP=1 (smallest world that satisfies the parallelism plan). Assuming 8 GPUs per node:
+Target the smallest world that satisfies the parallelism plan: `PP * lcm(CP, EP)` GPUs, the smallest stage that both `CP` and `EP` divide. EP may span CP, so CP does not multiply the world. Assuming 8 GPUs per node:
 
-| Config | PP * CP * EP | Min nodes (8 GPUs/node) |
+| Config | Min world `PP * lcm(CP, EP)` | Min nodes (8 GPUs/node) |
 |---|---|---|
 | `pp=2 cp=1 ep=2` | 4 | 1 (half of an 8-GPU node) |
 | `pp=2 cp=1 ep=8` | 16 | 2 |
+| `pp=2 cp=2 ep=8` | 16 | 2 (attention `dp=4 x cp=2`, experts `ep=8`) |
 | `pp=4 cp=1 ep=8` | 32 | 4 |
 
 ### If running under SLURM
