@@ -350,6 +350,7 @@ def main():
     p.add_argument("--nsys-max-mb", type=int, default=32, help="skip the nsys step above this M")
     p.add_argument("--oom-M", type=int, default=2)
     p.add_argument("--oom-lengths", default="16384,24576,32768,49152,65536,98304,131072")
+    p.add_argument("--only", default=None, help="comma-separated workload names to keep")
     p.add_argument("--out", required=True)
     args = p.parse_args()
 
@@ -372,6 +373,9 @@ def main():
         for L in [int(x) for x in args.oom_lengths.split(",")]:
             lens = [[L] * args.oom_M for _ in range(world)]
             workloads.append(dict(name=f"oom-M{args.oom_M}-L{L}", kind="packed", M=args.oom_M, lengths=lens, probe_len=L))  # fmt: skip
+    if args.only:
+        keep = set(args.only.split(","))
+        workloads = [w for w in workloads if w["name"] in keep]
     max_len = 2048
     for w in workloads:
         if w["kind"] == "packed":
