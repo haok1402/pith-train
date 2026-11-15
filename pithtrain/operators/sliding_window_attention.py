@@ -177,24 +177,23 @@ def halo_backward(
         learnable_sink=learnable_sink,
     )
     # Split [front halo, front block, back halo, back block] per sample back apart.
-    dkv = torch.stack([dk, dv]).view(2, B, hf + h + S, *k.shape[2:])
-    d_front_halo, d_front, d_back_halo, d_back = dkv.split([hf, block, h, block], dim=2)
-    d_local = torch.cat([d_front, d_back], dim=2).float()
+    dk, dv = (x.view(B, hf + h + S, *k.shape[2:]).split([hf, block, h, block], dim=1) for x in (dk, dv))  # fmt: skip
+    d_front_halo, d_back_halo = torch.stack([dk[0], dv[0]]), torch.stack([dk[2], dv[2]])
+    dk, dv = torch.cat([dk[1], dk[3]], dim=1), torch.cat([dv[1], dv[3]], dim=1)
 
     # Each halo's gradient belongs to the tokens the neighbour sent; take back our tails' share.
     last = cp_rank + 1 == cp_size
     front_tail_grad = d_back_halo if last else torch.empty_like(d_back_halo)
     back_tail_grad = torch.empty_like(d_back_halo) if cp_rank > 0 else None
-    to_next, from_next = (None, None) if last else (d_back_halo.contiguous(), front_tail_grad)
-    to_prev, from_prev = (
-        (d_front_halo.contiguous(), back_tail_grad) if cp_rank > 0 else (None, None)
-    )
+    to_next, from_next = (None, None) if last else (d_back_halo, front_tail_grad)
+    to_prev, from_prev = (d_front_halo, back_tail_grad) if cp_rank > 0 else (None, None)
     swap_halos(to_next, to_prev, from_next, from_prev, group)
-    d_local[:, :, block - h : block] += front_tail_grad
+    # A bf16 add accumulates in fp32 and rounds once, as an fp32 buffer would.
+    dk[:, block - h : block] += front_tail_grad[0]
+    dv[:, block - h : block] += front_tail_grad[1]
     if back_tail_grad is not None:
-        d_local[:, :, S - h :] += back_tail_grad
-    # Separate copies: custom-op outputs must not alias one another.
-    dk, dv = (d_local[i].to(q.dtype, copy=True) for i in range(2))
+        dk[:, S - h :] += back_tail_grad[0]
+        dv[:, S - h :] += back_tail_grad[1]
     return dq.view_as(q), dk, dv, grad_sink_or_empty(grad_sink, q)
 
 
