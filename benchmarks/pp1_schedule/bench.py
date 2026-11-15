@@ -213,6 +213,7 @@ def train_step(microbatches, update: bool = True, label: str | None = None) -> d
     torch.cuda.synchronize()
     dist.barrier()
     torch.cuda.reset_peak_memory_stats()
+    stats0 = torch.cuda.memory_stats()
     t0 = time.perf_counter()
     model, optimizers, schedulers = training.model, training.optimizers, training.schedulers
     model.train()
@@ -248,6 +249,17 @@ def train_step(microbatches, update: bool = True, label: str | None = None) -> d
         tokens=int(tok.item()),
         peak_alloc_gib=all_max(torch.cuda.max_memory_allocated() / 2**30),
         peak_reserved_gib=all_max(torch.cuda.max_memory_reserved() / 2**30),
+        # Allocator pressure within the step, worst rank: a retry frees cached blocks and calls
+        # cudaMalloc again after a failed allocation (synchronizing the device).
+        alloc_retries=int(
+            all_max(torch.cuda.memory_stats()["num_alloc_retries"] - stats0["num_alloc_retries"])
+        ),  # fmt: skip
+        cuda_mallocs=int(
+            all_max(
+                torch.cuda.memory_stats().get("num_device_alloc", 0)
+                - stats0.get("num_device_alloc", 0)
+            )
+        ),  # fmt: skip
     )
 
 
@@ -449,6 +461,10 @@ def main():
                 rec["tokens_per_s_per_gpu"] = rec["tokens"] / rec["step_time"] / world
                 rec["peak_alloc_gib"] = max(x["peak_alloc_gib"] for x in steps)
                 rec["peak_reserved_gib"] = max(x["peak_reserved_gib"] for x in steps)
+                rec["step_peak_alloc_gib"] = [x["peak_alloc_gib"] for x in steps]
+                rec["step_peak_reserved_gib"] = [x["peak_reserved_gib"] for x in steps]
+                rec["step_alloc_retries"] = [x["alloc_retries"] for x in steps]
+                rec["step_cuda_mallocs"] = [x["cuda_mallocs"] for x in steps]
                 rec["loss"] = steps[-1]["loss"]
                 if args.nsys and wl["M"] <= args.nsys_max_mb:
                     mbs = build_microbatches(src, wl, n)
