@@ -4,8 +4,8 @@ Branch `haok/pp1-sequential-prof` of haok1402/pith-train, from upstream main `2b
 pp1, cp1, MoE parallel folding (attention always DP8; experts EP8, or EP1 = experts replicated
 over 8 DP ranks). ZeRO-1 FSDP as today in both schedules.
 
-**Status: partial.** Everything below is measured; cells marked `pending` were not run yet (see
-[Pending](#pending)). No number in this file is an estimate unless it says so.
+Everything below is measured; no number in this file is an estimate unless it says so. What was not
+measured is listed under [Not measured](#not-measured).
 
 ## What was changed
 
@@ -50,9 +50,13 @@ about 1e-4 in loss.
     micro-batches differ), same list on every rank. `full`: the per-rank budget also differs across ranks
     (6k-37k tokens) and lengths differ within each rank.
   - (c) OOM probes: M = 1 or 2 equal packs of growing length, until each schedule OOMs.
-- Step time: wall time of the full step (model.step, grad scale, clip, Muon step), max over ranks, median
-  of 3 timed steps after 2 warmup steps; min-max of the 3 shown. tokens/s/GPU = real tokens per step /
-  step time / 8. Peak memory: max over ranks of `max_memory_allocated` / `max_memory_reserved`, cache
+- Step time: wall time of the full step (model.step, grad scale, clip, Muon step), max over ranks, 3
+  timed steps after 2 warmup steps. The tables show the fastest of the 3 and all 3; comparisons use the
+  fastest. A timed step can carry a recompilation (each step's packs have a different document count,
+  so the cu_seqlens shape changes; one dsv2 step took 21.6 s against 0.99 s) or, near the memory
+  limit, allocator retries; the latter are reported on their own (allocator table), the former are
+  not a cost of either schedule. tokens/s/GPU = real tokens per step /
+  fastest step time / 8. Peak memory: max over ranks of `max_memory_allocated` / `max_memory_reserved`, cache
   emptied before each workload.
 - Both schedules of a workload run back to back in one process on one node (column `host`), so
   node-to-node differences do not enter a comparison.
@@ -74,7 +78,9 @@ about 1e-4 in loss.
   (0.1.0a5, 0.1.0 only; 0.1.0 needs a newer tvm-ffi). Ran with 0.1.0a5 (local, uncommitted).
 - `benchmarks/pretraining/<model>/setup.py` tokenization crashes in a GPU-less step: its spawned
   workers re-import the script, which imports `pithtrain.modules.training`, which queries the device.
-- nsys `--capture-range-end=repeat` keeps every capture in `$TMPDIR` until the process exits; a
-  preempted step lost its traces until the harness put nsys's (only nsys's) temp dir on shared storage.
+- nsys `--capture-range-end=repeat` keeps every capture in `$TMPDIR` until the process exits, so a
+  preempted step can lose traces (on SIGTERM it converts some). With `$TMPDIR` on weka, the profiled
+  processes died with SIGBUS (every SIGBUS seen came from runs started that way), so it stays
+  node-local; the Triton and inductor caches are kept node-local as well.
 
 ## Results

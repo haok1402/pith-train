@@ -1,16 +1,13 @@
 
-## Pending
+## Not measured
 
-Interrupted by the shared quota filling at about 02:40 UTC on 2026-11-15, and resumed after:
-
-- dsv2-lite EP8 recapture (`main-dsv2-ep8-r2`): 12 of the 24 traces of the measured pass were lost
-  to a preemption; this pass repeats all 13 workloads with allocator statistics.
-- Allocator attribution of the near-limit slowdowns: dsv2 DP8 reruns (uniform M=32, M=4 even, M=8 even,
-  M=8 intra) and the dsv2 EP8 2-pack probe at 12k-24k, now recording per-step `num_alloc_retries`,
-  cudaMalloc calls, and peak allocated and reserved memory.
-- OOM probes: dsv2 DP8 2 packs (unfinished above 2,048), qwen3 EP8 1 pack (unfinished above 8,192 ovl
-  / 6,144 seq), qwen3 EP8 2 packs (not run).
-- A kernel-level breakdown of DP8 vs EP8 (no DP8 uniform trace survived; M = 128 is never profiled).
+- A kernel-level breakdown of where DP8's step time goes (the traces give compute, exposed
+  communication and idle time per rank, not per kernel family); M = 128 is never profiled (nsys is
+  limited to M <= 32 to keep reports small).
+- qwen3-30b-a3b DP8 probes at lengths below 2,048: skipped on the user's static-memory estimate above.
+- Timed steps are 3 per cell; differences under about 2% are within the step-to-step spread seen.
+- 10 raw nsys streams were truncated by killed processes and could not be converted; the cells they
+  would have filled show `-`.
 
 ## Reproduce
 
@@ -25,5 +22,5 @@ srun --jobid=<job> -N1 -n1 --cpus-per-task=32 --gres=gpu:8 -W 0 -o logging/pp1/m
 ```
 
 Records: `workspace/pp1/{main,probe}-*.jsonl` and `*.oom.rank*.jsonl`; nsys analysis:
-`workspace/pp1/analysis.jsonl`; reports under `workspace/pp1/nsys/` and `workspace/pp1/nsys-recovered/`
+`workspace/pp1/analysis.jsonl`; allocator statistics in the `-r2` records; reports under `workspace/pp1/nsys/` and `workspace/pp1/nsys-recovered/`
 (`workspace` is the shared-space symlink, `/mnt/weka/shrd/ci/haok/pith-train-pp1-schedule/workspace`).
