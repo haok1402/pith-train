@@ -311,6 +311,12 @@ def pending_runs(recs: list[dict], workloads: list[dict], schedules: list[str]) 
                 ok_hosts[r["schedule"]].add(r["host"])
             elif r.get("status") == "oom":
                 oom[r["schedule"]] = True
+        if wl.get("probe_len") is not None:
+            # An OOM probe: a schedule that has OOMed at a shorter pack is not run longer.
+            for sched in schedules:
+                for r in recs:
+                    if r.get("schedule") == sched and r.get("status") == "oom" and r.get("probe_len") is not None and r["probe_len"] <= wl["probe_len"]:  # fmt: skip
+                        oom[sched] = True
         hosts = set().union(*ok_hosts.values()) or {None}
         if any(all(oom[x] or h in ok_hosts[x] for x in schedules) for h in hosts):
             continue
@@ -353,7 +359,7 @@ def main():
         workloads = []
         for L in [int(x) for x in args.oom_lengths.split(",")]:
             lens = [[L] * args.oom_M for _ in range(world)]
-            workloads.append(dict(name=f"oom-M{args.oom_M}-L{L}", kind="packed", M=args.oom_M, lengths=lens))  # fmt: skip
+            workloads.append(dict(name=f"oom-M{args.oom_M}-L{L}", kind="packed", M=args.oom_M, lengths=lens, probe_len=L))  # fmt: skip
     max_len = 2048
     for w in workloads:
         if w["kind"] == "packed":
@@ -414,7 +420,7 @@ def main():
         if True:
             key = (schedule, wl["name"])
             torch.cuda.empty_cache()
-            base = dict(schedule=schedule, workload=wl["name"], M=wl["M"], static_alloc_gib=static_alloc, host=host)  # fmt: skip
+            base = dict(schedule=schedule, workload=wl["name"], M=wl["M"], static_alloc_gib=static_alloc, host=host, probe_len=wl.get("probe_len"))  # fmt: skip
             if wl["kind"] == "packed":
                 lens = wl["lengths"]
                 base["lengths"] = lens
