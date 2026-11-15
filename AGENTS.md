@@ -41,7 +41,7 @@ pytest tests/test_deepgemm_fp8_linear_correctness.py -v
 pytest tests/test_grouped_linear_correctness.py -v
 pytest tests/test_ep_dedup_dispatch.py -v
 pytest tests/test_silu_mul.py tests/test_clamped_swiglu.py tests/test_indexed_bias_add.py tests/test_log_prob.py -v
-pytest tests/operators -v              # operator-level tests (ring attention, CP sequence, gated delta rule)
+pytest tests/operators -v              # operator-level tests (ring and sliding-window attention, CP sequence, gated delta rule)
 pytest tests/test_import_layers.py -v  # import layering, kernel naming, kernels interface and verifier coverage (CPU only, AST)
 
 # Single test function
@@ -124,7 +124,7 @@ The pipeline is **BSHD** end to end: hidden states are `(B, S, hidden)` through 
 
 **Packed / variable-length (SFT) training** enforces `micro_batch_size == 1`. A micro-batch is `(1, S, hidden)` where `S` is the total token count and several documents are concatenated along the `S` axis; a per-sample `cu_seqlens` (int32 cumulative document offsets `[0, …, S]`) marks the boundaries. So the residual stream is semantically `TD` (`T = S` tokens × `hidden`) wearing a batch-of-one BSHD coat — kept 3-D on purpose so (a) every BSHD-assuming module (norm, MoE, embed, loss, P2P) is untouched and (b) the caller can still split the batch into micro-batches along dim 0 (the `B=1` is that seam).
 
-**THD is confined to the attention kernel.** Only attention reshapes `(1, S, H, D) → (S, H, D)` (`squeeze(0)`) to hand FlashAttention-4's varlen entry (`operators/flash_attn_v4.py:flash_attn_varlen_func`) a flat `(total_tokens, H, D)` tensor plus `cu_seqlens`, then `unsqueeze(0)` back. Attention dispatches on `cu_seqlens is None` (dense causal) vs set (block-diagonal varlen), and under context parallelism the same squeeze feeds `ring_attention_varlen_func`, the zigzag ring made block-diagonal by document. `max_seqlen` is passed as `S` — a compile-safe upper bound; FA4 schedules work off `cu_seqlens`, so over-allocating it is free and avoids a per-call device sync.
+**THD is confined to the attention kernel.** Only attention reshapes `(1, S, H, D) → (S, H, D)` (`squeeze(0)`) to hand FlashAttention-4's varlen entry (`operators/flash_attn_v4.py:flash_attn_varlen_func`) a flat `(total_tokens, H, D)` tensor plus `cu_seqlens`, then `unsqueeze(0)` back. Attention dispatches on `cu_seqlens is None` (dense causal) vs set (block-diagonal varlen), and under context parallelism the same squeeze feeds `ring_attention_varlen_func`, the zigzag ring made block-diagonal by document (or `sliding_window_attention_varlen_func` for a sliding-window layer). `max_seqlen` is passed as `S` — a compile-safe upper bound; FA4 schedules work off `cu_seqlens`, so over-allocating it is free and avoids a per-call device sync.
 
 **Positions**: `forward_posemb(S, cu_seqlens)` builds per-document-reset positions when packed; under context parallelism it takes each token's global index from `zigzag_varlen_index`, so positions follow the tokens wherever the partition puts them. Because RoPE is relative and the mask is block-diagonal, the reset changes what attention computes only by rounding; it keeps positions within the longest document rather than the packed length, as an inference engine counts them. **Loss**: boundary/prompt tokens are masked with `-100` (no separate loss-mask tensor) and the loss is token-weighted (the objective returns the loss summed over the micro-batch's tokens; the step divides by the global non-ignored token count).
 
@@ -136,7 +136,8 @@ Only what training code calls directly: autograd functions and custom ops with t
 
 - **Linear layers** (`linear.py`, `grouped_linear.py`) — BF16 / FP8 dense and grouped (expert) linear layers, with fp32 main_grad accumulation of the weight gradient
 - **Expert ops** — `fp8_experts.py` (FP8 SwiGLU, fused gate_up SwiGLU and gpt-oss clamped SwiGLU experts as single autograd nodes, plus `fp8_scatter_quant`, the fused stage-3 input), `bf16_experts.py` (fused BF16 experts, CuTe on SM90 and TIRx on SM100; models import it lazily after `bf16_experts_supported()`), `fp8_swiglu_mlp.py` (fused FP8 dense SwiGLU MLP), `main_grad.py` (fp32 main_grad of raw expert parameters)
-- **Ring Attention** (`ring_attention.py`) — zigzag ring attention for context parallelism (standard, packed and MLA-aware variants)
+- **Ring Attention** (`ring_attention.py`) — zigzag ring attention for context parallelism (standard, packed and MLA-aware variants; the first two take gpt-oss attention sinks, applied in step 0 only)
+- **Sliding-Window Attention** (`sliding_window_attention.py`) — causal sliding-window attention under CP (gpt-oss's sliding layers): each zigzag block needs only the `window_left` tokens before it, so a rank swaps those halos with its two neighbours and runs one varlen flash call; packed documents (and blocks shorter than the window) all-gather K/V and index each block's window instead
 - **CP Sequence** (`cp_sequence.py`) — defines both CP sequence layouts, exposing the zigzag partition as `zigzag_spans` (and, one packed document at a time, as `zigzag_varlen_index`), converts the hidden stream between them, and fetches the conv state a depthwise convolution needs, the tokens before a shard, from the previous rank
 - **FlashAttention v4** (`flash_attn_v4.py`) — custom ops around the FA4 kernel (host-side launch memoization: `memoized_launch`)
 - **MLA** — Multi-head Latent Attention is implemented inside the DeepSeek model (`models/deepseek_v2.py`), with MLA-aware ring attention in `ring_attention.py`

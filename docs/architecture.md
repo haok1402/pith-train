@@ -140,7 +140,7 @@ Saving converts localized to canonical, loading converts back. Because the on-di
 A few of the most important, roughly in order:
 
 1. `ep_dispatch.py`: expert-parallel token dispatch with deduplication (fused index kernels in `kernels/ep_dispatch*.py`); central to MoE routing and the all-to-all overlap.
-2. `ring_attention.py`: zigzag, causal-balanced ring attention for context parallelism (standard, packed and MLA-aware variants).
+2. `ring_attention.py`: zigzag, causal-balanced ring attention for context parallelism (standard, packed and MLA-aware variants, with optional attention sinks); `sliding_window_attention.py` covers sliding-window layers under CP with a neighbour halo swap instead of a ring.
 3. `kernels/fp8_*`: fused block-scaled FP8 quantization behind the FP8 training path, and `fp8_experts.py`, the FP8 expert ops built on it.
 4. `token_scatter.py`: groups tokens per expert ahead of the grouped GEMM.
 
