@@ -14,7 +14,8 @@ if [[ "${1:-}" == "--nsys" ]]; then
     # nsys streams each capture to $TMPDIR and converts it only at exit; on shared storage the raw
     # .qdstrm of a preempted step survives and converts offline with QdstrmImporter.
     # Only nsys itself gets it: the training processes keep a node-local /tmp, since the inductor
-    # cache there holds compiled kernels that are mmapped and must not live on weka.
+    # cache there holds compiled kernels that are mmapped and must not live on weka (SIGBUS when a
+    # process on another node rewrites a mapped file); the Triton cache likewise.
     NSYS_TMP=$PWD/workspace/pp1/nsys-tmp/j${SLURM_JOB_ID:-0}.${SLURM_STEP_ID:-0}
     mkdir -p "$NSYS_TMP"
     NSYS=(env TMPDIR=$NSYS_TMP nsys profile --stats=false --trace=cuda,nvtx --force-overwrite=true --output="$2"
@@ -23,4 +24,4 @@ if [[ "${1:-}" == "--nsys" ]]; then
 fi
 PORT=$((15000 + RANDOM % 5000))
 TORCHRUN_ARGS=(--nnodes=1 --nproc-per-node=gpu --rdzv-backend=c10d --rdzv-endpoint=localhost:$PORT)
-exec "${NSYS[@]}" env TMPDIR=/tmp TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_$USER torchrun "${TORCHRUN_ARGS[@]}" "$@"
+exec "${NSYS[@]}" env TMPDIR=/tmp TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_$USER TRITON_CACHE_DIR=/tmp/triton_$USER torchrun "${TORCHRUN_ARGS[@]}" "$@"
