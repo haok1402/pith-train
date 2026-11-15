@@ -11,14 +11,9 @@ source .venv/bin/activate
 NSYS=()
 if [[ "${1:-}" == "--nsys" ]]; then
     mkdir -p "$(dirname "$2")"
-    # nsys streams each capture to $TMPDIR and converts it only at exit; on shared storage the raw
-    # .qdstrm of a preempted step survives and converts offline with QdstrmImporter.
-    # Only nsys itself gets it: the training processes keep a node-local /tmp, since the inductor
-    # cache there holds compiled kernels that are mmapped and must not live on weka (SIGBUS when a
-    # process on another node rewrites a mapped file); the Triton cache likewise.
-    NSYS_TMP=$PWD/workspace/pp1/nsys-tmp/j${SLURM_JOB_ID:-0}.${SLURM_STEP_ID:-0}
-    mkdir -p "$NSYS_TMP"
-    NSYS=(env TMPDIR=$NSYS_TMP nsys profile --stats=false --trace=cuda,nvtx --force-overwrite=true --output="$2"
+    # nsys keeps each capture in a node-local $TMPDIR until exit (on SIGTERM it converts what it
+    # can). A $TMPDIR on weka made the profiled processes die with SIGBUS, so it stays local.
+    NSYS=(nsys profile --stats=false --trace=cuda,nvtx --force-overwrite=true --output="$2"
           --cuda-graph-trace=node --capture-range=cudaProfilerApi --capture-range-end=repeat --delay=0)
     shift 2
 fi
