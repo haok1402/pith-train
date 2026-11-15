@@ -264,6 +264,17 @@ def main_workloads(per_rank: int, world: int, uniform_gbs: list[int]) -> list[di
     return wls
 
 
+def is_oom(e: BaseException) -> bool:
+    """
+    An allocation failure, also when raised from a compiled graph: AOTInductor reports a failed
+    allocation as RuntimeError from aoti_torch_empty_strided, not as torch.OutOfMemoryError.
+    """
+    if isinstance(e, torch.OutOfMemoryError):
+        return True
+    text = str(e)
+    return "out of memory" in text.lower() or "aoti_torch_empty_strided" in text
+
+
 def append_jsonl(path: Path, rec: dict) -> None:
     with open(path, "a") as f:
         f.write(json.dumps(rec) + "\n")
@@ -453,7 +464,11 @@ def main():
                     rec["nsys_prefix"] = os.environ.get("PP1_NSYS_PREFIX")
                     rec["nsys_step_time"] = r["step_time"]
                 record(rec)
-            except torch.OutOfMemoryError as e:
+            except Exception as e:
+                if not is_oom(e):
+                    traceback.print_exc()
+                    sys.stdout.flush()
+                    os._exit(4)
                 # The other ranks may sit in a collective this rank never reaches, so the process
                 # group cannot continue: record and leave.
                 msg = str(e).splitlines()[0][:300]
@@ -463,10 +478,6 @@ def main():
                 append_jsonl(out.with_suffix(f".oom.rank{rank}.jsonl"), rec)
                 sys.stdout.flush()
                 os._exit(3)
-            except Exception:
-                traceback.print_exc()
-                sys.stdout.flush()
-                os._exit(4)
     if rank == 0:
         print("SUITE DONE", flush=True)
     dist.barrier()
