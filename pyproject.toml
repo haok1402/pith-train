@@ -35,7 +35,7 @@ url = "https://download.pytorch.org/whl/cu132"
 explicit = true
 
 [tool.uv.sources]
-deep-gemm = { git = "https://github.com/deepseek-ai/DeepGEMM", rev = "559d79fb6994a58b8a15b4b93bf13ccc16edf247" }
+deep-gemm = { git = "https://github.com/deepseek-ai/DeepGEMM", rev = "5081f8513af57e61696de4f4f04b0e707ffb503e" }
 tirx-kernels = { git = "https://github.com/mlc-ai/TIRx-kernels", rev = "716d8a3cfc8cb5810f79f2515a39d400c1264340" }  # the tvm_tirx tirx-lite API (PyPI 0.1.2.post1 is the apache-tvm one)
 torch = { index = "torch-cu132" }
 
