@@ -72,7 +72,7 @@ The `examples/` tree drives end-to-end workflows; each subdir has a `launch.sh` 
 # Tokenize a pretraining corpus (per-tokenizer; rerun when switching models)
 bash examples/tokenize_corpus/launch.sh dclm-qwen3
 
-# Pretrain (qwen3-30b-a3b | deepseek-v2-lite | gpt-oss-20b | gpt-oss-120b)
+# Pretrain (qwen3-30b-a3b | qwen3.5-35b-a3b | deepseek-v2-lite | gpt-oss-20b | gpt-oss-120b)
 bash examples/pretrain_lm/launch.sh qwen3-30b-a3b
 
 # Convert a training checkpoint to / from HuggingFace
@@ -121,7 +121,7 @@ Replayed routes follow the loader's zigzag order. Each linear-attention layer co
 
 ### Model Layer Protocol (`pithtrain/models/interface.py`)
 
-Models implement `ModelProtocol` with layers that expose `forward_stage1`, `forward_stage3`, `forward_stage5` — matching the 5-stage split. Supported models: DeepSeek-V2-Lite (`deepseek_v2.py`), Qwen3 MoE (`qwen3_moe.py`), GPT-OSS 20B/120B (`gpt_oss.py`).
+Models implement `ModelProtocol` with layers that expose `forward_stage1`, `forward_stage3`, `forward_stage5` — matching the 5-stage split. Supported models: DeepSeek-V2-Lite (`deepseek_v2.py`), Qwen3 MoE (`qwen3_moe.py`), Qwen3.5 MoE (`qwen35_moe.py`), GPT-OSS 20B/120B (`gpt_oss.py`).
 
 ### Tensor Layouts & Sequence Packing
 

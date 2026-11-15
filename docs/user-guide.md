@@ -94,9 +94,11 @@ The hard constraints: **`pp` must divide your total GPU count**, and `cp` and `e
 | Goal | Mesh |
 |---|---|
 | Single node, max expert sharding | `pp=1, ep=8` → `dp=8`, `expt_dp=1` |
-| Single node, fewer experts per rank | `pp=1, ep=4` → `dp=8`, `expt_dp=2` |
+| Single node, smaller EP groups | `pp=1, ep=4` → `dp=8`, `expt_dp=2` (each rank holds twice the experts of `ep=8`) |
 | Two nodes (16 GPUs), pipeline + experts | `pp=2, ep=8` → `dp=8`, `expt_dp=1` |
+| Two nodes, no pipeline, EP across nodes | `pp=1, ep=16` → `dp=16`, `expt_dp=1` |
 | Long sequences | raise `cp` (e.g. `cp=2`), which shards the sequence via ring attention |
+| Long sequences, EP spanning CP | `pp=1, cp=8, ep=16` on 16 GPUs → `dp=2`, `expt_dp=1` |
 
 **Multi-node (SLURM).** The same launcher works under `srun` — it reads `SLURM_*` env vars to build the `torchrun` rendezvous automatically:
 
