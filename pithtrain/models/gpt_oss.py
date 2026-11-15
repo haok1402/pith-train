@@ -25,6 +25,7 @@ from pithtrain.modules.load_balance import (
     replay_indices,
 )
 from pithtrain.operators.clamped_swiglu import clamped_swiglu
+from pithtrain.operators.cp_sequence import zigzag_spans, zigzag_varlen_index
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
 from pithtrain.operators.fp8_experts import fp8_clamped_swiglu_experts, fp8_scatter_quant
@@ -32,6 +33,11 @@ from pithtrain.operators.grouped_linear import FP8GroupedLinearFunc, GroupedLine
 from pithtrain.operators.indexed_bias_add import indexed_bias_add
 from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.main_grad import raw_main_grad
+from pithtrain.operators.ring_attention import ring_attention_func, ring_attention_varlen_func
+from pithtrain.operators.sliding_window_attention import (
+    sliding_window_attention_func,
+    sliding_window_attention_varlen_func,
+)
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
     precompute_group_indices,
@@ -358,7 +364,19 @@ class GptOssAttention(nn.Module):
         query_states, key_states = self.apply_rotary_posemb(query_states, key_states, rotary_posemb)  # fmt: skip
         window_size = (self.sliding_window - 1, 0) if self.is_sliding else (None, None)
         sinks = self.sinks.to(query_states.dtype)
-        if cu_seqlens is not None:
+        cp_group, window_left = distributed.cp_group, window_size[0]
+        if distributed.cp_size > 1 and cu_seqlens is not None:
+            q, k, v = query_states.squeeze(0), key_states.squeeze(0), value_states.squeeze(0)
+            if self.is_sliding:
+                attn_output = sliding_window_attention_varlen_func(q, k, v, cu_seqlens, self.scaling, window_left, cp_group, sinks)  # fmt: skip
+            else:
+                attn_output = ring_attention_varlen_func(q, k, v, cu_seqlens, self.scaling, cp_group, sinks)  # fmt: skip
+            attn_output = attn_output.unsqueeze(0)
+        elif distributed.cp_size > 1 and self.is_sliding:
+            attn_output = sliding_window_attention_func(query_states, key_states, value_states, self.scaling, window_left, cp_group, sinks)  # fmt: skip
+        elif distributed.cp_size > 1:
+            attn_output = ring_attention_func(query_states, key_states, value_states, self.scaling, cp_group, sinks)  # fmt: skip
+        elif cu_seqlens is not None:
             attn_output = flash_attn_varlen_func(query_states.squeeze(0), key_states.squeeze(0), value_states.squeeze(0), cu_seqlens, S, softmax_scale=self.scaling, causal=True, window_size=window_size, learnable_sink=sinks).unsqueeze(0)  # fmt: skip
         else:
             attn_output = flash_attn_func(query_states, key_states, value_states, softmax_scale=self.scaling, causal=True, window_size=window_size, learnable_sink=sinks)  # fmt: skip
@@ -475,9 +493,6 @@ class GptOssDecoderLayer(nn.Module):
 class GptOssModel(nn.Module):
     def __init__(self, config: GptOssConfig, phase: int):
         super().__init__()
-        if distributed.cp_size > 1:
-            raise NotImplementedError("GptOssModel doesn't support context parallelism.")
-
         match phase:
             case 0:
                 stage_count = distributed.pp_size * 2
@@ -515,14 +530,19 @@ class GptOssModel(nn.Module):
     def forward_posemb(
         self, S: int, cu_seqlens: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        cos, sin = self.rotary_emb(S)
+        device = distributed.device
+        cp_rank, cp_size = distributed.cp_rank, distributed.cp_size
         if cu_seqlens is not None:
-            device = distributed.device
-            starts, ends = cu_seqlens[:-1], cu_seqlens[1:]
-            lengths = ends - starts
-            position_ids = torch.arange(S, device=device) - torch.repeat_interleave(starts, lengths)
-            cos, sin = cos[position_ids], sin[position_ids]
-        return cos.unsqueeze(0), sin.unsqueeze(0)
+            index = zigzag_varlen_index(cp_rank, cp_size, cu_seqlens, S * cp_size)
+            position_ids = index - cu_seqlens[torch.searchsorted(cu_seqlens, index, right=True) - 1]
+        elif cp_size > 1:
+            spans = zigzag_spans(cp_rank, cp_size, S * cp_size)
+            position_ids = torch.cat([torch.arange(span.start, span.stop, device=device) for span in spans])  # fmt: skip
+        else:
+            cos, sin = self.rotary_emb(S)
+            return cos.unsqueeze(0), sin.unsqueeze(0)
+        cos, sin = self.rotary_emb(S * cp_size)
+        return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
 
     def forward_prolog(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(hidden_states)

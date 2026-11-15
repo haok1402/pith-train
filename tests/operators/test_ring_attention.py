@@ -24,6 +24,7 @@ class Request:
     HK: int
     D: int
     atol: float = 1e-5
+    sink: bool = False
 
 
 @dataclass
@@ -32,6 +33,34 @@ class Result:
     dq: torch.Tensor
     dk: torch.Tensor
     dv: torch.Tensor
+    dsink: torch.Tensor | None = None
+
+
+def make_sink(enabled: bool, H: int, device) -> torch.Tensor | None:
+    """
+    gpt-oss-style attention sinks, one logit per head, or None.
+    """
+    if not enabled:
+        return None
+    torch.manual_seed(7)
+    return torch.randn(H, device=device, dtype=torch.bfloat16)
+
+
+def sink_grads(sink: torch.Tensor | None) -> tuple:
+    """
+    A leaf for the reference and one for the ring, which each rank sums across CP.
+    """
+    if sink is None:
+        return None, None
+    return sink.clone().requires_grad_(True), sink.clone().requires_grad_(True)
+
+
+def summed_grad(sink: torch.Tensor | None, cp_group) -> torch.Tensor | None:
+    if sink is None:
+        return None
+    grad = sink.grad.float()
+    torch.distributed.all_reduce(grad, group=cp_group)
+    return grad
 
 
 def extract_zigzag(x: torch.Tensor, cp_rank: int, cp_size: int) -> torch.Tensor:
@@ -49,24 +78,26 @@ def record(req: Request) -> tuple[Result, Result]:
     q_full = torch.randn(req.B, req.S, req.HQ, req.D, device=device, dtype=torch.bfloat16)
     k_full = torch.randn(req.B, req.S, req.HK, req.D, device=device, dtype=torch.bfloat16)
     v_full = torch.randn(req.B, req.S, req.HK, req.D, device=device, dtype=torch.bfloat16)
+    sink_ref, sink_imp = sink_grads(make_sink(req.sink, req.HQ, device))
 
     q_ref = q_full.clone().requires_grad_(True)
     k_ref = k_full.clone().requires_grad_(True)
     v_ref = v_full.clone().requires_grad_(True)
-    out_ref = flash_attn_func(q_ref, k_ref, v_ref, softmax_scale, causal=True)
+    out_ref = flash_attn_func(q_ref, k_ref, v_ref, softmax_scale, causal=True, learnable_sink=sink_ref)  # fmt: skip
     out_ref.sum().backward()
     out_ref = extract_zigzag(out_ref, cp_rank, cp_size)
     dq_ref = extract_zigzag(q_ref.grad, cp_rank, cp_size)
     dk_ref = extract_zigzag(k_ref.grad, cp_rank, cp_size)
     dv_ref = extract_zigzag(v_ref.grad, cp_rank, cp_size)
-    ref = Result(out_ref, dq_ref, dk_ref, dv_ref)
+    dsink_ref = sink_ref.grad.float() if sink_ref is not None else None
+    ref = Result(out_ref, dq_ref, dk_ref, dv_ref, dsink_ref)
 
     q_imp = extract_zigzag(q_full, cp_rank, cp_size).clone().requires_grad_(True)
     k_imp = extract_zigzag(k_full, cp_rank, cp_size).clone().requires_grad_(True)
     v_imp = extract_zigzag(v_full, cp_rank, cp_size).clone().requires_grad_(True)
-    out_imp = ring_attention_func(q_imp, k_imp, v_imp, softmax_scale, cp_group)
+    out_imp = ring_attention_func(q_imp, k_imp, v_imp, softmax_scale, cp_group, sink_imp)
     out_imp.sum().backward()
-    imp = Result(out_imp, q_imp.grad, k_imp.grad, v_imp.grad)
+    imp = Result(out_imp, q_imp.grad, k_imp.grad, v_imp.grad, summed_grad(sink_imp, cp_group))
 
     return ref, imp
 
@@ -74,6 +105,8 @@ def record(req: Request) -> tuple[Result, Result]:
 def verify(req: Request) -> None:
     ref, imp = record(req)
     for f in fields(ref):
+        if getattr(ref, f.name) is None:
+            continue
         error = cosine_error(getattr(ref, f.name), getattr(imp, f.name))
         if error >= req.atol:
             raise AssertionError(f"{f.name} diverged: {error=:.2e} >= {req.atol=}")
@@ -83,6 +116,9 @@ REQUESTS = []
 REQUESTS.append(pytest.param(2, Request(B=1, S=2048, HQ=4, HK=4, D=64), id="CP2-MHA-S2048"))
 REQUESTS.append(pytest.param(2, Request(B=2, S=2048, HQ=8, HK=2, D=64), id="CP2-GQA-S2048"))
 REQUESTS.append(pytest.param(4, Request(B=1, S=4096, HQ=12, HK=4, D=128), id="CP4-GQA-S4096"))
+# gpt-oss geometry (64 query heads over 8 key-value heads of 64) with attention sinks.
+REQUESTS.append(pytest.param(2, Request(B=2, S=2048, HQ=64, HK=8, D=64, sink=True), id="CP2-sink-S2048"))  # fmt: skip
+REQUESTS.append(pytest.param(4, Request(B=1, S=4096, HQ=64, HK=8, D=64, sink=True), id="CP4-sink-S4096"))  # fmt: skip
 
 
 @pytest.mark.parametrize("cp_size,req", REQUESTS)
@@ -99,6 +135,7 @@ class VarlenRequest:
     HK: int
     D: int
     atol: float = 1e-5
+    sink: bool = False
 
 
 def extract_zigzag_varlen(x: torch.Tensor, cu_seqlens: torch.Tensor, cp_rank: int, cp_size: int):
@@ -120,6 +157,7 @@ def record_varlen(req: VarlenRequest) -> tuple[Result, Result]:
     k_full = torch.randn(T, req.HK, req.D, device=device, dtype=torch.bfloat16)
     v_full = torch.randn(T, req.HK, req.D, device=device, dtype=torch.bfloat16)
     grad_out = torch.randn(T, req.HQ, req.D, device=device, dtype=torch.bfloat16)
+    sink_ref, sink_imp = sink_grads(make_sink(req.sink, req.HQ, device))
 
     def shard(x: torch.Tensor) -> torch.Tensor:
         return extract_zigzag_varlen(x, cu_seqlens, cp_rank, cp_size)
@@ -127,16 +165,17 @@ def record_varlen(req: VarlenRequest) -> tuple[Result, Result]:
     q_ref = q_full.clone().requires_grad_(True)
     k_ref = k_full.clone().requires_grad_(True)
     v_ref = v_full.clone().requires_grad_(True)
-    out_ref = flash_attn_varlen_func(q_ref, k_ref, v_ref, cu_seqlens, T, softmax_scale, causal=True)
+    out_ref = flash_attn_varlen_func(q_ref, k_ref, v_ref, cu_seqlens, T, softmax_scale, causal=True, learnable_sink=sink_ref)  # fmt: skip
     out_ref.backward(grad_out)
-    ref = Result(shard(out_ref), shard(q_ref.grad), shard(k_ref.grad), shard(v_ref.grad))
+    dsink_ref = sink_ref.grad.float() if sink_ref is not None else None
+    ref = Result(shard(out_ref), shard(q_ref.grad), shard(k_ref.grad), shard(v_ref.grad), dsink_ref)
 
     q_imp = shard(q_full).requires_grad_(True)
     k_imp = shard(k_full).requires_grad_(True)
     v_imp = shard(v_full).requires_grad_(True)
-    out_imp = ring_attention_varlen_func(q_imp, k_imp, v_imp, cu_seqlens, softmax_scale, cp_group)
+    out_imp = ring_attention_varlen_func(q_imp, k_imp, v_imp, cu_seqlens, softmax_scale, cp_group, sink_imp)  # fmt: skip
     out_imp.backward(shard(grad_out))
-    imp = Result(out_imp, q_imp.grad, k_imp.grad, v_imp.grad)
+    imp = Result(out_imp, q_imp.grad, k_imp.grad, v_imp.grad, summed_grad(sink_imp, cp_group))
 
     return ref, imp
 
@@ -144,6 +183,8 @@ def record_varlen(req: VarlenRequest) -> tuple[Result, Result]:
 def verify_varlen(req: VarlenRequest) -> None:
     ref, imp = record_varlen(req)
     for f in fields(ref):
+        if getattr(ref, f.name) is None:
+            continue
         expected, actual = (getattr(result, f.name).double() for result in (ref, imp))
         error = float(
             (expected - actual).square().sum()
@@ -171,6 +212,8 @@ VARLEN_REQUESTS.append(
 VARLEN_REQUESTS.append(
     pytest.param(4, VarlenRequest((8,) * 32, HQ=8, HK=2, D=64), id="CP4-GQA-32x8")
 )
+VARLEN_REQUESTS.append(pytest.param(2, VarlenRequest((4, 60, 0, 512, 196, 252), HQ=64, HK=8, D=64, sink=True), id="CP2-sink-6docs"))  # fmt: skip
+VARLEN_REQUESTS.append(pytest.param(4, VarlenRequest((8, 120, 1024, 392, 504), HQ=64, HK=8, D=64, sink=True), id="CP4-sink-5docs"))  # fmt: skip
 
 
 @pytest.mark.parametrize("cp_size,req", VARLEN_REQUESTS)

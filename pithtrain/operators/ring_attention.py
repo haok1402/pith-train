@@ -25,6 +25,11 @@ flash calls covers the step:
   kv < r: only K's front block precedes Q, and all of Q attends to it.
   kv > r: only Q's back block follows K, and it attends to all of K.
 
+Attention sinks (one logit per head that joins every softmax denominator, gpt-oss) enter once:
+step 0 covers every local query, so its flash call takes the sink, and its lse carries the sink
+into the merge of the later steps. The backward reads the final lse, which already includes the
+sink, so only step 0 passes it again, which returns the sink gradient of this rank's queries.
+
 Packed sequences use the same schedule one document at a time (zigzag_varlen_index), with one
 varlen call per step: local boundaries are cu_seqlens // cp_size and block boundaries
 cu_seqlens // (2 * cp_size).
@@ -126,6 +131,7 @@ def zigzag_forward(
     v: torch.Tensor,
     sm_scale: float,
     cp_group: ProcessGroup,
+    learnable_sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     cp_rank, cp_size = get_rank(cp_group), get_world_size(cp_group)
     dst = get_global_rank(cp_group, (cp_rank + 1) % cp_size)
@@ -144,7 +150,13 @@ def zigzag_forward(
             next_k, next_v, kv_work = post_ring_kv(k, v, cp_group, dst, src)
         if step == 0:
             partial_out, partial_lse, *_ = _flash_attn_fwd(
-                q, k, v, softmax_scale=sm_scale, causal=True, return_lse=True
+                q,
+                k,
+                v,
+                softmax_scale=sm_scale,
+                causal=True,
+                learnable_sink=learnable_sink,
+                return_lse=True,
             )
             out, lse = combine_partial(out, lse, partial_out, partial_lse)
         elif step <= cp_rank:
@@ -180,11 +192,13 @@ def zigzag_backward(
     lse: torch.Tensor,
     sm_scale: float,
     cp_group: ProcessGroup,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    learnable_sink: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     cp_rank, cp_size = get_rank(cp_group), get_world_size(cp_group)
     dst = get_global_rank(cp_group, (cp_rank + 1) % cp_size)
     src = get_global_rank(cp_group, (cp_rank - 1) % cp_size)
     block = q.shape[1] // 2
+    dsink: Optional[torch.Tensor] = None
 
     dout_back = dout[:, block:].contiguous()
     q_back = q[:, block:].contiguous()
@@ -207,9 +221,18 @@ def zigzag_backward(
         if step + 1 < cp_size:
             next_k, next_v, kv_work = post_ring_kv(k, v, cp_group, dst, src)
         if step == 0:
-            dq_step, dk_step, dv_step = _flash_attn_bwd(
-                q, k, v, out, dout, lse, softmax_scale=sm_scale, causal=True
+            dq_step, dk_step, dv_step, *grad_sink = _flash_attn_bwd(
+                q,
+                k,
+                v,
+                out,
+                dout,
+                lse,
+                softmax_scale=sm_scale,
+                causal=True,
+                learnable_sink=learnable_sink,
             )
+            dsink = grad_sink[0] if grad_sink else None
             dq = dq_step.to(torch.float32)
             dk = dk_step.to(torch.float32)
             dv = dv_step.to(torch.float32)
@@ -257,11 +280,20 @@ def zigzag_backward(
         )
 
     wait_ring(grad_work)
-    return dq.to(q.dtype), incoming_dk.to(q.dtype), incoming_dv.to(q.dtype)
+    return dq.to(q.dtype), incoming_dk.to(q.dtype), incoming_dv.to(q.dtype), dsink
 
 
 # Each ring is a custom op so that a fullgraph torch.compile region can call it as one opaque
 # node. A ProcessGroup cannot be a custom-op argument, so the op takes the group's name.
+# A custom op cannot return None, so a ring without sinks returns an empty sink gradient.
+def grad_sink_or_empty(dsink: Optional[torch.Tensor], q: torch.Tensor) -> torch.Tensor:
+    return dsink if dsink is not None else q.new_empty(0)
+
+
+def empty_grad_sink_like(learnable_sink: Optional[torch.Tensor], q: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(learnable_sink) if learnable_sink is not None else q.new_empty(0)
+
+
 @torch.library.custom_op("pithtrain::zigzag_ring_fwd", mutates_args=())
 def zigzag_ring_fwd(
     q: torch.Tensor,
@@ -269,16 +301,18 @@ def zigzag_ring_fwd(
     v: torch.Tensor,
     sm_scale: float,
     group_name: str,
+    learnable_sink: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if not (k.is_contiguous() and v.is_contiguous()):
         raise ValueError("ring attention requires contiguous k and v")
     if q.shape[1] % 2:
         raise ValueError(f"zigzag layout needs even local seq len, got {q.shape[1]}")
-    return zigzag_forward(q, k, v, sm_scale, _resolve_process_group(group_name))
+    group = _resolve_process_group(group_name)
+    return zigzag_forward(q, k, v, sm_scale, group, learnable_sink)
 
 
 @zigzag_ring_fwd.register_fake
-def _(q, k, v, sm_scale, group_name):
+def _(q, k, v, sm_scale, group_name, learnable_sink):
     b, s, hq, _ = q.shape
     out = torch.empty((b, s, hq, v.shape[-1]), dtype=q.dtype, device=q.device)
     lse = torch.empty((b, hq, s), dtype=torch.float32, device=q.device)
@@ -295,32 +329,38 @@ def zigzag_ring_bwd(
     lse: torch.Tensor,
     sm_scale: float,
     group_name: str,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return zigzag_backward(dout, q, k, v, out, lse, sm_scale, _resolve_process_group(group_name))
+    learnable_sink: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    group = _resolve_process_group(group_name)
+    dq, dk, dv, dsink = zigzag_backward(dout, q, k, v, out, lse, sm_scale, group, learnable_sink)
+    return dq, dk, dv, grad_sink_or_empty(dsink, q)
 
 
 @zigzag_ring_bwd.register_fake
-def _(dout, q, k, v, out, lse, sm_scale, group_name):
+def _(dout, q, k, v, out, lse, sm_scale, group_name, learnable_sink):
     # dk and dv take q.dtype, as zigzag_backward casts them to it.
     return (
         torch.empty_like(q),
         torch.empty(k.shape, dtype=q.dtype, device=q.device),
         torch.empty(v.shape, dtype=q.dtype, device=q.device),
+        empty_grad_sink_like(learnable_sink, q),
     )
 
 
 def zigzag_ring_setup_context(ctx, inputs, output):
-    q, k, v, sm_scale, group_name = inputs
+    q, k, v, sm_scale, group_name, learnable_sink = inputs
     out, lse = output
-    ctx.save_for_backward(q, k, v, out, lse)
+    ctx.save_for_backward(q, k, v, out, lse, learnable_sink)
     ctx.sm_scale = sm_scale
     ctx.group_name = group_name
 
 
 def zigzag_ring_backward(ctx, grad_out, grad_lse):
-    q, k, v, out, lse = ctx.saved_tensors
-    dq, dk, dv = zigzag_ring_bwd(grad_out, q, k, v, out, lse, ctx.sm_scale, ctx.group_name)
-    return dq, dk, dv, None, None
+    q, k, v, out, lse, learnable_sink = ctx.saved_tensors
+    dq, dk, dv, dsink = zigzag_ring_bwd(
+        grad_out, q, k, v, out, lse, ctx.sm_scale, ctx.group_name, learnable_sink
+    )
+    return dq, dk, dv, None, None, dsink if learnable_sink is not None else None
 
 
 zigzag_ring_fwd.register_autograd(zigzag_ring_backward, setup_context=zigzag_ring_setup_context)
@@ -332,14 +372,16 @@ def ring_attention_func(
     v: torch.Tensor,
     sm_scale: float,
     cp_group: ProcessGroup,
+    learnable_sink: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Causal zigzag ring attention across the cp_group ranks (at least two). q (B, S_local, Hq, D),
     k (B, S_local, Hkv, D) and v (B, S_local, Hkv, Dv) are in the zigzag layout, S_local being
-    S / cp_size; k and v must be contiguous. Returns the output (B, S_local, Hq, Dv) in q.dtype,
-    in the same layout.
+    S / cp_size; k and v must be contiguous. learnable_sink (Hq,), if given, is one logit per
+    head added to every softmax denominator, and receives its gradient. Returns the output
+    (B, S_local, Hq, Dv) in q.dtype, in the same layout.
     """
-    out, _ = zigzag_ring_fwd(q, k, v, sm_scale, cp_group.group_name)
+    out, _ = zigzag_ring_fwd(q, k, v, sm_scale, cp_group.group_name, learnable_sink)
     return out
 
 
@@ -361,6 +403,7 @@ def zigzag_varlen_forward(
     cu_seqlens: torch.Tensor,
     sm_scale: float,
     cp_group: ProcessGroup,
+    learnable_sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     cp_rank, cp_size = get_rank(cp_group), get_world_size(cp_group)
     dst = get_global_rank(cp_group, (cp_rank + 1) % cp_size)
@@ -386,6 +429,7 @@ def zigzag_varlen_forward(
                 cu_seqlens_k=cu_local,
                 softmax_scale=sm_scale,
                 causal=True,
+                learnable_sink=learnable_sink,
                 return_lse=True,
             )
             out, lse = combine_partial(out, lse, partial_out, partial_lse)
@@ -438,12 +482,14 @@ def zigzag_varlen_backward(
     cu_seqlens: torch.Tensor,
     sm_scale: float,
     cp_group: ProcessGroup,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    learnable_sink: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     cp_rank, cp_size = get_rank(cp_group), get_world_size(cp_group)
     dst = get_global_rank(cp_group, (cp_rank + 1) % cp_size)
     src = get_global_rank(cp_group, (cp_rank - 1) % cp_size)
     cu_local, cu_blocks = cu_seqlens // cp_size, cu_seqlens // (2 * cp_size)
     front, back = document_blocks(cu_blocks, q.shape[0])
+    dsink: Optional[torch.Tensor] = None
 
     dout = dout.contiguous()
     if cp_rank + 1 < cp_size:
@@ -468,7 +514,7 @@ def zigzag_varlen_backward(
         if step + 1 < cp_size:
             next_k, next_v, kv_work = post_ring_kv(k, v, cp_group, dst, src)
         if step == 0:
-            dq_step, dk_step, dv_step = _flash_attn_bwd(
+            dq_step, dk_step, dv_step, *grad_sink = _flash_attn_bwd(
                 q,
                 k,
                 v,
@@ -479,7 +525,9 @@ def zigzag_varlen_backward(
                 cu_seqlens_k=cu_local,
                 softmax_scale=sm_scale,
                 causal=True,
+                learnable_sink=learnable_sink,
             )
+            dsink = grad_sink[0] if grad_sink else None
             dq = dq_step.to(torch.float32)
             dk = dk_step.to(torch.float32)
             dv = dv_step.to(torch.float32)
@@ -536,7 +584,7 @@ def zigzag_varlen_backward(
     wait_ring(grad_work)
     if cp_rank + 1 < cp_size:
         dq.index_add_(0, back, dq_back)
-    return dq.to(q.dtype), incoming_dk.to(q.dtype), incoming_dv.to(q.dtype)
+    return dq.to(q.dtype), incoming_dk.to(q.dtype), incoming_dv.to(q.dtype), dsink
 
 
 @torch.library.custom_op("pithtrain::zigzag_ring_varlen_fwd", mutates_args=())
@@ -547,16 +595,18 @@ def zigzag_ring_varlen_fwd(
     cu_seqlens: torch.Tensor,
     sm_scale: float,
     group_name: str,
+    learnable_sink: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if not (k.is_contiguous() and v.is_contiguous()):
         raise ValueError("ring attention requires contiguous k and v")
     if q.shape[0] % 2:
         raise ValueError(f"packed zigzag layout needs an even local token count, got {q.shape[0]}")
-    return zigzag_varlen_forward(q, k, v, cu_seqlens, sm_scale, _resolve_process_group(group_name))
+    group = _resolve_process_group(group_name)
+    return zigzag_varlen_forward(q, k, v, cu_seqlens, sm_scale, group, learnable_sink)
 
 
 @zigzag_ring_varlen_fwd.register_fake
-def _(q, k, v, cu_seqlens, sm_scale, group_name):
+def _(q, k, v, cu_seqlens, sm_scale, group_name, learnable_sink):
     t, hq, _ = q.shape
     out = torch.empty((t, hq, v.shape[-1]), dtype=q.dtype, device=q.device)
     lse = torch.empty((hq, t), dtype=torch.float32, device=q.device)
@@ -574,34 +624,38 @@ def zigzag_ring_varlen_bwd(
     cu_seqlens: torch.Tensor,
     sm_scale: float,
     group_name: str,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    learnable_sink: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     group = _resolve_process_group(group_name)
-    return zigzag_varlen_backward(dout, q, k, v, out, lse, cu_seqlens, sm_scale, group)
+    args = (dout, q, k, v, out, lse, cu_seqlens, sm_scale, group, learnable_sink)
+    dq, dk, dv, dsink = zigzag_varlen_backward(*args)
+    return dq, dk, dv, grad_sink_or_empty(dsink, q)
 
 
 @zigzag_ring_varlen_bwd.register_fake
-def _(dout, q, k, v, out, lse, cu_seqlens, sm_scale, group_name):
+def _(dout, q, k, v, out, lse, cu_seqlens, sm_scale, group_name, learnable_sink):
     return (
         torch.empty_like(q),
         torch.empty(k.shape, dtype=q.dtype, device=q.device),
         torch.empty(v.shape, dtype=q.dtype, device=q.device),
+        empty_grad_sink_like(learnable_sink, q),
     )
 
 
 def zigzag_ring_varlen_setup_context(ctx, inputs, output):
-    q, k, v, cu_seqlens, sm_scale, group_name = inputs
+    q, k, v, cu_seqlens, sm_scale, group_name, learnable_sink = inputs
     out, lse = output
-    ctx.save_for_backward(q, k, v, out, lse, cu_seqlens)
+    ctx.save_for_backward(q, k, v, out, lse, cu_seqlens, learnable_sink)
     ctx.sm_scale = sm_scale
     ctx.group_name = group_name
 
 
 def zigzag_ring_varlen_backward(ctx, grad_out, grad_lse):
-    q, k, v, out, lse, cu_seqlens = ctx.saved_tensors
-    dq, dk, dv = zigzag_ring_varlen_bwd(
-        grad_out, q, k, v, out, lse, cu_seqlens, ctx.sm_scale, ctx.group_name
+    q, k, v, out, lse, cu_seqlens, learnable_sink = ctx.saved_tensors
+    dq, dk, dv, dsink = zigzag_ring_varlen_bwd(
+        grad_out, q, k, v, out, lse, cu_seqlens, ctx.sm_scale, ctx.group_name, learnable_sink
     )
-    return dq, dk, dv, None, None, None
+    return dq, dk, dv, None, None, None, dsink if learnable_sink is not None else None
 
 
 zigzag_ring_varlen_fwd.register_autograd(
@@ -616,16 +670,18 @@ def ring_attention_varlen_func(
     cu_seqlens: torch.Tensor,
     sm_scale: float,
     cp_group: ProcessGroup,
+    learnable_sink: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Causal zigzag ring attention over a packed sequence, block-diagonal by document. q (S_local, Hq,
     D), k and v (S_local, Hkv, D or Dv) hold this rank's tokens in the order zigzag_varlen_index
     gives; k and v must be contiguous. cu_seqlens holds the int32 document boundaries of the whole
     packed sequence, every document a multiple of 2 * cp_size tokens long, so S_local ==
-    cu_seqlens[-1] // cp_size. cp_group has at least two ranks. Returns the output (S_local, Hq, Dv)
-    in q.dtype, in the same layout.
+    cu_seqlens[-1] // cp_size. cp_group has at least two ranks. learnable_sink as for
+    ring_attention_func. Returns the output (S_local, Hq, Dv) in q.dtype, in the same layout.
     """
-    out, _ = zigzag_ring_varlen_fwd(q, k, v, cu_seqlens, sm_scale, cp_group.group_name)
+    group_name = cp_group.group_name
+    out, _ = zigzag_ring_varlen_fwd(q, k, v, cu_seqlens, sm_scale, group_name, learnable_sink)
     return out
 
 
