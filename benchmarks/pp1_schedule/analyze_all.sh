@@ -1,7 +1,9 @@
 #!/bin/bash
 # Convert leftover raw nsys streams, export every report to SQLite and run analyze.py on each,
 # appending one JSON line per report to workspace/pp1/analysis.jsonl (reports already there are
-# skipped). Run as a CPU-only srun step.
+# skipped). Each SQLite export and each converted raw stream is deleted as soon as it is consumed,
+# to keep the shared quota low; only the .nsys-rep files and the records stay. Run as a CPU-only
+# srun step.
 set -uo pipefail
 cd ~/pith-train-pp1-schedule
 source .venv/bin/activate
@@ -16,7 +18,8 @@ for q in $(find workspace/pp1/nsys-tmp -name "*.qdstrm" -mmin +10); do
     base=workspace/pp1/nsys-recovered/$(basename $(dirname $q))-$(basename $q .qdstrm)
     [ -f $base.nsys-rep ] && continue
     echo "import $q"
-    $IMPORTER -i $q -o $base.nsys-rep > /dev/null 2>&1 || echo "import failed: $q"
+    # The raw stream is deleted once it converted; a failed import is kept for inspection.
+    $IMPORTER -i $q -o $base.nsys-rep > /dev/null 2>&1 && [ -f $base.nsys-rep ] && rm -f -- "$q" || echo "import failed: $q"
 done
 
 for rep in workspace/pp1/nsys/*.nsys-rep workspace/pp1/nsys-recovered/*.nsys-rep; do
@@ -27,6 +30,6 @@ for rep in workspace/pp1/nsys/*.nsys-rep workspace/pp1/nsys-recovered/*.nsys-rep
     python benchmarks/pp1_schedule/analyze.py $db --json | python -c "
 import json, sys
 r = json.loads(sys.stdin.read()); r['report'] = '$rep'; r['sqlite'] = '$db'
-print(json.dumps(r))" >> $OUT && echo "analyzed $rep" || echo "analyze failed: $rep"
+print(json.dumps(r))" >> $OUT && echo "analyzed $rep" && rm -f -- "$db" || echo "analyze failed: $rep"
 done
 echo "ANALYZE DONE $(date -u +%T)"
