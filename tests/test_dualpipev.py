@@ -434,11 +434,13 @@ def main(model_name: str):
         return modules
 
     # SHARDING_STAGES="attn,expert" sets DistributedCfg.attn_sharding_stage and
-    # expert_sharding_stage. Other than at 1,1, a copy at 1,1 runs the same steps as a baseline.
+    # expert_sharding_stage. Other than at 1,1, a copy at 1,1 runs the same steps as a baseline;
+    # SHARDING_BASELINE=1 adds it at 1,1 too, to measure how far two identical copies differ.
     stages = tuple(int(stage) for stage in os.environ.get("SHARDING_STAGES", "1,1").split(","))
     local_modules = build_local_modules(*stages)
     dualpipev_model = DualPipeV(local_modules)
-    baseline_modules = build_local_modules(1, 1) if stages != (1, 1) else None
+    with_baseline = stages != (1, 1) or os.environ.get("SHARDING_BASELINE") == "1"
+    baseline_modules = build_local_modules(1, 1) if with_baseline else None
     baseline_model = DualPipeV(baseline_modules) if baseline_modules is not None else None
     if distributed.rank == 0:
         print("[INFO] Sharding stages (attn, expert): %s." % (stages,), flush=True)
@@ -605,29 +607,38 @@ def main(model_name: str):
     assert not failed
 
     if baseline_modules is not None:
-        # Same shards, same micro-batches: the stages differ only in the order of the fp32 sums
-        # (per micro-batch reduce-scatter, then the sum over micro-batches), far below eps.
-        stage_eps, largest_stage_diff = 1e-4, 0.0
+        # Same shards and micro-batches, but the routed path (EP all-to-all, bf16 scatter-add) is
+        # not bit-reproducible, so two stage 1,1 copies already differ; SHARDING_BASELINE=1 measures
+        # it. A cosine distance misses a scale error, such as a dropped or doubled micro-batch
+        # reduction (about 5% of a gradient's norm at 20 micro-batches), so the norm ratio is checked
+        # too. Limits are per class, about 2.5x the largest of 1,1 vs 1,1 and 3,3 vs 1,1 at pp=1 and
+        # pp=2 on deepseek-v2-lite (8 H200): routed experts and router cosine 4.2e-4, norm 7.4e-4;
+        # everything else cosine 3.8e-4, norm 4.5e-3.
+        limits = {"routed": (1e-3, 5e-3), "dense": (1e-3, 1.5e-2)}  # (cosine, |norm ratio - 1|)
+        largest = {kind: [0.0, 0.0] for kind in limits}
         for (param_name, param), param_base in zip(local_modules.named_parameters(), baseline_modules.parameters()):  # fmt: skip
             assert (param.grad is None) == (param_base.grad is None), param_name
             if param.grad is None:
                 continue
-            grad, grad_base = param.grad.to_local(), param_base.grad.to_local()
+            grad, grad_base = param.grad.to_local().double(), param_base.grad.to_local().double()
             if not (grad.any() or grad_base.any()):
                 continue
+            kind = "routed" if ".experts." in param_name or param_name.endswith((".gate.weight", ".router.weight", ".router.bias")) else "dense"  # fmt: skip
             diff = calculate_difference(grad, grad_base)
-            largest_stage_diff = max(largest_stage_diff, diff)
-            if diff > stage_eps:
+            ratio = abs(grad.norm().item() / grad_base.norm().item() - 1)
+            largest[kind] = [max(largest[kind][0], diff), max(largest[kind][1], ratio)]
+            if diff > limits[kind][0] or ratio > limits[kind][1]:
                 failed = True
                 print(
-                    "[ERROR] rank-%d, Parameter %s grad differs from stage 1,1: diff=%.3e"
-                    % (distributed.rank, param_name, diff)
+                    "[ERROR] rank-%d, Parameter %s grad differs from stage 1,1: diff=%.3e, |norm ratio - 1|=%.3e"
+                    % (distributed.rank, param_name, diff, ratio)
                 )
-        print(
-            "[INFO] rank-%d, largest grad diff from stage 1,1 = %.3e"
-            % (distributed.rank, largest_stage_diff),
-            flush=True,
-        )
+        for kind, (diff, ratio) in largest.items():
+            print(
+                "[INFO] rank-%d, largest %s grad diff from stage 1,1 = %.3e, |norm ratio - 1| = %.3e"
+                % (distributed.rank, kind, diff, ratio),
+                flush=True,
+            )
     assert not failed
 
     for rank in range(distributed.world_size):

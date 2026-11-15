@@ -16,7 +16,8 @@ MODEL="${1:-examples/pretrain_lm/deepseek-v2-lite/config.json}"
 # which leaves attn dp=4 and expt dp=2. Set CP_SIZE=2 to exercise the folded layout, where cp
 # and ep partition the same stage ranks two different ways.
 # SHARDING_STAGES=attn,expert (e.g. 3,2) runs DualPipeV at those FSDP sharding stages and also
-# checks its losses and gradients against a copy at 1,1.
+# checks its losses and gradients against a copy at 1,1; SHARDING_BASELINE=1 adds that copy at 1,1
+# too, to measure how far two identical copies differ.
 PP_SIZE="${PP_SIZE:-2}"
 EP_SIZE="${EP_SIZE:-2}"
 CP_SIZE="${CP_SIZE:-1}"
