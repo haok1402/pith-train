@@ -13,12 +13,14 @@ if [[ "${1:-}" == "--nsys" ]]; then
     mkdir -p "$(dirname "$2")"
     # nsys streams each capture to $TMPDIR and converts it only at exit; on shared storage the raw
     # .qdstrm of a preempted step survives and converts offline with QdstrmImporter.
-    export TMPDIR=$PWD/workspace/pp1/nsys-tmp/j${SLURM_JOB_ID:-0}.${SLURM_STEP_ID:-0}
-    mkdir -p "$TMPDIR"
-    NSYS=(nsys profile --stats=false --trace=cuda,nvtx --force-overwrite=true --output="$2"
+    # Only nsys itself gets it: the training processes keep a node-local /tmp, since the inductor
+    # cache there holds compiled kernels that are mmapped and must not live on weka.
+    NSYS_TMP=$PWD/workspace/pp1/nsys-tmp/j${SLURM_JOB_ID:-0}.${SLURM_STEP_ID:-0}
+    mkdir -p "$NSYS_TMP"
+    NSYS=(env TMPDIR=$NSYS_TMP nsys profile --stats=false --trace=cuda,nvtx --force-overwrite=true --output="$2"
           --cuda-graph-trace=node --capture-range=cudaProfilerApi --capture-range-end=repeat --delay=0)
     shift 2
 fi
 PORT=$((15000 + RANDOM % 5000))
 TORCHRUN_ARGS=(--nnodes=1 --nproc-per-node=gpu --rdzv-backend=c10d --rdzv-endpoint=localhost:$PORT)
-exec "${NSYS[@]}" torchrun "${TORCHRUN_ARGS[@]}" "$@"
+exec "${NSYS[@]}" env TMPDIR=/tmp TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_$USER torchrun "${TORCHRUN_ARGS[@]}" "$@"
