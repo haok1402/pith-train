@@ -611,10 +611,10 @@ def main(model_name: str):
         # not bit-reproducible, so two stage 1,1 copies already differ; SHARDING_BASELINE=1 measures
         # it. A cosine distance misses a scale error, such as a dropped or doubled micro-batch
         # reduction (about 5% of a gradient's norm at 20 micro-batches), so the norm ratio is checked
-        # too. Limits are per class, about 2.5x the largest of 1,1 vs 1,1 and 3,3 vs 1,1 at pp=1 and
-        # pp=2 on deepseek-v2-lite (8 H200): routed experts and router cosine 4.2e-4, norm 7.4e-4;
-        # everything else cosine 3.8e-4, norm 4.5e-3.
-        limits = {"routed": (1e-3, 5e-3), "dense": (1e-3, 1.5e-2)}  # (cosine, |norm ratio - 1|)
+        # too. Limits are per class, about 2.5x the largest over stages 1,1 to 3,3 against 1,1 at pp=1
+        # and pp=2 on deepseek-v2-lite (8 H200): routed experts and router cosine 4.4e-4, norm 4.3e-3;
+        # everything else cosine 3.8e-4, norm 5.1e-3.
+        limits = {"routed": (1e-3, 1.5e-2), "dense": (1e-3, 1.5e-2)}  # (cosine, |norm ratio - 1|)
         largest = {kind: [0.0, 0.0] for kind in limits}
         for (param_name, param), param_base in zip(local_modules.named_parameters(), baseline_modules.parameters()):  # fmt: skip
             assert (param.grad is None) == (param_base.grad is None), param_name
