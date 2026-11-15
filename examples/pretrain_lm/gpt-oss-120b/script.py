@@ -1,3 +1,5 @@
+"""Pretrain GPT-OSS-120B on four 8-GPU nodes: 4 pipeline stages, 8-way expert parallelism."""
+
 from functools import partial
 from pathlib import Path
 
