@@ -40,7 +40,7 @@ pytest tests/kernels -v
 pytest tests/test_deepgemm_fp8_linear_correctness.py -v
 pytest tests/test_grouped_linear_correctness.py -v
 pytest tests/test_ep_dedup_dispatch.py -v
-pytest tests/test_silu_mul.py tests/test_clamped_swiglu.py tests/test_indexed_bias_add.py tests/test_log_prob.py -v
+pytest tests/test_silu_mul.py tests/test_clamped_swiglu.py tests/test_indexed_bias_add.py tests/test_log_prob.py tests/test_embedding_main_grad.py -v
 pytest tests/operators -v              # operator-level tests (ring attention, CP sequence, gated delta rule)
 pytest tests/test_import_layers.py -v  # import layering, kernel naming, kernels interface and verifier coverage (CPU only, AST)
 
@@ -138,6 +138,7 @@ The pipeline is **BSHD** end to end: hidden states are `(B, S, hidden)` through 
 Only what training code calls directly: autograd functions and custom ops with their functional entry points, `nn.Module` layers, and collective wrappers. The kernels they launch live in `pithtrain/kernels/` (below).
 
 - **Linear layers** (`linear.py`, `grouped_linear.py`) — BF16 / FP8 dense and grouped (expert) linear layers, with fp32 main_grad accumulation of the weight gradient
+- **Embedding** (`embedding.py`) — nn.Embedding whose backward adds only the rows of the micro-batch into an fp32 main_grad
 - **Expert ops** — `fp8_experts.py` (FP8 SwiGLU, fused gate_up SwiGLU and gpt-oss clamped SwiGLU experts as single autograd nodes, plus `fp8_scatter_quant`, the fused stage-3 input), `bf16_experts.py` (fused BF16 experts, CuTe on SM90 and TIRx on SM100; models import it lazily after `bf16_experts_supported()`), `fp8_swiglu_mlp.py` (fused FP8 dense SwiGLU MLP), `main_grad.py` (fp32 main_grad of raw expert parameters)
 - **Ring Attention** (`ring_attention.py`) — zigzag ring attention for context parallelism (standard, packed and MLA-aware variants)
 - **CP Sequence** (`cp_sequence.py`) — defines both CP sequence layouts, exposing the zigzag partition as `zigzag_spans` (and, one packed document at a time, as `zigzag_varlen_index`), converts the hidden stream between them, and fetches the conv state a depthwise convolution needs, the tokens before a shard, from the previous rank

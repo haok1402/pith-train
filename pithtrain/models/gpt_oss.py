@@ -25,6 +25,7 @@ from pithtrain.modules.load_balance import (
     replay_indices,
 )
 from pithtrain.operators.clamped_swiglu import clamped_swiglu
+from pithtrain.operators.embedding import Embedding
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
 from pithtrain.operators.fp8_experts import fp8_clamped_swiglu_experts, fp8_scatter_quant
@@ -497,7 +498,7 @@ class GptOssModel(nn.Module):
         self.rotary_emb = GptOssRotaryEmbedding(config)
         self.embed_tokens, self.norm, self.lm_head = None, None, None
         if stage_index == 0:
-            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+            self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
         if stage_index == stage_count - 1:
             self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.lm_head = BF16Linear(config.hidden_size, config.vocab_size, bias=False)

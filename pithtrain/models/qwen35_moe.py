@@ -31,6 +31,7 @@ from pithtrain.operators.cp_sequence import (
     zigzag_spans,
     zigzag_to_contiguous,
 )
+from pithtrain.operators.embedding import Embedding
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
 from pithtrain.operators.fp8_experts import fp8_scatter_quant, fp8_swiglu_gate_up_experts
@@ -600,7 +601,7 @@ class Qwen35MoeModel(nn.Module):
         self.rotary_emb = Qwen35MoeRotaryEmbedding(config)
         self.embed_tokens, self.norm, self.lm_head = None, None, None
         if stage_index == 0:
-            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+            self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
         if stage_index == stage_count - 1:
             self.norm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.lm_head = BF16Linear(config.hidden_size, config.vocab_size, bias=False)

@@ -22,6 +22,7 @@ from pithtrain.modules.load_balance import (
 )
 from pithtrain.modules.recompute import norm_recompute
 from pithtrain.operators.cp_sequence import zigzag_spans, zigzag_varlen_index
+from pithtrain.operators.embedding import Embedding
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
 from pithtrain.operators.fp8_experts import fp8_scatter_quant, fp8_swiglu_experts
@@ -418,7 +419,7 @@ class Qwen3MoeModel(nn.Module):
         self.rotary_emb = Qwen3MoeRotaryEmbedding(config)
         self.embed_tokens, self.norm, self.lm_head = None, None, None
         if stage_index == 0:
-            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+            self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
         if stage_index == stage_count - 1:
             self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.lm_head = BF16Linear(config.hidden_size, config.vocab_size, bias=False)

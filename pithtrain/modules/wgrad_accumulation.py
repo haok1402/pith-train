@@ -1,10 +1,11 @@
 """
 Weight-gradient accumulation into a layer-owned fp32 buffer.
 
-BF16Linear, GroupedLinear and FP8GroupedLinear add their weight gradient straight into the fp32
-main_grad buffer instead of writing a bf16 gradient per micro-batch that autograd then adds into the
-fp32 .grad of FSDP2: the GEMM accumulates in fp32, so no gradient of a micro-batch is rounded to
-bf16 and no bf16 temporary is allocated. setup_model enables it for every run, BF16 or FP8.
+BF16Linear, GroupedLinear, FP8GroupedLinear and Embedding add their weight gradient straight into
+the fp32 main_grad buffer instead of writing a bf16 gradient per micro-batch that autograd then adds
+into the fp32 .grad of FSDP2: the GEMM (for Embedding, the row add) accumulates in fp32, so no
+gradient of a micro-batch is rounded to bf16 and no bf16 temporary is allocated. setup_model enables
+it for every run, BF16 or FP8.
 
 install_wgrad_accumulation connects these layers to FSDP2 after fully_shard by extending two methods
 of each parameter group:
@@ -40,6 +41,7 @@ from pithtrain.kernels import (
     fp8_fused_experts_supported,
     fp8_grouped_wgrad_empty,
 )
+from pithtrain.operators.embedding import Embedding
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
 from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.main_grad import MAIN_GRADS
@@ -49,8 +51,8 @@ __all__ = ["install_raw_main_grad", "install_side_grads", "install_wgrad_accumul
 
 def install_wgrad_accumulation(model: nn.Module) -> None:
     """
-    Give every BF16Linear, GroupedLinear and FP8GroupedLinear weight in the model a main_grad,
-    after fully_shard.
+    Give every BF16Linear, Embedding, GroupedLinear and FP8GroupedLinear weight in the model a
+    main_grad, after fully_shard.
     """
     for module in model.modules():
         if not isinstance(module, FSDPModule):
@@ -63,7 +65,7 @@ def install_wgrad_accumulation(model: nn.Module) -> None:
                 owner = fsdp_param._module_info.module
                 if fsdp_param._module_info.param_name != "weight":
                     continue
-                if not isinstance(owner, (BF16Linear, GroupedLinear, FP8GroupedLinear)):
+                if not isinstance(owner, (BF16Linear, Embedding, GroupedLinear, FP8GroupedLinear)):
                     continue
                 size, device = fsdp_param._orig_size, fsdp_param.device
                 if isinstance(owner, FP8GroupedLinear):
