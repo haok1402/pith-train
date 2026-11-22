@@ -279,8 +279,10 @@ def main():
     if args.bisect:
         from tp_precision_cases import (
             COMPILED_DECAY_CASES,
+            MODULE_TP_CASES,
             PROJECTION_CASES,
             DecayProbeTP,
+            ModuleTP,
             PrecisionTP,
             check_column_partials,
             check_row_partials,
@@ -350,6 +352,8 @@ def main():
                 layout = dense_tp.DenseTP(mesh, async_tp=overlap)
             elif case in COMPILED_DECAY_CASES:
                 layout = DecayProbeTP(mesh, case)
+            elif case in MODULE_TP_CASES:
+                layout = ModuleTP(mesh)
             elif case in TRACE_CASES:
                 layout = dense_tp.DenseTP(mesh, async_tp=False)
             else:

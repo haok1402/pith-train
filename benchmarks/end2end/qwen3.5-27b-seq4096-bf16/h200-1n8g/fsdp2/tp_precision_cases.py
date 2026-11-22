@@ -73,6 +73,78 @@ COMPILED_DECAY_CASES = (
     "fp32-residual-stream-all-row-out32-compiled",
 )
 
+MODULE_TP_CASES = ("module-tp-compiled", "module-tp-staged")
+
+
+class ModuleTP(dense_tp.DenseTP):
+    """Run the stock attention and MLP modules with TP at projection boundaries."""
+
+    def __init__(self, mesh):
+        super().__init__(mesh, async_tp=False)
+
+    def shard_model(self, model):
+        super().shard_model(model)
+        delta_columns = ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b")
+        gqa_columns = ("q_proj", "k_proj", "v_proj")
+        for layer in model.layers:
+            attn = layer.linear_attn if layer.is_linear else layer.self_attn
+            for name in delta_columns if layer.is_linear else gqa_columns:
+                module = getattr(attn, name)
+                module.forward = partial(self.column, module)
+            row = attn.out_proj if layer.is_linear else attn.o_proj
+            row.forward = partial(self.row, row)
+            for module in (layer.mlp.gate_proj, layer.mlp.up_proj):
+                module.forward = partial(self.column, module)
+            down = layer.mlp.down_proj
+            down.forward = partial(self.row, down)
+
+    def column(self, module, x, quantized_input=None):
+        result = ModuleColumn.apply(x, module.weight, getattr(module, "main_grad", None))
+        return result if module.bias is None else result + module.bias
+
+    def row(self, module, x, quantized_input=None):
+        return self.rows(x.flatten(0, -2), module)
+
+    def token_mixing(self, layer, hidden, rotary):
+        seq = rotary[0].size(1)
+        batch = hidden.size(0) * self.size // seq
+        x = self.attention_input(layer, hidden)
+        x = ModuleGather.apply(x, self.size, self.name).view(batch, seq, -1)
+        if layer.is_linear:
+            return layer.linear_attn(x)
+        return layer.self_attn(x, rotary)
+
+    def mlp(self, layer, x):
+        return layer.mlp(ModuleGather.apply(x, self.size, self.name))
+
+
+class ModuleGather(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, size, name):
+        ctx.size, ctx.name, ctx.dtype = size, name, x.dtype
+        return dense_tp._gather(x, size, name).float()
+
+    @staticmethod
+    def backward(ctx, grad):
+        return dense_tp._scatter_sum(grad, ctx.size, ctx.name).to(ctx.dtype), None, None
+
+
+class ModuleColumn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, main_grad):
+        operand = x.to(weight.dtype).flatten(0, -2)
+        ctx.save_for_backward(operand, weight)
+        ctx.input_shape, ctx.main_grad = x.shape, main_grad
+        return F.linear(operand, weight).view(*x.shape[:-1], weight.size(0))
+
+    @staticmethod
+    def backward(ctx, grad):
+        x, weight = ctx.saved_tensors
+        grad = grad.reshape(-1, grad.size(-1))
+        dx = dense_tp._mm_fp32(grad, weight).view(ctx.input_shape)
+        dw = dense_tp._weight_grad(ctx.main_grad, grad, x)
+        return dx, dw, None
+
 
 class DecayProbeTP(dense_tp.DenseTP):
     def __init__(self, mesh, case):
