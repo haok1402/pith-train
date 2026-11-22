@@ -59,6 +59,9 @@ class PretrainLMCfg(SlottedDefault):
     allocator_retry_warmup_steps: int | None = None
     """Log allocator statistics every step and fail on retries after this many warmup steps."""
 
+    profile_pipeline_step: int | None = None
+    """Measure per-stage pipeline actions on this one-based diagnostic step."""
+
 
 def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset:
     if cfg.training.benchmark:
@@ -174,7 +177,10 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     microbatches = get_global_batch(cfg, dataset, step, device)
 
     # One detached loss per micro-batch on the rank that owns the LM head.
-    objective_outputs = model.step(microbatches, objective)
+    if cfg.profile_pipeline_step == step + 1:
+        objective_outputs = model.step(microbatches, objective, profile_actions=True)
+    else:
+        objective_outputs = model.step(microbatches, objective)
 
     # Every pipeline rank holds the same labels, so all stages count the same total for the scale.
     counted = 0
@@ -289,6 +295,8 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         if rank_memory:
             statements.append("num_alloc_retries %d" % step_retries)
             statements.append("num_alloc_retries_total %d" % max(row[0] for row in rank_memory))
+            statements.append("device_allocs %d" % max(row[5] for row in rank_memory))
+            statements.append("device_frees %d" % max(row[6] for row in rank_memory))
         logger.info(" | ".join(statements))
         for rank, (_, retries, allocated, reserved, inactive, allocs, frees) in enumerate(
             rank_memory

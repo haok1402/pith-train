@@ -1,8 +1,9 @@
 """Interleaved 1F1B and split-backward schedules for dense Qwen3.5."""
 
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
 from functools import lru_cache
+from statistics import median
 from typing import Any
 
 import torch
@@ -29,7 +30,7 @@ from torch.distributed.pipelining.schedules import (
     _get_warmup_ops,
 )
 
-from pithtrain.contexts import distributed, training
+from pithtrain.contexts import distributed, logging, training
 from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
 from pithtrain.contexts.weight_grad_store import WeightGradStore
 from pithtrain.pipeline.dualpipev import Microbatch
@@ -176,7 +177,13 @@ class ScheduledDensePipeline(nn.Module):
             self.edge_groups, rounds = _build_p2p_edge_groups(self.pp_group, assignment, device)
             _preconnect_p2p_edge_groups(self.pp_group, self.edge_groups, rounds, device)
 
-    def step(self, microbatches: list[Microbatch], objective: Callable | None = None) -> list[Any]:
+    def step(
+        self,
+        microbatches: list[Microbatch],
+        objective: Callable | None = None,
+        *,
+        profile_actions: bool = False,
+    ) -> list[Any]:
         if training.offloaded and self is training.model:
             raise RuntimeError("training state is offloaded; call reload_training_state")
         if self.last_stage in self.stages and objective is None:
@@ -207,6 +214,20 @@ class ScheduledDensePipeline(nn.Module):
         results = {}
         deferred_wgrads = {}
         reductions = []
+        timings = []
+
+        def start_timing():
+            if profile_actions:
+                start = torch.cuda.Event(enable_timing=True)
+                start.record()
+                return start
+            return None
+
+        def end_timing(start, stage, operation):
+            if start is not None:
+                end = torch.cuda.Event(enable_timing=True)
+                end.record()
+                timings.append((stage, operation, start, end))
 
         def receive(operation, stage, index):
             tensor, work = receives.pop((operation, stage, index))
@@ -259,6 +280,7 @@ class ScheduledDensePipeline(nn.Module):
                     cu_seqlens = microbatch.cu_seqlens
                     if cu_seqlens is not None:
                         cu_seqlens = cu_seqlens.to(device=distributed.device, dtype=torch.int32)
+                    tick = start_timing()
                     output = self.stages[stage_index](activation, cu_seqlens=cu_seqlens)
                     if stage_index == self.last_stage:
                         output, results[index] = objective((output,), microbatch.objective_inputs)
@@ -266,6 +288,7 @@ class ScheduledDensePipeline(nn.Module):
                         outgoing[SEND_F, *key] = output
                     if train:
                         activations[key] = (activation, output)
+                    end_timing(tick, stage_index, "F")
                     del activation, output
                 elif operation in (FULL_BACKWARD, BACKWARD_INPUT):
                     activation, output = activations.pop(key)
@@ -284,6 +307,7 @@ class ScheduledDensePipeline(nn.Module):
                         stage.set_is_last_backward(True)
                     if split:
                         WeightGradStore.enabled = True
+                    tick = start_timing()
                     try:
                         with torch.autograd.set_multithreading_enabled(False):
                             torch.autograd.backward(output, gradient)
@@ -294,8 +318,10 @@ class ScheduledDensePipeline(nn.Module):
                         deferred_wgrads[key] = WeightGradStore.take()
                     if stage_index > 0:
                         outgoing[SEND_B, *key] = activation.grad
+                    end_timing(tick, stage_index, "B")
                     del activation, output, gradient
                 elif operation == BACKWARD_WEIGHT:
+                    tick = start_timing()
                     with torch.no_grad():
                         for accumulate in deferred_wgrads.pop(key):
                             accumulate()
@@ -305,6 +331,7 @@ class ScheduledDensePipeline(nn.Module):
                         stage.set_requires_gradient_sync(True)
                         stage.set_reshard_after_backward(True)
                         reductions.append(stage.finalize_backward(async_op=True))
+                    end_timing(tick, stage_index, "W")
                 else:
                     raise RuntimeError(f"Unexpected dense pipeline operation: {operation}")
             for reduction in reductions:
@@ -313,6 +340,28 @@ class ScheduledDensePipeline(nn.Module):
                 for module in self.module.modules():
                     if isinstance(module, FSDPModule):
                         module.reshard()
+            if timings:
+                torch.cuda.synchronize(distributed.device)
+                by_action = defaultdict(list)
+                for stage, operation, start, end in timings:
+                    by_action[stage, operation].append(start.elapsed_time(end))
+                summary = [
+                    (stage, op, median(times), sum(times))
+                    for (stage, op), times in sorted(by_action.items())
+                ]
+                summaries = [None] * dist.get_world_size()
+                dist.all_gather_object(summaries, summary)
+                if dist.get_rank() == 0:
+                    for rank, rows in enumerate(summaries):
+                        for stage, op, p50, total in rows:
+                            logging.stdout.info(
+                                "pipeline-action rank=%d stage=%d action=%s median_ms=%.3f total_ms=%.1f",
+                                rank,
+                                stage,
+                                op,
+                                p50,
+                                total,
+                            )
             return [results[index] for index in range(len(results))]
         finally:
             training.current_microbatch = None

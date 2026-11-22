@@ -42,16 +42,23 @@ def main() -> None:
     parser.add_argument("--log-first-microbatch-loss", action="store_true")
     parser.add_argument("--allocator-trace-step", type=int)
     parser.add_argument("--allocator-trace-dir", type=Path)
+    parser.add_argument("--profile-pipeline-step", type=int)
     args = parser.parse_args()
     if args.allocator_trace_step is not None and (
         args.allocator_trace_dir is None or not 1 <= args.allocator_trace_step <= args.steps
     ):
         parser.error("--allocator-trace-step requires a valid step and --allocator-trace-dir")
+    if args.profile_pipeline_step is not None and (
+        args.schedule not in ("interleaved", "zb-h1", "zbv")
+        or not 1 <= args.profile_pipeline_step <= args.steps
+    ):
+        parser.error("--profile-pipeline-step requires a valid step and a scheduled dense pipeline")
 
     cfg = PretrainLMCfg()
     cfg.dataset = args.dataset or Path(".")
     cfg.log_first_microbatch_loss = args.log_first_microbatch_loss
     cfg.allocator_retry_warmup_steps = 3
+    cfg.profile_pipeline_step = args.profile_pipeline_step
     cfg.distributed.pipeline_parallel_size = args.pp
     cfg.distributed.context_parallel_size = 1
     cfg.distributed.expert_parallel_size = 1
