@@ -2,10 +2,14 @@
 
 import argparse
 import copy
+import gc
 import logging as std_logging
+import math
 import os
+from collections import defaultdict
 from contextlib import contextmanager
 from functools import partial
+from statistics import geometric_mean, mean, stdev
 from unittest.mock import patch
 
 import torch
@@ -234,13 +238,90 @@ def main():
     parser.add_argument("--full-checkpoint-blocks", type=int, default=0)
     parser.add_argument("--token-sums-audit", action="store_true")
     parser.add_argument("--attention-bias", action="store_true")
+    parser.add_argument("--statistical", action="store_true")
+    parser.add_argument("--seeds", nargs="+", type=int, default=[17, 18, 19, 20, 21])
+    parser.add_argument("--batches", type=int, default=2)
     args = parser.parse_args()
+    if args.statistical and (
+        args.bisect
+        or args.cases
+        or len(set(args.seeds)) != len(args.seeds)
+        or len(args.seeds) < 5
+        or args.batches < 2
+    ):
+        parser.error(
+            "statistical parity needs one configuration, at least five unique seeds, and at least two batches"
+        )
 
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
     dist.init_process_group("nccl", device_id=device)
     torch.set_float32_matmul_precision("highest")
     torch.backends.cudnn.allow_tf32 = False
+    mesh = init_device_mesh(
+        "cuda", (dist.get_world_size() // args.tp, args.tp), mesh_dim_names=("dp", "tp")
+    )
+    if args.statistical:
+        passed = statistical_parity(args, device, mesh)
+    else:
+        passed, _ = run_trial(args, device, mesh, seed=17, batch_index=0)
+    dist.destroy_process_group()
+    assert passed, "TP failed the selected FP32-reference parity gate"
+
+
+def error_ratio(tp_error, stock_error):
+    if stock_error:
+        return tp_error / stock_error
+    return math.inf if tp_error else 1.0
+
+
+def statistical_parity(args, device, mesh):
+    results = defaultdict(lambda: defaultdict(list))
+    for seed in args.seeds:
+        for batch_index in range(args.batches):
+            _, local = run_trial(args, device, mesh, seed, batch_index)
+            gathered = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, local)
+            seen = set()
+            for samples in gathered:
+                for name, shard, stock_error, tp_error in samples:
+                    assert (name, shard) not in seen, (name, shard)
+                    seen.add((name, shard))
+                    results[name][seed].append((stock_error, tp_error))
+            gc.collect()
+
+    ratios = []
+    for name, per_seed in sorted(results.items()):
+        assert len(per_seed) == len(args.seeds), name
+        counts = {len(samples) for samples in per_seed.values()}
+        assert counts in ({args.batches}, {args.batches * args.tp}), (name, counts)
+        seed_means = [tuple(map(mean, zip(*samples, strict=True))) for samples in per_seed.values()]
+        stock_error, tp_error = map(mean, zip(*seed_means, strict=True))
+        ratio = error_ratio(tp_error, stock_error)
+        spread = [error_ratio(tp, stock) for stock, tp in seed_means]
+        seed_sd = stdev(spread) if all(map(math.isfinite, spread)) else math.inf
+        ratios.append(ratio)
+        if dist.get_rank() == 0:
+            print(
+                f"parity_parameter name={name} stock_mean={stock_error:.10g} "
+                f"tp_mean={tp_error:.10g} ratio={ratio:.10g} "
+                f"seed_min={min(spread):.10g} seed_max={max(spread):.10g} seed_sd={seed_sd:.10g} "
+                f"observations={len(args.seeds) * next(iter(counts))}",
+                flush=True,
+            )
+    geomean = math.inf if math.inf in ratios else 0.0 if 0.0 in ratios else geometric_mean(ratios)
+    passed = max(ratios) <= 1.02 and geomean <= 1.0
+    if dist.get_rank() == 0:
+        print(
+            f"parity_statistics seeds={','.join(map(str, args.seeds))} batches={args.batches} "
+            f"parameters={len(ratios)} max_ratio={max(ratios):.10g} "
+            f"geomean_ratio={geomean:.10g} passed={passed}",
+            flush=True,
+        )
+    return passed
+
+
+def run_trial(args, device, mesh, seed, batch_index):
 
     from pithtrain.contexts import distributed, logging, training
     from pithtrain.models import qwen35_moe
@@ -255,7 +336,7 @@ def main():
     distributed.cp_size = 1
     logging.stdout = std_logging.getLogger("tp-parity")
     std_logging.basicConfig(level=std_logging.INFO)
-    torch.manual_seed(17)
+    torch.manual_seed(seed)
     config = Qwen3_5TextConfig(
         hidden_size=768,
         intermediate_size=1024,
@@ -279,12 +360,9 @@ def main():
         },
     )
     oracle = Qwen35TextModel(config).to(device)
-    init_weights(oracle, config.num_hidden_layers, seed=17, pipeline_chunks=False)
+    init_weights(oracle, config.num_hidden_layers, seed=seed, pipeline_chunks=False)
     initial, stock = copy.deepcopy(oracle), copy.deepcopy(oracle)
     fp32_tp = copy.deepcopy(oracle)
-    mesh = init_device_mesh(
-        "cuda", (dist.get_world_size() // args.tp, args.tp), mesh_dim_names=("dp", "tp")
-    )
     dp_mesh = mesh["dp"]
     dp = dp_mesh.get_group()
     for layer in stock.layers:
@@ -294,8 +372,13 @@ def main():
     shard_dense_model(stock, dp_mesh, stock_fsdp)
     install_wgrad_accumulation(stock)
 
-    tokens = torch.randint(config.vocab_size, (2, dp.size(), 1, 512), device=device)
-    labels = torch.randint(config.vocab_size, tokens.shape, device=device)
+    data_generator = None
+    if args.statistical:
+        data_generator = torch.Generator(device=device).manual_seed(seed * 1_000_003 + batch_index)
+    tokens = torch.randint(
+        config.vocab_size, (2, dp.size(), 1, 512), device=device, generator=data_generator
+    )
+    labels = torch.randint(config.vocab_size, tokens.shape, device=device, generator=data_generator)
     labels[..., 3::11] = -100
     stock_adjoints = []
     if args.cases and "stock-adjoint-compiled" in args.cases:
@@ -388,7 +471,7 @@ def main():
     layout_grads = {name: p.grad.full_tensor() for name, p in fp32_tp.named_parameters()}
     oracle_rel = ((fp32_loss - oracle_loss).abs() / oracle_loss).item()
     assert oracle_rel < 1e-5
-    passed = []
+    passed, samples = [], []
     for case in cases:
         parallel = copy.deepcopy(initial)
         if case == "requested":
@@ -483,6 +566,9 @@ def main():
             assert torch.isfinite(actual).all()
             bf16_error = rel_l2(actual, expected)
             stock_error = rel_l2(baseline, expected)
+            assert math.isfinite(stock_error) and math.isfinite(bf16_error), name
+            if args.statistical and dp.rank() == 0 and (spec or layout.rank == 0):
+                samples.append((name, layout.rank, stock_error, bf16_error))
             layout_error = rel_l2(fp32_actual, expected)
             excess = bf16_error - stock_error
             exceeding += excess > 0
@@ -492,7 +578,7 @@ def main():
             print(
                 f"case={case} rank={rank} grad={name} tp_to_fp32={bf16_error:.8f} "
                 f"stock_to_fp32={stock_error:.8f} tp_to_stock={rel_l2(actual, baseline):.8f} "
-                f"fp32_layout={layout_error:.8f}",
+                f"fp32_layout={layout_error:.8f} seed={seed} batch={batch_index}",
                 flush=True,
             )
 
@@ -502,7 +588,7 @@ def main():
             f"compiled={compiled} checkpoint={checkpoint} stock_loss={stock_loss.item():.8f} "
             f"tp_loss={tp_loss.item():.8f} fp32_loss={oracle_loss.item():.8f} "
             f"max_tp_to_fp32={max_bf16_error:.8f} max_fp32_layout={max_layout_error:.8f} "
-            f"exceeding_stock={exceeding} max_excess={max_excess:.8f}",
+            f"exceeding_stock={exceeding} max_excess={max_excess:.8f} seed={seed} batch={batch_index}",
             flush=True,
         )
         if case == "requested":
@@ -516,14 +602,14 @@ def main():
             print(f"rank={rank} fp32_adamw=passed", flush=True)
         assert loss_rel < 0.001
         assert max_layout_error < 2e-4
-        bad = torch.tensor(exceeding > 0, dtype=torch.int, device=device)
-        dist.all_reduce(bad, op=dist.ReduceOp.MAX)
-        if not bad.item():
-            passed.append(case)
+        if not args.statistical:
+            bad = torch.tensor(exceeding > 0, dtype=torch.int, device=device)
+            dist.all_reduce(bad, op=dist.ReduceOp.MAX)
+            if not bad.item():
+                passed.append(case)
         del parallel, layout
 
-    dist.destroy_process_group()
-    assert passed, "No tested TP configuration stayed within stock's FP32-reference error"
+    return passed, samples
 
 
 if __name__ == "__main__":
