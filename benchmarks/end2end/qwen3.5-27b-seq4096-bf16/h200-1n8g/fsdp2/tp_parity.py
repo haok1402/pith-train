@@ -95,7 +95,13 @@ def backward(model, tokens, labels, dp, tp=None, begin_microbatch=None):
     from pithtrain.tasks.pretrain_lm import objective
 
     losses = []
+    retained = model.retained_fsdp_units if tokens.size(0) > 1 else ()
+    for unit in retained:
+        unit.set_reshard_after_backward(False, recurse=False)
     for i, (x, y) in enumerate(zip(tokens[:, dp.rank()], labels[:, dp.rank()], strict=True)):
+        if i == tokens.size(0) - 1:
+            for unit in retained:
+                unit.set_reshard_after_backward(True, recurse=False)
         if begin_microbatch is not None:
             begin_microbatch(i)
         if tp is None:
@@ -240,6 +246,7 @@ def main():
     parser.add_argument("--compile-blocks", action="store_true")
     parser.add_argument("--blocks-per-group", type=int, default=2)
     parser.add_argument("--reuse-single-weight-gather-buffers", action="store_true")
+    parser.add_argument("--keep-head-gathered", action="store_true")
     parser.add_argument("--checkpoint", choices=("none", "selective", "full"), default="none")
     parser.add_argument("--full-checkpoint-blocks", type=int, default=0)
     parser.add_argument("--token-sums-audit", action="store_true")
@@ -541,6 +548,7 @@ def run_trial(args, device, mesh, seed, batch_index):
         config_fsdp.blocks_per_group = args.blocks_per_group
         config_fsdp.skip_embedding_backward_gather = True
         config_fsdp.reuse_single_weight_gather_buffers = args.reuse_single_weight_gather_buffers
+        config_fsdp.keep_head_gathered = args.keep_head_gathered
         shard_dense_model(parallel, dp_mesh, config_fsdp)
         install_wgrad_accumulation(parallel, tp_overwrite=config_fsdp.tp_overwrite_wgrad)
         if args.token_sums_audit:

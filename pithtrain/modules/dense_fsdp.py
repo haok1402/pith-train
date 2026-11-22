@@ -80,6 +80,9 @@ class DenseFSDPCfg(SlottedDefault):
     keep_gathered_across_microbatches: bool = False
     """Keep the selected buckets materialized until the final backward of the step."""
 
+    keep_head_gathered: bool = False
+    """Keep the separately sharded LM head gathered until the last backward."""
+
     skip_embedding_backward_gather: bool = False
     """Skip gathering the embedding weight in backward when it is its own bucket."""
 
@@ -216,6 +219,8 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError("Skipping the embedding backward gather requires a separate embedding")
     if cfg.edge_sharding == "root" and cfg.reuse_single_weight_gather_buffers:
         raise ValueError("Reusing gathered weights requires separate edge buckets")
+    if cfg.edge_sharding == "root" and cfg.keep_head_gathered:
+        raise ValueError("Keeping the head gathered requires a separate head bucket")
     if cfg.prefetch < 0:
         raise ValueError("dense_fsdp.prefetch must be nonnegative")
     if cfg.reduce_dtype not in ("fp32", "bf16"):
@@ -351,12 +356,16 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
     )
     if cfg.edge_sharding == "separate":
         fully_shard(model.embed_tokens, mesh=mesh, reshard_after_forward=True, mp_policy=mp)
-        fully_shard(model.lm_head, mesh=mesh, reshard_after_forward=True, mp_policy=mp)
+        fully_shard(
+            model.lm_head, mesh=mesh, reshard_after_forward=not cfg.keep_head_gathered, mp_policy=mp
+        )
         if cfg.reuse_single_weight_gather_buffers:
             reuse_single_weight_gather_buffer(model.embed_tokens)
             reuse_single_weight_gather_buffer(model.lm_head)
         if cfg.skip_embedding_backward_gather:
             model.embed_tokens.set_unshard_in_backward(False)
+        if cfg.keep_head_gathered:
+            model.retained_fsdp_units += (model.lm_head,)
         order = [model.embed_tokens, *order, model.lm_head]
     fully_shard(model, mesh=mesh, reshard_after_forward=False, mp_policy=mp)
 
