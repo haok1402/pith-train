@@ -5,6 +5,7 @@ from functools import partial
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from tp_delta_trace import capture
 
 from pithtrain.kernels import cross_entropy_fwd_bwd, stage_compile_options
 from pithtrain.models.qwen35_moe import Qwen35MoeRMSNorm, Qwen35MoeRMSNormGated
@@ -103,16 +104,12 @@ class DecayProbeTP(dense_tp.DenseTP):
     def delta_attention(self, delta, x, batch, seq):
         output = super().delta_attention(delta, x, batch, seq)
         if self.case == "trace-decoder-compiled":
-            from tp_delta_trace import capture
-
             return capture(output, self.case, "gdn_row", self.rank, self.size)
         return output
 
     def mlp(self, layer, x):
         if self.case != "trace-decoder-compiled" or not layer.is_linear:
             return super().mlp(layer, x)
-        from tp_delta_trace import capture
-
         x = capture(x, self.case, "mlp_input", self.rank, self.size)
         return capture(super().mlp(layer, x), self.case, "mlp_output", self.rank, self.size)
 
