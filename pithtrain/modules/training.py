@@ -54,7 +54,6 @@ __all__ = [
     "is_muon_param",
     "make_muon_optimizer",
     "make_adamw_optimizer",
-    "initialize_fused_adamw_state",
     "make_wsd_scheduler",
     "make_constant_scheduler",
     "init_weights",
@@ -100,28 +99,6 @@ def make_muon_optimizer(cfg: TrainingCfg, *, weight_decay: float = 0.1) -> tuple
 def make_adamw_optimizer(cfg: TrainingCfg, *, weight_decay: float = 0.1) -> tuple[Optimizer, ...]:
     kwargs = dict(lr=cfg.lr, weight_decay=weight_decay)
     return (AdamW(training.model.parameters(), fused=True, **kwargs),)
-
-
-@torch.no_grad()
-def initialize_fused_adamw_state(optimizer: AdamW) -> None:
-    """Allocate the persistent FP32 state shards before transient activations fill the allocator."""
-    for group in optimizer.param_groups:
-        if not group["fused"]:
-            raise ValueError("Early state initialization requires fused AdamW")
-        for param in group["params"]:
-            if not param.requires_grad or optimizer.state.get(param):
-                continue
-            if param.dtype != torch.float32:
-                raise ValueError("Early AdamW state initialization requires FP32 master weights")
-            # These are the same initial tensors as fused AdamW's lazy initialization.
-            state = optimizer.state[param]
-            state["step"] = torch.zeros((), dtype=torch.float32, device=param.device)
-            for name in ("exp_avg", "exp_avg_sq"):
-                state[name] = torch.zeros_like(param, memory_format=torch.preserve_format)
-            if group["amsgrad"]:
-                state["max_exp_avg_sq"] = torch.zeros_like(
-                    param, memory_format=torch.preserve_format
-                )
 
 
 def make_wsd_scheduler(

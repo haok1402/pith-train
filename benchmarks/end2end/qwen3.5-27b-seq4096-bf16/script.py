@@ -35,7 +35,6 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--seq", type=int, default=4096)
     parser.add_argument("--optimizer", choices=("adamw", "muon"), default="adamw")
-    parser.add_argument("--initialize-adamw-state", action="store_true")
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--model", type=Path)
     parser.add_argument("--hf-import", type=Path)
@@ -44,8 +43,6 @@ def main() -> None:
     parser.add_argument("--allocator-trace-step", type=int)
     parser.add_argument("--allocator-trace-dir", type=Path)
     args = parser.parse_args()
-    if args.initialize_adamw_state and args.optimizer != "adamw":
-        parser.error("--initialize-adamw-state requires --optimizer adamw")
     if args.allocator_trace_step is not None and (
         args.allocator_trace_dir is None or not 1 <= args.allocator_trace_step <= args.steps
     ):
@@ -55,7 +52,6 @@ def main() -> None:
     cfg.dataset = args.dataset or Path(".")
     cfg.log_first_microbatch_loss = args.log_first_microbatch_loss
     cfg.allocator_retry_warmup_steps = 3
-    cfg.initialize_adamw_state = args.initialize_adamw_state
     cfg.distributed.pipeline_parallel_size = args.pp
     cfg.distributed.context_parallel_size = 1
     cfg.distributed.expert_parallel_size = 1

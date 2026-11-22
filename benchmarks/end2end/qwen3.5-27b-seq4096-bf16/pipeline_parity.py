@@ -30,7 +30,6 @@ def main():
     parser.add_argument("--oracle", type=Path, required=True)
     parser.add_argument("--arms", nargs="+", default=["1f1b-attention", "interleaved-attention"])
     parser.add_argument("--repeat-stock", action="store_true")
-    parser.add_argument("--verify-adamw-initialization", action="store_true")
     parser.add_argument("--compute-stream-grad-buffers", action="store_true")
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -194,23 +193,7 @@ def main():
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.1, fused=True)
         first = next(iter(params.values()))
         before = local(first).detach().clone()
-        verify_adamw = args.verify_adamw_initialization and arm == "stock"
-        if verify_adamw:
-            trial_params = [nn.Parameter(p.detach().clone()) for p in params.values()]
-            for param, trial in zip(params.values(), trial_params, strict=True):
-                trial.grad = param.grad.clone()
-            trial_optimizer = torch.optim.AdamW(trial_params, lr=1e-5, weight_decay=0.1, fused=True)
-            train.initialize_fused_adamw_state(trial_optimizer)
-            trial_optimizer.step()
         optimizer.step()
-        if verify_adamw:
-            for param, trial in zip(params.values(), trial_params, strict=True):
-                assert torch.equal(local(param), local(trial))
-                for key, value in optimizer.state[param].items():
-                    assert torch.equal(local(value), local(trial_optimizer.state[trial][key]))
-            if rank == 0:
-                print("Early and lazy AdamW initialization produced identical weights and state.")
-            del trial_optimizer, trial_params
         for state in optimizer.state.values():
             assert state["exp_avg"].dtype == state["exp_avg_sq"].dtype == torch.float32
         assert not torch.equal(local(first), before), (arm, rank)
