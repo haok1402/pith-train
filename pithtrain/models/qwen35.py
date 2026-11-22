@@ -2,6 +2,7 @@
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 from pithtrain.contexts import distributed, training
@@ -48,6 +49,8 @@ class Qwen35DecoderLayer(nn.Module):
         else:
             raise ValueError(f"Unsupported Qwen3.5 layer type: {self.layer_type}")
         self.mlp = Qwen35MLP(config)
+        self.compile_mode = "layer"
+        self.recompute_mlp = False
         self.input_layernorm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen35MoeRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -77,6 +80,11 @@ class Qwen35DecoderLayer(nn.Module):
     ):
         return self.mlp(gathered_tokens)
 
+    def forward_dense_mlp(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.recompute_mlp and torch.is_grad_enabled():
+            return checkpoint(self.mlp, hidden_states, use_reentrant=False)
+        return self.mlp(hidden_states)
+
     @torch.compile(fullgraph=True, options=stage_compile_options() or None)
     def forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
         hidden_states = residual + moe_outs
@@ -94,13 +102,23 @@ class Qwen35DecoderLayer(nn.Module):
         else:
             hidden_states = self.self_attn(hidden_states, rotary_posemb, cu_seqlens)
         hidden_states = residual + hidden_states
-        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        hidden_states = hidden_states + self.forward_dense_mlp(
+            self.post_attention_layernorm(hidden_states)
+        )
         if self.to_zigzag:
             hidden_states = contiguous_to_zigzag(hidden_states, distributed.cp_group)
         return hidden_states
 
     @torch.compile(fullgraph=True, options=stage_compile_options() or None)
+    def forward_compiled(self, hidden_states, rotary_posemb, cu_seqlens=None):
+        return self.reference_forward(hidden_states, rotary_posemb, cu_seqlens)
+
     def forward(self, hidden_states, rotary_posemb, cu_seqlens=None):
+        if self.compile_mode == "layer":
+            return self.forward_compiled(hidden_states, rotary_posemb, cu_seqlens)
+        if self.compile_mode == "attention":
+            mlp_input, residual, _ = self.forward_stage1(hidden_states, rotary_posemb, cu_seqlens)
+            return self.forward_stage5(self.forward_dense_mlp(mlp_input), None, None, residual)
         return self.reference_forward(hidden_states, rotary_posemb, cu_seqlens)
 
 
@@ -113,7 +131,13 @@ class Qwen35Model(Qwen35MoeModel):
 class Qwen35DenseStage(Qwen35Model):
     """A contiguous Qwen3.5 stage using the normal autograd graph of each layer."""
 
-    def __init__(self, config: Qwen3_5TextConfig, layer_counts: tuple[int, ...] | None):
+    def __init__(
+        self,
+        config: Qwen3_5TextConfig,
+        layer_counts: tuple[int, ...] | None,
+        compile_mode: str,
+        recompute_mlp: bool,
+    ):
         nn.Module.__init__(self)
         count, index = distributed.pp_size, distributed.pp_rank
         if layer_counts is None:
@@ -129,6 +153,9 @@ class Qwen35DenseStage(Qwen35Model):
             )
         start = sum(layer_counts[:index])
         self._build_stage(config, index, count, range(start, start + layer_counts[index]))
+        for layer in self.layers.values():
+            layer.compile_mode = compile_mode
+            layer.recompute_mlp = recompute_mlp
 
     def forward(
         self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None

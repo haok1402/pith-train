@@ -223,6 +223,12 @@ class TrainingCfg(SlottedDefault):
     pipeline_layer_counts: Optional[tuple[int, ...]] = None
     """Optional decoder layer count per 1F1B stage, in forward order."""
 
+    pipeline_compile: Literal["layer", "attention", "eager"] = "layer"
+    """For 1F1B, compile the whole decoder layer, just its attention and residual, or neither."""
+
+    pipeline_recompute_mlp: bool = False
+    """For 1F1B, checkpoint the dense SwiGLU MLP to reduce live activation memory."""
+
     fp8: bool = False
     """
     Train the linear layers in FP8 through DeepGEMM with 128-element block scaling; False is BF16.
@@ -409,10 +415,25 @@ def setup_model(
     if cfg.pipeline_schedule == "1f1b":
         if ModelClass is not Qwen35Model or distributed.ep_size != 1:
             raise ValueError("1f1b requires dense Qwen3.5 with expert_parallel_size=1")
-        modules = nn.Sequential(Qwen35DenseStage(module_config, cfg.pipeline_layer_counts))
+        if cfg.pipeline_compile not in ("layer", "attention", "eager"):
+            raise ValueError(f"Unknown pipeline_compile: {cfg.pipeline_compile!r}")
+        modules = nn.Sequential(
+            Qwen35DenseStage(
+                module_config,
+                cfg.pipeline_layer_counts,
+                cfg.pipeline_compile,
+                cfg.pipeline_recompute_mlp,
+            )
+        )
     elif cfg.pipeline_schedule == "dualpipev":
-        if cfg.pipeline_layer_counts is not None:
-            raise ValueError("pipeline_layer_counts requires the 1f1b schedule")
+        if (
+            cfg.pipeline_layer_counts is not None
+            or cfg.pipeline_compile != "layer"
+            or cfg.pipeline_recompute_mlp
+        ):
+            raise ValueError(
+                "pipeline_layer_counts, pipeline_compile and pipeline_recompute_mlp require 1f1b"
+            )
         modules = nn.Sequential(
             ModelClass(module_config, phase=0), ModelClass(module_config, phase=1)
         )
