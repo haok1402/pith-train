@@ -4,6 +4,7 @@ import argparse
 import copy
 import logging as std_logging
 import os
+from functools import partial
 from unittest.mock import patch
 
 import torch
@@ -202,7 +203,7 @@ def main():
         fp32_loss = backward(fp32_tp, tokens, labels, dp, fp32_layout)
 
     if args.bisect:
-        from tp_precision_cases import PROJECTION_CASES, PrecisionTP, check_row_partials
+        from tp_precision_cases import PROJECTION_CASES, PrecisionTP, check_row_partials, tp_staged
 
         check_row_partials(dense_tp.DenseTP(mesh, async_tp=True), device)
         cases = args.cases or (
@@ -210,6 +211,8 @@ def main():
             "async",
             "sync-compiled",
             "async-compiled",
+            "sync-staged",
+            "async-staged",
             "stock-loss",
             "separate-dgrad",
             "stock-row",
@@ -242,11 +245,21 @@ def main():
         else:
             overlap, compiled = case.startswith("async"), case.endswith("-compiled")
             checkpoint = "selective" if compiled else "none"
-            if case in ("sync", "async", "sync-compiled", "async-compiled"):
+            if case in (
+                "sync",
+                "async",
+                "sync-compiled",
+                "async-compiled",
+                "sync-staged",
+                "async-staged",
+            ):
                 layout = dense_tp.DenseTP(mesh, async_tp=overlap)
             else:
                 layout = PrecisionTP(mesh, case, async_tp=overlap)
         layout.shard_model(parallel)
+        if case.endswith("-staged"):
+            for layer in parallel.layers:
+                layer.forward = partial(tp_staged, layer)
         config_fsdp = DenseFSDPCfg()
         config_fsdp.tensor_parallel_size = args.tp
         config_fsdp.compile_blocks = compiled

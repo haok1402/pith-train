@@ -185,7 +185,7 @@ class DenseTP:
     def delta_decay(self, delta, a):
         return -delta.A_log.float().exp() * F.softplus(a.float() + delta.dt_bias.float())
 
-    def decoder(
+    def attention(
         self,
         layer: Qwen35DecoderLayer,
         hidden: torch.Tensor,
@@ -214,11 +214,21 @@ class DenseTP:
             x = flash_attn_func(q, k, v.view(kv_shape), softmax_scale=attn.scaling, causal=True)
             x = x.reshape(batch * seq, -1) * gate.reshape(batch * seq, -1).sigmoid()
             x = self.rows(x, attn.o_proj)
-        hidden = hidden + x
+        return hidden + x
 
+    def mlp(self, layer: Qwen35DecoderLayer, x: torch.Tensor) -> torch.Tensor:
         mlp = layer.mlp
-        gate, up = self.columns(layer.post_attention_layernorm(hidden), mlp.gate_proj, mlp.up_proj)
-        return hidden + self.rows(silu_mul(gate, up), mlp.down_proj)
+        gate, up = self.columns(x, mlp.gate_proj, mlp.up_proj)
+        return self.rows(silu_mul(gate, up), mlp.down_proj)
+
+    def decoder(
+        self,
+        layer: Qwen35DecoderLayer,
+        hidden: torch.Tensor,
+        rotary: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        hidden = self.attention(layer, hidden, rotary)
+        return hidden + self.mlp(layer, layer.post_attention_layernorm(hidden))
 
     def loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         return _VocabCrossEntropy.apply(

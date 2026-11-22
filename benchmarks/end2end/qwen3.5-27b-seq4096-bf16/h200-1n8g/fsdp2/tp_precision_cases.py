@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from pithtrain.kernels import cross_entropy_fwd_bwd
+from pithtrain.kernels import cross_entropy_fwd_bwd, stage_compile_options
 from pithtrain.models.qwen35_moe import Qwen35MoeRMSNorm, Qwen35MoeRMSNormGated
 from pithtrain.modules import dense_tp
 
@@ -25,6 +25,18 @@ PROJECTION_CASES = (
     "mlp.down_proj",
     "lm_head",
 )
+
+
+@torch.compile(fullgraph=True, options=stage_compile_options() or None)
+def tp_stage1(layer, hidden, rotary):
+    hidden = layer.tensor_parallel.attention(layer, hidden, rotary)
+    return layer.post_attention_layernorm(hidden), hidden
+
+
+def tp_staged(layer, hidden, rotary):
+    x, residual = tp_stage1(layer, hidden, rotary)
+    x = layer.tensor_parallel.mlp(layer, x)
+    return layer.forward_stage5(x, None, None, residual)
 
 
 class PrecisionTP(dense_tp.DenseTP):
