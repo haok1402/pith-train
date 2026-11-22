@@ -314,17 +314,24 @@ class _ColumnParallel(torch.autograd.Function):
             x = torch.ops._c10d_functional.all_gather_into_tensor(
                 x.contiguous(), ctx.size, ctx.name
             )
-        if len(weights) == 1:
+        scatter_pending = len(weights) != 1 or not ctx.overlap
+        if not scatter_pending:
             dx = _mm_scatter(grads[0], weights[0], ctx.size, ctx.name, ctx.overlap)
         else:
             contributions = (_mm_fp32(grad, weight) for grad, weight in zip(grads, weights))
             total = next(contributions)
             for contribution in contributions:
                 total = total + contribution
-            dx = _scatter_sum(total, ctx.size, ctx.name).to(x.dtype)
+            # The weight-gradient GEMMs only need the gathered input, so they can run
+            # while NCCL is reducing the input-gradient partials.
+            dx = torch.ops._c10d_functional.reduce_scatter_tensor(
+                total.contiguous(), "sum", ctx.size, ctx.name
+            )
         if ctx.regather:
             x = torch.ops._c10d_functional.wait_tensor(x)
         dweights = tuple(_weight_grad(mg, grad, x) for mg, grad in zip(ctx.main_grads, grads))
+        if scatter_pending:
+            dx = torch.ops._c10d_functional.wait_tensor(dx).to(x.dtype)
         return dx, None, None, None, None, None, *dweights
 
 
