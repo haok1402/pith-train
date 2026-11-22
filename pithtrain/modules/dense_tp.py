@@ -129,10 +129,11 @@ class DenseTP:
     def gather(self, x: torch.Tensor) -> torch.Tensor:
         return _Gather.apply(x, self.size, self.name)
 
+    def column_weights(self, x: torch.Tensor, *weights: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return _ColumnParallel.apply(x, self.size, self.name, self.async_tp, *weights)
+
     def columns(self, x: torch.Tensor, *modules: nn.Linear) -> tuple[torch.Tensor, ...]:
-        outputs = _ColumnParallel.apply(
-            x, self.size, self.name, self.async_tp, *(module.weight for module in modules)
-        )
+        outputs = self.column_weights(x, *(module.weight for module in modules))
         return tuple(
             output if module.bias is None else output + module.bias
             for output, module in zip(outputs, modules)
@@ -153,9 +154,13 @@ class DenseTP:
         x = layer.input_layernorm(hidden)
         if layer.is_linear:
             delta = layer.linear_attn
-            qkv, z, b, a = self.columns(
-                x, delta.in_proj_qkv, delta.in_proj_z, delta.in_proj_b, delta.in_proj_a
+            # Both gates use the same gathered input. A combined small GEMM also
+            # combines their input gradients before rounding to BF16.
+            gate_weights = torch.cat((delta.in_proj_b.weight, delta.in_proj_a.weight), dim=0)
+            qkv, z, gates = self.column_weights(
+                x, delta.in_proj_qkv.weight, delta.in_proj_z.weight, gate_weights
             )
+            b, a = gates.chunk(2, dim=-1)
             q, k, v = delta.conv_qkv(qkv.view(batch, seq, -1), 0)
             beta = b.view(batch, seq, -1).sigmoid()
             decay = -delta.A_log.float().exp() * F.softplus(a.float() + delta.dt_bias.float())
