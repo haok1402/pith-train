@@ -106,6 +106,8 @@ def backward(model, tokens, labels, dp, tp=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tp", type=int, default=2)
+    parser.add_argument("--bisect", action="store_true")
+    parser.add_argument("--cases", nargs="+", help="Subset of cases for the bisection")
     parser.add_argument("--async-tp", action="store_true")
     parser.add_argument("--tp-regather-inputs", action="store_true")
     parser.add_argument("--tp-head-chunk-tokens", type=int, default=0)
@@ -158,29 +160,13 @@ def main():
     )
     oracle = Qwen35TextModel(config).to(device)
     init_weights(oracle, config.num_hidden_layers, seed=17, pipeline_chunks=False)
-    parallel, stock, fp32_tp = (copy.deepcopy(oracle) for _ in range(3))
+    initial, stock = copy.deepcopy(oracle), copy.deepcopy(oracle)
+    fp32_tp = copy.deepcopy(oracle)
     mesh = init_device_mesh(
         "cuda", (dist.get_world_size() // args.tp, args.tp), mesh_dim_names=("dp", "tp")
     )
     dp_mesh = mesh["dp"]
     dp = dp_mesh.get_group()
-    layout = dense_tp.DenseTP(
-        mesh,
-        async_tp=args.async_tp,
-        regather_inputs=args.tp_regather_inputs,
-        head_chunk_tokens=args.tp_head_chunk_tokens,
-    )
-    layout.shard_model(parallel)
-    config_fsdp = DenseFSDPCfg()
-    config_fsdp.tensor_parallel_size = args.tp
-    config_fsdp.compile_blocks = args.compile_blocks
-    config_fsdp.activation_checkpoint = args.checkpoint
-    config_fsdp.full_checkpoint_blocks = args.full_checkpoint_blocks
-    config_fsdp.blocks_per_group = args.blocks_per_group
-    config_fsdp.skip_embedding_backward_gather = True
-    shard_dense_model(parallel, dp_mesh, config_fsdp)
-    install_wgrad_accumulation(parallel)
-
     for layer in stock.layers:
         layer.forward = layer.forward_stock_stages
     stock_fsdp = DenseFSDPCfg()
@@ -191,7 +177,6 @@ def main():
     tokens = torch.randint(config.vocab_size, (2, dp.size(), 1, 512), device=device)
     labels = torch.randint(config.vocab_size, tokens.shape, device=device)
     labels[..., 3::11] = -100
-    tp_loss = backward(parallel, tokens, labels, dp, layout)
     stock_loss = backward(stock, tokens, labels, dp)
 
     dense_tokens = tokens.reshape(-1, tokens.size(-1))
@@ -216,50 +201,113 @@ def main():
     ):
         fp32_loss = backward(fp32_tp, tokens, labels, dp, fp32_layout)
 
+    if args.bisect:
+        from tp_precision_cases import PROJECTION_CASES, PrecisionTP, check_row_partials
+
+        check_row_partials(dense_tp.DenseTP(mesh, async_tp=True), device)
+        cases = args.cases or (
+            "sync",
+            "async",
+            "sync-compiled",
+            "async-compiled",
+            "stock-loss",
+            "separate-dgrad",
+            "stock-row",
+            *PROJECTION_CASES,
+        )
+    else:
+        cases = ("requested",)
+
     rank = dist.get_rank()
-    max_bf16_error = max_layout_error = 0.0
-    for name, param in parallel.named_parameters():
-        assert param.dtype == param.grad.dtype == torch.float32, name
-        actual = param.grad.full_tensor()
-        baseline = stock.get_parameter(name).grad.full_tensor()
-        expected = oracle.get_parameter(name).grad
-        fp32_actual = fp32_tp.get_parameter(name).grad.full_tensor()
-        if spec := layout.shards.get(name):
-            baseline, expected = spec.select(baseline), spec.select(expected)
-        assert torch.isfinite(actual).all()
-        bf16_error = rel_l2(actual, expected)
-        layout_error = rel_l2(fp32_actual, expected)
-        max_bf16_error = max(max_bf16_error, bf16_error)
-        max_layout_error = max(max_layout_error, layout_error)
+    baseline_grads = {name: p.grad.full_tensor() for name, p in stock.named_parameters()}
+    oracle_grads = {name: p.grad for name, p in oracle.named_parameters()}
+    layout_grads = {name: p.grad.full_tensor() for name, p in fp32_tp.named_parameters()}
+    oracle_rel = ((fp32_loss - oracle_loss).abs() / oracle_loss).item()
+    assert oracle_rel < 1e-5
+    passed = []
+    for case in cases:
+        parallel = copy.deepcopy(initial)
+        if case == "requested":
+            overlap, compiled = args.async_tp, args.compile_blocks
+            checkpoint = args.checkpoint
+            layout = dense_tp.DenseTP(
+                mesh,
+                async_tp=overlap,
+                regather_inputs=args.tp_regather_inputs,
+                head_chunk_tokens=args.tp_head_chunk_tokens,
+            )
+        else:
+            overlap, compiled = case.startswith("async"), case.endswith("-compiled")
+            checkpoint = "selective" if compiled else "none"
+            layout = PrecisionTP(mesh, case, async_tp=overlap)
+        layout.shard_model(parallel)
+        config_fsdp = DenseFSDPCfg()
+        config_fsdp.tensor_parallel_size = args.tp
+        config_fsdp.compile_blocks = compiled
+        config_fsdp.activation_checkpoint = checkpoint
+        config_fsdp.full_checkpoint_blocks = args.full_checkpoint_blocks
+        config_fsdp.blocks_per_group = args.blocks_per_group
+        config_fsdp.skip_embedding_backward_gather = True
+        shard_dense_model(parallel, dp_mesh, config_fsdp)
+        install_wgrad_accumulation(parallel)
+        tp_loss = backward(parallel, tokens, labels, dp, layout)
+
+        max_bf16_error = max_layout_error = max_excess = 0.0
+        exceeding = 0
+        for name, param in parallel.named_parameters():
+            assert param.dtype == param.grad.dtype == torch.float32, name
+            actual = param.grad.full_tensor()
+            baseline, expected, fp32_actual = (
+                baseline_grads[name],
+                oracle_grads[name],
+                layout_grads[name],
+            )
+            if spec := layout.shards.get(name):
+                baseline, expected = spec.select(baseline), spec.select(expected)
+            assert torch.isfinite(actual).all()
+            bf16_error = rel_l2(actual, expected)
+            stock_error = rel_l2(baseline, expected)
+            layout_error = rel_l2(fp32_actual, expected)
+            excess = bf16_error - stock_error
+            exceeding += excess > 0
+            max_excess = max(max_excess, excess)
+            max_bf16_error = max(max_bf16_error, bf16_error)
+            max_layout_error = max(max_layout_error, layout_error)
+            print(
+                f"case={case} rank={rank} grad={name} tp_to_fp32={bf16_error:.8f} "
+                f"stock_to_fp32={stock_error:.8f} tp_to_stock={rel_l2(actual, baseline):.8f} "
+                f"fp32_layout={layout_error:.8f}",
+                flush=True,
+            )
+
+        loss_rel = ((tp_loss - stock_loss).abs() / stock_loss).item()
         print(
-            f"rank={rank} grad={name} tp_to_fp32={bf16_error:.8f} "
-            f"stock_to_fp32={rel_l2(baseline, expected):.8f} "
-            f"tp_to_stock={rel_l2(actual, baseline):.8f} fp32_layout={layout_error:.8f}",
+            f"case={case} rank={rank} TP={layout.size} FSDP={dp.size()} async={overlap} "
+            f"compiled={compiled} checkpoint={checkpoint} stock_loss={stock_loss.item():.8f} "
+            f"tp_loss={tp_loss.item():.8f} fp32_loss={oracle_loss.item():.8f} "
+            f"max_tp_to_fp32={max_bf16_error:.8f} max_fp32_layout={max_layout_error:.8f} "
+            f"exceeding_stock={exceeding} max_excess={max_excess:.8f}",
             flush=True,
         )
+        if case == "requested":
+            optimizer = torch.optim.AdamW(parallel.parameters(), lr=1e-5, fused=True)
+            before = parallel.lm_head.weight.to_local().detach().clone()
+            optimizer.step()
+            assert not torch.equal(before, parallel.lm_head.weight.to_local())
+            for param in parallel.parameters():
+                state = optimizer.state[param]
+                assert state["exp_avg"].dtype == state["exp_avg_sq"].dtype == torch.float32
+            print(f"rank={rank} fp32_adamw=passed", flush=True)
+        assert loss_rel < 0.001
+        assert max_layout_error < 2e-4
+        bad = torch.tensor(exceeding > 0, dtype=torch.int, device=device)
+        dist.all_reduce(bad, op=dist.ReduceOp.MAX)
+        if not bad.item():
+            passed.append(case)
+        del parallel, layout
 
-    optimizer = torch.optim.AdamW(parallel.parameters(), lr=1e-5, fused=True)
-    before = parallel.lm_head.weight.to_local().detach().clone()
-    optimizer.step()
-    assert not torch.equal(before, parallel.lm_head.weight.to_local())
-    for param in parallel.parameters():
-        state = optimizer.state[param]
-        assert state["exp_avg"].dtype == state["exp_avg_sq"].dtype == torch.float32
-    loss_rel = ((tp_loss - stock_loss).abs() / stock_loss).item()
-    oracle_rel = ((fp32_loss - oracle_loss).abs() / oracle_loss).item()
-    print(
-        f"rank={rank} TP={layout.size} FSDP={dp.size()} async={args.async_tp} "
-        f"compiled={args.compile_blocks} checkpoint={args.checkpoint} "
-        f"stock_loss={stock_loss.item():.8f} tp_loss={tp_loss.item():.8f} "
-        f"fp32_loss={oracle_loss.item():.8f} max_tp_to_fp32={max_bf16_error:.8f} "
-        f"max_fp32_layout={max_layout_error:.8f} fp32_adamw=passed",
-        flush=True,
-    )
-    assert loss_rel < 0.001
-    assert oracle_rel < 1e-5
-    assert max_layout_error < 2e-4
-    assert max_bf16_error < 0.06
     dist.destroy_process_group()
+    assert passed, "No tested TP configuration stayed within stock's FP32-reference error"
 
 
 if __name__ == "__main__":
