@@ -363,6 +363,15 @@ class ScheduledDensePipeline(nn.Module):
                                 total,
                             )
             return [results[index] for index in range(len(results))]
+        except torch.OutOfMemoryError as error:
+            if distributed.device.type == "cuda":
+                retries = torch.cuda.memory_stats()["num_alloc_retries"]
+                error.add_note(
+                    f"Pipeline rank {self.pp_rank}, stage {stage_index}, {operation} on "
+                    f"microbatch {index}. Live activation sets {len(activations)}, "
+                    f"deferred W sets {len(deferred_wgrads)}, num_alloc_retries_total {retries}."
+                )
+            raise
         finally:
             training.current_microbatch = None
             if self.split_backward:
