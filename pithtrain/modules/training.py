@@ -247,6 +247,9 @@ class TrainingCfg(SlottedDefault):
     pipeline_recompute_mlp_up_layers: tuple[int, ...] = ()
     """Replay the up projection on these global layers, overriding their other MLP replay mode."""
 
+    pipeline_recompute_mlp_full_layers: tuple[int, ...] = ()
+    """Replay the full MLP in these layers, overriding the other replay modes."""
+
     pipeline_grad_sync_layers: tuple[int, ...] = ()
     """Reduce gradients for these 1F1B decoder layers after each microbatch."""
 
@@ -568,6 +571,7 @@ def setup_model(
                 recompute_mlp_up_only=cfg.pipeline_recompute_mlp_up_only,
                 recompute_mlp_product_only=cfg.pipeline_recompute_mlp_product_only,
                 recompute_mlp_up_layers=cfg.pipeline_recompute_mlp_up_layers,
+                recompute_mlp_full_layers=cfg.pipeline_recompute_mlp_full_layers,
                 compact_embedding_grad=cfg.pipeline_compact_embedding_grad,
             )
             for stage_index in range(stage_count)
@@ -583,6 +587,7 @@ def setup_model(
             or cfg.pipeline_recompute_mlp_up_only
             or cfg.pipeline_recompute_mlp_product_only
             or cfg.pipeline_recompute_mlp_up_layers
+            or cfg.pipeline_recompute_mlp_full_layers
             or cfg.pipeline_grad_sync_layers
             or cfg.pipeline_compute_stream_grad_buffers
             or cfg.pipeline_compact_embedding_grad

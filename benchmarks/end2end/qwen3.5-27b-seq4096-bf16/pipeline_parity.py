@@ -42,6 +42,7 @@ def main():
     parser.add_argument("--zb-h1-weight-delays", type=int, nargs=2)
     parser.add_argument("--zb-h1-forward-warmups", type=int, nargs=2)
     parser.add_argument("--recompute-mlp-up-layers", type=int, nargs="+", default=())
+    parser.add_argument("--recompute-mlp-full-layers", type=int, nargs="+", default=())
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     from pithtrain.contexts import distributed, logging, training
@@ -179,6 +180,9 @@ def main():
         cfg.training.pipeline_recompute_mlp_product_only = replay_product
         cfg.training.pipeline_recompute_mlp_up_layers = (
             tuple(args.recompute_mlp_up_layers) if arm not in controls else ()
+        )
+        cfg.training.pipeline_recompute_mlp_full_layers = (
+            tuple(args.recompute_mlp_full_layers) if arm not in controls else ()
         )
         with torch.device(device):
             train.setup_model(cfg.training, cfg.distributed)
