@@ -446,7 +446,7 @@ def setup_model(
         ):
             raise ValueError(f"Invalid pipeline_grad_sync_layers: {cfg.pipeline_grad_sync_layers}")
         stage_count = chunks * distributed.pp_size
-        modules = nn.Sequential(
+        local_stages = [
             Qwen35DenseStage(
                 module_config,
                 cfg.pipeline_layer_counts,
@@ -459,7 +459,8 @@ def setup_model(
             )
             for stage_index in range(stage_count)
             if stage_to_rank(stage_index, distributed.pp_size, schedule) == distributed.pp_rank
-        )
+        ]
+        modules = nn.Sequential(*local_stages)
     elif schedule == "dualpipev":
         if (
             cfg.pipeline_layer_counts is not None
