@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from pithtrain.kernels import cross_entropy_fwd_bwd, stage_compile_options
 from pithtrain.models.qwen35_moe import Qwen35MoeRMSNorm, Qwen35MoeRMSNormGated
 from pithtrain.modules import dense_tp
+from pithtrain.operators.causal_conv1d import causal_conv1d
 
 PROJECTION_CASES = (
     "linear_attn.in_proj_qkv",
@@ -49,6 +50,9 @@ COMPILED_DECAY_CASES = (
     "separate-dgrad-compiled",
     "mlp-dgrad-compiled",
     "gqa-dgrad-compiled",
+    "qk-round-silu-compiled",
+    "qk-fp32-silu-compiled",
+    "qk-fp32-silu-rounded-loss-compiled",
 )
 
 
@@ -60,12 +64,16 @@ class DecayProbeTP(dense_tp.DenseTP):
 
     def shard_model(self, model):
         super().shard_model(model)
-        if self.master:
-            for layer in model.layers:
-                if layer.is_linear:
-                    delta = layer.linear_attn
-                    delta.audit_master_A_log = delta.A_log.detach().clone()
-                    delta.audit_master_dt_bias = delta.dt_bias.detach().clone()
+        for layer in model.layers:
+            if not layer.is_linear:
+                continue
+            delta = layer.linear_attn
+            if self.master:
+                delta.audit_master_A_log = delta.A_log.detach().clone()
+                delta.audit_master_dt_bias = delta.dt_bias.detach().clone()
+            if self.case.startswith("qk-"):
+                round_silu = self.case == "qk-round-silu-compiled"
+                delta.conv_qkv = partial(probe_conv_qkv, delta, round_silu)
 
     def delta_decay(self, delta, a):
         if self.master:
@@ -118,7 +126,7 @@ class DecayProbeTP(dense_tp.DenseTP):
         )
 
     def loss(self, logits, labels):
-        if self.case == "stock-loss-compiled":
+        if self.case in ("stock-loss-compiled", "qk-fp32-silu-rounded-loss-compiled"):
             return StockLoss.apply(logits, labels.flatten(), self.size, self.name, self.rank)
         return super().loss(logits, labels)
 
@@ -131,6 +139,38 @@ class ForwardMaster(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         return grad, None
+
+
+@torch.library.custom_op("pithtrain::tp_audit_materialize", mutates_args=())
+def materialize(x: torch.Tensor) -> torch.Tensor:
+    return x.clone()
+
+
+@materialize.register_fake
+def fake_materialize(x):
+    return torch.empty_like(x)
+
+
+def materialize_backward(ctx, grad):
+    return grad
+
+
+materialize.register_autograd(materialize_backward)
+
+
+def probe_conv_qkv(delta, round_silu, qkv, offset):
+    conv = causal_conv1d(qkv, delta.conv1d.weight, offset)
+    if round_silu:
+        return delta.split_qkv(materialize(F.silu(conv)))
+
+    batch, seq, _ = conv.shape
+    q, k, v = F.silu(conv.float()).split([delta.key_dim, delta.key_dim, delta.value_dim], dim=-1)
+    q, k = (tensor.reshape(batch, seq, -1, delta.head_k_dim) for tensor in (q, k))
+    q, k = (
+        (tensor * torch.rsqrt(tensor.square().sum(-1, keepdim=True) + 1e-6)).to(conv.dtype)
+        for tensor in (q, k)
+    )
+    return q, k, v.reshape(batch, seq, -1, delta.head_v_dim).to(conv.dtype).contiguous()
 
 
 class PrecisionTP(dense_tp.DenseTP):
