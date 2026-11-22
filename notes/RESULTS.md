@@ -125,4 +125,6 @@ setsid nohup env E2EFP8_INTEGRATION_TREE=wt-integration PYTORCH_ALLOC_CONF=expan
 
 ## FP8 integration branch
 
-`e2efp8-integration-fp8` starts at the BF16 headline commit and merges `kda-fp8-rbt` at `34f26b0` and `kda-fp8-weight-quant` at `d0c28d8`. The merged revision `0438a4d` is queued for joint H200 tests of activation and weight quantization, scale layout and DeepGEMM FP8Linear correctness. `kda-fp8-rt` awaits a fork branch. The dense FSDP2 trainer currently requires BF16, so these tests cover the FP8 operators for the subsequent recipe ablations. [Correctness submission](../logs/integration-fp8-correctness-submit.log), [trainer](../wt-integration-fp8/pithtrain/modules/training.py#L403).
+Branch `e2efp8-integration-fp8` starts at the BF16 headline commit and merges `kda-fp8-rbt` at `34f26b0` and `kda-fp8-weight-quant` at `d0c28d8`. At `0438a4d4921f4051e5c84e2280f4200a140ff347`, **611 correctness tests passed** in Slurm job `1268129`, task 62, on one H200 on `pool1-00228`. The suite covered activation and weight quantization, scale layout and DeepGEMM FP8Linear forward and backward. FP8 training throughput is unmeasured. [Fork branch](https://github.com/haok1402/pith-train/tree/e2efp8-integration-fp8), [correctness log](../logs/integration-fp8-correctness-1268129-62.log).
+
+The rowwise-transpose port is in validation before its `kda-fp8-rt` branch is published. The dense FSDP2 trainer currently requires BF16. The FP8 merges stage the kernels for the subsequent recipe ablations. [Trainer](../wt-integration-fp8/pithtrain/modules/training.py#L403).
