@@ -46,6 +46,9 @@ class Qwen35MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         quantized_x = training.Linear.quantize_input(x)
         gate = self.gate_proj(x, quantized_x)
+        return self.forward_from_gate(x, gate, quantized_x)
+
+    def forward_from_gate(self, x, gate, quantized_x=None) -> torch.Tensor:
         up = self.up_proj(x, quantized_x)
         return self.down_proj(silu_mul(gate, up))
 
@@ -65,6 +68,7 @@ class Qwen35DecoderLayer(nn.Module):
         self.mlp = Qwen35MLP(config)
         self.compile_mode = "layer"
         self.recompute_mlp = False
+        self.recompute_mlp_up_only = False
         self.input_layernorm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen35MoeRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -96,6 +100,11 @@ class Qwen35DecoderLayer(nn.Module):
 
     def forward_dense_mlp(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.recompute_mlp and torch.is_grad_enabled():
+            if self.recompute_mlp_up_only:
+                gate = self.mlp.gate_proj(hidden_states)
+                return checkpoint(
+                    self.mlp.forward_from_gate, hidden_states, gate, use_reentrant=False
+                )
             return checkpoint(self.mlp, hidden_states, use_reentrant=False)
         return self.mlp(hidden_states)
 
@@ -156,6 +165,7 @@ class Qwen35DenseStage(Qwen35Model):
         stage_index: int | None = None,
         stage_count: int | None = None,
         defer_wgrad: bool = False,
+        recompute_mlp_up_only: bool = False,
     ):
         nn.Module.__init__(self)
         count = distributed.pp_size if stage_count is None else stage_count
@@ -184,6 +194,7 @@ class Qwen35DenseStage(Qwen35Model):
             layer.recompute_mlp = (
                 layer.idx in recompute_mlp if isinstance(recompute_mlp, tuple) else recompute_mlp
             )
+            layer.recompute_mlp_up_only = recompute_mlp_up_only
             if layer.is_linear:
                 layer.linear_attn.fuse_gates = fuse_delta_gates
         if defer_wgrad:

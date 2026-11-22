@@ -235,6 +235,9 @@ class TrainingCfg(SlottedDefault):
     pipeline_recompute_mlp: bool | tuple[int, ...] = False
     """Checkpoint SwiGLU in every 1F1B decoder layer or in the given global layer indices."""
 
+    pipeline_recompute_mlp_up_only: bool = False
+    """Retain the gate projection and replay the up projection and SwiGLU."""
+
     pipeline_grad_sync_layers: tuple[int, ...] = ()
     """Reduce gradients for these 1F1B decoder layers after each microbatch."""
 
@@ -445,6 +448,8 @@ def setup_model(
             raise ValueError(f"{schedule} reduces gradients after the last weight backward")
         if cfg.pipeline_compile not in ("layer", "attention", "eager"):
             raise ValueError(f"Unknown pipeline_compile: {cfg.pipeline_compile!r}")
+        if cfg.pipeline_recompute_mlp_up_only and (cfg.fp8 or not cfg.pipeline_recompute_mlp):
+            raise ValueError("Selective up-projection replay requires BF16 and MLP checkpointing")
         for option in ("pipeline_grad_sync_layers", "pipeline_offload_adamw_layers"):
             indices = getattr(cfg, option)
             if any(not 0 <= index < module_config.num_hidden_layers for index in indices):
@@ -460,6 +465,7 @@ def setup_model(
                 stage_index=stage_index,
                 stage_count=stage_count,
                 defer_wgrad=split_backward,
+                recompute_mlp_up_only=cfg.pipeline_recompute_mlp_up_only,
             )
             for stage_index in range(stage_count)
             if stage_to_rank(stage_index, distributed.pp_size, schedule) == distributed.pp_rank
@@ -471,6 +477,7 @@ def setup_model(
             or cfg.pipeline_virtual_stages != 1
             or cfg.pipeline_compile != "layer"
             or cfg.pipeline_recompute_mlp
+            or cfg.pipeline_recompute_mlp_up_only
             or cfg.pipeline_grad_sync_layers
             or cfg.pipeline_offload_adamw_layers
             or cfg.pipeline_fuse_delta_gates

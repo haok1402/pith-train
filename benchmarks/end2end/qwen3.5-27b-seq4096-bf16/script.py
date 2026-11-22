@@ -26,6 +26,7 @@ def main() -> None:
     recompute = parser.add_mutually_exclusive_group()
     recompute.add_argument("--recompute-mlp", action="store_true")
     recompute.add_argument("--recompute-mlp-layers", type=int, nargs="+")
+    parser.add_argument("--recompute-mlp-up-only", action="store_true")
     parser.add_argument("--grad-sync-layers", type=int, nargs="+", default=())
     parser.add_argument("--offload-adamw-layers", type=int, nargs="+", default=())
     parser.add_argument("--fuse-delta-gates", action="store_true")
@@ -65,6 +66,7 @@ def main() -> None:
         tuple(args.recompute_mlp_layers) if args.recompute_mlp_layers else args.recompute_mlp
     )
     training.pipeline_grad_sync_layers = tuple(args.grad_sync_layers)
+    training.pipeline_recompute_mlp_up_only = args.recompute_mlp_up_only
     training.pipeline_offload_adamw_layers = tuple(args.offload_adamw_layers)
     training.pipeline_fuse_delta_gates = args.fuse_delta_gates
     training.optimizer = make_muon_optimizer if args.optimizer == "muon" else make_adamw_optimizer

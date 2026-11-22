@@ -118,9 +118,13 @@ def main():
     for arm in [*controls, *args.arms]:
         records = []
         schedule, compile_mode = ("dualpipev", "layer") if arm in controls else arm.rsplit("-", 1)
+        replay_up = schedule.endswith("-up")
+        schedule = schedule.removesuffix("-up")
         cfg.training.pipeline_schedule = schedule
         cfg.training.pipeline_virtual_stages = 2 if schedule in ("interleaved", "zbv") else 1
         cfg.training.pipeline_compile = compile_mode
+        cfg.training.pipeline_recompute_mlp = replay_up
+        cfg.training.pipeline_recompute_mlp_up_only = replay_up
         with torch.device(device):
             train.setup_model(cfg.training, cfg.distributed)
         model = training.model
