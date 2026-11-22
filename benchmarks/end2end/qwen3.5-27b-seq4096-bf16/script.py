@@ -30,10 +30,12 @@ def main() -> None:
     parser.add_argument("--model", type=Path)
     parser.add_argument("--hf-import", type=Path)
     parser.add_argument("--dataset", type=Path, help="Directory of PithTrain token shards.")
+    parser.add_argument("--log-first-microbatch-loss", action="store_true")
     args = parser.parse_args()
 
     cfg = PretrainLMCfg()
     cfg.dataset = args.dataset or Path(".")
+    cfg.log_first_microbatch_loss = args.log_first_microbatch_loss
     cfg.distributed.pipeline_parallel_size = args.pp
     cfg.distributed.context_parallel_size = 1
     cfg.distributed.expert_parallel_size = 1

@@ -53,6 +53,9 @@ class PretrainLMCfg(SlottedDefault):
     The root directory hosting the tokenized corpus, globbed for *.bin shards.
     """
 
+    log_first_microbatch_loss: bool = False
+    """Log the first data replica's first loss for reference-model checks."""
+
 
 def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset:
     if cfg.training.benchmark:
@@ -182,6 +185,20 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         if cp_size > 1:
             torch.distributed.all_reduce(loss, group=distributed.cp_group)
             loss /= cp_size
+        if step == 0 and cfg.log_first_microbatch_loss and distributed.dp_rank == 0:
+            (first_labels,) = microbatches[0].objective_inputs
+            first_loss = objective_outputs[0]
+            first_count = (first_labels != -100).sum().to(first_loss.dtype).clamp_min(1)
+            stats = torch.stack((first_loss, first_count))
+            if cp_size > 1:
+                torch.distributed.all_reduce(stats, group=distributed.cp_group)
+            if distributed.cp_rank == 0:
+                logging.stdout.info(
+                    "first-microbatch-loss %.6f over %d tokens",
+                    (stats[0] / stats[1]).item(),
+                    stats[1].item(),
+                    rank=distributed.rank,
+                )
     if loss_rank != 0:
         if distributed.pp_rank != loss_rank:
             loss = num_tokens.new_empty(())
