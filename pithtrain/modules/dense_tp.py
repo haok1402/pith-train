@@ -532,13 +532,16 @@ class _ChunkedVocabHead(torch.autograd.Function):
         size, vocab_size = group.size(), weight.size(0)
         targets = _local_targets(labels, group.rank() * vocab_size, vocab_size)
         gathered = _gather(x, size, name)
+        logits = x.new_empty((min(chunk_tokens, gathered.size(0)), vocab_size))
         maxima, sums, losses = [], [], []
         for xs, *ys in zip(
             gathered.split(chunk_tokens),
             *(target.split(chunk_tokens) for target in targets),
             strict=True,
         ):
-            maximum, sumexp, loss = _vocab_loss_stats(F.linear(xs, weight), *ys, group)
+            scores = logits[: xs.size(0)]
+            torch.mm(xs, weight.t(), out=scores)
+            maximum, sumexp, loss = _vocab_loss_stats(scores, *ys, group)
             maxima.append(maximum)
             sums.append(sumexp)
             losses.append(loss)
@@ -552,6 +555,7 @@ class _ChunkedVocabHead(torch.autograd.Function):
         x, weight, maximum, sumexp, *targets = ctx.saved_tensors
         rcp_count, scale = _vocab_gradient_scale(targets[-1], grad, x.dtype)
         dx = torch.empty_like(x, dtype=torch.float32)
+        logits = x.new_empty((min(ctx.chunk_tokens, x.size(0)), weight.size(0)))
         dw = ctx.main_grad
         if dw is None:
             dw = torch.zeros_like(weight, dtype=torch.float32)
@@ -564,7 +568,11 @@ class _ChunkedVocabHead(torch.autograd.Function):
             *(target.split(ctx.chunk_tokens) for target in targets),
             strict=True,
         ):
-            logits_grad = _local_loss_gradient(F.linear(xs, weight), ms, es, *ys, rcp_count, scale)
+            # Reuse one tile instead of allocating scores while the previous
+            # tile's gradient still owns its buffer.
+            logits_grad = logits[: xs.size(0)]
+            torch.mm(xs, weight.t(), out=logits_grad)
+            _local_loss_gradient(logits_grad, ms, es, *ys, rcp_count, scale)
             if x.dtype == torch.float32:
                 torch.mm(logits_grad, weight, out=dxs)
             else:
