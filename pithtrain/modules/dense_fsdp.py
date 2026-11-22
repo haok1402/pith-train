@@ -50,6 +50,9 @@ class DenseFSDPCfg(SlottedDefault):
     tp_overwrite_wgrad: bool = False
     """Write each TP weight's first microbatch contribution directly into the FP32 buffer."""
 
+    tp_recompute_mlp_columns: bool = False
+    """Replay the two wide MLP column projections during selective checkpointing."""
+
     blocks_per_group: int = 1
     """Number of consecutive decoder blocks per communication bucket."""
 
@@ -102,9 +105,13 @@ class DenseFSDPCfg(SlottedDefault):
     compile_blocks: bool = False
 
 
-def checkpoint_policy(ctx, op, *args, **kwargs):
+def checkpoint_policy(ctx, op, *args, recompute_mlp_columns=False, **kwargs):
+    name = op.name()
+    if recompute_mlp_columns and name == "symm_mem::fused_all_gather_matmul" and len(args[1]) == 2:
+        # The MLP is the only dense TP call that gathers for two projections.
+        return CheckpointPolicy.MUST_RECOMPUTE
     # The combined TP operators contain GEMMs just like aten.mm.
-    if op.name() in {
+    if name in {
         "symm_mem::fused_all_gather_matmul",
         "pithtrain::tp_fp32_matmul_reduce_scatter",
     }:
@@ -120,8 +127,11 @@ def checkpoint_policy(ctx, op, *args, **kwargs):
     return CheckpointPolicy.PREFER_RECOMPUTE
 
 
-def selective_checkpoint_contexts():
-    return create_selective_checkpoint_contexts(checkpoint_policy)
+def selective_checkpoint_contexts(recompute_mlp_columns=False):
+    policy = checkpoint_policy
+    if recompute_mlp_columns:
+        policy = partial(checkpoint_policy, recompute_mlp_columns=True)
+    return create_selective_checkpoint_contexts(policy)
 
 
 def reuse_single_weight_gather_buffer(unit: nn.Module) -> None:
@@ -203,6 +213,12 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError("dense_fsdp.reduce_dtype must be fp32 or bf16")
     if cfg.activation_checkpoint not in ("none", "selective", "full"):
         raise ValueError("dense_fsdp.activation_checkpoint must be none, selective or full")
+    if cfg.tp_recompute_mlp_columns and (
+        cfg.activation_checkpoint != "selective"
+        or model.tensor_parallel is None
+        or not model.tensor_parallel.async_tp
+    ):
+        raise ValueError("Replaying TP MLP columns requires async TP and selective checkpointing")
     if cfg.tensor_parallel_size > 1 and (cfg.reduce_dtype != "fp32" or cfg.bf16_sharded_gradients):
         raise ValueError("Dense TP requires FP32 reduction and gradient shards")
     if cfg.tp_overwrite_wgrad and (model.tensor_parallel is None or cfg.reduce_at_step_end):
@@ -253,10 +269,13 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError(
             "Full checkpoint prefix requires selective checkpointing and a valid depth"
         )
+    contexts = selective_checkpoint_contexts
+    if cfg.tp_recompute_mlp_columns:
+        contexts = partial(selective_checkpoint_contexts, recompute_mlp_columns=True)
     for i, layer in enumerate(model.layers):
         if i < checkpoint_blocks and cfg.activation_checkpoint != "none":
             ctx = (
-                {"context_fn": selective_checkpoint_contexts}
+                {"context_fn": contexts}
                 if cfg.activation_checkpoint == "selective" and i >= cfg.full_checkpoint_blocks
                 else {}
             )
