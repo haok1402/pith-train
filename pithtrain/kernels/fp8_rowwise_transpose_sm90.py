@@ -2,9 +2,9 @@
 CuTe-DSL (SM90) rowwise FP8 quantization of x and of x.T from one read of x, for every input
 fp8_quant_grad accepts: bf16, fp16 or fp32, any shape (empty included) and any strides.
 
-One CTA (256 threads) per 128x128 tile; each thread owns an 8x8 block. The transposed tile goes
-through bank-swizzled smem so every warp writes whole 128-byte rows of x.T, where a store straight
-from registers would scatter each warp instruction over 16 rows. Routes, chosen on the host: a view
+One CTA (256 threads) per 128x128 tile. Large, aligned BF16 grids stage input in a swizzled shared
+tile and use separate row and column warps. Other inputs use 8x8 per-thread blocks and a swizzled
+output tile so each warp writes whole 128-byte rows of x.T. A view
 with unit row stride runs as its transpose with the outputs swapped; rows with unit column stride
 whose 16-byte column groups are all aligned and in or out of their row as a whole are read in place
 with 16-byte loads and a runtime row stride; every other view (a non-unit column stride, misaligned
@@ -24,7 +24,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T
 
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import lds_v4, max2, prmt, st_b32, st_v2, st_v4
+from pithtrain.kernels.cute_ptx_sm90 import cp_async16, lds_b32, lds_v4, max2, prmt, st_b32, st_v2, st_v4
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale
 
 __all__ = ["fp8_quant_grad_sm90"]
@@ -579,23 +579,108 @@ def rowwise_transpose_kernel(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: c
     store_transposed(sub_block, s_tile, out_t_base, M64, N64, m_align)
 
 
+def staged_chunk_addr(tile: Int32, row: Int32, chunk: Int32) -> Int32:
+    """An input row has sixteen 16-byte chunks, swizzled by four-row groups."""
+    return tile + row * (TILE * 2) + (chunk ^ ((row // 4) % 8)) * 16
+
+
 @cute.jit
-def launch(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, stream, kind: cutlass.Constexpr[str], is_tok_aligned: cutlass.Constexpr[bool], m_align: cutlass.Constexpr[int], is_gather: cutlass.Constexpr[bool], full_tiles: cutlass.Constexpr[bool]) -> None:
+def quantize_staged_rows(tile: Int32, lane: Int32, warp: Int32, row0: Int32, col0: Int32, M: Int64, N: Int64, out: Int64, scales: Int64) -> None:
+    lane_in_row = lane % 16
+    for step in cutlass.range(16, unroll=2):
+        row = warp * 2 + lane // 16 + step * 8
+        words = list(lds_v4(staged_chunk_addr(tile, row, lane_in_row)))
+        magnitudes = [word & Uint32(0x7FFF7FFF) for word in words]
+        amax = max2(max2(magnitudes[0], magnitudes[1]), max2(magnitudes[2], magnitudes[3]))
+        amax = max2(amax, (amax << 16) | (amax >> 16))
+        for stage in cutlass.range_constexpr(4):
+            other = Uint32(cute.arch.shuffle_sync_bfly(Int32(amax), offset=1 << stage))
+            amax = max2(amax, other)
+        scale = e8m0_scale_bits(widen(amax, 0, "bf16"))
+        out_row = Int64(row0 + row)
+        scale_idx = Int64(col0 // TILE) * M + out_row
+        st_b32(scales + scale_idx * 4, scale, pred_i32(lane_in_row == 0))
+        rcp = Uint32(0x7F000000) - scale
+        lo, hi = quantize_row(words, rcp, "bf16")
+        st_v2(out + out_row * N + Int64(col0 + lane_in_row * 8), lo, hi, Int32(1))
+
+
+@cute.jit
+def quantize_staged_cols(tile: Int32, lane: Int32, warp: Int32, row0: Int32, col0: Int32, M: Int64, N: Int64, out: Int64, scales: Int64) -> None:
+    row = (lane % 8) * 4
+    pair_in_chunk = lane // 8
+    for step in cutlass.range(4, unroll=1):
+        chunk = warp + step * 4
+        # The eight lanes for a column pair each own four adjacent rows in
+        # each 32-row slab. The swizzle gives those eight lanes different
+        # four-bank groups. The four pairs in a chunk use all four banks.
+        words = [
+            lds_b32(staged_chunk_addr(tile, row + i % 4 + (i // 4) * 32, chunk) + pair_in_chunk * 4)
+            for i in range(16)
+        ]
+        amax = words[0] & Uint32(0x7FFF7FFF)
+        for i in cutlass.range_constexpr(1, 16):
+            amax = max2(amax, words[i] & Uint32(0x7FFF7FFF))
+        for stage in cutlass.range_constexpr(3):
+            other = Uint32(cute.arch.shuffle_sync_bfly(Int32(amax), offset=1 << stage))
+            amax = max2(amax, other)
+        for half in cutlass.range_constexpr(2):
+            col = Int64(col0 + chunk * 8 + pair_in_chunk * 2 + half)
+            scale = e8m0_scale_bits(widen(amax, half, "bf16"))
+            scale_idx = Int64(row0 // TILE) * N + col
+            st_b32(scales + scale_idx * 4, scale, pred_i32(lane % 8 == 0))
+            rcp = Uint32(0x7F000000) - scale
+            out_addr = out + col * M + Int64(row0 + row)
+            for slab in cutlass.range_constexpr(4):
+                quant = quantize_column(words[4 * slab : 4 * slab + 4], rcp, half, "bf16")
+                st_b32(out_addr + slab * 32, quant, Int32(1))
+
+
+@cute.kernel
+def staged_bf16_kernel(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor) -> None:
+    tidx, _, _ = cute.arch.thread_idx()
+    pid_col, pid_row, _ = cute.arch.block_idx()
+    M, N = Int64(mX.shape[0]), Int64(mX.shape[1])
+    row0, col0 = pid_row * TILE, pid_col * TILE
+    smem = cutlass.memory.SmemAllocator()
+    tile = smem.allocate_array(cutlass.Uint8, TILE * TILE * 2, byte_alignment=128).toint()
+    base = mX.iterator.toint()
+    stride = Int64(mX.stride[0])
+    for segment in cutlass.range_constexpr(8):
+        row, chunk = tidx // 16 + segment * 16, tidx % 16
+        addr = base + (Int64(row0 + row) * stride + Int64(col0 + chunk * 8)) * 2
+        cp_async16(staged_chunk_addr(tile, row, chunk), addr, Int32(16))
+    cute.arch.cp_async_commit_group()
+    cute.arch.cp_async_wait_group(0)
+    cute.arch.barrier()
+    warp, lane = tidx // 32, tidx % 32
+    if warp < 4:
+        quantize_staged_rows(tile, lane, warp, row0, col0, M, N, mOutTok.iterator.toint(), mScaleTok.iterator.toint())
+    else:
+        quantize_staged_cols(tile, lane, warp - 4, row0, col0, M, N, mOutT.iterator.toint(), mScaleT.iterator.toint())
+
+
+@cute.jit
+def launch(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, stream, kind: cutlass.Constexpr[str], is_tok_aligned: cutlass.Constexpr[bool], m_align: cutlass.Constexpr[int], is_gather: cutlass.Constexpr[bool], full_tiles: cutlass.Constexpr[bool], staged: cutlass.Constexpr[bool]) -> None:
     M, N = mX.shape[0], mX.shape[1]
-    rowwise_transpose_kernel(mX, mOutTok, mScaleTok, mOutT, mScaleT, kind, is_tok_aligned, m_align, is_gather, full_tiles).launch(grid=[(N + (TILE - 1)) // TILE, (M + (TILE - 1)) // TILE, 1], block=[THREADS, 1, 1], stream=stream)
+    grid = [(N + (TILE - 1)) // TILE, (M + (TILE - 1)) // TILE, 1]
+    if const_expr(staged):
+        staged_bf16_kernel(mX, mOutTok, mScaleTok, mOutT, mScaleT).launch(grid=grid, block=[THREADS, 1, 1], stream=stream)
+    else:
+        rowwise_transpose_kernel(mX, mOutTok, mScaleTok, mOutT, mScaleT, kind, is_tok_aligned, m_align, is_gather, full_tiles).launch(grid=grid, block=[THREADS, 1, 1], stream=stream)
 
 
 INPUT_KINDS = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}
-COMPILED: dict[tuple[str, bool, int, bool, bool], Callable] = {}
+COMPILED: dict[tuple[str, bool, int, bool, bool, bool], Callable] = {}
 
 
-def compile_kernel(kind: str, is_tok_aligned: bool, m_align: int, is_gather: bool, full_tiles: bool) -> Callable:
+def compile_kernel(kind: str, is_tok_aligned: bool, m_align: int, is_gather: bool, full_tiles: bool, staged: bool = False) -> Callable:
     M, N, num_scale_tok_cols, num_scale_t_cols = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
     dtype = {"bf16": cutlass.BFloat16, "f16": cutlass.Float16, "f32": cutlass.Float32}[kind]
     x = fake(dtype, (M, N), (cute.sym_int64(), cute.sym_int64() if is_gather else 1), dtype.width // 8 if is_gather else 16)
     out_tok, scale_tok = fake(cutlass.Float8E4M3FN, (M, N), (cute.sym_int64(), 1)), fake(cutlass.Float32, (M, num_scale_tok_cols), (1, cute.sym_int64()))
     out_t, scale_t = fake(cutlass.Float8E4M3FN, (N, M), (cute.sym_int64(), 1)), fake(cutlass.Float32, (N, num_scale_t_cols), (1, cute.sym_int64()))
-    return cute.compile(launch, x, out_tok, scale_tok, out_t, scale_t, fake_stream(), kind, is_tok_aligned, m_align, is_gather, full_tiles, options="--enable-tvm-ffi")
+    return cute.compile(launch, x, out_tok, scale_tok, out_t, scale_t, fake_stream(), kind, is_tok_aligned, m_align, is_gather, full_tiles, staged, options="--enable-tvm-ffi")
 
 
 def quantize(x: torch.Tensor, kind: str, M: int, N: int, row_stride: int, col_stride: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -611,8 +696,10 @@ def quantize(x: torch.Tensor, kind: str, M: int, N: int, row_stride: int, col_st
     is_gather = col_stride != 1 or x.data_ptr() % 16 != 0 or row_stride % elems_per_16_bytes != 0 or N % elems_per_16_bytes != 0
     # The aligned BF16 load path and complete tiles make every vector access in-bounds.
     full_tiles = kind == "bf16" and not is_gather and M % TILE == 0 and N % TILE == 0
+    # Staging has enough work to amortize its CTA rendezvous on large grids.
+    staged = full_tiles and M >= 4096 and N >= 10240 and (M // TILE) * (N // TILE) >= 4352
     # 8-byte fp8 stores of out_tok need N % 8 == 0
-    key = (kind, N % 8 == 0, 16 if M % 16 == 0 else 8 if M % 8 == 0 else 1, is_gather, full_tiles)
+    key = (kind, N % 8 == 0, 16 if M % 16 == 0 else 8 if M % 8 == 0 else 1, is_gather, full_tiles, staged)
     fn = COMPILED.get(key)
     if fn is None:
         fn = COMPILED[key] = compile_kernel(*key)
