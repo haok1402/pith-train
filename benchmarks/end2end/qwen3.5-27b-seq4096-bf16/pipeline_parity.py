@@ -34,6 +34,7 @@ def main():
     parser.add_argument("--compute-stream-grad-buffers", action="store_true")
     parser.add_argument("--preallocate-grad-buffers", choices=("input", "output", "both"))
     parser.add_argument("--preallocate-grad-output-layers", type=int, nargs="+", default=())
+    parser.add_argument("--split-mlp-shard-layers", type=int, nargs="+", default=())
     parser.add_argument("--compact-embedding-grad", action="store_true")
     parser.add_argument("--virtual-layer-counts", type=int, nargs=4)
     parser.add_argument("--microbatch-size", type=int, choices=(1, 2), default=2)
@@ -162,6 +163,9 @@ def main():
             tuple(args.preallocate_grad_output_layers)
             if cfg.training.pipeline_preallocate_grad_buffers is not None
             else ()
+        )
+        cfg.training.pipeline_split_mlp_shard_layers = (
+            tuple(args.split_mlp_shard_layers) if schedule in ("zb-h1", "zbv") else ()
         )
         cfg.training.pipeline_compact_embedding_grad = (
             args.compact_embedding_grad and arm not in controls

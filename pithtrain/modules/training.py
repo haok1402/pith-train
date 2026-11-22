@@ -265,6 +265,9 @@ class TrainingCfg(SlottedDefault):
     pipeline_preallocate_grad_output_layers: tuple[int, ...] = ()
     """Limit preallocated reduce-scatter outputs to these decoder layers when given."""
 
+    pipeline_split_mlp_shard_layers: tuple[int, ...] = ()
+    """Use separate FSDP groups for MLP projections in these dense decoder layers."""
+
     pipeline_compact_embedding_grad: bool = False
     """Use a microbatch-sized temporary for embedding backward."""
 
@@ -350,7 +353,13 @@ def split_replicas(mesh: DeviceMesh, hsdp_replica: int) -> DeviceMesh:
     return mesh._unflatten(0, (hsdp_replica, size // hsdp_replica), ("replica", "shard"))
 
 
-def apply_fsdp(model, hsdp_replica: int = 1, *, compute_stream_grad_buffers: bool = False):
+def apply_fsdp(
+    model,
+    hsdp_replica: int = 1,
+    *,
+    compute_stream_grad_buffers: bool = False,
+    split_mlp_shard_layers: tuple[int, ...] = (),
+):
     """
     Shard the pipeline chunks in model with FSDP2 in place and return model. The routed expert
     weights shard over the dp axis of the expert mesh, everything else over the dp x cp stage, and
@@ -383,6 +392,13 @@ def apply_fsdp(model, hsdp_replica: int = 1, *, compute_stream_grad_buffers: boo
                     child, mesh=attn_fsdp_mesh, reshard_after_forward=not dense_stage, mp_policy=mp
                 )
         for layer in stage.layers.values():
+            if dense_stage and layer.idx in split_mlp_shard_layers:
+                # Small packing/output groups can reuse fragmented cached blocks without
+                # keeping every sharded gradient resident throughout the next backward.
+                for projection in (layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj):
+                    fully_shard(
+                        projection, mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp
+                    )
             if hasattr(layer.mlp, "experts"):
                 fully_shard(
                     layer.mlp.experts,
@@ -459,6 +475,7 @@ def setup_model(
     schedule = cfg.pipeline_schedule
     grad_buffers = cfg.pipeline_preallocate_grad_buffers
     output_layers = cfg.pipeline_preallocate_grad_output_layers
+    split_mlp_shard_layers = cfg.pipeline_split_mlp_shard_layers
     if grad_buffers is not None and (
         grad_buffers not in ("input", "output", "both")
         or schedule not in ("zb-h1", "zbv")
@@ -478,6 +495,12 @@ def setup_model(
         raise ValueError(
             "Preallocated gradient output layers require valid decoder indices and output buffers"
         )
+    if split_mlp_shard_layers and (
+        schedule not in ("zb-h1", "zbv")
+        or cfg.pipeline_grad_sync_layers
+        or any(not 0 <= index < module_config.num_hidden_layers for index in split_mlp_shard_layers)
+    ):
+        raise ValueError("MLP sharding requires valid dense ZB-H1 or ZB-V decoder indices")
     weight_delays = cfg.pipeline_zb_h1_weight_delays
     if weight_delays is not None and (
         schedule != "zb-h1"
@@ -569,6 +592,7 @@ def setup_model(
         modules,
         distributed_cfg.hsdp_replica,
         compute_stream_grad_buffers=cfg.pipeline_compute_stream_grad_buffers,
+        split_mlp_shard_layers=split_mlp_shard_layers,
     )
     if grad_buffers is not None:
         output_modules = (

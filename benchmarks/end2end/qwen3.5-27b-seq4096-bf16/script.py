@@ -36,6 +36,7 @@ def main() -> None:
     parser.add_argument("--compute-stream-grad-buffers", action="store_true")
     parser.add_argument("--preallocate-grad-buffers", choices=("input", "output", "both"))
     parser.add_argument("--preallocate-grad-output-layers", type=int, nargs="+", default=())
+    parser.add_argument("--split-mlp-shard-layers", type=int, nargs="+", default=())
     parser.add_argument("--compact-embedding-grad", action="store_true")
     parser.add_argument("--batch", type=int, default=256)
     parser.add_argument("--micro-batch", type=int, default=1)
@@ -92,6 +93,7 @@ def main() -> None:
     training.pipeline_compute_stream_grad_buffers = args.compute_stream_grad_buffers
     training.pipeline_preallocate_grad_buffers = args.preallocate_grad_buffers
     training.pipeline_preallocate_grad_output_layers = tuple(args.preallocate_grad_output_layers)
+    training.pipeline_split_mlp_shard_layers = tuple(args.split_mlp_shard_layers)
     training.pipeline_compact_embedding_grad = args.compact_embedding_grad
     training.pipeline_recompute_mlp_up_only = args.recompute_mlp_up_only
     training.pipeline_recompute_mlp_product_only = args.recompute_mlp_product_only
