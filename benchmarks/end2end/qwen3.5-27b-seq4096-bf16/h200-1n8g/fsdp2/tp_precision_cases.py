@@ -252,7 +252,7 @@ def probe_conv_qkv(delta, round_silu, qkv, offset):
 class PrecisionTP(dense_tp.DenseTP):
     def __init__(self, mesh, case, *, async_tp=False):
         super().__init__(mesh, async_tp=async_tp)
-        self.case = case.removesuffix("-staged")
+        self.case = case.removesuffix("-staged").removesuffix("-compiled")
 
     def shard_model(self, model):
         super().shard_model(model)
@@ -493,4 +493,26 @@ def check_row_partials(layout, device):
         assert torch.equal(actual, torch.full_like(actual, 2**-8)), (rank, overlap, actual)
         print(
             f"row_probe rank={dist.get_rank()} async={overlap} fp32_cancellation=passed", flush=True
+        )
+
+
+def check_column_partials(layout, device):
+    rank, size = layout.rank, layout.size
+    first = torch.zeros(32, 32, dtype=torch.bfloat16, device=device)
+    second = torch.zeros_like(first)
+    first[0] = 1 if rank == 0 else -1 if rank == 1 else 0
+    if rank == 0:
+        second[0] = 2**-8
+    grad = torch.zeros(2 * size, 32, dtype=torch.bfloat16, device=device)
+    grad[:, 0] = 1
+    for overlap in (False, True):
+        x = torch.zeros_like(grad[:2], requires_grad=True)
+        outputs = dense_tp._ColumnParallel.apply(
+            x, size, layout.name, overlap, False, (None, None), first, second
+        )
+        torch.autograd.backward(outputs, (grad, grad))
+        assert torch.equal(x.grad, torch.full_like(x, 2**-8)), (rank, overlap, x.grad)
+        print(
+            f"column_probe rank={dist.get_rank()} async={overlap} fp32_cancellation=passed",
+            flush=True,
         )

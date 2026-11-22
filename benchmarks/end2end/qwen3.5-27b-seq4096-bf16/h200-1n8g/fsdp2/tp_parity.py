@@ -259,11 +259,14 @@ def main():
             PROJECTION_CASES,
             DecayProbeTP,
             PrecisionTP,
+            check_column_partials,
             check_row_partials,
             tp_staged,
         )
 
-        check_row_partials(dense_tp.DenseTP(mesh, async_tp=True), device)
+        precision_layout = dense_tp.DenseTP(mesh, async_tp=True)
+        check_row_partials(precision_layout, device)
+        check_column_partials(precision_layout, device)
         cases = args.cases or (
             "sync",
             "async",
