@@ -104,6 +104,31 @@ def backward(model, tokens, labels, dp, tp=None):
     return loss
 
 
+def record_block_adjoints(layer, adjoints):
+    def record_output(_layer, _inputs, output):
+        def record_grad(grad):
+            adjoints.append(grad.detach().clone())
+
+        output.register_hook(record_grad)
+
+    return layer.register_forward_hook(record_output)
+
+
+def use_stock_block_adjoints(layer, adjoints, layout):
+    next_adjoint = iter(adjoints)
+
+    def repair_output(_layer, _inputs, output):
+        expected = next(next_adjoint).flatten(0, 1).chunk(layout.size)[layout.rank].contiguous()
+
+        def replace_grad(grad):
+            print(f"rank={dist.get_rank()} first_block_adjoint_error={rel_l2(grad, expected):.8f}")
+            return expected
+
+        output.register_hook(replace_grad)
+
+    return layer.register_forward_hook(repair_output)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tp", type=int, default=2)
@@ -178,7 +203,12 @@ def main():
     tokens = torch.randint(config.vocab_size, (2, dp.size(), 1, 512), device=device)
     labels = torch.randint(config.vocab_size, tokens.shape, device=device)
     labels[..., 3::11] = -100
+    stock_adjoints = []
+    if args.cases and "stock-adjoint-compiled" in args.cases:
+        capture = record_block_adjoints(stock.layers[0], stock_adjoints)
     stock_loss = backward(stock, tokens, labels, dp)
+    if stock_adjoints:
+        capture.remove()
 
     dense_tokens = tokens.reshape(-1, tokens.size(-1))
     dense_labels = labels.reshape(-1, labels.size(-1))
@@ -278,7 +308,11 @@ def main():
         config_fsdp.skip_embedding_backward_gather = True
         shard_dense_model(parallel, dp_mesh, config_fsdp)
         install_wgrad_accumulation(parallel)
+        if case == "stock-adjoint-compiled":
+            override = use_stock_block_adjoints(parallel.layers[0], stock_adjoints, layout)
         tp_loss = backward(parallel, tokens, labels, dp, layout)
+        if case == "stock-adjoint-compiled":
+            override.remove()
 
         max_bf16_error = max_layout_error = max_excess = 0.0
         exceeding = 0

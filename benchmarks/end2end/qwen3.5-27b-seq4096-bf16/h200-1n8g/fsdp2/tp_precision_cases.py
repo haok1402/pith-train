@@ -40,6 +40,7 @@ def tp_staged(layer, hidden, rotary):
 
 
 COMPILED_DECAY_CASES = (
+    "stock-adjoint-compiled",
     "stock-loss-compiled",
     "fp32-decay-grad-compiled",
     "fp32-decay-master-compiled",
