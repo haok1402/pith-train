@@ -213,6 +213,9 @@ def main():
             "stock-loss",
             "separate-dgrad",
             "stock-row",
+            "fp32-norm-grads",
+            "fp32-decay-grads",
+            "fp32-decay-projection",
             *PROJECTION_CASES,
         )
     else:
@@ -239,7 +242,10 @@ def main():
         else:
             overlap, compiled = case.startswith("async"), case.endswith("-compiled")
             checkpoint = "selective" if compiled else "none"
-            layout = PrecisionTP(mesh, case, async_tp=overlap)
+            if case in ("sync", "async", "sync-compiled", "async-compiled"):
+                layout = dense_tp.DenseTP(mesh, async_tp=overlap)
+            else:
+                layout = PrecisionTP(mesh, case, async_tp=overlap)
         layout.shard_model(parallel)
         config_fsdp = DenseFSDPCfg()
         config_fsdp.tensor_parallel_size = args.tp

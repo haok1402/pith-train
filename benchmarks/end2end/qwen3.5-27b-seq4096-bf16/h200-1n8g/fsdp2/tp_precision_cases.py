@@ -1,10 +1,13 @@
 """Counterfactual projection and loss arithmetic for the reduced TP audit."""
 
+from functools import partial
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
 from pithtrain.kernels import cross_entropy_fwd_bwd
+from pithtrain.models.qwen35_moe import Qwen35MoeRMSNorm, Qwen35MoeRMSNormGated
 from pithtrain.modules import dense_tp
 
 PROJECTION_CASES = (
@@ -33,6 +36,10 @@ class PrecisionTP(dense_tp.DenseTP):
     def shard_model(self, model):
         super().shard_model(model)
         self.names = {id(module): name for name, module in model.named_modules()}
+        if self.case == "fp32-norm-grads":
+            for module in model.modules():
+                if isinstance(module, (Qwen35MoeRMSNorm, Qwen35MoeRMSNormGated)):
+                    module.forward = partial(norm_with_fp32_grad, module)
 
     def selects(self, module):
         return self.names[id(module)].endswith(self.case)
@@ -51,7 +58,13 @@ class PrecisionTP(dense_tp.DenseTP):
         return super().rows(x, module)
 
     def columns(self, x, *modules):
-        selected = tuple(self.selects(module) for module in modules)
+        fp32_decay = self.case == "fp32-decay-projection"
+        selected = tuple(
+            self.selects(module)
+            or fp32_decay
+            and self.names[id(module)].endswith("linear_attn.in_proj_a")
+            for module in modules
+        )
         split_dgrad = self.case == "separate-dgrad"
         if not any(selected) and not split_dgrad:
             return super().columns(x, *modules)
@@ -61,6 +74,7 @@ class PrecisionTP(dense_tp.DenseTP):
             self.name,
             selected,
             split_dgrad,
+            fp32_decay,
             tuple(getattr(module, "main_grad", None) for module in modules),
             *(module.weight for module in modules),
         )
@@ -69,6 +83,31 @@ class PrecisionTP(dense_tp.DenseTP):
         if self.case == "stock-loss":
             return StockLoss.apply(logits, labels.flatten(), self.size, self.name, self.rank)
         return super().loss(logits, labels)
+
+    def delta_decay(self, delta, a):
+        if self.case == "fp32-decay-grads":
+            decay, bias = map(FP32WeightGrad.apply, (delta.A_log, delta.dt_bias))
+            return -decay.exp() * F.softplus(a.float() + bias)
+        return super().delta_decay(delta, a)
+
+
+class FP32WeightGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, weight):
+        return weight.float()
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad
+
+
+def norm_with_fp32_grad(module, x, gate=None):
+    value = x.float()
+    normalized = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + module.eps)
+    weight = FP32WeightGrad.apply(module.weight)
+    if gate is None:
+        return (normalized * (1 + weight)).to(x.dtype)
+    return (normalized * weight * F.silu(gate.float())).to(x.dtype)
 
 
 class ProbeRow(torch.autograd.Function):
@@ -93,13 +132,13 @@ class ProbeRow(torch.autograd.Function):
 
 class ProbeColumns(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, size, name, selected, split_dgrad, main_grads, *weights):
+    def forward(ctx, x, size, name, selected, split_dgrad, fp32_decay, main_grads, *weights):
         gathered = dense_tp._gather(x, size, name)
         ctx.save_for_backward(gathered, *weights)
         ctx.size, ctx.name, ctx.selected = size, name, selected
         ctx.split_dgrad, ctx.main_grads = split_dgrad, main_grads
         return tuple(
-            (gathered.float() @ weight.float().t()).to(x.dtype)
+            (gathered.float() @ weight.float().t()).to(torch.float32 if fp32_decay else x.dtype)
             if precise
             else F.linear(gathered, weight)
             for precise, weight in zip(selected, weights, strict=True)
@@ -125,10 +164,12 @@ class ProbeColumns(torch.autograd.Function):
             pieces = [dense_tp._scatter_sum(total, ctx.size, ctx.name).to(x.dtype)]
         dx = sum(pieces[-2::-1], pieces[-1])
         dw = tuple(
-            dense_tp._weight_grad(mg, grad, x)
+            grad.t() @ x.float()
+            if grad.dtype == torch.float32
+            else dense_tp._weight_grad(mg, grad, x)
             for mg, grad in zip(ctx.main_grads, grads, strict=True)
         )
-        return dx, None, None, None, None, None, *dw
+        return dx, None, None, None, None, None, None, *dw
 
 
 class StockLoss(torch.autograd.Function):

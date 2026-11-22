@@ -182,6 +182,9 @@ class DenseTP:
         )
         return output if module.bias is None else output + module.bias
 
+    def delta_decay(self, delta, a):
+        return -delta.A_log.float().exp() * F.softplus(a.float() + delta.dt_bias.float())
+
     def decoder(
         self,
         layer: Qwen35DecoderLayer,
@@ -198,7 +201,7 @@ class DenseTP:
             )
             q, k, v = delta.conv_qkv(qkv.view(batch, seq, -1), 0)
             beta = b.view(batch, seq, -1).sigmoid()
-            decay = -delta.A_log.float().exp() * F.softplus(a.float() + delta.dt_bias.float())
+            decay = self.delta_decay(delta, a)
             x = gated_delta_rule(q, k, v, decay.view(batch, seq, -1), beta)
             x = delta.norm(x.reshape(-1, delta.head_v_dim), z.reshape(-1, delta.head_v_dim))
             x = self.rows(x.view(batch * seq, -1), delta.out_proj)
