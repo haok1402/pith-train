@@ -39,6 +39,73 @@ def tp_staged(layer, hidden, rotary):
     return layer.forward_stage5(x, None, None, residual)
 
 
+COMPILED_DECAY_CASES = (
+    "stock-loss-compiled",
+    "fp32-decay-grad-compiled",
+    "fp32-decay-master-compiled",
+    "fp32-gate-compiled",
+    "fp32-decay-combined-compiled",
+)
+
+
+class DecayProbeTP(dense_tp.DenseTP):
+    def __init__(self, mesh, case):
+        super().__init__(mesh, async_tp=False)
+        self.case = case
+        self.master = case in ("fp32-decay-master-compiled", "fp32-decay-combined-compiled")
+
+    def shard_model(self, model):
+        super().shard_model(model)
+        if self.master:
+            for layer in model.layers:
+                if layer.is_linear:
+                    delta = layer.linear_attn
+                    delta.audit_master_A_log = delta.A_log.detach().clone()
+                    delta.audit_master_dt_bias = delta.dt_bias.detach().clone()
+
+    def delta_decay(self, delta, a):
+        if self.master:
+            decay = ForwardMaster.apply(delta.A_log, delta.audit_master_A_log)
+            bias = ForwardMaster.apply(delta.dt_bias, delta.audit_master_dt_bias)
+        elif self.case == "fp32-decay-grad-compiled":
+            decay, bias = map(FP32WeightGrad.apply, (delta.A_log, delta.dt_bias))
+        else:
+            return super().delta_decay(delta, a)
+        return -decay.exp() * F.softplus(a.float() + bias)
+
+    def delta_project(self, delta, x):
+        if self.case not in ("fp32-gate-compiled", "fp32-decay-combined-compiled"):
+            return super().delta_project(delta, x)
+        return ProbeColumns.apply(
+            x,
+            self.size,
+            self.name,
+            (False, False, False, True),
+            False,
+            True,
+            (delta.in_proj_qkv.main_grad, delta.in_proj_z.main_grad, None, None),
+            delta.in_proj_qkv.weight,
+            delta.in_proj_z.weight,
+            delta.in_proj_b.weight,
+            delta.in_proj_a.weight,
+        )
+
+    def loss(self, logits, labels):
+        if self.case == "stock-loss-compiled":
+            return StockLoss.apply(logits, labels.flatten(), self.size, self.name, self.rank)
+        return super().loss(logits, labels)
+
+
+class ForwardMaster(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, parameter, master):
+        return master.clone()
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad, None
+
+
 class PrecisionTP(dense_tp.DenseTP):
     def __init__(self, mesh, case, *, async_tp=False):
         super().__init__(mesh, async_tp=async_tp)

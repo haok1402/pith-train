@@ -203,7 +203,14 @@ def main():
         fp32_loss = backward(fp32_tp, tokens, labels, dp, fp32_layout)
 
     if args.bisect:
-        from tp_precision_cases import PROJECTION_CASES, PrecisionTP, check_row_partials, tp_staged
+        from tp_precision_cases import (
+            COMPILED_DECAY_CASES,
+            PROJECTION_CASES,
+            DecayProbeTP,
+            PrecisionTP,
+            check_row_partials,
+            tp_staged,
+        )
 
         check_row_partials(dense_tp.DenseTP(mesh, async_tp=True), device)
         cases = args.cases or (
@@ -254,6 +261,8 @@ def main():
                 "async-staged",
             ):
                 layout = dense_tp.DenseTP(mesh, async_tp=overlap)
+            elif case in COMPILED_DECAY_CASES:
+                layout = DecayProbeTP(mesh, case)
             else:
                 layout = PrecisionTP(mesh, case, async_tp=overlap)
         layout.shard_model(parallel)

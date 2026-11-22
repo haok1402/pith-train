@@ -185,6 +185,9 @@ class DenseTP:
     def delta_decay(self, delta, a):
         return -delta.A_log.float().exp() * F.softplus(a.float() + delta.dt_bias.float())
 
+    def delta_project(self, delta, x):
+        return self.columns(x, delta.in_proj_qkv, delta.in_proj_z, delta.in_proj_b, delta.in_proj_a)
+
     def attention(
         self,
         layer: Qwen35DecoderLayer,
@@ -196,9 +199,7 @@ class DenseTP:
         x = layer.input_layernorm(hidden)
         if layer.is_linear:
             delta = layer.linear_attn
-            qkv, z, b, a = self.columns(
-                x, delta.in_proj_qkv, delta.in_proj_z, delta.in_proj_b, delta.in_proj_a
-            )
+            qkv, z, b, a = self.delta_project(delta, x)
             q, k, v = delta.conv_qkv(qkv.view(batch, seq, -1), 0)
             beta = b.view(batch, seq, -1).sigmoid()
             decay = self.delta_decay(delta, a)
