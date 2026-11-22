@@ -4,6 +4,7 @@ import argparse
 import copy
 import logging as std_logging
 import os
+from contextlib import contextmanager
 from functools import partial
 from unittest.mock import patch
 
@@ -129,6 +130,23 @@ def use_stock_block_adjoints(layer, adjoints, layout):
         output.register_hook(replace_grad)
 
     return layer.register_forward_hook(repair_output)
+
+
+@contextmanager
+def cublas_fp32_reduction(case):
+    if "-cublas-" not in case:
+        yield
+        return
+    matmul = torch.backends.cuda.matmul
+    previous = (
+        matmul.allow_bf16_reduced_precision_reduction,
+        matmul.allow_bf16_reduced_precision_reduction_split_k,
+    )
+    matmul.allow_bf16_reduced_precision_reduction = (False, "nosplit" not in case)
+    try:
+        yield
+    finally:
+        matmul.allow_bf16_reduced_precision_reduction = previous
 
 
 def main():
@@ -318,6 +336,9 @@ def main():
                 "async-compiled",
                 "sync-staged",
                 "async-staged",
+                "sync-cublas-fp32-compiled",
+                "async-cublas-fp32-compiled",
+                "sync-cublas-nosplit-compiled",
                 *fp32_master_cases,
             ):
                 layout = dense_tp.DenseTP(mesh, async_tp=overlap)
@@ -361,7 +382,8 @@ def main():
                 tp_loss = backward(parallel, tokens, labels, dp, layout, begin_microbatch)
             report(case, layout.rank, layout.size, rel_l2)
         else:
-            tp_loss = backward(parallel, tokens, labels, dp, layout)
+            with cublas_fp32_reduction(case):
+                tp_loss = backward(parallel, tokens, labels, dp, layout)
         if case == "stock-adjoint-compiled":
             override.remove()
 
