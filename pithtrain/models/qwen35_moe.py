@@ -189,7 +189,10 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
     ) -> torch.Tensor:
         if cu_seqlens is not None or not torch.is_grad_enabled():
             return self.block(hidden_states, cu_seqlens)
-        return checkpoint(self.block, hidden_states, None, use_reentrant=False, context_fn=selective_recompute_contexts)  # fmt: skip
+        return self.checkpoint_block(self.block, hidden_states, None)  # fmt: skip
+
+    def checkpoint_block(self, function, *args):
+        return checkpoint(function, *args, use_reentrant=False, context_fn=selective_recompute_contexts)  # fmt: skip
 
     def block(
         self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None

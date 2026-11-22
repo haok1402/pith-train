@@ -207,7 +207,13 @@ class DenseTP:
         batch = hidden.size(0) * self.size // seq
         x = layer.input_layernorm(hidden)
         if layer.is_linear:
-            x = self.delta_attention(layer.linear_attn, x, batch, seq)
+            delta = layer.linear_attn
+            if x.dtype == torch.bfloat16 and torch.is_grad_enabled():
+                # The stock DeltaNet checkpoint preserves BF16 rounding between
+                # convolution/SiLU and Q/K normalization in compiled execution.
+                x = delta.checkpoint_block(partial(self.delta_attention, delta), x, batch, seq)
+            else:
+                x = self.delta_attention(delta, x, batch, seq)
         else:
             attn = layer.self_attn
             q, k, v = self.columns(x, attn.q_proj, attn.k_proj, attn.v_proj)
