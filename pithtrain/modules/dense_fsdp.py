@@ -292,7 +292,7 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
             "Full checkpoint prefix requires selective checkpointing and a valid depth"
         )
     contexts = selective_checkpoint_contexts
-    if cfg.tp_recompute_mlp_columns:
+    if cfg.tp_recompute_mlp_columns or cfg.tp_recompute_mlp_once:
         contexts = partial(selective_checkpoint_contexts, recompute_mlp_columns=True)
     for i, layer in enumerate(model.layers):
         if i < checkpoint_blocks and cfg.activation_checkpoint != "none":
