@@ -275,7 +275,12 @@ class PrecisionTP(dense_tp.DenseTP):
 
     def rows(self, x, module):
         stock_row = self.case in ("stock-row", "stock-linear-loss")
-        if self.selects(module) or stock_row:
+        fp32_dgrad = (
+            self.case == "row-dgrad-fp32"
+            or self.case.endswith("-dgrad-fp32")
+            and module.audit_name.endswith(self.case.removesuffix("-dgrad-fp32"))
+        )
+        if self.selects(module) or stock_row or fp32_dgrad:
             return ProbeRow.apply(
                 x,
                 module.weight,
@@ -284,6 +289,7 @@ class PrecisionTP(dense_tp.DenseTP):
                 self.name,
                 self.rank,
                 stock_row,
+                fp32_dgrad,
             )
         return super().rows(x, module)
 
@@ -358,13 +364,16 @@ def norm_with_fp32_grad(module, x, gate=None):
 
 class ProbeRow(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, main_grad, size, name, rank, stock_row):
+    def forward(ctx, x, weight, main_grad, size, name, rank, stock_row, fp32_dgrad):
         ctx.save_for_backward(x, weight)
         ctx.main_grad, ctx.size, ctx.name = main_grad, size, name
+        ctx.fp32_dgrad = fp32_dgrad
         if stock_row:
             full_x = dense_tp._gather(x.t().contiguous(), size, name).t()
             full_weight = dense_tp._gather(weight.t().contiguous(), size, name).t()
             return F.linear(full_x.contiguous(), full_weight.contiguous()).chunk(size)[rank].clone()
+        if fp32_dgrad:
+            return dense_tp._mm_scatter(x, weight.t(), size, name, False)
         partial = x.float() @ weight.float().t()
         return dense_tp._scatter_sum(partial, size, name).to(x.dtype)
 
@@ -373,7 +382,10 @@ class ProbeRow(torch.autograd.Function):
         x, weight = ctx.saved_tensors
         gathered = dense_tp._gather(dout, ctx.size, ctx.name)
         dw = dense_tp._weight_grad(ctx.main_grad, gathered, x)
-        return gathered @ weight, dw, None, None, None, None, None
+        dx = (
+            (gathered.float() @ weight.float()).to(x.dtype) if ctx.fp32_dgrad else gathered @ weight
+        )
+        return dx, dw, None, None, None, None, None, None
 
 
 class ProbeColumns(torch.autograd.Function):
