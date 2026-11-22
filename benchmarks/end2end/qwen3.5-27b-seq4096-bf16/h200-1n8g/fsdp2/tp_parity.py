@@ -139,6 +139,8 @@ def main():
     parser.add_argument("--async-tp", action="store_true")
     parser.add_argument("--tp-regather-inputs", action="store_true")
     parser.add_argument("--tp-head-chunk-tokens", type=int, default=0)
+    parser.add_argument("--tp-fp32-affine", action="store_true")
+    parser.add_argument("--tp-fp32-gates", action="store_true")
     parser.add_argument("--compile-blocks", action="store_true")
     parser.add_argument("--blocks-per-group", type=int, default=2)
     parser.add_argument("--checkpoint", choices=("none", "selective", "full"), default="none")
@@ -272,6 +274,11 @@ def main():
         cases = ("requested",)
 
     rank = dist.get_rank()
+    fp32_master_cases = (
+        "fp32-affine-compiled",
+        "fp32-gates-compiled",
+        "fp32-affine-gates-compiled",
+    )
     baseline_grads = {name: p.grad.full_tensor() for name, p in stock.named_parameters()}
     oracle_grads = {name: p.grad for name, p in oracle.named_parameters()}
     layout_grads = {name: p.grad.full_tensor() for name, p in fp32_tp.named_parameters()}
@@ -299,6 +306,7 @@ def main():
                 "async-compiled",
                 "sync-staged",
                 "async-staged",
+                *fp32_master_cases,
             ):
                 layout = dense_tp.DenseTP(mesh, async_tp=overlap)
             elif case in TRACE_CASES:
@@ -314,6 +322,14 @@ def main():
         config_fsdp = DenseFSDPCfg()
         config_fsdp.tensor_parallel_size = args.tp
         config_fsdp.compile_blocks = compiled
+        config_fsdp.tp_fp32_affine = args.tp_fp32_affine or case in (
+            "fp32-affine-compiled",
+            "fp32-affine-gates-compiled",
+        )
+        config_fsdp.tp_fp32_gates = args.tp_fp32_gates or case in (
+            "fp32-gates-compiled",
+            "fp32-affine-gates-compiled",
+        )
         config_fsdp.activation_checkpoint = checkpoint
         config_fsdp.full_checkpoint_blocks = args.full_checkpoint_blocks
         config_fsdp.blocks_per_group = args.blocks_per_group

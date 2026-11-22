@@ -41,6 +41,12 @@ class DenseFSDPCfg(SlottedDefault):
     tp_head_chunk_tokens: int = 0
     """Bound vocab-logit storage by rematerializing token chunks of this size in backward."""
 
+    tp_fp32_affine: bool = False
+    """Gather the small norm and decay parameters directly in their master dtype."""
+
+    tp_fp32_gates: bool = False
+    """Gather the small DeltaNet a and b projection weights in their master dtype."""
+
     blocks_per_group: int = 1
     """Number of consecutive decoder blocks per communication bucket."""
 
@@ -166,10 +172,22 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
             raise ValueError("BF16 sharded gradients require BF16 reduction")
         for param in model.parameters():
             param.grad_dtype = torch.bfloat16
+    fp32_params = set()
+    if cfg.tp_fp32_affine:
+        fp32_params.update(param for param in model.parameters() if param.ndim == 1)
+    if cfg.tp_fp32_gates:
+        for layer in model.layers:
+            if layer.is_linear:
+                fp32_params.update(
+                    (layer.linear_attn.in_proj_a.weight, layer.linear_attn.in_proj_b.weight)
+                )
     mp = MixedPrecisionPolicy(
         param_dtype=training.PARAM_DTYPE,
         reduce_dtype=reduce_dtype,
         cast_forward_inputs=False,
+        param_dtype_override_fn=(lambda param: param.dtype if param in fp32_params else None)
+        if fp32_params
+        else None,
     )
     checkpoint_blocks = cfg.checkpoint_blocks or len(model.layers)
     if cfg.full_checkpoint_blocks and (

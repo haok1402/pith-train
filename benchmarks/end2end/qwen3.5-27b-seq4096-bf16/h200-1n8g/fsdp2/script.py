@@ -48,6 +48,8 @@ if __name__ == "__main__":
     parser.add_argument("--async-tp", action="store_true")
     parser.add_argument("--tp-regather-inputs", action="store_true")
     parser.add_argument("--tp-head-chunk-tokens", type=int, default=0)
+    parser.add_argument("--tp-fp32-affine", action="store_true")
+    parser.add_argument("--tp-fp32-gates", action="store_true")
     args = parser.parse_args()
     if args.tp > 1 and any(
         name in os.environ for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
@@ -78,6 +80,8 @@ if __name__ == "__main__":
     train.dense_fsdp.async_tensor_parallel = args.async_tp
     train.dense_fsdp.tp_regather_inputs = args.tp_regather_inputs
     train.dense_fsdp.tp_head_chunk_tokens = args.tp_head_chunk_tokens
+    train.dense_fsdp.tp_fp32_affine = args.tp_fp32_affine
+    train.dense_fsdp.tp_fp32_gates = args.tp_fp32_gates
     train.dense_fsdp.blocks_per_group = args.blocks_per_group
     train.dense_fsdp.group_by_attention_type = args.group_by_attention_type
     train.dense_fsdp.edge_sharding = args.edge_sharding

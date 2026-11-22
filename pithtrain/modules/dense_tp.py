@@ -201,7 +201,7 @@ class DenseTP:
             delta = layer.linear_attn
             qkv, z, b, a = self.delta_project(delta, x)
             q, k, v = delta.conv_qkv(qkv.view(batch, seq, -1), 0)
-            beta = b.view(batch, seq, -1).sigmoid()
+            beta = b.view(batch, seq, -1).sigmoid().to(qkv.dtype)
             decay = self.delta_decay(delta, a)
             x = gated_delta_rule(q, k, v, decay.view(batch, seq, -1), beta)
             x = delta.norm(x.reshape(-1, delta.head_v_dim), z.reshape(-1, delta.head_v_dim))
@@ -266,8 +266,8 @@ def _scatter_sum(x: torch.Tensor, size: int, name: str) -> torch.Tensor:
 
 
 def _mm_fp32(a, b):
-    if a.dtype == torch.float32:
-        return a @ b
+    if a.dtype == torch.float32 or b.dtype == torch.float32:
+        return a.float() @ b.float()
     return torch.mm(a, b, out_dtype=torch.float32)
 
 
@@ -308,13 +308,13 @@ def _weight_grad(main_grad, grad, x):
 class _ColumnParallel(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, size, name, overlap, regather, main_grads, *weights):
-        if overlap:
+        if overlap and all(weight.dtype == x.dtype for weight in weights):
             gathered, outputs = torch.ops.symm_mem.fused_all_gather_matmul(
                 x, [w.t() for w in weights], 0, name, return_A=not regather
             )
         else:
             gathered = _gather(x, size, name)
-            outputs = tuple(F.linear(gathered, w) for w in weights)
+            outputs = tuple(F.linear(gathered.to(w.dtype), w) for w in weights)
         ctx.save_for_backward(x if regather else gathered, *weights)
         ctx.size, ctx.name, ctx.overlap, ctx.regather = size, name, overlap, regather
         ctx.main_grads = main_grads
