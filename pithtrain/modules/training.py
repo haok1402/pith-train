@@ -29,7 +29,11 @@ from pithtrain.modules.fp8_param_gather import (
     install_fp8_param_gather,
     install_raw_fp8_param_gather,
 )
-from pithtrain.modules.fsdp_forward import install_lean_hooks, register_fsdp_forward_method
+from pithtrain.modules.fsdp_forward import (
+    ComputeStreamReduceScatter,
+    install_lean_hooks,
+    register_fsdp_forward_method,
+)
 from pithtrain.modules.load_balance import make_load_balance_loss_fn
 from pithtrain.modules.optimizer import Muon
 from pithtrain.modules.wgrad_accumulation import (
@@ -115,7 +119,9 @@ def initialize_fused_adamw_state(optimizer: AdamW) -> None:
             for name in ("exp_avg", "exp_avg_sq"):
                 state[name] = torch.zeros_like(param, memory_format=torch.preserve_format)
             if group["amsgrad"]:
-                state["max_exp_avg_sq"] = torch.zeros_like(param, memory_format=torch.preserve_format)
+                state["max_exp_avg_sq"] = torch.zeros_like(
+                    param, memory_format=torch.preserve_format
+                )
 
 
 def make_wsd_scheduler(
@@ -260,6 +266,9 @@ class TrainingCfg(SlottedDefault):
     pipeline_grad_sync_layers: tuple[int, ...] = ()
     """Reduce gradients for these 1F1B decoder layers after each microbatch."""
 
+    pipeline_compute_stream_grad_buffers: bool = False
+    """Allocate FSDP reduction buffers on the model compute stream."""
+
     pipeline_fuse_delta_gates: bool = False
     """Fuse the two BF16 DeltaNet gate projections in dense 1F1B."""
 
@@ -345,7 +354,7 @@ def split_replicas(mesh: DeviceMesh, hsdp_replica: int) -> DeviceMesh:
     return mesh._unflatten(0, (hsdp_replica, size // hsdp_replica), ("replica", "shard"))
 
 
-def apply_fsdp(model, hsdp_replica: int = 1):
+def apply_fsdp(model, hsdp_replica: int = 1, *, compute_stream_grad_buffers: bool = False):
     """
     Shard the pipeline chunks in model with FSDP2 in place and return model. The routed expert
     weights shard over the dp axis of the expert mesh, everything else over the dp x cp stage, and
@@ -396,9 +405,14 @@ def apply_fsdp(model, hsdp_replica: int = 1):
 
     # Sum, not average: the two classes reduce over groups of different size, yet each sum is the
     # global gradient, so the step's single divide by the global token count normalizes both.
+    reduce_scatter = (
+        ComputeStreamReduceScatter(distributed.device) if compute_stream_grad_buffers else None
+    )
     for module in model.modules():
         if isinstance(module, FSDPModule):
             module.set_gradient_divide_factor(1.0)
+            if reduce_scatter is not None:
+                module.set_custom_reduce_scatter(reduce_scatter)
 
     # Gathering FP8 weights in FP8 gives the same operands as quantizing the gathered bf16 weight.
     if training.fp8:
@@ -496,6 +510,7 @@ def setup_model(
             or cfg.pipeline_recompute_mlp
             or cfg.pipeline_recompute_mlp_up_only
             or cfg.pipeline_grad_sync_layers
+            or cfg.pipeline_compute_stream_grad_buffers
             or cfg.pipeline_fuse_delta_gates
         ):
             raise ValueError("Dense pipeline tuning options require a dense schedule")
@@ -506,7 +521,11 @@ def setup_model(
         raise ValueError(f"Unknown pipeline_schedule: {cfg.pipeline_schedule!r}")
 
     init_weights(modules, module_config.num_hidden_layers, cfg.init_std, cfg.seed)
-    apply_fsdp(modules, distributed_cfg.hsdp_replica)
+    apply_fsdp(
+        modules,
+        distributed_cfg.hsdp_replica,
+        compute_stream_grad_buffers=cfg.pipeline_compute_stream_grad_buffers,
+    )
     install_wgrad_accumulation(modules)
     install_raw_main_grad(modules)  # gpt-oss raw expert weights; no-op elsewhere
     install_side_grads(modules)  # after the main_grad installs: its post_backward runs first

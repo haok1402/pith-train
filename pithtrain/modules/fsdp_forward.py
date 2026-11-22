@@ -27,6 +27,7 @@ from torch.distributed.fsdp import FSDPModule
 from torch.distributed.fsdp import (
     register_fsdp_forward_method as upstream_register_fsdp_forward_method,  # fmt: skip
 )
+from torch.distributed.fsdp._fully_shard._fsdp_collectives import DefaultReduceScatter
 from torch.distributed.fsdp._fully_shard._fsdp_common import (
     TrainingState,
     _dynamo_disable,
@@ -38,7 +39,23 @@ from torch.distributed.fsdp._fully_shard._fsdp_param_group import (
 )
 from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
 
-__all__ = ["install_lean_hooks", "register_fsdp_forward_method"]
+__all__ = ["ComputeStreamReduceScatter", "install_lean_hooks", "register_fsdp_forward_method"]
+
+
+class ComputeStreamReduceScatter(DefaultReduceScatter):
+    """Let FP32 reduction outputs reuse blocks released by model compute."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.compute_stream = torch.cuda.current_stream(device)
+
+    def allocate(self, size, *, dtype, device):
+        caller = torch.cuda.current_stream(device)
+        with torch.cuda.stream(self.compute_stream):
+            buffer = super().allocate(size, dtype=dtype, device=device)
+        if caller != self.compute_stream:
+            caller.wait_stream(self.compute_stream)
+            buffer.record_stream(caller)
+        return buffer
 
 
 def is_sequence(x: Any) -> bool:

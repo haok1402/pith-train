@@ -31,6 +31,7 @@ def main():
     parser.add_argument("--arms", nargs="+", default=["1f1b-attention", "interleaved-attention"])
     parser.add_argument("--repeat-stock", action="store_true")
     parser.add_argument("--verify-adamw-initialization", action="store_true")
+    parser.add_argument("--compute-stream-grad-buffers", action="store_true")
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     from pithtrain.contexts import distributed, logging, training
@@ -125,6 +126,9 @@ def main():
         cfg.training.pipeline_schedule = schedule
         cfg.training.pipeline_virtual_stages = 2 if schedule in ("interleaved", "zbv") else 1
         cfg.training.pipeline_compile = compile_mode
+        cfg.training.pipeline_compute_stream_grad_buffers = (
+            args.compute_stream_grad_buffers and arm not in controls
+        )
         cfg.training.pipeline_recompute_mlp = replay_up
         cfg.training.pipeline_recompute_mlp_up_only = replay_up
         with torch.device(device):
