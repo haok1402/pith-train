@@ -66,7 +66,7 @@ class Qwen35DecoderLayer(nn.Module):
         else:
             raise ValueError(f"Unsupported Qwen3.5 layer type: {self.layer_type}")
         self.mlp = Qwen35MLP(config)
-        self.compile_mode = "layer"
+        self.compile_mode = "attention"
         self.recompute_mlp = False
         self.recompute_mlp_up_only = False
         self.input_layernorm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -132,13 +132,7 @@ class Qwen35DecoderLayer(nn.Module):
             hidden_states = contiguous_to_zigzag(hidden_states, distributed.cp_group)
         return hidden_states
 
-    @torch.compile(fullgraph=True, options=stage_compile_options() or None)
-    def forward_compiled(self, hidden_states, rotary_posemb, cu_seqlens=None):
-        return self.reference_forward(hidden_states, rotary_posemb, cu_seqlens)
-
     def forward(self, hidden_states, rotary_posemb, cu_seqlens=None):
-        if self.compile_mode == "layer":
-            return self.forward_compiled(hidden_states, rotary_posemb, cu_seqlens)
         if self.compile_mode == "attention":
             mlp_input, residual, _ = self.forward_stage1(hidden_states, rotary_posemb, cu_seqlens)
             return self.forward_stage5(self.forward_dense_mlp(mlp_input), None, None, residual)

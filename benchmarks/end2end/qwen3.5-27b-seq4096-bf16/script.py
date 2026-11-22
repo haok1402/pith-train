@@ -22,7 +22,7 @@ def main() -> None:
     )
     parser.add_argument("--virtual-stages", type=int)
     parser.add_argument("--layer-counts", type=int, nargs="+")
-    parser.add_argument("--compile-mode", choices=("layer", "attention", "eager"))
+    parser.add_argument("--compile-mode", choices=("attention", "eager"), default="attention")
     recompute = parser.add_mutually_exclusive_group()
     recompute.add_argument("--recompute-mlp", action="store_true")
     recompute.add_argument("--recompute-mlp-layers", type=int, nargs="+")
@@ -63,9 +63,7 @@ def main() -> None:
     if training.pipeline_virtual_stages is None:
         training.pipeline_virtual_stages = 2 if args.schedule in ("interleaved", "zbv") else 1
     training.pipeline_layer_counts = tuple(args.layer_counts) if args.layer_counts else None
-    training.pipeline_compile = args.compile_mode or (
-        "attention" if args.schedule in ("zb-h1", "zbv") else "layer"
-    )
+    training.pipeline_compile = args.compile_mode
     training.pipeline_recompute_mlp = (
         tuple(args.recompute_mlp_layers) if args.recompute_mlp_layers else args.recompute_mlp
     )

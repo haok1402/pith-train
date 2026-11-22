@@ -116,7 +116,7 @@ def main():
     controls = ["stock", "stock-repeat"] if args.repeat_stock else ["stock"]
     for arm in [*controls, *args.arms]:
         records = []
-        schedule, compile_mode = ("dualpipev", "layer") if arm in controls else arm.rsplit("-", 1)
+        schedule, compile_mode = ("dualpipev", "attention") if arm in controls else arm.rsplit("-", 1)
         replay_up = schedule.endswith("-up")
         schedule = schedule.removesuffix("-up")
         cfg.training.pipeline_schedule = schedule
@@ -169,6 +169,8 @@ def main():
                     target[name] = tensor
         contiguous = contiguous_grads.get(compile_mode)
         for name, gradient in gradients.items():
+            if compile_mode == "attention":
+                assert torch.equal(gradient, stock_grads[name]), (arm, name)
             if distributed.dp_rank == 0:
                 records.append(
                     (
@@ -221,7 +223,6 @@ def main():
             )
         del model, optimizer, params, gradients, training.model
         dist.barrier()
-    dist.destroy_process_group()
 
 
 if __name__ == "__main__":

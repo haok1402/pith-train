@@ -227,8 +227,8 @@ class TrainingCfg(SlottedDefault):
     pipeline_layer_counts: Optional[tuple[int, ...]] = None
     """Optional decoder layer count per stage, in forward order."""
 
-    pipeline_compile: Literal["layer", "attention", "eager"] = "layer"
-    """Compile the whole dense layer, its attention and residual, or neither."""
+    pipeline_compile: Literal["attention", "eager"] = "attention"
+    """Use stock staged compilation or eager execution for a dense pipeline."""
 
     pipeline_recompute_mlp: bool | tuple[int, ...] = False
     """Checkpoint SwiGLU in every 1F1B decoder layer or in the given global layer indices."""
@@ -437,11 +437,11 @@ def setup_model(
         if schedule == "zbv" and (chunks != 2 or distributed.pp_size < 2):
             raise ValueError("zbv requires two chunks and at least two pipeline ranks")
         split_backward = schedule in ("zb-h1", "zbv")
-        if split_backward and (cfg.fp8 or cfg.pipeline_compile == "layer"):
-            raise ValueError(f"{schedule} requires BF16 and attention or eager compilation")
+        if split_backward and cfg.fp8:
+            raise ValueError(f"{schedule} requires BF16")
         if split_backward and cfg.pipeline_grad_sync_layers:
             raise ValueError(f"{schedule} reduces gradients after the last weight backward")
-        if cfg.pipeline_compile not in ("layer", "attention", "eager"):
+        if cfg.pipeline_compile not in ("attention", "eager"):
             raise ValueError(f"Unknown pipeline_compile: {cfg.pipeline_compile!r}")
         if cfg.pipeline_recompute_mlp_up_only and (cfg.fp8 or not cfg.pipeline_recompute_mlp):
             raise ValueError("Selective up-projection replay requires BF16 and MLP checkpointing")
@@ -471,7 +471,7 @@ def setup_model(
         if (
             cfg.pipeline_layer_counts is not None
             or cfg.pipeline_virtual_stages != 1
-            or cfg.pipeline_compile != "layer"
+            or cfg.pipeline_compile != "attention"
             or cfg.pipeline_recompute_mlp
             or cfg.pipeline_recompute_mlp_up_only
             or cfg.pipeline_grad_sync_layers
