@@ -31,6 +31,7 @@ def main():
     parser.add_argument("--arms", nargs="+", default=["1f1b-attention", "interleaved-attention"])
     parser.add_argument("--repeat-stock", action="store_true")
     parser.add_argument("--compute-stream-grad-buffers", action="store_true")
+    parser.add_argument("--virtual-layer-counts", type=int, nargs=4)
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     from pithtrain.contexts import distributed, logging, training
@@ -124,6 +125,11 @@ def main():
         schedule = schedule.removesuffix("-up")
         cfg.training.pipeline_schedule = schedule
         cfg.training.pipeline_virtual_stages = 2 if schedule in ("interleaved", "zbv") else 1
+        cfg.training.pipeline_layer_counts = (
+            tuple(args.virtual_layer_counts)
+            if cfg.training.pipeline_virtual_stages == 2 and args.virtual_layer_counts is not None
+            else None
+        )
         cfg.training.pipeline_compile = compile_mode
         cfg.training.pipeline_compute_stream_grad_buffers = (
             args.compute_stream_grad_buffers and arm not in controls
