@@ -167,7 +167,8 @@ def main():
             assert param.grad is not None and param.grad.dtype == torch.float32, (arm, name)
             gradient = param.grad.full_tensor()
             assert torch.isfinite(gradient).all(), (arm, name)
-            gradients[name] = gradient
+            # A DP1 full_tensor can alias .grad, which clipping mutates below.
+            gradients[name] = gradient.detach().clone()
 
         # Share the controls with every pipeline stage since a parameter can change owners.
         target = None
