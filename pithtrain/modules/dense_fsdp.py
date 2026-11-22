@@ -119,23 +119,28 @@ def selective_checkpoint_contexts():
 
 
 def log_bucket_sizes(
-    buckets: list[tuple[str, list[nn.Module]]], shard_size: int, reduce_dtype: torch.dtype
+    buckets: list[tuple[str, list[nn.Module]]],
+    shard_size: int,
+    reduce_dtype: torch.dtype,
+    fp32_params: set[nn.Parameter],
 ) -> None:
     logger = getattr(logging, "stdout", None)
     if logger is None:
         return
     sizes = Counter()
     for name, modules in buckets:
-        numel = sum(
-            (-(-p.size(0) // shard_size) * shard_size) * (p.numel() // p.size(0))
-            for module in modules
-            for p in module.parameters()
-        )
-        sizes[name, numel] += 1
+        gather_bytes = reduce_bytes = 0
+        for module in modules:
+            for param in module.parameters():
+                rows = -(-param.size(0) // shard_size) * shard_size
+                numel = rows * (param.numel() // param.size(0))
+                gather_dtype = param.dtype if param in fp32_params else training.PARAM_DTYPE
+                gather_bytes += numel * gather_dtype.itemsize
+                reduce_bytes += numel * reduce_dtype.itemsize
+        sizes[name, gather_bytes, reduce_bytes] += 1
     payloads = (
-        f"{count} {name} {numel * training.PARAM_DTYPE.itemsize / 2**20:.1f}/"
-        f"{numel * reduce_dtype.itemsize / 2**20:.1f}"
-        for (name, numel), count in sizes.items()
+        f"{count} {name} {gather / 2**20:.1f}/{reduce / 2**20:.1f}"
+        for (name, gather, reduce), count in sizes.items()
     )
     logger.info("Dense FSDP buckets (AG/RS MiB) | %s", ", ".join(payloads))
 
@@ -241,7 +246,7 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         ]
     else:
         buckets.append(("root", [model.embed_tokens, model.norm, model.lm_head]))
-    log_bucket_sizes(buckets, mesh.size(mesh.ndim - 1), reduce_dtype)
+    log_bucket_sizes(buckets, mesh.size(mesh.ndim - 1), reduce_dtype, fp32_params)
 
     for i, group in enumerate(decoder_groups):
         keep = i >= len(decoder_groups) - cfg.keep_last_groups
