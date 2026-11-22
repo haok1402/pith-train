@@ -28,6 +28,12 @@ The benchmark uses fused AdamW by default. SymmetricMemory's CUDA backend
 creates Unix sockets under `TMPDIR`. Use a sufficiently short path reachable
 by every rank on the node.
 
+On one eight-H200 node with 4K WikiText-103, async TP2 at microbatch 2
+reached 47.54% MFU and 117.24 GiB peak allocated per GPU with zero
+allocator retries over six steps. TP2 at microbatch 4 ran out of memory.
+Async TP4 at microbatch 4 reached 42.59% MFU. The tuned FSDP2 control
+reached 50.65% MFU, so the benchmark keeps TP optional.
+
 On two GPUs, run `tp_parity.py --hf-roundtrip` with `torchrun` for the reduced
 loss and gradient check. Use `--precision-reference` to add BF16 FSDP2 and
 FP32 recurrence controls, or `--check-tp-partials` to also check the head-local
