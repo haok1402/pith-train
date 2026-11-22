@@ -171,6 +171,8 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     cp_size = distributed.cp_size
     dense_fsdp = cfg.training.dense_fsdp
     tp = getattr(model, "tensor_parallel", None)
+    if tp is not None:
+        start_retries = torch.cuda.memory_stats()["num_alloc_retries"]
     if dense_fsdp is not None:
         batches = get_batch_tensors(cfg, dataset, step, device)
         delay_reduce = dense_fsdp.reduce_at_step_end and len(batches) > 1
@@ -252,8 +254,14 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     elapsed = elapsed_tensor.item()
 
     peak_gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
-    peak_gpu_mem = torch.tensor(peak_gpu_mem, device=device)
-    torch.distributed.all_reduce(peak_gpu_mem, op=torch.distributed.ReduceOp.MAX)
+    if tp is not None:
+        retries = torch.cuda.memory_stats()["num_alloc_retries"] - start_retries
+        memory = torch.tensor((peak_gpu_mem, retries), device=device)
+        torch.distributed.all_reduce(memory, op=torch.distributed.ReduceOp.MAX)
+        peak_gpu_mem, retries = memory.unbind()
+    else:
+        peak_gpu_mem = torch.tensor(peak_gpu_mem, device=device)
+        torch.distributed.all_reduce(peak_gpu_mem, op=torch.distributed.ReduceOp.MAX)
 
     # The tracked values include the coefficient; dividing it out logs E * dot(f, p), where 1.0
     # is perfect balance (the Megatron-LM convention).
@@ -281,6 +289,8 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         statements.append("gradient-norm %.4f" % gradient_norm.item())
         statements.append("tokens-per-second %s" % format(tokens_per_second, ",.0f"))
         statements.append("peak-gpu-memory %.2f GB" % peak_gpu_mem)
+        if tp is not None:
+            statements.append("allocator-retries %d" % retries)
         logger.info(" | ".join(statements))
         activate_wandb(cfg)
         if logging.wandb is not None:
