@@ -296,9 +296,10 @@ class ScheduledDensePipeline(nn.Module):
                         outgoing[SEND_B, *key] = activation.grad
                     del activation, output, gradient
                 elif operation == BACKWARD_WEIGHT:
-                    for accumulate in deferred_wgrads.pop(key):
-                        accumulate()
-                        del accumulate
+                    with torch.no_grad():
+                        for accumulate in deferred_wgrads.pop(key):
+                            accumulate()
+                            del accumulate
                     stage = self.stages[stage_index]
                     if isinstance(stage, FSDPModule) and index == len(microbatches) - 1:
                         stage.set_requires_gradient_sync(True)
