@@ -15,7 +15,8 @@ from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 def main() -> None:
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--pp", type=int, required=True)
-    parser.add_argument("--schedule", choices=("dualpipev", "1f1b"), default="dualpipev")
+    parser.add_argument("--schedule", choices=("dualpipev", "1f1b", "interleaved"), default="dualpipev")
+    parser.add_argument("--virtual-stages", type=int, default=1)
     parser.add_argument("--layer-counts", type=int, nargs="+")
     parser.add_argument("--compile-mode", choices=("layer", "attention", "eager"), default="layer")
     recompute = parser.add_mutually_exclusive_group()
@@ -46,6 +47,7 @@ def main() -> None:
     training.model = args.model or repo / "examples/pretrain_lm/qwen3.5-27b"
     training.hf_import_path = args.hf_import
     training.pipeline_schedule = args.schedule
+    training.pipeline_virtual_stages = args.virtual_stages
     training.pipeline_layer_counts = tuple(args.layer_counts) if args.layer_counts else None
     training.pipeline_compile = args.compile_mode
     training.pipeline_recompute_mlp = (

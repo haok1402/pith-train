@@ -40,6 +40,7 @@ from pithtrain.modules.wgrad_accumulation import (
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
 from pithtrain.operators.linear import BF16Linear, FP8Linear
 from pithtrain.pipeline import DualPipeV
+from pithtrain.pipeline.interleaved import InterleavedPipeline
 from pithtrain.pipeline.one_f_one_b import OneForwardOneBackward
 
 from .distributed import DistributedCfg
@@ -217,11 +218,14 @@ class TrainingCfg(SlottedDefault):
     ignored) and replays MoE routing with a realistic expert-load imbalance (imbalance.SIGMA).
     """
 
-    pipeline_schedule: Literal["dualpipev", "1f1b"] = "dualpipev"
-    """Dense Qwen3.5 can use one contiguous stage per rank with the 1F1B schedule."""
+    pipeline_schedule: Literal["dualpipev", "1f1b", "interleaved"] = "dualpipev"
+    """Dense Qwen3.5 can also use contiguous or interleaved 1F1B."""
+
+    pipeline_virtual_stages: int = 1
+    """Number of chunks per rank for interleaved 1F1B."""
 
     pipeline_layer_counts: Optional[tuple[int, ...]] = None
-    """Optional decoder layer count per 1F1B stage, in forward order."""
+    """Optional decoder layer count per stage, in forward order."""
 
     pipeline_compile: Literal["layer", "attention", "eager"] = "layer"
     """For 1F1B, compile the whole decoder layer, just its attention and residual, or neither."""
@@ -418,9 +422,14 @@ def setup_model(
     else:
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")
 
-    if cfg.pipeline_schedule == "1f1b":
+    if cfg.pipeline_schedule in ("1f1b", "interleaved"):
         if ModelClass is not Qwen35Model or distributed.ep_size != 1:
-            raise ValueError("1f1b requires dense Qwen3.5 with expert_parallel_size=1")
+            raise ValueError("Dense pipeline schedules require Qwen3.5 with expert_parallel_size=1")
+        chunks = cfg.pipeline_virtual_stages
+        if cfg.pipeline_schedule == "1f1b" and chunks != 1:
+            raise ValueError("1f1b requires one stage per rank")
+        if cfg.pipeline_schedule == "interleaved" and (chunks < 2 or distributed.pp_size < 2):
+            raise ValueError("interleaved requires at least two chunks and two pipeline ranks")
         if cfg.pipeline_compile not in ("layer", "attention", "eager"):
             raise ValueError(f"Unknown pipeline_compile: {cfg.pipeline_compile!r}")
         if any(
@@ -435,17 +444,21 @@ def setup_model(
                 cfg.pipeline_compile,
                 cfg.pipeline_recompute_mlp,
                 fuse_delta_gates=cfg.pipeline_fuse_delta_gates,
+                stage_index=chunk * distributed.pp_size + distributed.pp_rank,
+                stage_count=chunks * distributed.pp_size,
             )
+            for chunk in range(chunks)
         )
     elif cfg.pipeline_schedule == "dualpipev":
         if (
             cfg.pipeline_layer_counts is not None
+            or cfg.pipeline_virtual_stages != 1
             or cfg.pipeline_compile != "layer"
             or cfg.pipeline_recompute_mlp
             or cfg.pipeline_grad_sync_layers
             or cfg.pipeline_fuse_delta_gates
         ):
-            raise ValueError("Dense pipeline tuning options require 1f1b")
+            raise ValueError("Dense pipeline tuning options require a dense schedule")
         modules = nn.Sequential(
             ModelClass(module_config, phase=0), ModelClass(module_config, phase=1)
         )
@@ -458,13 +471,10 @@ def setup_model(
     install_raw_main_grad(modules)  # gpt-oss raw expert weights; no-op elsewhere
     install_side_grads(modules)  # after the main_grad installs: its post_backward runs first
 
-    # The two V-chunks build identical read-only rotary caches; share one to save memory.
-    if (
-        len(modules) == 2
-        and hasattr(modules[0], "rotary_emb")
-        and hasattr(modules[1], "rotary_emb")
-    ):
-        modules[1].rotary_emb = modules[0].rotary_emb
+    # Local chunks build identical read-only rotary caches.
+    for chunk in list(modules)[1:]:
+        if hasattr(modules[0], "rotary_emb") and hasattr(chunk, "rotary_emb"):
+            chunk.rotary_emb = modules[0].rotary_emb
 
     local_seq_len = cfg.sequence_length // cp_size
 
@@ -493,14 +503,19 @@ def setup_model(
                 layer = int(name.split("layers.")[1].split(".")[0])
                 module.router_replay = imbalance.replay(module.num_experts, layer)
 
-    if cfg.pipeline_schedule == "1f1b":
-        stage = modules[0]
-        grad_sync_layers = tuple(
-            layer for layer in stage.layers.values() if layer.idx in cfg.pipeline_grad_sync_layers
-        )
-        training.model = OneForwardOneBackward(stage, grad_sync_layers)
-    else:
+    if cfg.pipeline_schedule == "dualpipev":
         training.model = DualPipeV(modules)
+        return
+    grad_sync_layers = tuple(
+        layer
+        for stage in modules
+        for layer in stage.layers.values()
+        if layer.idx in cfg.pipeline_grad_sync_layers
+    )
+    if cfg.pipeline_schedule == "1f1b":
+        training.model = OneForwardOneBackward(modules[0], grad_sync_layers)
+    else:
+        training.model = InterleavedPipeline(modules, grad_sync_layers)
 
 
 offloaded_state: list[tuple[torch.UntypedStorage, torch.Tensor]] = []

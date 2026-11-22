@@ -151,9 +151,13 @@ class Qwen35DenseStage(Qwen35Model):
         compile_mode: str,
         recompute_mlp: bool | tuple[int, ...],
         fuse_delta_gates: bool = False,
+        *,
+        stage_index: int | None = None,
+        stage_count: int | None = None,
     ):
         nn.Module.__init__(self)
-        count, index = distributed.pp_size, distributed.pp_rank
+        count = distributed.pp_size if stage_count is None else stage_count
+        index = distributed.pp_rank if stage_index is None else stage_index
         if layer_counts is None:
             layer_counts = layer_sizes(config.num_hidden_layers, count)
         if (
