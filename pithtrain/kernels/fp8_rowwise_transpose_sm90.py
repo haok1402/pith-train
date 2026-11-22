@@ -162,6 +162,8 @@ mov.b32 $0, 0; mov.b32 $1, 0; mov.b32 $2, 0; mov.b32 $3, 0;
 @p ld.global.nc.L1::no_allocate.v4.b32 {$0, $1, $2, $3}, [$4];
 }"""
 
+LD_V4_NC_FULL_PTX = "ld.global.nc.L1::no_allocate.v4.b32 {$0, $1, $2, $3}, [$4];"
+
 LD_B32_PTX = """{
 .reg .pred p;
 setp.ne.b32 p, $2, 0;
@@ -311,16 +313,21 @@ class SubBlock:
     predicates of its rows and columns.
     """
 
-    def __init__(self, tidx: Int32, pid_row: Int32, pid_col: Int32, M: Int32, N: Int32) -> None:
+    def __init__(self, tidx: Int32, pid_row: Int32, pid_col: Int32, M: Int32, N: Int32, full_tiles: bool) -> None:
         self.warp, self.lane = tidx // 32, tidx % 32
         self.col_group_idx = self.lane % 16
         self.row_group_idx = self.warp * 2 + self.lane // 16
         self.pid_row, self.pid_col = pid_row, pid_col
         self.row0 = pid_row * TILE + self.row_group_idx * 8
         self.col0 = pid_col * TILE + self.col_group_idx * 8
-        self.rows_ok = [pred_i32(self.row0 + i < M) for i in range(8)]
-        self.cols_ok = [pred_i32(self.col0 + j < N) for j in range(8)]
-        self.full_cols_ok = pred_i32(self.col0 + 8 <= N)
+        self.full_tiles = full_tiles
+        if full_tiles:
+            self.rows_ok = self.cols_ok = [Int32(1)] * 8
+            self.full_cols_ok = Int32(1)
+        else:
+            self.rows_ok = [pred_i32(self.row0 + i < M) for i in range(8)]
+            self.cols_ok = [pred_i32(self.col0 + j < N) for j in range(8)]
+            self.full_cols_ok = pred_i32(self.col0 + 8 <= N)
 
 
 def load_rows(x_base: Int64, row_stride: Int64, sub_block: SubBlock, kind: str) -> list:
@@ -334,7 +341,9 @@ def load_rows(x_base: Int64, row_stride: Int64, sub_block: SubBlock, kind: str) 
     rows = []
     for i in range(8):
         elem_idx = Int64(row0 + i) * row_stride + Int64(col0)
-        if kind == "f32":
+        if sub_block.full_tiles:
+            rows.append(asm_words(LD_V4_NC_FULL_PTX, "=r,=r,=r,=r,l", [ir_value(x_base + elem_idx * 2)], 4))
+        elif kind == "f32":
             words = []
             for half in range(2):
                 load_ok = rows_ok[i] & cols_ok[4 * half]
@@ -512,10 +521,11 @@ def store_transposed(sub_block: SubBlock, s_tile: Int32, out_t_base: Int64, M64:
         is_odd_swizzle = (swizzle % 2) != 0
         words_lo, words_hi = [cutlass.select_(is_odd_swizzle, words[2], words[0]), cutlass.select_(is_odd_swizzle, words[3], words[1])], [cutlass.select_(is_odd_swizzle, words[0], words[2]), cutlass.select_(is_odd_swizzle, words[1], words[3])]
         x_col = sub_block.pid_col * TILE + tile_row_idx
-        col_ok = pred_i32(x_col < N64)
+        col_ok = Int32(1) if sub_block.full_tiles else pred_i32(x_col < N64)
         out_addr = out_t_base + Int64(x_col) * M64 + x_row_start
         if const_expr(m_align == 16):
-            st_v4(out_addr, words_lo + words_hi, col_ok & pred_i32(x_row_start < M64))
+            store_ok = col_ok if sub_block.full_tiles else col_ok & pred_i32(x_row_start < M64)
+            st_v4(out_addr, words_lo + words_hi, store_ok)
         else:
             for half, (word0, word1) in enumerate((words_lo, words_hi)):
                 half_row_start = x_row_start + 8 * half
@@ -531,11 +541,11 @@ def store_transposed(sub_block: SubBlock, s_tile: Int32, out_t_base: Int64, M64:
 
 
 @cute.kernel
-def rowwise_transpose_kernel(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, kind: cutlass.Constexpr[str], is_tok_aligned: cutlass.Constexpr[bool], m_align: cutlass.Constexpr[int], is_gather: cutlass.Constexpr[bool]) -> None:
+def rowwise_transpose_kernel(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, kind: cutlass.Constexpr[str], is_tok_aligned: cutlass.Constexpr[bool], m_align: cutlass.Constexpr[int], is_gather: cutlass.Constexpr[bool], full_tiles: cutlass.Constexpr[bool]) -> None:
     M, N = mX.shape[0], mX.shape[1]
     tidx, _, _ = cute.arch.thread_idx()
     pid_col, pid_row, _ = cute.arch.block_idx()
-    sub_block = SubBlock(tidx, pid_row, pid_col, M, N)
+    sub_block = SubBlock(tidx, pid_row, pid_col, M, N, full_tiles)
     smem = cutlass.memory.SmemAllocator()
     num_words = 8 if const_expr(kind == "f32") else 4
     # 2 KB (4 KB for fp32) for the cross-warp column amax, 16 KB for the transposed tile
@@ -570,22 +580,22 @@ def rowwise_transpose_kernel(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: c
 
 
 @cute.jit
-def launch(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, stream, kind: cutlass.Constexpr[str], is_tok_aligned: cutlass.Constexpr[bool], m_align: cutlass.Constexpr[int], is_gather: cutlass.Constexpr[bool]) -> None:
+def launch(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, stream, kind: cutlass.Constexpr[str], is_tok_aligned: cutlass.Constexpr[bool], m_align: cutlass.Constexpr[int], is_gather: cutlass.Constexpr[bool], full_tiles: cutlass.Constexpr[bool]) -> None:
     M, N = mX.shape[0], mX.shape[1]
-    rowwise_transpose_kernel(mX, mOutTok, mScaleTok, mOutT, mScaleT, kind, is_tok_aligned, m_align, is_gather).launch(grid=[(N + (TILE - 1)) // TILE, (M + (TILE - 1)) // TILE, 1], block=[THREADS, 1, 1], stream=stream)
+    rowwise_transpose_kernel(mX, mOutTok, mScaleTok, mOutT, mScaleT, kind, is_tok_aligned, m_align, is_gather, full_tiles).launch(grid=[(N + (TILE - 1)) // TILE, (M + (TILE - 1)) // TILE, 1], block=[THREADS, 1, 1], stream=stream)
 
 
 INPUT_KINDS = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}
-COMPILED: dict[tuple[str, bool, int, bool], Callable] = {}
+COMPILED: dict[tuple[str, bool, int, bool, bool], Callable] = {}
 
 
-def compile_kernel(kind: str, is_tok_aligned: bool, m_align: int, is_gather: bool) -> Callable:
+def compile_kernel(kind: str, is_tok_aligned: bool, m_align: int, is_gather: bool, full_tiles: bool) -> Callable:
     M, N, num_scale_tok_cols, num_scale_t_cols = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
     dtype = {"bf16": cutlass.BFloat16, "f16": cutlass.Float16, "f32": cutlass.Float32}[kind]
     x = fake(dtype, (M, N), (cute.sym_int64(), cute.sym_int64() if is_gather else 1), dtype.width // 8 if is_gather else 16)
     out_tok, scale_tok = fake(cutlass.Float8E4M3FN, (M, N), (cute.sym_int64(), 1)), fake(cutlass.Float32, (M, num_scale_tok_cols), (1, cute.sym_int64()))
     out_t, scale_t = fake(cutlass.Float8E4M3FN, (N, M), (cute.sym_int64(), 1)), fake(cutlass.Float32, (N, num_scale_t_cols), (1, cute.sym_int64()))
-    return cute.compile(launch, x, out_tok, scale_tok, out_t, scale_t, fake_stream(), kind, is_tok_aligned, m_align, is_gather, options="--enable-tvm-ffi")
+    return cute.compile(launch, x, out_tok, scale_tok, out_t, scale_t, fake_stream(), kind, is_tok_aligned, m_align, is_gather, full_tiles, options="--enable-tvm-ffi")
 
 
 def quantize(x: torch.Tensor, kind: str, M: int, N: int, row_stride: int, col_stride: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -599,8 +609,10 @@ def quantize(x: torch.Tensor, kind: str, M: int, N: int, row_stride: int, col_st
     scale_tok, scale_t = mn_major_scale(M, (N + 127) >> 7, device), mn_major_scale(N, (M + 127) >> 7, device)
     elems_per_16_bytes = 4 if kind == "f32" else 8
     is_gather = col_stride != 1 or x.data_ptr() % 16 != 0 or row_stride % elems_per_16_bytes != 0 or N % elems_per_16_bytes != 0
+    # The aligned BF16 load path and complete tiles make every vector access in-bounds.
+    full_tiles = kind == "bf16" and not is_gather and M % TILE == 0 and N % TILE == 0
     # 8-byte fp8 stores of out_tok need N % 8 == 0
-    key = (kind, N % 8 == 0, 16 if M % 16 == 0 else 8 if M % 8 == 0 else 1, is_gather)
+    key = (kind, N % 8 == 0, 16 if M % 16 == 0 else 8 if M % 8 == 0 else 1, is_gather, full_tiles)
     fn = COMPILED.get(key)
     if fn is None:
         fn = COMPILED[key] = compile_kernel(*key)
