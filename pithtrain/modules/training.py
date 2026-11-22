@@ -31,6 +31,7 @@ from pithtrain.modules.fp8_param_gather import (
 )
 from pithtrain.modules.fsdp_forward import (
     ComputeStreamReduceScatter,
+    PersistentReduceScatterOutput,
     install_lean_hooks,
     register_fsdp_forward_method,
 )
@@ -258,6 +259,9 @@ class TrainingCfg(SlottedDefault):
     pipeline_compute_stream_grad_buffers: bool = False
     """Allocate FSDP reduction buffers on the model compute stream."""
 
+    pipeline_persistent_reduce_output_layers: tuple[int, ...] = ()
+    """Keep each selected decoder FSDP group's FP32 reduction output across steps."""
+
     pipeline_compact_embedding_grad: bool = False
     """Use a microbatch-sized temporary for embedding backward."""
 
@@ -343,7 +347,13 @@ def split_replicas(mesh: DeviceMesh, hsdp_replica: int) -> DeviceMesh:
     return mesh._unflatten(0, (hsdp_replica, size // hsdp_replica), ("replica", "shard"))
 
 
-def apply_fsdp(model, hsdp_replica: int = 1, *, compute_stream_grad_buffers: bool = False):
+def apply_fsdp(
+    model,
+    hsdp_replica: int = 1,
+    *,
+    compute_stream_grad_buffers: bool = False,
+    persistent_reduce_output_layers: tuple[int, ...] = (),
+):
     """
     Shard the pipeline chunks in model with FSDP2 in place and return model. The routed expert
     weights shard over the dp axis of the expert mesh, everything else over the dp x cp stage, and
@@ -397,10 +407,24 @@ def apply_fsdp(model, hsdp_replica: int = 1, *, compute_stream_grad_buffers: boo
     reduce_scatter = (
         ComputeStreamReduceScatter(distributed.device) if compute_stream_grad_buffers else None
     )
+    persistent_layers = (
+        {
+            layer
+            for stage in model
+            for layer in stage.layers.values()
+            if layer.idx in persistent_reduce_output_layers
+        }
+        if persistent_reduce_output_layers
+        else set()
+    )
     for module in model.modules():
         if isinstance(module, FSDPModule):
             module.set_gradient_divide_factor(1.0)
-            if reduce_scatter is not None:
+            if module in persistent_layers:
+                module.set_custom_reduce_scatter(
+                    PersistentReduceScatterOutput(distributed.device, tuple(module.parameters()))
+                )
+            elif reduce_scatter is not None:
                 module.set_custom_reduce_scatter(reduce_scatter)
 
     # Gathering FP8 weights in FP8 gives the same operands as quantizing the gathered bf16 weight.
@@ -465,6 +489,16 @@ def setup_model(
         or any(left < right for left, right in zip(forward_warmups, forward_warmups[1:]))
     ):
         raise ValueError("ZB-H1 forward warmups require a nonincreasing value per rank ending at zero")
+    persistent_reduce_output_layers = cfg.pipeline_persistent_reduce_output_layers
+    if persistent_reduce_output_layers and (
+        schedule != "zb-h1"
+        or not cfg.pipeline_compute_stream_grad_buffers
+        or any(
+            not 0 <= index < module_config.num_hidden_layers
+            for index in persistent_reduce_output_layers
+        )
+    ):
+        raise ValueError("Persistent output layers require valid ZB-H1 indices and compute-stream buffers")
     if schedule in ("1f1b", "interleaved", "zb-h1", "zbv"):
         if ModelClass is not Qwen35Model or distributed.ep_size != 1:
             raise ValueError("Dense pipeline schedules require Qwen3.5 with expert_parallel_size=1")
@@ -539,6 +573,7 @@ def setup_model(
         modules,
         distributed_cfg.hsdp_replica,
         compute_stream_grad_buffers=cfg.pipeline_compute_stream_grad_buffers,
+        persistent_reduce_output_layers=persistent_reduce_output_layers,
     )
     install_wgrad_accumulation(modules)
     install_raw_main_grad(modules)  # gpt-oss raw expert weights; no-op elsewhere

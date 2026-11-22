@@ -39,7 +39,12 @@ from torch.distributed.fsdp._fully_shard._fsdp_param_group import (
 )
 from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
 
-__all__ = ["ComputeStreamReduceScatter", "install_lean_hooks", "register_fsdp_forward_method"]
+__all__ = [
+    "ComputeStreamReduceScatter",
+    "PersistentReduceScatterOutput",
+    "install_lean_hooks",
+    "register_fsdp_forward_method",
+]
 
 
 class ComputeStreamReduceScatter(DefaultReduceScatter):
@@ -56,6 +61,29 @@ class ComputeStreamReduceScatter(DefaultReduceScatter):
             caller.wait_stream(self.compute_stream)
             buffer.record_stream(caller)
         return buffer
+
+
+class PersistentReduceScatterOutput(ComputeStreamReduceScatter):
+    """Reuse one FSDP group's FP32 output after its sharded gradients are cleared."""
+
+    def __init__(self, device: torch.device, parameters: tuple[nn.Parameter, ...]) -> None:
+        super().__init__(device)
+        self.parameters = parameters
+        self.output: torch.Tensor | None = None
+
+    def allocate(self, size, *, dtype, device):
+        caller = torch.cuda.current_stream(device)
+        if caller == self.compute_stream or any(param.grad is not None for param in self.parameters):
+            # The packing input and additional reductions into live grads need their own storage.
+            return super().allocate(size, dtype=dtype, device=device)
+        if self.output is None:
+            self.output = super().allocate(size, dtype=dtype, device=device)
+            return self.output
+        if self.output.shape != size or self.output.dtype != dtype or self.output.device != device:
+            return super().allocate(size, dtype=dtype, device=device)
+        caller.wait_stream(self.compute_stream)
+        self.output.record_stream(caller)
+        return self.output
 
 
 def is_sequence(x: Any) -> bool:
