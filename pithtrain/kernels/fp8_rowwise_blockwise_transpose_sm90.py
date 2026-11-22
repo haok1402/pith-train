@@ -123,8 +123,9 @@ class RowwiseBlockwiseTranspose:
     rows), chosen on the host so no vector straddles the edge.
     """
 
-    def __init__(self, dtype: type, vec_k: int, vec_m: int, rows: int, full_tiles: bool) -> None:
+    def __init__(self, dtype: type, vec_k: int, vec_m: int, rows: int, full_tiles: bool, coalesced_kmajor: bool) -> None:
         self.dtype, self.rows, self.full_tiles = dtype, rows, full_tiles
+        self.coalesced_kmajor = coalesced_kmajor
         self.threads, self.num_warps = 1024 // rows, 32 // rows
         self.kind = {cutlass.BFloat16: "bf16", cutlass.Float16: "f16", Float32: "f32"}[dtype]
         self.elem_bytes = dtype.width // 8
@@ -135,19 +136,30 @@ class RowwiseBlockwiseTranspose:
     def __call__(self, mX: cute.Tensor, mTok: cute.Tensor, mTokScale: cute.Tensor, mBlkT: cute.Tensor, mBlkTScale: cute.Tensor, stream) -> None:
         M, K = mX.shape[0], mX.shape[1]
         grid_m, grid_k = (M + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
-        self.kernel(mX, mTok, mTokScale, mBlkT, mBlkTScale).launch(grid=[grid_m, grid_k, 1], block=[self.threads, 1, 1], stream=stream)
+        if cutlass.const_expr(self.coalesced_kmajor):
+            grid = [grid_k, grid_m, 1]
+        else:
+            grid = [grid_m, grid_k, 1]
+        self.kernel(mX, mTok, mTokScale, mBlkT, mBlkTScale).launch(grid=grid, block=[self.threads, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, mX: cute.Tensor, mTok: cute.Tensor, mTokScale: cute.Tensor, mBlkT: cute.Tensor, mBlkTScale: cute.Tensor) -> None:
         tidx, _, _ = cute.arch.thread_idx()
-        m_tile_idx, k_tile_idx, _ = cute.arch.block_idx()
+        tile_x, tile_y, _ = cute.arch.block_idx()
+        if cutlass.const_expr(self.coalesced_kmajor):
+            m_tile_idx, k_tile_idx = tile_y, tile_x
+        else:
+            m_tile_idx, k_tile_idx = tile_x, tile_y
         sub_block = SubBlock(tidx, m_tile_idx, k_tile_idx, Int32(mX.shape[0]), Int32(mX.shape[1]), self.rows)
         x_words = self.load_block(mX, sub_block)
         row_amax = self.reduce_row_amax(x_words)
         quant_bytes = cute.make_rmem_tensor(cute.make_layout(8), Uint8)
         self.store_rowwise(x_words, row_amax, quant_bytes, mTok, mTokScale, sub_block)
         tile_rcp = self.reduce_tile_amax(row_amax, mBlkTScale, sub_block)
-        self.store_transposed(x_words, tile_rcp, quant_bytes, mBlkT, sub_block)
+        if cutlass.const_expr(self.coalesced_kmajor):
+            self.store_transposed_coalesced(x_words, tile_rcp, mBlkT, sub_block)
+        else:
+            self.store_transposed(x_words, tile_rcp, quant_bytes, mBlkT, sub_block)
 
     @cute.jit
     def load_block(self, mX: cute.Tensor, sub_block: SubBlock) -> cute.Tensor:
@@ -248,6 +260,42 @@ class RowwiseBlockwiseTranspose:
         return tile_rcp
 
     @cute.jit
+    def store_transposed_coalesced(
+        self, x_words: cute.Tensor, tile_rcp: Float32, mBlkT: cute.Tensor, sub_block: SubBlock
+    ) -> None:
+        # The dense four-row path produces one word per column and lane. In shared
+        # memory each column has 32 words, and its eight-column group permutes
+        # the eight aligned 16-byte vectors to distribute producers over 32 banks.
+        smem = cutlass.memory.SmemAllocator()
+        tile = smem.allocate_tensor(Uint32, cute.make_layout(BLOCK * BLOCK // 4), byte_alignment=128)
+        word_row = sub_block.warp * 4 + sub_block.row_group_idx
+        column_group = sub_block.col_group_idx
+        swizzled_word = word_row ^ (column_group * 4)
+        for half in cutlass.range_constexpr(2):
+            for col_in_half in cutlass.range_constexpr(8):
+                col = half * 64 + column_group * 8 + col_in_half
+                indices = [row * 16 + half * 8 + col_in_half for row in range(4)]
+                tile[col * (BLOCK // 4) + swizzled_word] = self.quantize4(x_words, indices, tile_rcp)
+        cute.arch.barrier()
+
+        # Eight adjacent lanes cover all 128 bytes of one transposed column.
+        # Reverse the shared-memory permutation at the 16-byte vector granularity.
+        vector = sub_block.tidx % 8
+        row = sub_block.m_tile_idx * BLOCK + vector * 16
+        vector_layout = cute.make_layout(4)
+        for group in cutlass.range_constexpr(4):
+            col = sub_block.tidx // 8 + group * 32
+            col_group = (col // 8) % 8
+            shared_word = col * (BLOCK // 4) + (vector ^ col_group) * 4
+            src_ptr = cute.make_ptr(
+                Uint32, (tile.iterator + shared_word).toint(), cute.AddressSpace.smem, assumed_align=16
+            )
+            global_col = sub_block.k_tile_idx * BLOCK + col
+            offset = Int64(global_col) * Int64(sub_block.M) + Int64(row)
+            dst_ptr = global_ptr(mBlkT.iterator, offset, 1, Uint32, 16)
+            cute.autovec_copy(cute.make_tensor(src_ptr, vector_layout), cute.make_tensor(dst_ptr, vector_layout))
+
+    @cute.jit
     def store_transposed(self, x_words: cute.Tensor, tile_rcp: Float32, quant_bytes: cute.Tensor, mBlkT: cute.Tensor, sub_block: SubBlock) -> None:
         """
         Quantize the register block by the tile scale into blk_t, each column's rows as one vector.
@@ -297,7 +345,7 @@ def vector_width(size: int, max_width: int) -> int:
     return width
 
 
-def compile_kernel(dtype: type, vec_k: int, vec_m: int, rows: int, full_tiles: bool) -> Callable:
+def compile_kernel(dtype: type, vec_k: int, vec_m: int, rows: int, full_tiles: bool, coalesced_kmajor: bool) -> Callable:
     m_sym, k_sym, num_k_tiles_sym, num_m_tiles_sym = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
     elem_bytes = dtype.width // 8
     make_fake = cute.runtime.make_fake_tensor
@@ -306,7 +354,7 @@ def compile_kernel(dtype: type, vec_k: int, vec_m: int, rows: int, full_tiles: b
     tok_scale = make_fake(Float32, (m_sym, num_k_tiles_sym), stride=(1, cute.sym_int64()), assumed_align=16)
     blk_t = make_fake(cutlass.Float8E4M3FN, (k_sym, m_sym), stride=(m_sym, 1), assumed_align=16)
     blk_t_scale = make_fake(Float32, (num_k_tiles_sym, num_m_tiles_sym), stride=(num_m_tiles_sym, 1), assumed_align=16)
-    return cute.compile(RowwiseBlockwiseTranspose(dtype, vec_k, vec_m, rows, full_tiles), x, tok, tok_scale, blk_t, blk_t_scale, fake_stream(), options="--enable-tvm-ffi")
+    return cute.compile(RowwiseBlockwiseTranspose(dtype, vec_k, vec_m, rows, full_tiles, coalesced_kmajor), x, tok, tok_scale, blk_t, blk_t_scale, fake_stream(), options="--enable-tvm-ffi")
 
 
 DISPATCH: dict[tuple, tuple] = {}
@@ -323,16 +371,15 @@ def resolve(dtype: torch.dtype, M: int, K: int, x_row_stride: int, x_addr: int) 
     vec_k = vector_width(K, min(16 // elem_bytes, 8))
     vec_k = vector_width(x_row_stride, vec_k)
     vec_k = vector_width(x_addr // elem_bytes, vec_k)
-    # 128 threads x 8 rows wins once the grid fills the GPU (fewer, fuller stores); a small grid
-    # is latency-bound, so split each tile over 256 threads x 4 rows.
-    rows = 4 if num_m_tiles * num_k_tiles <= SMALL_GRID_TILES else 8
-    vec_m = vector_width(M, rows)
     # All tiles take the full-width path for the aligned dense BF16 production workloads.
     full_tiles = dtype == torch.bfloat16 and M in (4096, 8192) and K in (5120, 6144, 17408) and x_row_stride == K and vec_k == 8
-    key = (dtype, vec_k, vec_m, rows, full_tiles)
+    coalesced_kmajor = full_tiles and K in (5120, 6144)
+    rows = 4 if coalesced_kmajor or num_m_tiles * num_k_tiles <= SMALL_GRID_TILES else 8
+    vec_m = vector_width(M, rows)
+    key = (dtype, vec_k, vec_m, rows, full_tiles, coalesced_kmajor)
     fn = COMPILED.get(key)
     if fn is None:
-        fn = COMPILED[key] = compile_kernel(TORCH2CUTE[dtype], vec_k, vec_m, rows, full_tiles)
+        fn = COMPILED[key] = compile_kernel(TORCH2CUTE[dtype], vec_k, vec_m, rows, full_tiles, coalesced_kmajor)
     if len(DISPATCH) > 4096:
         DISPATCH.clear()
     return fn, num_k_tiles, num_m_tiles
