@@ -55,6 +55,7 @@ if __name__ == "__main__":
     parser.add_argument("--tp-overwrite-wgrad", action="store_true")
     parser.add_argument("--tp-recompute-mlp-columns", action="store_true")
     parser.add_argument("--tp-recompute-mlp-once", action="store_true")
+    parser.add_argument("--tp-mlp-replay-blocks", type=int)
     parser.add_argument("--tp-bulk-row-reduce", action="store_true")
     parser.add_argument("--tp-no-delta-checkpoint", action="store_true")
     args = parser.parse_args()
@@ -92,6 +93,7 @@ if __name__ == "__main__":
     train.dense_fsdp.tp_overwrite_wgrad = args.tp_overwrite_wgrad
     train.dense_fsdp.tp_recompute_mlp_columns = args.tp_recompute_mlp_columns
     train.dense_fsdp.tp_recompute_mlp_once = args.tp_recompute_mlp_once
+    train.dense_fsdp.tp_mlp_replay_blocks = args.tp_mlp_replay_blocks
     train.dense_fsdp.tp_bulk_row_reduce = args.tp_bulk_row_reduce
     train.dense_fsdp.tp_no_delta_checkpoint = args.tp_no_delta_checkpoint
     train.dense_fsdp.blocks_per_group = args.blocks_per_group

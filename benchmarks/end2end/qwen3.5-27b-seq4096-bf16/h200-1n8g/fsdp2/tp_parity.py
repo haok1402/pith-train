@@ -241,6 +241,7 @@ def main():
     parser.add_argument("--tp-overwrite-wgrad", action="store_true")
     parser.add_argument("--tp-recompute-mlp-columns", action="store_true")
     parser.add_argument("--tp-recompute-mlp-once", action="store_true")
+    parser.add_argument("--tp-mlp-replay-blocks", type=int)
     parser.add_argument("--tp-bulk-row-reduce", action="store_true")
     parser.add_argument("--tp-no-delta-checkpoint", action="store_true")
     parser.add_argument("--compile-blocks", action="store_true")
@@ -541,6 +542,7 @@ def run_trial(args, device, mesh, seed, batch_index):
         config_fsdp.tp_overwrite_wgrad = args.tp_overwrite_wgrad
         config_fsdp.tp_recompute_mlp_columns = args.tp_recompute_mlp_columns
         config_fsdp.tp_recompute_mlp_once = args.tp_recompute_mlp_once
+        config_fsdp.tp_mlp_replay_blocks = args.tp_mlp_replay_blocks
         config_fsdp.tp_bulk_row_reduce = args.tp_bulk_row_reduce
         config_fsdp.tp_no_delta_checkpoint = args.tp_no_delta_checkpoint
         config_fsdp.activation_checkpoint = checkpoint

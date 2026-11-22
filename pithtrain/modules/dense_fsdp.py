@@ -56,6 +56,9 @@ class DenseFSDPCfg(SlottedDefault):
     tp_recompute_mlp_once: bool = False
     """Use the MLP projection replay gather for the weight gradients too."""
 
+    tp_mlp_replay_blocks: int | None = None
+    """Limit MLP projection replay to this decoder prefix."""
+
     tp_bulk_row_reduce: bool = False
     """Keep async input gathers and use full FP32 GEMMs followed by NCCL reduce-scatter."""
 
@@ -236,8 +239,14 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError("The bulk row reduction override requires async TP")
     if cfg.tp_no_delta_checkpoint and tp is None:
         raise ValueError("The DeltaNet checkpoint override requires dense TP")
+    has_mlp_replay = cfg.tp_recompute_mlp_columns or cfg.tp_recompute_mlp_once
+    if cfg.tp_mlp_replay_blocks is not None and (
+        not has_mlp_replay or not 1 <= cfg.tp_mlp_replay_blocks <= len(model.layers)
+    ):
+        raise ValueError("The MLP replay prefix requires a replay mode and a valid decoder depth")
+    mlp_replay_blocks = (cfg.tp_mlp_replay_blocks or len(model.layers)) if has_mlp_replay else 0
     if tp is not None:
-        tp.recompute_mlp_once = cfg.tp_recompute_mlp_once
+        tp.mlp_replay_blocks = mlp_replay_blocks if cfg.tp_recompute_mlp_once else 0
         tp.bulk_row_reduce = cfg.tp_bulk_row_reduce
         tp.no_delta_checkpoint = cfg.tp_no_delta_checkpoint
     if cfg.tp_recompute_mlp_columns and (
@@ -296,10 +305,9 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError(
             "Full checkpoint prefix requires selective checkpointing and a valid depth"
         )
-    contexts = selective_checkpoint_contexts
-    if cfg.tp_recompute_mlp_columns or cfg.tp_recompute_mlp_once:
-        contexts = partial(selective_checkpoint_contexts, recompute_mlp_columns=True)
+    replay_contexts = partial(selective_checkpoint_contexts, recompute_mlp_columns=True)
     for i, layer in enumerate(model.layers):
+        contexts = replay_contexts if i < mlp_replay_blocks else selective_checkpoint_contexts
         if i < checkpoint_blocks and cfg.activation_checkpoint != "none":
             ctx = (
                 {"context_fn": contexts}

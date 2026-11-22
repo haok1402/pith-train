@@ -52,7 +52,7 @@ class DenseTP:
         self.name = self.group.group_name
         self.async_tp = async_tp
         self.bulk_row_reduce = False
-        self.recompute_mlp_once = False
+        self.mlp_replay_blocks = 0
         self.no_delta_checkpoint = False
         self.regather_inputs = regather_inputs
         self.head_chunk_tokens = head_chunk_tokens
@@ -280,7 +280,7 @@ class DenseTP:
 
     def mlp(self, layer: Qwen35DecoderLayer, x: torch.Tensor) -> torch.Tensor:
         mlp = layer.mlp
-        if self.recompute_mlp_once:
+        if layer.idx < self.mlp_replay_blocks:
             columns = (mlp.gate_proj, mlp.up_proj)
             product = _RecomputedSwiGLU.apply(
                 x,
