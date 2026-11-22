@@ -797,24 +797,30 @@ def shard_tile_row(shard_base: Int64, amax_addr: Int64, out_base: Int64, local_r
     col = tile_col_idx * BLOCK + lane * 4
     group_elem_start = Int64(group_idx) * Int64(local_rows) * Int64(K)
     tile_row_start = tile_row_idx * BLOCK - row_offset
-    words, rows_ok = load_shard_rows(shard_base, group_elem_start, tile_row_start, warp, col, local_rows, K)
     if const_expr(is_cast):
-        cast_shard_rows(out_base, amax_addr, words, rows_ok, group_elem_start, tile_row_start, warp, col, K)
+        rcp_bits = Uint32(0x7F000000) - compute_scale_bits(ld_scalar_ordered(amax_addr, Int32(1), 4))
+        rows_per_warp = BLOCK // NUM_WARPS // 2
+        # Store the first half of the tile before loading the second to limit live registers.
+        for batch in cutlass.range_constexpr(2):
+            batch_start = tile_row_start + batch * (BLOCK // 2)
+            words, rows_ok = load_shard_rows(shard_base, group_elem_start, batch_start, warp, col, local_rows, K, rows_per_warp)
+            cast_shard_rows(out_base, rcp_bits, words, rows_ok, group_elem_start, batch_start, warp, col, K, rows_per_warp)
     else:
+        words, _ = load_shard_rows(shard_base, group_elem_start, tile_row_start, warp, col, local_rows, K, BLOCK // NUM_WARPS)
         amax_bits = reduce_shard_rows_amax(words, warp, lane)
         if tidx == 0:
             st_scalar(amax_addr, amax_bits, Int32(1), 4)
 
 
 @cute.jit
-def load_shard_rows(shard_base: Int64, group_elem_start: Int64, tile_row_start: Int32, warp: Int32, col: Int32, local_rows: Int32, K: Int32) -> tuple:
+def load_shard_rows(shard_base: Int64, group_elem_start: Int64, tile_row_start: Int32, warp: Int32, col: Int32, local_rows: Int32, K: Int32, rows_per_warp: cutlass.Constexpr[int]) -> tuple:
     """
     Load the warp's rows of the tile, four fp32 per lane rounded to two bf16x2 words; returns the
     words and the per-row predicates (rows outside the shard read as zero).
     """
     col_ok = Int32(col < K)
     words, rows_ok = [], []
-    for i in cutlass.range_constexpr(BLOCK // NUM_WARPS):
+    for i in cutlass.range_constexpr(rows_per_warp):
         row = tile_row_start + i * NUM_WARPS + warp
         row_ok = Int32(row >= 0) & Int32(row < local_rows) & col_ok
         f32_bits = ld_v4_ordered(shard_base + (group_elem_start + Int64(row) * Int64(K) + Int64(col)) * 4, row_ok)
@@ -824,9 +830,8 @@ def load_shard_rows(shard_base: Int64, group_elem_start: Int64, tile_row_start: 
 
 
 @cute.jit
-def cast_shard_rows(out_base: Int64, amax_addr: Int64, words: list, rows_ok: list, group_elem_start: Int64, tile_row_start: Int32, warp: Int32, col: Int32, K: Int32) -> None:
-    rcp_bits = Uint32(0x7F000000) - compute_scale_bits(ld_scalar_ordered(amax_addr, Int32(1), 4))
-    for i in cutlass.range_constexpr(BLOCK // NUM_WARPS):
+def cast_shard_rows(out_base: Int64, rcp_bits: Uint32, words: list, rows_ok: list, group_elem_start: Int64, tile_row_start: Int32, warp: Int32, col: Int32, K: Int32, rows_per_warp: cutlass.Constexpr[int]) -> None:
+    for i in cutlass.range_constexpr(rows_per_warp):
         row = tile_row_start + i * NUM_WARPS + warp
         cols01, cols23 = words[i]
         quant = cast4(cols01 << 16, cols01 & Uint32(0xFFFF0000), cols23 << 16, cols23 & Uint32(0xFFFF0000), rcp_bits)
@@ -926,21 +931,27 @@ def fp8_scales_sm90(amax: torch.Tensor, scale: torch.Tensor, scale_t: torch.Tens
 
 
 PACK_THREADS = 128
+PACK_ROW_TILES = 8
 
 
 class PackTranspose:
     def __init__(self, mode: str) -> None:
         self.mode = mode
-        self.num_threads = PACK_THREADS if mode == "w16" else NUM_THREADS
+        self.num_threads = PACK_THREADS if mode in ("w16", "w16_grouped") else NUM_THREADS
 
     @cute.jit
     def __call__(self, mX: cute.Tensor, mOut: cute.Tensor, stream: cuda.CUstream):
         G, N, K = mX.shape[0], mX.shape[1], mX.shape[2]
-        self.kernel(mX.iterator.toint(), mOut.iterator.toint(), Int32(N), Int32(K), Int32(G)).launch(grid=[(N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK, G], block=[self.num_threads, 1, 1], stream=stream)
+        tiles_n, tiles_k = (N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
+        if const_expr(self.mode == "w16_grouped"):
+            grid = [tiles_n * tiles_k, 1, G]
+        else:
+            grid = [tiles_n, tiles_k, G]
+        self.kernel(mX.iterator.toint(), mOut.iterator.toint(), Int32(N), Int32(K), Int32(G)).launch(grid=grid, block=[self.num_threads, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, x_base: Int64, out_base: Int64, N: Int32, K: Int32, G: Int32):
-        if const_expr(self.mode == "w16"):
+        if const_expr(self.mode == "w16" or self.mode == "w16_grouped"):
             self.kernel_w16(x_base, out_base, N, K, G)
         else:
             self.kernel_8x8(x_base, out_base, N, K, G)
@@ -952,6 +963,11 @@ class PackTranspose:
         for 16-byte stores.
         """
         bx, by, bz = cute.arch.block_idx()
+        if const_expr(self.mode == "w16_grouped"):
+            tiles_k = K // BLOCK
+            column_band = bx // PACK_ROW_TILES
+            row_band = column_band // tiles_k
+            bx, by = row_band * PACK_ROW_TILES + bx % PACK_ROW_TILES, column_band - row_band * tiles_k
         tidx, _, _ = cute.arch.thread_idx()
         warp, lane = tidx // 32, tidx % 32
         block_row, block_col = warp * 32 + (lane // 8) * 8, (lane % 8) * 16
@@ -998,7 +1014,8 @@ def fp8_pack_transpose_sm90(x: torch.Tensor, out: torch.Tensor) -> None:
     if x.numel() == 0:
         return
     if N % 16 == 0 and K % 16 == 0 and x.data_ptr() % 16 == 0 and out.data_ptr() % 16 == 0:
-        mode = "w16"
+        # Visit nearby columns before moving on to the next complete band of tile rows.
+        mode = "w16_grouped" if N % (BLOCK * PACK_ROW_TILES) == 0 and K % BLOCK == 0 else "w16"
     elif N % 8 == 0 and K % 8 == 0 and x.data_ptr() % 8 == 0 and out.data_ptr() % 8 == 0:
         mode = "v8"
     else:
@@ -1036,13 +1053,13 @@ class ShardAmaxMulti:
     """
 
     @cute.jit
-    def __call__(self, mTable: cute.Tensor, num_shards: Int32, num_ctas: Int32, stream: cuda.CUstream):
-        self.kernel(mTable.iterator.toint(), num_shards).launch(grid=[num_ctas, 1, 1], block=[NUM_THREADS, 1, 1], stream=stream)
+    def __call__(self, mTable: cute.Tensor, mShardForCta: cute.Tensor, num_ctas: Int32, stream: cuda.CUstream):
+        self.kernel(mTable.iterator.toint(), mShardForCta.iterator.toint()).launch(grid=[num_ctas, 1, 1], block=[NUM_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(self, table_base: Int64, num_shards: Int32):
+    def kernel(self, table_base: Int64, shard_for_cta_base: Int64):
         bx, _, _ = cute.arch.block_idx()
-        shard_idx = find_table_row(table_base, num_shards, bx, 2 * DESC_WORDS)
+        shard_idx = Int32(ld_scalar_ordered(shard_for_cta_base + Int64(bx) * 4, Int32(1), 4))
         desc_addr = table_base + Int64(shard_idx) * 2 * DESC_WORDS * 8
         shard_base, amax_base = ld_u64(desc_addr), ld_u64(desc_addr + 8)
         local_rows, K = Int32(ld_u64(desc_addr + 16)), Int32(ld_u64(desc_addr + 24))
@@ -1067,7 +1084,7 @@ class FP8ShardAmaxGroup:
 
     def __init__(self, shards: Sequence[torch.Tensor], amaxes: Sequence[torch.Tensor], row_offsets: Sequence[int], group_offsets: Sequence[int]) -> None:
         desc_rows = []
-        first_cta = 0
+        shard_for_cta = []
         self.fallback = []
         for shard, amax, row_offset, group_offset in zip(shards, amaxes, row_offsets, group_offsets):
             num_local_groups, local_rows, K = shard.shape
@@ -1080,22 +1097,24 @@ class FP8ShardAmaxGroup:
             tile_row_start = row_offset // BLOCK
             num_row_tiles = (row_offset + local_rows + BLOCK - 1) // BLOCK - tile_row_start
             num_col_tiles = (K + BLOCK - 1) // BLOCK
+            shard_idx = len(desc_rows) // 2
+            first_cta = len(shard_for_cta)
             desc_rows.append([shard.data_ptr(), amax.data_ptr(), local_rows, K, row_offset, tile_row_start, group_offset * amax_rows * amax_cols, first_cta])
             desc_rows.append([amax_rows, amax_cols, num_col_tiles, num_row_tiles, 0, 0, 0, 0])
-            first_cta += num_row_tiles * num_col_tiles * num_local_groups
-        self.num_ctas = first_cta
-        self.num_shards = len(desc_rows) // 2
+            shard_for_cta.extend([shard_idx] * (num_row_tiles * num_col_tiles * num_local_groups))
+        self.num_ctas = len(shard_for_cta)
         device = shards[0].device
         self.table = torch.tensor(desc_rows or [[0] * DESC_WORDS], dtype=torch.int64, device=device)
+        self.shard_for_cta = torch.tensor(shard_for_cta, dtype=torch.int32, device=device)
         fn = COMPILED.get("amax_multi")
         if fn is None:
-            fn = cute.compile(ShardAmaxMulti(), fake_row_major(cutlass.Int64, 2, 8), Int32(0), Int32(0), fake_stream(), options="--enable-tvm-ffi")
+            fn = cute.compile(ShardAmaxMulti(), fake_row_major(cutlass.Int64, 2, 8), fake_row_major(Int32, 1, 4), Int32(0), fake_stream(), options="--enable-tvm-ffi")
             COMPILED["amax_multi"] = fn
         self.fn = fn
 
     def __call__(self) -> None:
         if self.num_ctas:
-            self.fn(self.table, self.num_shards, self.num_ctas)
+            self.fn(self.table, self.shard_for_cta, self.num_ctas)
         for shard, amax, row_offset, group_offset in self.fallback:
             fp8_shard_amax_sm90(shard, amax, row_offset, group_offset)
 
