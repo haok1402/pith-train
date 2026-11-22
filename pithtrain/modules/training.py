@@ -22,7 +22,7 @@ from pithtrain.contexts import distributed, training
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
-from pithtrain.models.qwen35 import Qwen35Model
+from pithtrain.models.qwen35 import Qwen35DenseStage, Qwen35Model
 from pithtrain.models.qwen35_moe import Qwen35MoeModel
 from pithtrain.modules import imbalance
 from pithtrain.modules.fp8_param_gather import (
@@ -40,6 +40,7 @@ from pithtrain.modules.wgrad_accumulation import (
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
 from pithtrain.operators.linear import BF16Linear, FP8Linear
 from pithtrain.pipeline import DualPipeV
+from pithtrain.pipeline.one_f_one_b import OneForwardOneBackward
 
 from .distributed import DistributedCfg
 
@@ -216,6 +217,12 @@ class TrainingCfg(SlottedDefault):
     ignored) and replays MoE routing with a realistic expert-load imbalance (imbalance.SIGMA).
     """
 
+    pipeline_schedule: Literal["dualpipev", "1f1b"] = "dualpipev"
+    """Dense Qwen3.5 can use one contiguous stage per rank with the 1F1B schedule."""
+
+    pipeline_layer_counts: Optional[tuple[int, ...]] = None
+    """Optional decoder layer count per 1F1B stage, in forward order."""
+
     fp8: bool = False
     """
     Train the linear layers in FP8 through DeepGEMM with 128-element block scaling; False is BF16.
@@ -255,7 +262,7 @@ class TrainingCfg(SlottedDefault):
 
 def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02, seed: int = 0) -> None:
     """
-    Initialize this rank's V-chunks (an nn.Sequential of two models) in place, before FSDP shards
+    Initialize this rank's pipeline chunks in place, before FSDP shards
     them. Every parameter of 2 or more dims draws from N(0, init_std), except o_proj and down_proj,
     which use N(0, init_std / sqrt(2 * num_layers)) with num_layers of the full model. 1D parameters
     stay as they are.
@@ -269,7 +276,7 @@ def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02, seed
     for chunk_name, param in model.named_parameters():
         if param.dim() < 2:
             continue
-        name = chunk_name.split(".", 1)[1]  # drop the V-chunk index
+        name = chunk_name.split(".", 1)[1]  # drop the local chunk index
         std = output_std if "o_proj" in name or "down_proj" in name else init_std
         # Routed experts are stacked (local experts, ...), the local ones of this EP rank.
         if ".experts." in name and param.dim() == 3:
@@ -300,7 +307,7 @@ def split_replicas(mesh: DeviceMesh, hsdp_replica: int) -> DeviceMesh:
 
 def apply_fsdp(model, hsdp_replica: int = 1):
     """
-    Shard the two V-chunks in model with FSDP2 in place and return model. The routed expert
+    Shard the pipeline chunks in model with FSDP2 in place and return model. The routed expert
     weights shard over the dp axis of the expert mesh, everything else over the dp x cp stage, and
     gradients reduce as a plain sum. Under FP8 the FP8 weights are all-gathered in FP8.
     """
@@ -322,13 +329,15 @@ def apply_fsdp(model, hsdp_replica: int = 1):
     install_lean_hooks()
     # FSDP2 shards submodules before their parents; the walk stops at a sharded submodule, so
     # the expert parameters stay out of the layer's group.
-    for i in range(2):
-        assert isinstance(model[i], PIPELINE_STAGE_MODELS)
-        # Embeddings, final norm and LM head run once per step, so they reshard after forward.
-        for name, child in model[i].named_children():
+    for stage in model:
+        assert isinstance(stage, PIPELINE_STAGE_MODELS)
+        dense_stage = isinstance(stage, Qwen35DenseStage)
+        for name, child in stage.named_children():
             if name != "layers" and next(child.parameters(), None) is not None:
-                fully_shard(child, mesh=attn_fsdp_mesh, reshard_after_forward=True, mp_policy=mp)
-        for layer in model[i].layers.values():
+                fully_shard(
+                    child, mesh=attn_fsdp_mesh, reshard_after_forward=not dense_stage, mp_policy=mp
+                )
+        for layer in stage.layers.values():
             if hasattr(layer.mlp, "experts"):
                 fully_shard(
                     layer.mlp.experts,
@@ -339,10 +348,11 @@ def apply_fsdp(model, hsdp_replica: int = 1):
                 if hasattr(layer.mlp.experts, "forward_from_tokens"):
                     register_fsdp_forward_method(layer.mlp.experts, "forward_from_tokens")
             fully_shard(layer, mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
-            register_fsdp_forward_method(layer, "forward_stage1")
-            register_fsdp_forward_method(layer, "forward_stage3")
-            register_fsdp_forward_method(layer, "forward_stage5")
-        fully_shard(model[i], mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
+            if not dense_stage:
+                register_fsdp_forward_method(layer, "forward_stage1")
+                register_fsdp_forward_method(layer, "forward_stage3")
+                register_fsdp_forward_method(layer, "forward_stage5")
+        fully_shard(stage, mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
 
     # Sum, not average: the two classes reduce over groups of different size, yet each sum is the
     # global gradient, so the step's single divide by the global token count normalizes both.
@@ -369,7 +379,6 @@ def setup_model(
     cp_size = distributed.cp_size
     cp_group = distributed.cp_group
 
-    modules = []
     module_config = AutoConfig.from_pretrained(cfg.model)
     if module_config.model_type in ("qwen3_5", "qwen3_5_moe"):
         module_config = module_config.text_config
@@ -397,10 +406,19 @@ def setup_model(
     else:
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")
 
-    modules.append(ModelClass(module_config, phase=0))
-    modules.append(ModelClass(module_config, phase=1))
+    if cfg.pipeline_schedule == "1f1b":
+        if ModelClass is not Qwen35Model or distributed.ep_size != 1:
+            raise ValueError("1f1b requires dense Qwen3.5 with expert_parallel_size=1")
+        modules = nn.Sequential(Qwen35DenseStage(module_config, cfg.pipeline_layer_counts))
+    elif cfg.pipeline_schedule == "dualpipev":
+        if cfg.pipeline_layer_counts is not None:
+            raise ValueError("pipeline_layer_counts requires the 1f1b schedule")
+        modules = nn.Sequential(
+            ModelClass(module_config, phase=0), ModelClass(module_config, phase=1)
+        )
+    else:
+        raise ValueError(f"Unknown pipeline_schedule: {cfg.pipeline_schedule!r}")
 
-    modules = nn.Sequential(*modules)
     init_weights(modules, module_config.num_hidden_layers, cfg.init_std, cfg.seed)
     apply_fsdp(modules, distributed_cfg.hsdp_replica)
     install_wgrad_accumulation(modules)
@@ -408,7 +426,7 @@ def setup_model(
     install_side_grads(modules)  # after the main_grad installs: its post_backward runs first
 
     # The two V-chunks build identical read-only rotary caches; share one to save memory.
-    if hasattr(modules[0], "rotary_emb") and hasattr(modules[1], "rotary_emb"):
+    if len(modules) == 2 and hasattr(modules[0], "rotary_emb") and hasattr(modules[1], "rotary_emb"):
         modules[1].rotary_emb = modules[0].rotary_emb
 
     local_seq_len = cfg.sequence_length // cp_size
@@ -417,8 +435,8 @@ def setup_model(
         # With hsdp_replica 1 this reuses the flat dp x cp mesh apply_fsdp built,
         # adding no communicator.
         lb_group = distributed.attn_mesh["dp", "cp"]._flatten().get_group()
-        for i in range(2):
-            for layer in modules[i].layers.values():
+        for stage in modules:
+            for layer in stage.layers.values():
                 gate = getattr(layer.mlp, "gate", None) or getattr(layer.mlp, "router", None)
                 if gate is not None:
                     loss_fn = make_load_balance_loss_fn(
@@ -438,7 +456,9 @@ def setup_model(
                 layer = int(name.split("layers.")[1].split(".")[0])
                 module.router_replay = imbalance.replay(module.num_experts, layer)
 
-    training.model = DualPipeV(modules)
+    training.model = (
+        OneForwardOneBackward(modules[0]) if cfg.pipeline_schedule == "1f1b" else DualPipeV(modules)
+    )
 
 
 offloaded_state: list[tuple[torch.UntypedStorage, torch.Tensor]] = []

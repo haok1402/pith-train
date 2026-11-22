@@ -14,8 +14,9 @@ from pithtrain.models.qwen35_moe import (
 )
 from pithtrain.operators.cp_sequence import contiguous_to_zigzag, zigzag_to_contiguous
 from pithtrain.operators.silu_mul import silu_mul
+from pithtrain.pipeline.dualpipev import layer_sizes
 
-__all__ = ["Qwen35Model"]
+__all__ = ["Qwen35Model", "Qwen35DenseStage"]
 
 
 class Qwen35MLP(nn.Module):
@@ -98,8 +99,45 @@ class Qwen35DecoderLayer(nn.Module):
             hidden_states = contiguous_to_zigzag(hidden_states, distributed.cp_group)
         return hidden_states
 
+    @torch.compile(fullgraph=True, options=stage_compile_options() or None)
+    def forward(self, hidden_states, rotary_posemb, cu_seqlens=None):
+        return self.reference_forward(hidden_states, rotary_posemb, cu_seqlens)
+
 
 class Qwen35Model(Qwen35MoeModel):
     """Reuse hybrid attention and pipeline plumbing; no routed or shared experts are created."""
 
     decoder_layer_class = Qwen35DecoderLayer
+
+
+class Qwen35DenseStage(Qwen35Model):
+    """A contiguous Qwen3.5 stage using the normal autograd graph of each layer."""
+
+    def __init__(self, config: Qwen3_5TextConfig, layer_counts: tuple[int, ...] | None):
+        nn.Module.__init__(self)
+        count, index = distributed.pp_size, distributed.pp_rank
+        if layer_counts is None:
+            layer_counts = layer_sizes(config.num_hidden_layers, count)
+        if (
+            len(layer_counts) != count
+            or sum(layer_counts) != config.num_hidden_layers
+            or min(layer_counts) <= 0
+        ):
+            raise ValueError(
+                f"pipeline_layer_counts must assign {config.num_hidden_layers} layers "
+                f"to {count} nonempty stages, got {layer_counts}"
+            )
+        start = sum(layer_counts[:index])
+        self._build_stage(config, index, count, range(start, start + layer_counts[index]))
+
+    def forward(
+        self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if self.embed_tokens is not None:
+            hidden_states = self.forward_prolog(hidden_states)
+        rotary_posemb = self.forward_posemb(hidden_states.shape[1], cu_seqlens)
+        for layer in self.layers.values():
+            hidden_states = layer(hidden_states, rotary_posemb, cu_seqlens)
+        if self.lm_head is not None:
+            hidden_states = self.forward_epilog(hidden_states)
+        return hidden_states

@@ -165,7 +165,7 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
 
     microbatches = get_global_batch(cfg, dataset, step, device)
 
-    # One detached loss per micro-batch on pipeline rank 0, an empty list on the other ranks.
+    # One detached loss per micro-batch on the rank that owns the LM head.
     objective_outputs = model.step(microbatches, objective)
 
     # Every pipeline rank holds the same labels, so all stages count the same total for the scale.
@@ -176,11 +176,16 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     num_tokens = counted.clamp_min(1).to(device=device, dtype=torch.float32)
 
     cp_size = distributed.cp_size
-    if distributed.pp_rank == 0:
+    loss_rank = getattr(model, "objective_pp_rank", 0)
+    if distributed.pp_rank == loss_rank:
         loss = torch.stack(objective_outputs).sum() / num_tokens
         if cp_size > 1:
             torch.distributed.all_reduce(loss, group=distributed.cp_group)
             loss /= cp_size
+    if loss_rank != 0:
+        if distributed.pp_rank != loss_rank:
+            loss = num_tokens.new_empty(())
+        torch.distributed.broadcast(loss, group=distributed.pp_group, group_src=loss_rank)
 
     # The one gradient normalization: FSDP reduces with a plain sum, so this gives the
     # token-weighted mean. The global count is the local count times dp * cp only while every rank

@@ -593,6 +593,11 @@ class Qwen35MoeModel(nn.Module):
                 stage_index = 0
             case _:
                 raise ValueError("phase must be 0, 1, or -1, got %d" % phase)
+        sizes = pipeline_layer_sizes(config.num_hidden_layers, stage_count)
+        indices = layer_partition(config.num_hidden_layers, stage_count, stage_index, sizes)
+        self._build_stage(config, stage_index, stage_count, indices)
+
+    def _build_stage(self, config, stage_index: int, stage_count: int, indices: range) -> None:
         self.stage_index, self.stage_count = stage_index, stage_count
         self.hidden_size = config.hidden_size
         self.chunk_record: ChunkRecord | None = None
@@ -604,12 +609,8 @@ class Qwen35MoeModel(nn.Module):
         if stage_index == stage_count - 1:
             self.norm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.lm_head = BF16Linear(config.hidden_size, config.vocab_size, bias=False)
-        sizes = pipeline_layer_sizes(config.num_hidden_layers, stage_count)
         self.layers = nn.ModuleDict(
-            {
-                str(i): self.decoder_layer_class(config, i)
-                for i in layer_partition(config.num_hidden_layers, stage_count, stage_index, sizes)
-            }
+            {str(i): self.decoder_layer_class(config, i) for i in indices}
         )
 
     def forward_posemb(
