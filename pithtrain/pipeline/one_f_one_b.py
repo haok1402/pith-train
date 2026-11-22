@@ -15,9 +15,10 @@ from pithtrain.pipeline.dualpipev import Microbatch
 class OneForwardOneBackward(nn.Module):
     """One contiguous stage per rank, with FIFO activation lifetimes."""
 
-    def __init__(self, stage: nn.Module) -> None:
+    def __init__(self, stage: nn.Module, grad_sync_layers: tuple[FSDPModule, ...] = ()) -> None:
         super().__init__()
         self.module = nn.ModuleList([stage])
+        self.grad_sync_layers = grad_sync_layers
         self.hidden_size = stage.hidden_size
         self.rank = distributed.pp_rank
         self.objective_pp_rank = distributed.pp_size - 1
@@ -76,6 +77,9 @@ class OneForwardOneBackward(nn.Module):
             fsdp.set_requires_gradient_sync(False)
             fsdp.set_reshard_after_backward(False)
             fsdp.set_is_last_backward(False)
+            # Selected layers accumulate sharded gradients while keeping BF16 weights resident.
+            for layer in self.grad_sync_layers:
+                layer.set_requires_gradient_sync(True, recurse=False)
         FP8WeightCacheControl.step()
 
         outputs = []

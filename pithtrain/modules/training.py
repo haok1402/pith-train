@@ -229,6 +229,9 @@ class TrainingCfg(SlottedDefault):
     pipeline_recompute_mlp: bool | tuple[int, ...] = False
     """Checkpoint SwiGLU in every 1F1B decoder layer or in the given global layer indices."""
 
+    pipeline_grad_sync_layers: tuple[int, ...] = ()
+    """Reduce gradients for these 1F1B decoder layers after each microbatch."""
+
     fp8: bool = False
     """
     Train the linear layers in FP8 through DeepGEMM with 128-element block scaling; False is BF16.
@@ -417,6 +420,11 @@ def setup_model(
             raise ValueError("1f1b requires dense Qwen3.5 with expert_parallel_size=1")
         if cfg.pipeline_compile not in ("layer", "attention", "eager"):
             raise ValueError(f"Unknown pipeline_compile: {cfg.pipeline_compile!r}")
+        if any(
+            not 0 <= index < module_config.num_hidden_layers
+            for index in cfg.pipeline_grad_sync_layers
+        ):
+            raise ValueError(f"Invalid pipeline_grad_sync_layers: {cfg.pipeline_grad_sync_layers}")
         modules = nn.Sequential(
             Qwen35DenseStage(
                 module_config,
@@ -430,10 +438,9 @@ def setup_model(
             cfg.pipeline_layer_counts is not None
             or cfg.pipeline_compile != "layer"
             or cfg.pipeline_recompute_mlp
+            or cfg.pipeline_grad_sync_layers
         ):
-            raise ValueError(
-                "pipeline_layer_counts, pipeline_compile and pipeline_recompute_mlp require 1f1b"
-            )
+            raise ValueError("Dense pipeline tuning options require 1f1b")
         modules = nn.Sequential(
             ModelClass(module_config, phase=0), ModelClass(module_config, phase=1)
         )
@@ -481,9 +488,14 @@ def setup_model(
                 layer = int(name.split("layers.")[1].split(".")[0])
                 module.router_replay = imbalance.replay(module.num_experts, layer)
 
-    training.model = (
-        OneForwardOneBackward(modules[0]) if cfg.pipeline_schedule == "1f1b" else DualPipeV(modules)
-    )
+    if cfg.pipeline_schedule == "1f1b":
+        stage = modules[0]
+        grad_sync_layers = tuple(
+            layer for layer in stage.layers.values() if layer.idx in cfg.pipeline_grad_sync_layers
+        )
+        training.model = OneForwardOneBackward(stage, grad_sync_layers)
+    else:
+        training.model = DualPipeV(modules)
 
 
 offloaded_state: list[tuple[torch.UntypedStorage, torch.Tensor]] = []

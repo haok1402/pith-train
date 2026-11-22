@@ -21,6 +21,7 @@ def main() -> None:
     recompute = parser.add_mutually_exclusive_group()
     recompute.add_argument("--recompute-mlp", action="store_true")
     recompute.add_argument("--recompute-mlp-layers", type=int, nargs="+")
+    parser.add_argument("--grad-sync-layers", type=int, nargs="+", default=())
     parser.add_argument("--batch", type=int, default=256)
     parser.add_argument("--micro-batch", type=int, default=1)
     parser.add_argument("--steps", type=int, default=8)
@@ -49,6 +50,7 @@ def main() -> None:
     training.pipeline_recompute_mlp = (
         tuple(args.recompute_mlp_layers) if args.recompute_mlp_layers else args.recompute_mlp
     )
+    training.pipeline_grad_sync_layers = tuple(args.grad_sync_layers)
     training.optimizer = make_muon_optimizer if args.optimizer == "muon" else make_adamw_optimizer
     training.scheduler = partial(
         make_wsd_scheduler, start_lr=1e-5, warmup_ratio=0.03, final_lr=1e-5
