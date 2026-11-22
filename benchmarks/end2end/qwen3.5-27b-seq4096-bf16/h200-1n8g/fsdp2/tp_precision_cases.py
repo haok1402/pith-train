@@ -58,6 +58,9 @@ COMPILED_DECAY_CASES = (
     "gqa-k-out32-compiled",
     "mlp-gate-out32-compiled",
     "gqa-k-mlp-gate-out32-compiled",
+    "residual-round-compiled",
+    "residual-round-stock-loss-compiled",
+    "residual-round-out32-compiled",
 )
 
 
@@ -90,6 +93,12 @@ class DecayProbeTP(dense_tp.DenseTP):
             return super().delta_decay(delta, a)
         return -decay.exp() * F.softplus(a.float() + bias)
 
+    def attention(self, layer, hidden, rotary):
+        residual = super().attention(layer, hidden, rotary)
+        if self.case.startswith("residual-round-"):
+            return materialize(residual)
+        return residual
+
     def delta_project(self, delta, x):
         if self.case not in ("fp32-gate-compiled", "fp32-decay-combined-compiled"):
             return super().delta_project(delta, x)
@@ -113,9 +122,17 @@ class DecayProbeTP(dense_tp.DenseTP):
         selected = (False,) * count
         if count == 4 and self.case == "qkv-out32-compiled":
             selected = (True, False, False, False)
-        if count == 3 and self.case in ("gqa-k-out32-compiled", "gqa-k-mlp-gate-out32-compiled"):
+        if count == 3 and self.case in (
+            "gqa-k-out32-compiled",
+            "gqa-k-mlp-gate-out32-compiled",
+            "residual-round-out32-compiled",
+        ):
             selected = (False, True, False)
-        if count == 2 and self.case in ("mlp-gate-out32-compiled", "gqa-k-mlp-gate-out32-compiled"):
+        if count == 2 and self.case in (
+            "mlp-gate-out32-compiled",
+            "gqa-k-mlp-gate-out32-compiled",
+            "residual-round-out32-compiled",
+        ):
             selected = (True, False)
         split = (
             self.case == "separate-dgrad-compiled"
@@ -140,7 +157,11 @@ class DecayProbeTP(dense_tp.DenseTP):
         )
 
     def loss(self, logits, labels):
-        if self.case in ("stock-loss-compiled", "qk-fp32-silu-rounded-loss-compiled"):
+        if self.case in (
+            "stock-loss-compiled",
+            "qk-fp32-silu-rounded-loss-compiled",
+            "residual-round-stock-loss-compiled",
+        ):
             return StockLoss.apply(logits, labels.flatten(), self.size, self.name, self.rank)
         return super().loss(logits, labels)
 
