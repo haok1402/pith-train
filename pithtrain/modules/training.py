@@ -595,17 +595,16 @@ def setup_model(
         split_mlp_shard_layers=split_mlp_shard_layers,
     )
     if grad_buffers is not None:
+        decoder_layers = {layer for stage in modules for layer in stage.layers.values()}
         output_modules = (
-            {
-                layer
-                for stage in modules
-                for layer in stage.layers.values()
-                if layer.idx in output_layers
-            }
+            {layer for layer in decoder_layers if layer.idx in output_layers}
             if output_layers
             else None
         )
-        preallocate_reduce_scatter(modules, distributed.device, grad_buffers, output_modules)
+        decoder_modules = {child for layer in decoder_layers for child in layer.modules()}
+        preallocate_reduce_scatter(
+            modules, distributed.device, grad_buffers, decoder_modules, output_modules
+        )
     install_wgrad_accumulation(modules)
     install_raw_main_grad(modules)  # gpt-oss raw expert weights; no-op elsewhere
     install_side_grads(modules)  # after the main_grad installs: its post_backward runs first

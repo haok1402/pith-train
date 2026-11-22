@@ -122,6 +122,7 @@ def preallocate_reduce_scatter(
     model: nn.Module,
     device: torch.device,
     mode: str,
+    decoder_modules: set[nn.Module],
     output_modules: set[nn.Module] | None = None,
 ) -> None:
     groups = []
@@ -147,8 +148,13 @@ def preallocate_reduce_scatter(
     arena = torch.empty(arena_size, dtype=torch.float32, device=device) if arena_size else None
     scratch = None
     if mode in ("input", "both"):
-        capacity = max(size for _, _, size in groups) * 2
-        scratch = ReduceScatterInput(torch.empty(capacity, dtype=torch.float32, device=device))
+        # A head-sized buffer would keep another 4.74 GiB live during backward.
+        # Keep the steady decoder workspace and allocate larger edge inputs as needed.
+        capacity = 2 * max(
+            (size for module, _, size in groups if module in decoder_modules), default=0
+        )
+        if capacity:
+            scratch = ReduceScatterInput(torch.empty(capacity, dtype=torch.float32, device=device))
 
     offset = 0
     for (module, group, size), aligned in zip(groups, aligned_sizes, strict=True):
