@@ -59,6 +59,10 @@ COMPILED_DECAY_CASES = (
     "qk-fp32-silu-compiled",
     "qk-fp32-silu-rounded-loss-compiled",
     "delta-stock-checkpoint-compiled",
+    "qkv-out32-compiled",
+    "gqa-k-out32-compiled",
+    "mlp-gate-out32-compiled",
+    "gqa-k-mlp-gate-out32-compiled",
 )
 
 
@@ -114,6 +118,7 @@ class DecayProbeTP(dense_tp.DenseTP):
             (False, False, False, True),
             False,
             True,
+            False,
             (delta.in_proj_qkv.main_grad, delta.in_proj_z.main_grad, None, None),
             delta.in_proj_qkv.weight,
             delta.in_proj_z.weight,
@@ -123,6 +128,13 @@ class DecayProbeTP(dense_tp.DenseTP):
 
     def columns(self, x, *modules):
         count = len(modules)
+        selected = (False,) * count
+        if count == 4 and self.case == "qkv-out32-compiled":
+            selected = (True, False, False, False)
+        if count == 3 and self.case in ("gqa-k-out32-compiled", "gqa-k-mlp-gate-out32-compiled"):
+            selected = (False, True, False)
+        if count == 2 and self.case in ("mlp-gate-out32-compiled", "gqa-k-mlp-gate-out32-compiled"):
+            selected = (True, False)
         split = (
             self.case == "separate-dgrad-compiled"
             and count > 1
@@ -131,15 +143,16 @@ class DecayProbeTP(dense_tp.DenseTP):
             or self.case == "gqa-dgrad-compiled"
             and count == 3
         )
-        if not split:
+        if not split and not any(selected):
             return super().columns(x, *modules)
         return ProbeColumns.apply(
             x,
             self.size,
             self.name,
-            (False,) * count,
-            True,
+            selected,
+            split,
             False,
+            True,
             tuple(getattr(module, "main_grad", None) for module in modules),
             *(module.weight for module in modules),
         )
@@ -258,6 +271,7 @@ class PrecisionTP(dense_tp.DenseTP):
             selected,
             split_dgrad,
             fp32_decay,
+            False,
             tuple(getattr(module, "main_grad", None) for module in modules),
             *(module.weight for module in modules),
         )
@@ -315,13 +329,18 @@ class ProbeRow(torch.autograd.Function):
 
 class ProbeColumns(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, size, name, selected, split_dgrad, fp32_decay, main_grads, *weights):
+    def forward(ctx, x, size, name, selected, split_dgrad, fp32_decay, out32, main_grads, *weights):
         gathered = dense_tp._gather(x, size, name)
         ctx.save_for_backward(gathered, *weights)
         ctx.size, ctx.name, ctx.selected = size, name, selected
         ctx.split_dgrad, ctx.main_grads = split_dgrad, main_grads
+        ctx.out32 = out32
         return tuple(
-            (gathered.float() @ weight.float().t()).to(torch.float32 if fp32_decay else x.dtype)
+            (
+                dense_tp._mm_fp32(gathered, weight.t())
+                if out32
+                else gathered.float() @ weight.float().t()
+            ).to(torch.float32 if fp32_decay else x.dtype)
             if precise
             else F.linear(gathered, weight)
             for precise, weight in zip(selected, weights, strict=True)
@@ -332,7 +351,9 @@ class ProbeColumns(torch.autograd.Function):
         x, *weights = ctx.saved_tensors
         grads = tuple(grad.contiguous() for grad in grads)
         partials = [
-            grad.float() @ weight.float() if precise else dense_tp._mm_fp32(grad, weight)
+            grad.float() @ weight.float()
+            if precise and not ctx.out32
+            else dense_tp._mm_fp32(grad, weight)
             for precise, grad, weight in zip(ctx.selected, grads, weights, strict=True)
         ]
         if ctx.split_dgrad:
@@ -352,7 +373,7 @@ class ProbeColumns(torch.autograd.Function):
             else dense_tp._weight_grad(mg, grad, x)
             for mg, grad in zip(ctx.main_grads, grads, strict=True)
         )
-        return dx, None, None, None, None, None, None, *dw
+        return dx, None, None, None, None, None, None, None, *dw
 
 
 def gather_column_rows(x, spans, size, name):
