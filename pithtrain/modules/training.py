@@ -249,6 +249,9 @@ class TrainingCfg(SlottedDefault):
     pipeline_zb_h1_weight_delays: tuple[int, ...] | None = None
     """Number of later input backwards to run before each weight backward, per rank."""
 
+    pipeline_zb_h1_forward_warmups: tuple[int, ...] | None = None
+    """Number of extra forwards before the first alternating forward/backward, per rank."""
+
     pipeline_compute_stream_grad_buffers: bool = False
     """Allocate FSDP reduction buffers on the model compute stream."""
 
@@ -451,6 +454,14 @@ def setup_model(
         or any(delay < 0 for delay in weight_delays)
     ):
         raise ValueError("ZB-H1 weight delays require one nonnegative value per pipeline rank")
+    forward_warmups = cfg.pipeline_zb_h1_forward_warmups
+    if forward_warmups is not None and (
+        schedule != "zb-h1"
+        or len(forward_warmups) != distributed.pp_size
+        or forward_warmups[-1] != 0
+        or any(left < right for left, right in zip(forward_warmups, forward_warmups[1:]))
+    ):
+        raise ValueError("ZB-H1 forward warmups require a nonincreasing value per rank ending at zero")
     if schedule in ("1f1b", "interleaved", "zb-h1", "zbv"):
         if ModelClass is not Qwen35Model or distributed.ep_size != 1:
             raise ValueError("Dense pipeline schedules require Qwen3.5 with expert_parallel_size=1")
@@ -571,7 +582,11 @@ def setup_model(
         training.model = OneForwardOneBackward(modules[0], grad_sync_layers)
     else:
         training.model = ScheduledDensePipeline(
-            schedule, modules, grad_sync_layers, weight_delays=weight_delays
+            schedule,
+            modules,
+            grad_sync_layers,
+            weight_delays=weight_delays,
+            forward_warmups=forward_warmups,
         )
 
 

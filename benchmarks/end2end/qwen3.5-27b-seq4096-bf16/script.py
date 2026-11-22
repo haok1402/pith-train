@@ -31,6 +31,7 @@ def main() -> None:
     replay.add_argument("--recompute-mlp-product-only", action="store_true")
     parser.add_argument("--grad-sync-layers", type=int, nargs="+", default=())
     parser.add_argument("--zb-h1-weight-delays", type=int, nargs="+")
+    parser.add_argument("--zb-h1-forward-warmups", type=int, nargs="+")
     parser.add_argument("--compute-stream-grad-buffers", action="store_true")
     parser.add_argument("--compact-embedding-grad", action="store_true")
     parser.add_argument("--batch", type=int, default=256)
@@ -81,6 +82,9 @@ def main() -> None:
     training.pipeline_grad_sync_layers = tuple(args.grad_sync_layers)
     training.pipeline_zb_h1_weight_delays = (
         tuple(args.zb_h1_weight_delays) if args.zb_h1_weight_delays is not None else None
+    )
+    training.pipeline_zb_h1_forward_warmups = (
+        tuple(args.zb_h1_forward_warmups) if args.zb_h1_forward_warmups is not None else None
     )
     training.pipeline_compute_stream_grad_buffers = args.compute_stream_grad_buffers
     training.pipeline_compact_embedding_grad = args.compact_embedding_grad

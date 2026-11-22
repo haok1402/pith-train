@@ -90,6 +90,7 @@ def dense_pipeline_actions(
     batches: int,
     train: bool,
     weight_delays: tuple[int, ...] | None = None,
+    forward_warmups: tuple[int, ...] | None = None,
 ) -> dict[int, list[_Action]]:
     stage_count = pp_size * chunks
 
@@ -108,13 +109,17 @@ def dense_pipeline_actions(
         group_size = batches // rounds
         actions = {}
         for rank in range(pp_size):
-            warmup = _get_warmup_ops(
-                rank,
-                chunks,
-                group_size,
-                pp_size,
-                batches,
-                multiply_factor=1 if split_backward else 2,
+            warmup = (
+                min(batches, forward_warmups[rank])
+                if forward_warmups is not None
+                else _get_warmup_ops(
+                    rank,
+                    chunks,
+                    group_size,
+                    pp_size,
+                    batches,
+                    multiply_factor=1 if split_backward else 2,
+                )
             )
             actions[rank] = _get_1f1b_rank_ops(
                 chunks,
@@ -154,6 +159,7 @@ class ScheduledDensePipeline(nn.Module):
         grad_sync_layers: tuple[FSDPModule, ...] = (),
         *,
         weight_delays: tuple[int, ...] | None = None,
+        forward_warmups: tuple[int, ...] | None = None,
     ) -> None:
         super().__init__()
         self.schedule = schedule
@@ -162,6 +168,7 @@ class ScheduledDensePipeline(nn.Module):
         self.stages = {stage.stage_index: stage for stage in stages}
         self.grad_sync_layers = grad_sync_layers
         self.weight_delays = weight_delays
+        self.forward_warmups = forward_warmups
         self.hidden_size = stages[0].hidden_size
         self.pp_size = distributed.pp_size
         self.pp_rank = distributed.pp_rank
@@ -201,7 +208,13 @@ class ScheduledDensePipeline(nn.Module):
 
         train = torch.is_grad_enabled()
         actions = dense_pipeline_actions(
-            self.schedule, self.pp_size, len(self.module), len(microbatches), train, self.weight_delays
+            self.schedule,
+            self.pp_size,
+            len(self.module),
+            len(microbatches),
+            train,
+            self.weight_delays,
+            self.forward_warmups,
         )[self.pp_rank]
         if train:
             for stage in self.module:
