@@ -192,10 +192,14 @@ class WyRepresentation:
         s_inverse = smem.allocate_tensor(Float32, fp32_layout, 1024)  # holds k first
         s_v_region = smem.allocate_tensor(Float32, cute.make_layout(BT * TF32_STRIDE), 1024)
         s_l = smem.allocate_tensor(Float32, fp32_layout, 1024)  # holds k again after the inverse
-        s_gcum, s_beta, s_a = smem.allocate_tensor(Float32, cute.make_layout(BT), 16), smem.allocate_tensor(Float32, cute.make_layout(BT), 16), smem.allocate_tensor(BFloat16, a_layout, 1024)
+        s_gcum, s_beta = smem.allocate_tensor(Float32, cute.make_layout(BT), 16), smem.allocate_tensor(Float32, cute.make_layout(BT), 16)
+        if const_expr(mP is not None):
+            s_a = cute.make_tensor(cute.recast_ptr(s_inverse.iterator, dtype=BFloat16), a_layout)
+        else:
+            s_a = smem.allocate_tensor(BFloat16, a_layout, 1024)
         s_k, s_k_again, s_v = cute.make_tensor(cute.recast_ptr(s_inverse.iterator, dtype=BFloat16), chunk_layout), cute.make_tensor(cute.recast_ptr(s_l.iterator, dtype=BFloat16), chunk_layout), cute.make_tensor(cute.recast_ptr(s_v_region.iterator, dtype=BFloat16), chunk_layout)
         load, store_128, store_64 = chunk_copies(WY_THREADS, tidx)
-        ld_A, ld_B, _, ldt_B, st_C, _, _ = operand_copies(mma_bf16, tidx)
+        ld_A, ld_B, _, ldt_B, _, _, _ = operand_copies(mma_bf16, tidx)
         thr = mma_bf16.get_slice(tidx)
         gK, gV, gA = cute.local_tile(mK[None, key_head_idx, None], (BT, HEAD_DIM), (chunk_idx, 0)), cute.local_tile(mV[None, head_idx, None], (BT, HEAD_DIM), (chunk_idx, 0)), cute.local_tile(mA[None, head_idx, None], (BT, BT), (chunk_idx, 0))
 
@@ -220,9 +224,8 @@ class WyRepresentation:
             # Q occupies the V region until the score MMA has consumed it.
             cute.arch.cp_async_wait_group(0)
             cute.arch.barrier()
-            r_p = causal_scores(mma_bf16, thr, ld_A, ld_B, s_v, s_k, s_gcum)
             s_p = cute.make_tensor(cute.recast_ptr(s_l.iterator, dtype=BFloat16), a_layout)
-            cute.copy(st_C, st_C.retile(r_p), st_C.partition_D(s_p))
+            self.triangular_product(s_v, s_k, s_p, s_gcum, s_beta, tidx, True)
             cute.arch.barrier()
             cute.copy(load, load.partition_S(gV), load.partition_D(s_v))
             cute.arch.cp_async_commit_group()
@@ -233,10 +236,14 @@ class WyRepresentation:
         else:
             cute.arch.cp_async_wait_group(1)
             cute.arch.barrier()
-        self.compute_l(mma_bf16, thr, ld_A, ld_B, s_k, s_l, s_gcum, s_beta)
+        if const_expr(mP is not None):
+            self.triangular_product(s_k, s_k, s_l, s_gcum, s_beta, tidx, False)
+            cute.arch.barrier()
+        else:
+            self.compute_l(mma_bf16, thr, ld_A, ld_B, s_k, s_l, s_gcum, s_beta)
         self.invert_diagonal_blocks(s_l, s_inverse, tidx)
         self.merge_blocks(mma_tf32, s_l, s_inverse, tidx)
-        self.convert_inverse(s_inverse, s_a, tidx)
+        self.convert_inverse(s_inverse, s_a, tidx, mP is not None)
         # k again from L2 into L's buffer, which the inverse no longer reads
         if const_expr(self.ragged):
             copy_rows(load, load.partition_S(gK), load.partition_D(s_k_again), rows_128, valid, True)
@@ -295,6 +302,40 @@ class WyRepresentation:
             else:
                 mGcum[row, head_idx], mGcum[row + 32, head_idx] = cum_first, cum_second
                 s_beta[tidx], s_beta[tidx + 32] = Float32(mBeta[row, head_idx]), Float32(mBeta[row + 32, head_idx])
+
+    @cute.jit
+    def triangular_product(self, s_left, s_k, s_dst, s_gcum, s_beta, tidx, score: cutlass.Constexpr[bool]):
+        mma = cute.make_tiled_mma(warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)), (1, 1, 1), permutation_mnk=(16, 16, 16))
+        warp_idx, lane = tidx // 32, tidx % 32
+        thr = mma.get_slice(lane)
+        ld_A, ld_B, _, _, _, _, _ = operand_copies(mma, lane)
+        for wave in cutlass.range_constexpr(3):
+            # Each wave assigns distinct 16x16 tiles to the participating warps.
+            if const_expr(wave == 0):
+                row_tile, col_tile = warp_idx, warp_idx
+            elif const_expr(wave == 1):
+                row_tile = warp_idx + 1 - warp_idx // 3
+                col_tile = warp_idx // 3
+            else:
+                row_tile, col_tile = warp_idx + 2, warp_idx + 1
+            if wave < 2 or warp_idx < 2:
+                left = cute.local_tile(s_left, (16, HEAD_DIM), (row_tile, 0))
+                right = cute.local_tile(s_k, (16, HEAD_DIM), (col_tile, 0))
+                acc = cute.make_rmem_tensor(thr.partition_shape_C((16, 16)), Float32)
+                acc.fill(0.0)
+                gemm(mma, acc, thr.make_fragment_A(thr.partition_A(left)), thr.make_fragment_B(thr.partition_B(right)), ld_A.partition_S(left), ld_B.partition_S(right), ld_A, ld_B)
+                coords = thr.partition_C(cute.make_identity_tensor((16, 16)))
+                for elem in cutlass.range_constexpr(cute.size(acc)):
+                    row, col = row_tile * 16 + coords[elem][0], col_tile * 16 + coords[elem][1]
+                    value = Float32(0.0)
+                    if const_expr(wave != 0) or row >= col + (0 if const_expr(score) else 1):
+                        value = acc[elem] * cute.math.exp2(s_gcum[row] - s_gcum[col], fastmath=True)
+                        if const_expr(not score):
+                            value = value * s_beta[row]
+                    # Keep the original swizzle origin for dynamically assigned tiles.
+                    s_dst[row, col] = value.to(s_dst.element_type)
+                    if const_expr(wave != 0):
+                        s_dst[col, row] = s_dst.element_type(0.0)
 
     @cute.jit
     def compute_l(self, mma: cute.TiledMma, thr: cute.ThrMma, ld_A: cute.TiledCopy, ld_B: cute.TiledCopy, s_k: cute.Tensor, s_l: cute.Tensor, s_gcum: cute.Tensor, s_beta: cute.Tensor):
@@ -376,11 +417,28 @@ class WyRepresentation:
             cute.arch.barrier()
 
     @cute.jit
-    def convert_inverse(self, s_inverse: cute.Tensor, s_a: cute.Tensor, tidx):
+    def convert_inverse(self, s_inverse: cute.Tensor, s_a: cute.Tensor, tidx, in_place: cutlass.Constexpr[bool]):
         """
         A = bf16(X), zero above the diagonal blocks (which the merge never writes).
         """
-        for i in cutlass.range_constexpr(BT * BT // WY_THREADS):
+        elements = BT * BT // WY_THREADS
+        first_half = elements // 2 if const_expr(in_place) else 0
+        if const_expr(in_place):
+            packed = cute.make_rmem_tensor(cute.make_layout(first_half), BFloat16)
+            for i in cutlass.range_constexpr(first_half):
+                elem_idx = i * WY_THREADS + tidx
+                row, col = elem_idx // BT, elem_idx % BT
+                value = Float32(0.0)
+                if row // 16 >= col // 16:
+                    value = s_inverse[row, col]
+                packed[i] = BFloat16(value)
+            # The entire BF16 tile ends before FP32 row 32. Only the first
+            # half of the inverse must be read before the first BF16 store.
+            cute.arch.barrier()
+            for i in cutlass.range_constexpr(first_half):
+                elem_idx = i * WY_THREADS + tidx
+                s_a[elem_idx // BT, elem_idx % BT] = packed[i]
+        for i in cutlass.range_constexpr(first_half, elements):
             elem_idx = i * WY_THREADS + tidx
             row, col = elem_idx // BT, elem_idx % BT
             value = Float32(0.0)
