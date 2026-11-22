@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal, Optional
@@ -55,6 +56,7 @@ __all__ = [
     "init_weights",
     "apply_fsdp",
     "setup_model",
+    "offload_adamw_moments",
     "offload_training_state",
     "reload_training_state",
     "setup_training",
@@ -235,6 +237,9 @@ class TrainingCfg(SlottedDefault):
 
     pipeline_grad_sync_layers: tuple[int, ...] = ()
     """Reduce gradients for these 1F1B decoder layers after each microbatch."""
+
+    pipeline_offload_adamw_layers: tuple[int, ...] = ()
+    """Keep these decoder layers' AdamW moment shards on CPU during forward/backward."""
 
     pipeline_fuse_delta_gates: bool = False
     """Fuse the two BF16 DeltaNet gate projections in dense 1F1B."""
@@ -440,11 +445,10 @@ def setup_model(
             raise ValueError(f"{schedule} reduces gradients after the last weight backward")
         if cfg.pipeline_compile not in ("layer", "attention", "eager"):
             raise ValueError(f"Unknown pipeline_compile: {cfg.pipeline_compile!r}")
-        if any(
-            not 0 <= index < module_config.num_hidden_layers
-            for index in cfg.pipeline_grad_sync_layers
-        ):
-            raise ValueError(f"Invalid pipeline_grad_sync_layers: {cfg.pipeline_grad_sync_layers}")
+        for option in ("pipeline_grad_sync_layers", "pipeline_offload_adamw_layers"):
+            indices = getattr(cfg, option)
+            if any(not 0 <= index < module_config.num_hidden_layers for index in indices):
+                raise ValueError(f"Invalid {option}: {indices}")
         stage_count = chunks * distributed.pp_size
         local_stages = [
             Qwen35DenseStage(
@@ -468,6 +472,7 @@ def setup_model(
             or cfg.pipeline_compile != "layer"
             or cfg.pipeline_recompute_mlp
             or cfg.pipeline_grad_sync_layers
+            or cfg.pipeline_offload_adamw_layers
             or cfg.pipeline_fuse_delta_gates
         ):
             raise ValueError("Dense pipeline tuning options require a dense schedule")
@@ -551,6 +556,56 @@ def take_pinned_buffer(num_bytes: int) -> torch.Tensor:
 
 def storage_bytes(storage: torch.UntypedStorage) -> torch.Tensor:
     return torch.empty(0, dtype=torch.uint8, device=storage.device).set_(storage)
+
+
+@contextmanager
+def offload_adamw_moments(model: nn.Module, optimizers: tuple[Optimizer, ...], layers: tuple[int, ...]):
+    """Temporarily evict the selected FP32 moment shards while running a pipeline step."""
+    if not layers:
+        yield
+        return
+    (optimizer,) = optimizers
+    if not isinstance(optimizer, AdamW):
+        raise ValueError("Pipeline moment offload requires AdamW")
+    selected = set(layers)
+    storages = {}
+    for chunk in model.module:
+        for layer in chunk.layers.values():
+            if layer.idx not in selected:
+                continue
+            for parameter in layer.parameters():
+                state = optimizer.state.get(parameter)
+                if not state:
+                    continue
+                for name in ("exp_avg", "exp_avg_sq"):
+                    moment = state[name]
+                    if moment.dtype != torch.float32:
+                        raise RuntimeError(f"Expected an FP32 AdamW moment, got {moment.dtype}")
+                    local = moment.to_local() if isinstance(moment, DTensor) else moment
+                    storage = local.untyped_storage()
+                    if storage.size() > 0:
+                        storages.setdefault(storage.data_ptr(), storage)
+    if not storages:
+        yield
+        return
+    evicted = []
+    for storage in storages.values():
+        host = take_pinned_buffer(storage.size())
+        host.copy_(storage_bytes(storage), non_blocking=True)
+        evicted.append((storage, host))
+    stream = torch.cuda.current_stream()
+    stream.synchronize()
+    for storage, _ in evicted:
+        storage.resize_(0)
+    try:
+        yield
+    finally:
+        for storage, host in evicted:
+            storage.resize_(host.numel())
+            storage_bytes(storage).copy_(host, non_blocking=True)
+        stream.synchronize()
+        for _, host in evicted:
+            offload_buffer_pool[host.numel()].append(host)
 
 
 def training_state_storages() -> list[torch.UntypedStorage]:

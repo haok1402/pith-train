@@ -25,7 +25,7 @@ from pithtrain.modules.hf_loader import load_hf_into_model
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
 from pithtrain.modules.optimizer import clip_grad_norm, local_grads, scale_grads_
-from pithtrain.modules.training import TrainingCfg, setup_training
+from pithtrain.modules.training import TrainingCfg, offload_adamw_moments, setup_training
 from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.cross_entropy import cross_entropy
 from pithtrain.pipeline import Microbatch
@@ -169,7 +169,8 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     microbatches = get_global_batch(cfg, dataset, step, device)
 
     # One detached loss per micro-batch on the rank that owns the LM head.
-    objective_outputs = model.step(microbatches, objective)
+    with offload_adamw_moments(model, optimizers, cfg.training.pipeline_offload_adamw_layers):
+        objective_outputs = model.step(microbatches, objective)
 
     # Every pipeline rank holds the same labels, so all stages count the same total for the scale.
     counted = 0
