@@ -33,6 +33,7 @@ def main():
     parser.add_argument("--compute-stream-grad-buffers", action="store_true")
     parser.add_argument("--compact-embedding-grad", action="store_true")
     parser.add_argument("--virtual-layer-counts", type=int, nargs=4)
+    parser.add_argument("--microbatch-size", type=int, choices=(1, 2), default=2)
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     from pithtrain.contexts import distributed, logging, training
@@ -87,7 +88,7 @@ def main():
     weights = {name: param.detach() for name, param in oracle.named_parameters()}
     generator = torch.Generator(device=device).manual_seed(713)
     local_batches = 8
-    shape = (local_batches, distributed.dp_size, 2, seq)
+    shape = (local_batches, distributed.dp_size, args.microbatch_size, seq)
     tokens = torch.randint(32, shape, generator=generator, device=device)
     labels = torch.randint(config.vocab_size, shape, generator=generator, device=device)
     labels[..., -1] = -100
@@ -123,7 +124,8 @@ def main():
             ("dualpipev", "attention") if arm in controls else arm.rsplit("-", 1)
         )
         replay_up = schedule.endswith("-up")
-        schedule = schedule.removesuffix("-up")
+        replay_product = schedule.endswith("-product")
+        schedule = schedule.removesuffix("-up").removesuffix("-product")
         cfg.training.pipeline_schedule = schedule
         cfg.training.pipeline_virtual_stages = 2 if schedule in ("interleaved", "zbv") else 1
         cfg.training.pipeline_layer_counts = (
@@ -138,8 +140,9 @@ def main():
         cfg.training.pipeline_compact_embedding_grad = (
             args.compact_embedding_grad and arm not in controls
         )
-        cfg.training.pipeline_recompute_mlp = replay_up
+        cfg.training.pipeline_recompute_mlp = replay_up or replay_product
         cfg.training.pipeline_recompute_mlp_up_only = replay_up
+        cfg.training.pipeline_recompute_mlp_product_only = replay_product
         with torch.device(device):
             train.setup_model(cfg.training, cfg.distributed)
         model = training.model

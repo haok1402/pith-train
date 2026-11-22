@@ -26,7 +26,9 @@ def main() -> None:
     recompute = parser.add_mutually_exclusive_group()
     recompute.add_argument("--recompute-mlp", action="store_true")
     recompute.add_argument("--recompute-mlp-layers", type=int, nargs="+")
-    parser.add_argument("--recompute-mlp-up-only", action="store_true")
+    replay = parser.add_mutually_exclusive_group()
+    replay.add_argument("--recompute-mlp-up-only", action="store_true")
+    replay.add_argument("--recompute-mlp-product-only", action="store_true")
     parser.add_argument("--grad-sync-layers", type=int, nargs="+", default=())
     parser.add_argument("--compute-stream-grad-buffers", action="store_true")
     parser.add_argument("--compact-embedding-grad", action="store_true")
@@ -79,6 +81,7 @@ def main() -> None:
     training.pipeline_compute_stream_grad_buffers = args.compute_stream_grad_buffers
     training.pipeline_compact_embedding_grad = args.compact_embedding_grad
     training.pipeline_recompute_mlp_up_only = args.recompute_mlp_up_only
+    training.pipeline_recompute_mlp_product_only = args.recompute_mlp_product_only
     training.optimizer = make_muon_optimizer if args.optimizer == "muon" else make_adamw_optimizer
     training.scheduler = partial(
         make_wsd_scheduler, start_lr=1e-5, warmup_ratio=0.03, final_lr=1e-5

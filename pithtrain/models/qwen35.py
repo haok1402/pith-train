@@ -2,6 +2,7 @@
 
 import torch
 from torch import nn
+from torch.autograd.graph import saved_tensors_hooks
 from torch.utils.checkpoint import checkpoint
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
@@ -40,6 +41,22 @@ class Qwen35MLP(nn.Module):
         up = self.up_proj(x, quantized_x)
         return self.down_proj(silu_mul(gate, up))
 
+    def forward_with_product_replay(self, x: torch.Tensor) -> torch.Tensor:
+        gate, up = self.gate_proj(x), self.up_proj(x)
+        product = silu_mul(gate, up)
+        product_id = id(product)
+
+        def pack(tensor: torch.Tensor) -> torch.Tensor | None:
+            return None if id(tensor) == product_id else tensor.detach()
+
+        def unpack(saved: torch.Tensor | None) -> torch.Tensor:
+            # The SwiGLU backward already retains these two projection outputs.
+            with torch.no_grad():
+                return silu_mul(gate, up) if saved is None else saved
+
+        with saved_tensors_hooks(pack, unpack):
+            return self.down_proj(product)
+
 
 class Qwen35DecoderLayer(nn.Module):
     def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
@@ -57,6 +74,7 @@ class Qwen35DecoderLayer(nn.Module):
         self.compile_mode = "attention"
         self.recompute_mlp = False
         self.recompute_mlp_up_only = False
+        self.recompute_mlp_product_only = False
         self.input_layernorm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen35MoeRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -88,6 +106,8 @@ class Qwen35DecoderLayer(nn.Module):
 
     def forward_dense_mlp(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.recompute_mlp and torch.is_grad_enabled():
+            if self.recompute_mlp_product_only:
+                return self.mlp.forward_with_product_replay(hidden_states)
             if self.recompute_mlp_up_only:
                 gate = self.mlp.gate_proj(hidden_states)
                 return checkpoint(
@@ -147,6 +167,7 @@ class Qwen35DenseStage(Qwen35Model):
         stage_count: int | None = None,
         defer_wgrad: bool = False,
         recompute_mlp_up_only: bool = False,
+        recompute_mlp_product_only: bool = False,
         compact_embedding_grad: bool = False,
     ):
         nn.Module.__init__(self)
@@ -181,6 +202,7 @@ class Qwen35DenseStage(Qwen35Model):
                 layer.idx in recompute_mlp if isinstance(recompute_mlp, tuple) else recompute_mlp
             )
             layer.recompute_mlp_up_only = recompute_mlp_up_only
+            layer.recompute_mlp_product_only = recompute_mlp_product_only
         if defer_wgrad:
             # Keep queued GEMM operands in eager autograd; compiled attention owns its buffers.
             deferred = self.modules() if compile_mode == "eager" else (
