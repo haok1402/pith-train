@@ -61,6 +61,7 @@ COMPILED_DECAY_CASES = (
     "residual-round-compiled",
     "residual-round-stock-loss-compiled",
     "residual-round-out32-compiled",
+    "trace-decoder-compiled",
 )
 
 
@@ -98,6 +99,22 @@ class DecayProbeTP(dense_tp.DenseTP):
         if self.case.startswith("residual-round-"):
             return materialize(residual)
         return residual
+
+    def delta_attention(self, delta, x, batch, seq):
+        output = super().delta_attention(delta, x, batch, seq)
+        if self.case == "trace-decoder-compiled":
+            from tp_delta_trace import capture
+
+            return capture(output, self.case, "gdn_row", self.rank, self.size)
+        return output
+
+    def mlp(self, layer, x):
+        if self.case != "trace-decoder-compiled" or not layer.is_linear:
+            return super().mlp(layer, x)
+        from tp_delta_trace import capture
+
+        x = capture(x, self.case, "mlp_input", self.rank, self.size)
+        return capture(super().mlp(layer, x), self.case, "mlp_output", self.rank, self.size)
 
     def delta_project(self, delta, x):
         if self.case not in ("fp32-gate-compiled", "fp32-decay-combined-compiled"):

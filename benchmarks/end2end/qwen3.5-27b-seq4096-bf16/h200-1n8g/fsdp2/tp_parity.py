@@ -211,14 +211,18 @@ def main():
     if args.cases and "stock-adjoint-compiled" in args.cases:
         capture = record_block_adjoints(stock.layers[0], stock_adjoints)
     from tp_delta_trace import (
+        DECODER_TRACE_CASES,
         GQA_TRACE_CASES,
         TRACE_CASES,
         begin_microbatch,
         report,
         trace_attention,
+        trace_stock_decoder,
     )
 
     if args.cases and any(case in TRACE_CASES for case in args.cases):
+        if any(case in DECODER_TRACE_CASES for case in args.cases):
+            trace_stock_decoder(stock)
         trace_gqa = any(case in GQA_TRACE_CASES for case in args.cases)
         with trace_attention(qwen35_moe, "stock", include_gqa=trace_gqa):
             stock_loss = backward(stock, tokens, labels, dp, begin_microbatch=begin_microbatch)

@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 
 GQA_TRACE_CASES = ("trace-gqa-compiled", "restore-gqa-k-compiled", "restore-gqa-adjoint-compiled")
+DECODER_TRACE_CASES = ("trace-decoder-compiled",)
 TRACE_CASES = (
     "trace-gdn-compiled",
     "restore-gdn-adjoint-compiled",
@@ -16,8 +17,10 @@ TRACE_CASES = (
     "qk-fp32-silu-rounded-loss-compiled",
     "delta-stock-checkpoint-compiled",
     *GQA_TRACE_CASES,
+    *DECODER_TRACE_CASES,
 )
 PROJECTIONS = ("q", "k", "v", "decay", "beta")
+SEQUENCE_FIELDS = ("gdn_row", "mlp_input", "mlp_output")
 TENSORS = defaultdict(dict)
 MICROBATCH = 0
 
@@ -28,7 +31,8 @@ def begin_microbatch(index):
 
 
 def stock_shard(direction, name, rank, size):
-    return TENSORS["stock", direction, MICROBATCH][name].chunk(size, dim=2)[rank]
+    dim = 0 if name in SEQUENCE_FIELDS else 2
+    return TENSORS["stock", direction, MICROBATCH][name].chunk(size, dim=dim)[rank]
 
 
 @torch.library.custom_op("pithtrain::tp_audit_capture", mutates_args=())
@@ -105,6 +109,23 @@ def trace_attention(module, arm, rank=0, size=1, *, include_gqa=False):
     if include_gqa:
         target["flash_attn_func"] = trace_gqa(module.flash_attn_func, arm, rank, size)
     return patch.multiple(module, **target)
+
+
+def trace_stock_decoder(model):
+    layer = model.layers[0]
+    attn, mlp = layer.linear_attn.block, layer.mlp.forward
+
+    def attn_with_trace(*args):
+        x = attn(*args)
+        return capture(x.flatten(0, 1), "stock", "gdn_row", 0, 1).view_as(x)
+
+    def mlp_with_trace(x):
+        x = capture(x.flatten(0, 1), "stock", "mlp_input", 0, 1).view_as(x)
+        output = mlp(x)
+        return capture(output.flatten(0, 1), "stock", "mlp_output", 0, 1).view_as(output)
+
+    layer.linear_attn.block = attn_with_trace
+    layer.mlp.forward = mlp_with_trace
 
 
 def report(arm, rank, size, relative_error):
