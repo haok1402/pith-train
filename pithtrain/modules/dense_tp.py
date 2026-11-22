@@ -234,7 +234,10 @@ class DenseTP:
         hidden: torch.Tensor,
         rotary: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        return hidden + self.token_mixing(layer, hidden, rotary)
+        mixed = self.token_mixing(layer, hidden, rotary)
+        if hidden.dtype == torch.bfloat16:
+            return _residual_add(hidden, mixed)
+        return hidden + mixed
 
     def mlp(self, layer: Qwen35DecoderLayer, x: torch.Tensor) -> torch.Tensor:
         mlp = layer.mlp
@@ -282,6 +285,25 @@ def _gather(x: torch.Tensor, size: int, name: str) -> torch.Tensor:
 def _scatter_sum(x: torch.Tensor, size: int, name: str) -> torch.Tensor:
     output = torch.ops._c10d_functional.reduce_scatter_tensor(x.contiguous(), "sum", size, name)
     return torch.ops._c10d_functional.wait_tensor(output)
+
+
+@torch.library.custom_op("pithtrain::tp_residual_add", mutates_args=())
+def _residual_add(residual: torch.Tensor, mixed: torch.Tensor) -> torch.Tensor:
+    # Stock's attention stage feeds a BF16 residual to the post-attention norm.
+    # Keep that rounding point when Inductor compiles the whole TP block.
+    return residual + mixed
+
+
+@_residual_add.register_fake
+def _residual_add_fake(residual, mixed):
+    return torch.empty_like(residual)
+
+
+def _residual_add_backward(ctx, grad):
+    return grad, grad
+
+
+_residual_add.register_autograd(_residual_add_backward)
 
 
 def _mm_fp32(a, b):
