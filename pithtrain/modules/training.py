@@ -40,7 +40,7 @@ from pithtrain.modules.wgrad_accumulation import (
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
 from pithtrain.operators.linear import BF16Linear, FP8Linear
 from pithtrain.pipeline import DualPipeV
-from pithtrain.pipeline.interleaved import InterleavedPipeline
+from pithtrain.pipeline.dense_schedule import ScheduledDensePipeline, stage_to_rank
 from pithtrain.pipeline.one_f_one_b import OneForwardOneBackward
 
 from .distributed import DistributedCfg
@@ -218,17 +218,17 @@ class TrainingCfg(SlottedDefault):
     ignored) and replays MoE routing with a realistic expert-load imbalance (imbalance.SIGMA).
     """
 
-    pipeline_schedule: Literal["dualpipev", "1f1b", "interleaved"] = "dualpipev"
-    """Dense Qwen3.5 can also use contiguous or interleaved 1F1B."""
+    pipeline_schedule: Literal["dualpipev", "1f1b", "interleaved", "zb-h1", "zbv"] = "dualpipev"
+    """Dense Qwen3.5 can also use contiguous 1F1B, interleaved 1F1B, ZB-H1 or ZB-V."""
 
     pipeline_virtual_stages: int = 1
-    """Number of chunks per rank for interleaved 1F1B."""
+    """Chunks per rank. Interleaved accepts two or more, and ZB-V requires two."""
 
     pipeline_layer_counts: Optional[tuple[int, ...]] = None
     """Optional decoder layer count per stage, in forward order."""
 
     pipeline_compile: Literal["layer", "attention", "eager"] = "layer"
-    """For 1F1B, compile the whole decoder layer, just its attention and residual, or neither."""
+    """Compile the whole dense layer, its attention and residual, or neither."""
 
     pipeline_recompute_mlp: bool | tuple[int, ...] = False
     """Checkpoint SwiGLU in every 1F1B decoder layer or in the given global layer indices."""
@@ -422,14 +422,22 @@ def setup_model(
     else:
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")
 
-    if cfg.pipeline_schedule in ("1f1b", "interleaved"):
+    schedule = cfg.pipeline_schedule
+    if schedule in ("1f1b", "interleaved", "zb-h1", "zbv"):
         if ModelClass is not Qwen35Model or distributed.ep_size != 1:
             raise ValueError("Dense pipeline schedules require Qwen3.5 with expert_parallel_size=1")
         chunks = cfg.pipeline_virtual_stages
-        if cfg.pipeline_schedule == "1f1b" and chunks != 1:
-            raise ValueError("1f1b requires one stage per rank")
-        if cfg.pipeline_schedule == "interleaved" and (chunks < 2 or distributed.pp_size < 2):
+        if schedule in ("1f1b", "zb-h1") and chunks != 1:
+            raise ValueError(f"{schedule} requires one stage per rank")
+        if schedule == "interleaved" and (chunks < 2 or distributed.pp_size < 2):
             raise ValueError("interleaved requires at least two chunks and two pipeline ranks")
+        if schedule == "zbv" and (chunks != 2 or distributed.pp_size < 2):
+            raise ValueError("zbv requires two chunks and at least two pipeline ranks")
+        split_backward = schedule in ("zb-h1", "zbv")
+        if split_backward and (cfg.fp8 or cfg.pipeline_compile == "layer"):
+            raise ValueError(f"{schedule} requires BF16 and attention or eager compilation")
+        if split_backward and cfg.pipeline_grad_sync_layers:
+            raise ValueError(f"{schedule} reduces gradients after the last weight backward")
         if cfg.pipeline_compile not in ("layer", "attention", "eager"):
             raise ValueError(f"Unknown pipeline_compile: {cfg.pipeline_compile!r}")
         if any(
@@ -437,6 +445,7 @@ def setup_model(
             for index in cfg.pipeline_grad_sync_layers
         ):
             raise ValueError(f"Invalid pipeline_grad_sync_layers: {cfg.pipeline_grad_sync_layers}")
+        stage_count = chunks * distributed.pp_size
         modules = nn.Sequential(
             Qwen35DenseStage(
                 module_config,
@@ -444,12 +453,14 @@ def setup_model(
                 cfg.pipeline_compile,
                 cfg.pipeline_recompute_mlp,
                 fuse_delta_gates=cfg.pipeline_fuse_delta_gates,
-                stage_index=chunk * distributed.pp_size + distributed.pp_rank,
-                stage_count=chunks * distributed.pp_size,
+                stage_index=stage_index,
+                stage_count=stage_count,
+                defer_wgrad=split_backward,
             )
-            for chunk in range(chunks)
+            for stage_index in range(stage_count)
+            if stage_to_rank(stage_index, distributed.pp_size, schedule) == distributed.pp_rank
         )
-    elif cfg.pipeline_schedule == "dualpipev":
+    elif schedule == "dualpipev":
         if (
             cfg.pipeline_layer_counts is not None
             or cfg.pipeline_virtual_stages != 1
@@ -503,7 +514,7 @@ def setup_model(
                 layer = int(name.split("layers.")[1].split(".")[0])
                 module.router_replay = imbalance.replay(module.num_experts, layer)
 
-    if cfg.pipeline_schedule == "dualpipev":
+    if schedule == "dualpipev":
         training.model = DualPipeV(modules)
         return
     grad_sync_layers = tuple(
@@ -512,10 +523,10 @@ def setup_model(
         for layer in stage.layers.values()
         if layer.idx in cfg.pipeline_grad_sync_layers
     )
-    if cfg.pipeline_schedule == "1f1b":
+    if schedule == "1f1b":
         training.model = OneForwardOneBackward(modules[0], grad_sync_layers)
     else:
-        training.model = InterleavedPipeline(modules, grad_sync_layers)
+        training.model = ScheduledDensePipeline(schedule, modules, grad_sync_layers)
 
 
 offloaded_state: list[tuple[torch.UntypedStorage, torch.Tensor]] = []

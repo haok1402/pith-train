@@ -2,6 +2,7 @@
 FP8Linear runs its GEMMs in FP8 E4M3 with one E8M0 scale per 128-element block.
 """
 
+from functools import partial
 from typing import Any, Optional, Tuple
 
 import torch
@@ -10,6 +11,7 @@ import torch.nn.functional as F
 from torch._inductor.lowering import fallback_handler, register_lowering
 
 from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
+from pithtrain.contexts.weight_grad_store import WeightGradStore
 from pithtrain.kernels import (
     act_scale_like,
     fp8_gemm_bwd,
@@ -266,13 +268,31 @@ class BF16LinearFunc(torch.autograd.Function):
     def backward(
         ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
     ) -> Tuple[torch.Tensor, None, None]:
+        return BF16LinearFunc._backward(ctx, grad_output, defer_wgrad=False)
+
+    @staticmethod
+    def _backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor, defer_wgrad: bool
+    ) -> Tuple[torch.Tensor, None, None]:
         input, weight = ctx.saved_tensors
         main_grad = ctx.main_grad
         grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
         input_2d = input.reshape(-1, input.shape[-1])
         grad_input = (grad_output_2d @ weight).view(*input.shape)
-        torch.ops.pithtrain.wgrad_accumulate_(main_grad, grad_output_2d.t(), input_2d)
+        wgrad = torch.ops.pithtrain.wgrad_accumulate_
+        if defer_wgrad:
+            WeightGradStore.put(partial(wgrad, main_grad, grad_output_2d.t(), input_2d))
+        else:
+            wgrad(main_grad, grad_output_2d.t(), input_2d)
         return grad_input, None, None
+
+
+class _DeferredBF16LinearFunc(BF16LinearFunc):
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
+    ) -> Tuple[torch.Tensor, None, None]:
+        return BF16LinearFunc._backward(ctx, grad_output, WeightGradStore.enabled)
 
 
 class BF16Linear(nn.Linear):
@@ -281,6 +301,7 @@ class BF16Linear(nn.Linear):
     """
 
     main_grad: Optional[torch.Tensor] = None
+    defer_wgrad: bool = False
 
     @staticmethod
     def quantize_input(x: torch.Tensor) -> None:
@@ -289,5 +310,6 @@ class BF16Linear(nn.Linear):
     def forward(self, input: torch.Tensor, quantized_input: None = None) -> torch.Tensor:
         if self.main_grad is None or not torch.is_grad_enabled():
             return F.linear(input, self.weight, self.bias)
-        output = BF16LinearFunc.apply(input, self.weight, self.main_grad)
+        function = _DeferredBF16LinearFunc if self.defer_wgrad else BF16LinearFunc
+        output = function.apply(input, self.weight, self.main_grad)
         return output if self.bias is None else output + self.bias

@@ -15,10 +15,14 @@ from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 def main() -> None:
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--pp", type=int, required=True)
-    parser.add_argument("--schedule", choices=("dualpipev", "1f1b", "interleaved"), default="dualpipev")
-    parser.add_argument("--virtual-stages", type=int, default=1)
+    parser.add_argument(
+        "--schedule",
+        choices=("dualpipev", "1f1b", "interleaved", "zb-h1", "zbv"),
+        default="dualpipev",
+    )
+    parser.add_argument("--virtual-stages", type=int)
     parser.add_argument("--layer-counts", type=int, nargs="+")
-    parser.add_argument("--compile-mode", choices=("layer", "attention", "eager"), default="layer")
+    parser.add_argument("--compile-mode", choices=("layer", "attention", "eager"))
     recompute = parser.add_mutually_exclusive_group()
     recompute.add_argument("--recompute-mlp", action="store_true")
     recompute.add_argument("--recompute-mlp-layers", type=int, nargs="+")
@@ -48,8 +52,12 @@ def main() -> None:
     training.hf_import_path = args.hf_import
     training.pipeline_schedule = args.schedule
     training.pipeline_virtual_stages = args.virtual_stages
+    if training.pipeline_virtual_stages is None:
+        training.pipeline_virtual_stages = 2 if args.schedule in ("interleaved", "zbv") else 1
     training.pipeline_layer_counts = tuple(args.layer_counts) if args.layer_counts else None
-    training.pipeline_compile = args.compile_mode
+    training.pipeline_compile = args.compile_mode or (
+        "attention" if args.schedule in ("zb-h1", "zbv") else "layer"
+    )
     training.pipeline_recompute_mlp = (
         tuple(args.recompute_mlp_layers) if args.recompute_mlp_layers else args.recompute_mlp
     )

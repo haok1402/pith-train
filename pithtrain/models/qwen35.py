@@ -15,6 +15,7 @@ from pithtrain.models.qwen35_moe import (
     Qwen35MoeRMSNorm,
 )
 from pithtrain.operators.cp_sequence import contiguous_to_zigzag, zigzag_to_contiguous
+from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.pipeline.dualpipev import layer_sizes
 
@@ -154,6 +155,7 @@ class Qwen35DenseStage(Qwen35Model):
         *,
         stage_index: int | None = None,
         stage_count: int | None = None,
+        defer_wgrad: bool = False,
     ):
         nn.Module.__init__(self)
         count = distributed.pp_size if stage_count is None else stage_count
@@ -184,6 +186,16 @@ class Qwen35DenseStage(Qwen35Model):
             )
             if layer.is_linear:
                 layer.linear_attn.fuse_gates = fuse_delta_gates
+        if defer_wgrad:
+            # Keep queued GEMM operands in eager autograd; compiled attention owns its buffers.
+            deferred = self.modules() if compile_mode == "eager" else (
+                module for layer in self.layers.values() for module in layer.mlp.modules()
+            )
+            for module in deferred:
+                if isinstance(module, BF16Linear):
+                    module.defer_wgrad = True
+            if self.lm_head is not None:
+                self.lm_head.defer_wgrad = True
 
     def forward(
         self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None

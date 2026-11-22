@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
     from pithtrain.operators import grouped_linear, linear
     from pithtrain.pipeline import DualPipeV
-    from pithtrain.pipeline.interleaved import InterleavedPipeline
+    from pithtrain.pipeline.dense_schedule import ScheduledDensePipeline
     from pithtrain.pipeline.one_f_one_b import OneForwardOneBackward
 
 __all__ = [
@@ -46,7 +46,7 @@ Linear: type[linear.BF16Linear | linear.FP8Linear]
 
 GroupedLinear: type[grouped_linear.GroupedLinear | grouped_linear.FP8GroupedLinear]
 
-model: DualPipeV | OneForwardOneBackward | InterleavedPipeline
+model: DualPipeV | OneForwardOneBackward | ScheduledDensePipeline
 
 optimizers: tuple[Optimizer, ...]
 """

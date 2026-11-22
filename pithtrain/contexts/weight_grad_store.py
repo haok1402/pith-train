@@ -30,9 +30,15 @@ class WeightGradStore:
         cls.cache.append(func)
 
     @classmethod
-    def flush(cls) -> None:
-        cls.funcs_queue.put(cls.cache)
+    def take(cls) -> List[Callable]:
+        """Detach the current group so a scheduler can run it by microbatch."""
+        funcs = cls.cache
         cls.cache = []
+        return funcs
+
+    @classmethod
+    def flush(cls) -> None:
+        cls.funcs_queue.put(cls.take())
 
     @classmethod
     def pop(cls) -> None:

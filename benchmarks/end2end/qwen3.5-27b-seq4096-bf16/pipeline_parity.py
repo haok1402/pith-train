@@ -90,9 +90,7 @@ def main():
     num_tokens = (labels != -100).sum()
     batches = [
         Microbatch(model_inputs=(x,), cu_seqlens=None, objective_inputs=(y,))
-        for x, y in zip(
-            tokens[:, distributed.dp_rank], labels[:, distributed.dp_rank], strict=True
-        )
+        for x, y in zip(tokens[:, distributed.dp_rank], labels[:, distributed.dp_rank], strict=True)
     ]
 
     fp32_reference = runpy.run_path(str(args.oracle))["fp32_reference"]
@@ -116,11 +114,9 @@ def main():
     contiguous_grads = {}
     records = []
     for arm in ["stock", *args.arms]:
-        schedule, compile_mode = (
-            ("dualpipev", "layer") if arm == "stock" else arm.rsplit("-", 1)
-        )
+        schedule, compile_mode = ("dualpipev", "layer") if arm == "stock" else arm.rsplit("-", 1)
         cfg.training.pipeline_schedule = schedule
-        cfg.training.pipeline_virtual_stages = 2 if schedule == "interleaved" else 1
+        cfg.training.pipeline_virtual_stages = 2 if schedule in ("interleaved", "zbv") else 1
         cfg.training.pipeline_compile = compile_mode
         with torch.device(device):
             train.setup_model(cfg.training, cfg.distributed)
@@ -157,7 +153,9 @@ def main():
             dist.all_gather_object(owners, tuple(gradients), group=group)
             for owner, names in enumerate(owners):
                 for name in names:
-                    tensor = gradients[name] if name in gradients else torch.empty_like(expected[name])
+                    tensor = (
+                        gradients[name] if name in gradients else torch.empty_like(expected[name])
+                    )
                     dist.broadcast(tensor, group=group, group_src=owner)
                     target[name] = tensor
         for name, gradient in gradients.items():
@@ -169,7 +167,9 @@ def main():
                         relative_error(gradient, expected[name]),
                         relative_error(stock_grads[name], expected[name]),
                         relative_error(gradient, stock_grads[name]),
-                        relative_error(gradient, contiguous_grads[name]) if contiguous_grads else None,
+                        relative_error(gradient, contiguous_grads[name])
+                        if contiguous_grads
+                        else None,
                     )
                 )
 
@@ -197,7 +197,9 @@ def main():
         records = sorted(row for rank_records in all_records for row in rank_records)
         with (args.output / "gradients.csv").open("w", newline="") as stream:
             writer = csv.writer(stream)
-            writer.writerow(("arm", "param", "vs_fp32", "stock_vs_fp32", "vs_stock", "vs_contiguous"))
+            writer.writerow(
+                ("arm", "param", "vs_fp32", "stock_vs_fp32", "vs_stock", "vs_contiguous")
+            )
             writer.writerows(records)
         for arm in dict.fromkeys(row[0] for row in records):
             rows = [row for row in records if row[0] == arm]
