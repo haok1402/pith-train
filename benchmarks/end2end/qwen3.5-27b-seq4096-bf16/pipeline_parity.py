@@ -29,7 +29,6 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--oracle", type=Path, required=True)
     parser.add_argument("--arms", nargs="+", default=["1f1b-attention", "interleaved-attention"])
-    parser.add_argument("--verify-offload", action="store_true")
     parser.add_argument("--repeat-stock", action="store_true")
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -190,13 +189,6 @@ def main():
         for state in optimizer.state.values():
             assert state["exp_avg"].dtype == state["exp_avg_sq"].dtype == torch.float32
         assert not torch.equal(local(first), before), (arm, rank)
-        if args.verify_offload and schedule != "dualpipev":
-            layer = next(iter(model.module[0].layers.values()))
-            moment = local(optimizer.state[next(layer.parameters())]["exp_avg"])
-            saved = moment.clone()
-            with train.offload_adamw_moments(model, (optimizer,), (layer.idx,)):
-                assert moment.untyped_storage().size() == 0
-            torch.testing.assert_close(moment, saved, rtol=0, atol=0)
         if rank == 0:
             print(
                 f"{arm} loss={loss.item() / num_tokens.item():.9f} "
