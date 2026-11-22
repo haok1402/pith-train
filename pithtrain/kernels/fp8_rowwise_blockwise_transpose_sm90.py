@@ -360,7 +360,7 @@ def compile_kernel(dtype: type, vec_k: int, vec_m: int, rows: int, full_tiles: b
 DISPATCH: dict[tuple, tuple] = {}
 
 
-def resolve(dtype: torch.dtype, M: int, K: int, x_row_stride: int, x_addr: int) -> tuple:
+def resolve(dtype: torch.dtype, M: int, K: int, x_row_stride: int, x_addr: int, unit_col_stride: bool) -> tuple:
     """
     Return (compiled kernel, or None for an empty input; ceil(K / 128); ceil(M / 128)).
     """
@@ -373,7 +373,7 @@ def resolve(dtype: torch.dtype, M: int, K: int, x_row_stride: int, x_addr: int) 
     vec_k = vector_width(x_addr // elem_bytes, vec_k)
     # All tiles take the full-width path for the aligned dense BF16 production workloads.
     full_tiles = dtype == torch.bfloat16 and M in (4096, 8192) and K in (5120, 6144, 17408) and x_row_stride == K and vec_k == 8
-    coalesced_kmajor = full_tiles and K in (5120, 6144)
+    coalesced_kmajor = unit_col_stride and full_tiles and K in (5120, 6144)
     rows = 4 if coalesced_kmajor or num_m_tiles * num_k_tiles <= SMALL_GRID_TILES else 8
     vec_m = vector_width(M, rows)
     key = (dtype, vec_k, vec_m, rows, full_tiles, coalesced_kmajor)
@@ -392,16 +392,17 @@ def fp8_quant_act_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, tor
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     M, K = x.shape
     x_row_stride, x_col_stride = x.stride()
-    if x_col_stride != 1:
+    unit_col_stride = x_col_stride == 1
+    if not unit_col_stride:
         # as_strided pins the unit inner stride that torch leaves arbitrary when K == 1.
         x = x.contiguous().as_strided((M, K), (K, 1))
         x_row_stride = K
     dtype = x.dtype
     # Host cost matters (hundreds of calls per step), so resolve once per key.
-    key = (dtype, M, K, x_row_stride, x.data_ptr() & 15)
+    key = (dtype, M, K, x_row_stride, x.data_ptr() & 15, unit_col_stride)
     entry = DISPATCH.get(key)
     if entry is None:
-        entry = DISPATCH[key] = resolve(dtype, M, K, x_row_stride, x.data_ptr())
+        entry = DISPATCH[key] = resolve(dtype, M, K, x_row_stride, x.data_ptr(), unit_col_stride)
     fn, num_k_tiles, num_m_tiles = entry
     device = x.device
     tok = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=device)
