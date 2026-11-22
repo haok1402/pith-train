@@ -26,12 +26,14 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--seq", type=int, default=4096)
     parser.add_argument("--optimizer", choices=("muon", "adamw"), default="muon")
+    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--model", type=Path)
     parser.add_argument("--hf-import", type=Path)
+    parser.add_argument("--dataset", type=Path, help="Directory of PithTrain token shards.")
     args = parser.parse_args()
 
     cfg = PretrainLMCfg()
-    cfg.dataset = Path(".")
+    cfg.dataset = args.dataset or Path(".")
     cfg.distributed.pipeline_parallel_size = args.pp
     cfg.distributed.context_parallel_size = 1
     cfg.distributed.expert_parallel_size = 1
@@ -49,12 +51,12 @@ def main() -> None:
     training.scheduler = partial(
         make_wsd_scheduler, start_lr=1e-5, warmup_ratio=0.03, final_lr=1e-5
     )
-    training.lr = 3e-4
+    training.lr = args.lr
     training.sequence_length = args.seq
     training.micro_batch_size = args.micro_batch
     training.global_batch_size = args.batch
     training.max_steps = args.steps
-    training.benchmark = True
+    training.benchmark = args.dataset is None
     training.fp8 = False
     launch(cfg)
 
