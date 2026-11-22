@@ -44,7 +44,7 @@ class OneForwardOneBackward(nn.Module):
 
         (tokens,) = receive_for.model_inputs
         incoming = torch.empty(
-            (*tokens.shape, self.hidden_size),
+            (*tokens.shape[:2], self.hidden_size),
             dtype=training.PARAM_DTYPE,
             device=distributed.device,
         )
