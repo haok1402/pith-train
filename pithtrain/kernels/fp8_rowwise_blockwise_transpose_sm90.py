@@ -123,8 +123,8 @@ class RowwiseBlockwiseTranspose:
     rows), chosen on the host so no vector straddles the edge.
     """
 
-    def __init__(self, dtype: type, vec_k: int, vec_m: int, rows: int = 8) -> None:
-        self.dtype, self.rows = dtype, rows
+    def __init__(self, dtype: type, vec_k: int, vec_m: int, rows: int, full_tiles: bool) -> None:
+        self.dtype, self.rows, self.full_tiles = dtype, rows, full_tiles
         self.threads, self.num_warps = 1024 // rows, 32 // rows
         self.kind = {cutlass.BFloat16: "bf16", cutlass.Float16: "f16", Float32: "f32"}[dtype]
         self.elem_bytes = dtype.width // 8
@@ -159,14 +159,15 @@ class RowwiseBlockwiseTranspose:
         VEC_K, elem_bytes = self.vec_k, self.elem_bytes
         x_row_stride = Int64(mX.stride[0])
         x_block = cute.make_rmem_tensor(cute.make_layout(16 * self.rows), self.dtype)
-        x_block.fill(0.0)
+        if cutlass.const_expr(not self.full_tiles):
+            x_block.fill(0.0)
         for i in cutlass.range_constexpr(self.rows):
             row = row0 + i
             for half in cutlass.range_constexpr(2):
                 for vec_idx in cutlass.range_constexpr(8 // VEC_K):
                     col = col0 + half * 64 + vec_idx * VEC_K
-                    if row < M:
-                        if col < K:
+                    if (row < M) | self.full_tiles:
+                        if (col < K) | self.full_tiles:
                             offset = Int64(row) * x_row_stride + Int64(col)
                             src = cute.make_tensor(global_ptr(mX.iterator, offset, elem_bytes, self.dtype, VEC_K * elem_bytes), cute.make_layout(VEC_K))
                             dst = cute.make_tensor(x_block.iterator + (i * 16 + half * 8 + vec_idx * VEC_K), cute.make_layout(VEC_K))
@@ -203,7 +204,7 @@ class RowwiseBlockwiseTranspose:
             row = row0 + i
             scale = e8m0_scale(row_amax[i])
             rcp = exact_rcp(scale)
-            if row < M:
+            if (row < M) | self.full_tiles:
                 if col_group_idx == i:
                     tok_scale_entry = cute.make_tensor(global_ptr(mTokScale.iterator, Int64(k_tile_idx) * tok_scale_stride + Int64(row), 4, Float32, 4), cute.make_layout(1))
                     tok_scale_entry[0] = scale
@@ -213,7 +214,7 @@ class RowwiseBlockwiseTranspose:
                         quant_words[quad] = self.quantize4(x_words, elem_idxs, rcp)
                     for vec_idx in cutlass.range_constexpr(8 // VEC_K):
                         col = col0 + half * 64 + vec_idx * VEC_K
-                        if col < K:
+                        if (col < K) | self.full_tiles:
                             dst = cute.make_tensor(global_ptr(mTok.iterator, Int64(row) * Int64(K) + Int64(col), 1, Uint8, VEC_K), cute.make_layout(VEC_K))
                             src = cute.make_tensor(quant_bytes.iterator + vec_idx * VEC_K, cute.make_layout(VEC_K))
                             cute.autovec_copy(src, dst)
@@ -254,16 +255,16 @@ class RowwiseBlockwiseTranspose:
         row0, col0, M, K = sub_block.row0, sub_block.col0, sub_block.M, sub_block.K
         VEC_M = self.vec_m
         quant_words = cute.recast_tensor(quant_bytes, Uint32)
-        if row0 < M:
+        if (row0 < M) | self.full_tiles:
             for half in cutlass.range_constexpr(2):
                 for col_in_half in cutlass.range_constexpr(8):
                     col = col0 + half * 64 + col_in_half
-                    if col < K:
+                    if (col < K) | self.full_tiles:
                         for quad in cutlass.range_constexpr(self.rows // 4):
                             quant_words[quad] = self.quantize4(x_words, [(4 * quad + k) * 16 + half * 8 + col_in_half for k in range(4)], tile_rcp)
                         for vec_idx in cutlass.range_constexpr(self.rows // VEC_M):
                             row = row0 + vec_idx * VEC_M
-                            if row < M:
+                            if (row < M) | self.full_tiles:
                                 offset = Int64(col) * Int64(M) + Int64(row)
                                 dst = cute.make_tensor(global_ptr(mBlkT.iterator, offset, 1, Uint8, VEC_M), cute.make_layout(VEC_M))
                                 src = cute.make_tensor(quant_bytes.iterator + vec_idx * VEC_M, cute.make_layout(VEC_M))
@@ -296,7 +297,7 @@ def vector_width(size: int, max_width: int) -> int:
     return width
 
 
-def compile_kernel(dtype: type, vec_k: int, vec_m: int, rows: int) -> Callable:
+def compile_kernel(dtype: type, vec_k: int, vec_m: int, rows: int, full_tiles: bool) -> Callable:
     m_sym, k_sym, num_k_tiles_sym, num_m_tiles_sym = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
     elem_bytes = dtype.width // 8
     make_fake = cute.runtime.make_fake_tensor
@@ -305,7 +306,7 @@ def compile_kernel(dtype: type, vec_k: int, vec_m: int, rows: int) -> Callable:
     tok_scale = make_fake(Float32, (m_sym, num_k_tiles_sym), stride=(1, cute.sym_int64()), assumed_align=16)
     blk_t = make_fake(cutlass.Float8E4M3FN, (k_sym, m_sym), stride=(m_sym, 1), assumed_align=16)
     blk_t_scale = make_fake(Float32, (num_k_tiles_sym, num_m_tiles_sym), stride=(num_m_tiles_sym, 1), assumed_align=16)
-    return cute.compile(RowwiseBlockwiseTranspose(dtype, vec_k, vec_m, rows), x, tok, tok_scale, blk_t, blk_t_scale, fake_stream(), options="--enable-tvm-ffi")
+    return cute.compile(RowwiseBlockwiseTranspose(dtype, vec_k, vec_m, rows, full_tiles), x, tok, tok_scale, blk_t, blk_t_scale, fake_stream(), options="--enable-tvm-ffi")
 
 
 DISPATCH: dict[tuple, tuple] = {}
@@ -326,10 +327,12 @@ def resolve(dtype: torch.dtype, M: int, K: int, x_row_stride: int, x_addr: int) 
     # is latency-bound, so split each tile over 256 threads x 4 rows.
     rows = 4 if num_m_tiles * num_k_tiles <= SMALL_GRID_TILES else 8
     vec_m = vector_width(M, rows)
-    key = (dtype, vec_k, vec_m, rows)
+    # All tiles take the full-width path for the aligned dense BF16 production workloads.
+    full_tiles = dtype == torch.bfloat16 and M in (4096, 8192) and K in (5120, 6144, 17408) and x_row_stride == K and vec_k == 8
+    key = (dtype, vec_k, vec_m, rows, full_tiles)
     fn = COMPILED.get(key)
     if fn is None:
-        fn = COMPILED[key] = compile_kernel(TORCH2CUTE[dtype], vec_k, vec_m, rows)
+        fn = COMPILED[key] = compile_kernel(TORCH2CUTE[dtype], vec_k, vec_m, rows, full_tiles)
     if len(DISPATCH) > 4096:
         DISPATCH.clear()
     return fn, num_k_tiles, num_m_tiles
