@@ -37,7 +37,6 @@ def main() -> None:
     parser.add_argument("--preallocate-grad-buffers", choices=("input", "output", "both"))
     parser.add_argument("--preallocate-grad-output-layers", type=int, nargs="+", default=())
     parser.add_argument("--split-mlp-shard-layers", type=int, nargs="+", default=())
-    parser.add_argument("--split-mlp-shard-projections", choices=("all", "down"), default="all")
     parser.add_argument("--preallocate-edge-wgrads", action="store_true")
     parser.add_argument("--compact-embedding-grad", action="store_true")
     parser.add_argument("--batch", type=int, default=256)
@@ -96,7 +95,6 @@ def main() -> None:
     training.pipeline_preallocate_grad_buffers = args.preallocate_grad_buffers
     training.pipeline_preallocate_grad_output_layers = tuple(args.preallocate_grad_output_layers)
     training.pipeline_split_mlp_shard_layers = tuple(args.split_mlp_shard_layers)
-    training.pipeline_split_mlp_shard_projections = args.split_mlp_shard_projections
     training.pipeline_preallocate_edge_wgrads = args.preallocate_edge_wgrads
     training.pipeline_compact_embedding_grad = args.compact_embedding_grad
     training.pipeline_recompute_mlp_up_only = args.recompute_mlp_up_only
