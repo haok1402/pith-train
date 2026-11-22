@@ -37,25 +37,21 @@ class OneForwardOneBackward(nn.Module):
     ) -> torch.Tensor | None:
         if peer is None:
             return None
-        if receive_for is None:
-            if send is not None:
-                dist.isend(send.detach().contiguous(), peer).wait()
-            return None
-
-        (tokens,) = receive_for.model_inputs
-        incoming = torch.empty(
-            (*tokens.shape[:2], self.hidden_size),
-            dtype=training.PARAM_DTYPE,
-            device=distributed.device,
-        )
-        if send is None:
-            dist.irecv(incoming, peer).wait()
-        else:
-            # Both sides must post the activation and its opposite-direction gradient together.
-            ops = [
-                dist.P2POp(dist.isend, send.detach().contiguous(), peer),
-                dist.P2POp(dist.irecv, incoming, peer),
-            ]
+        ops = []
+        if send is not None:
+            ops.append(dist.P2POp(dist.isend, send.detach().contiguous(), peer))
+        incoming = None
+        if receive_for is not None:
+            (tokens,) = receive_for.model_inputs
+            incoming = torch.empty(
+                (*tokens.shape[:2], self.hidden_size),
+                dtype=training.PARAM_DTYPE,
+                device=distributed.device,
+            )
+            ops.append(dist.P2POp(dist.irecv, incoming, peer))
+        # Coalesce opposite directions in steady state. Batch single transfers too,
+        # since eager NCCL otherwise serializes them on the world communicator.
+        if ops:
             for work in dist.batch_isend_irecv(ops):
                 work.wait()
         return incoming
