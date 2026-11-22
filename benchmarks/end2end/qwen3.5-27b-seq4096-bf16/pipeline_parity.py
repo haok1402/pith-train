@@ -34,6 +34,7 @@ def main():
     parser.add_argument("--compact-embedding-grad", action="store_true")
     parser.add_argument("--virtual-layer-counts", type=int, nargs=4)
     parser.add_argument("--microbatch-size", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--zb-h1-weight-delays", type=int, nargs=2)
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     from pithtrain.contexts import distributed, logging, training
@@ -127,6 +128,11 @@ def main():
         replay_product = schedule.endswith("-product")
         schedule = schedule.removesuffix("-up").removesuffix("-product")
         cfg.training.pipeline_schedule = schedule
+        cfg.training.pipeline_zb_h1_weight_delays = (
+            tuple(args.zb_h1_weight_delays)
+            if schedule == "zb-h1" and args.zb_h1_weight_delays is not None
+            else None
+        )
         cfg.training.pipeline_virtual_stages = 2 if schedule in ("interleaved", "zbv") else 1
         cfg.training.pipeline_layer_counts = (
             tuple(args.virtual_layer_counts)

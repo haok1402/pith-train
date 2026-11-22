@@ -246,6 +246,9 @@ class TrainingCfg(SlottedDefault):
     pipeline_grad_sync_layers: tuple[int, ...] = ()
     """Reduce gradients for these 1F1B decoder layers after each microbatch."""
 
+    pipeline_zb_h1_weight_delays: tuple[int, ...] | None = None
+    """Number of later input backwards to run before each weight backward, per rank."""
+
     pipeline_compute_stream_grad_buffers: bool = False
     """Allocate FSDP reduction buffers on the model compute stream."""
 
@@ -441,6 +444,13 @@ def setup_model(
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")
 
     schedule = cfg.pipeline_schedule
+    weight_delays = cfg.pipeline_zb_h1_weight_delays
+    if weight_delays is not None and (
+        schedule != "zb-h1"
+        or len(weight_delays) != distributed.pp_size
+        or any(delay < 0 for delay in weight_delays)
+    ):
+        raise ValueError("ZB-H1 weight delays require one nonnegative value per pipeline rank")
     if schedule in ("1f1b", "interleaved", "zb-h1", "zbv"):
         if ModelClass is not Qwen35Model or distributed.ep_size != 1:
             raise ValueError("Dense pipeline schedules require Qwen3.5 with expert_parallel_size=1")
@@ -560,7 +570,9 @@ def setup_model(
     if schedule == "1f1b":
         training.model = OneForwardOneBackward(modules[0], grad_sync_layers)
     else:
-        training.model = ScheduledDensePipeline(schedule, modules, grad_sync_layers)
+        training.model = ScheduledDensePipeline(
+            schedule, modules, grad_sync_layers, weight_delays=weight_delays
+        )
 
 
 offloaded_state: list[tuple[torch.UntypedStorage, torch.Tensor]] = []

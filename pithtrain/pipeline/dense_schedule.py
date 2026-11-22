@@ -84,7 +84,12 @@ def _zbv_rank_actions(rank: int, pp_size: int, batches: int) -> list[_Action]:
 
 @lru_cache(maxsize=16)
 def dense_pipeline_actions(
-    schedule: str, pp_size: int, chunks: int, batches: int, train: bool
+    schedule: str,
+    pp_size: int,
+    chunks: int,
+    batches: int,
+    train: bool,
+    weight_delays: tuple[int, ...] | None = None,
 ) -> dict[int, list[_Action]]:
     stage_count = pp_size * chunks
 
@@ -122,7 +127,7 @@ def dense_pipeline_actions(
                 lambda step: (
                     rank + (chunks - 1 - ((step - warmup) // group_size % chunks)) * pp_size
                 ),
-                num_1f1b_microbatches=rank,
+                num_1f1b_microbatches=rank if weight_delays is None else weight_delays[rank],
                 enable_zero_bubble=split_backward,
             )
     else:
@@ -147,6 +152,8 @@ class ScheduledDensePipeline(nn.Module):
         schedule: str,
         stages: Sequence[nn.Module],
         grad_sync_layers: tuple[FSDPModule, ...] = (),
+        *,
+        weight_delays: tuple[int, ...] | None = None,
     ) -> None:
         super().__init__()
         self.schedule = schedule
@@ -154,6 +161,7 @@ class ScheduledDensePipeline(nn.Module):
         self.module = nn.ModuleList(stages)
         self.stages = {stage.stage_index: stage for stage in stages}
         self.grad_sync_layers = grad_sync_layers
+        self.weight_delays = weight_delays
         self.hidden_size = stages[0].hidden_size
         self.pp_size = distributed.pp_size
         self.pp_rank = distributed.pp_rank
@@ -193,7 +201,7 @@ class ScheduledDensePipeline(nn.Module):
 
         train = torch.is_grad_enabled()
         actions = dense_pipeline_actions(
-            self.schedule, self.pp_size, len(self.module), len(microbatches), train
+            self.schedule, self.pp_size, len(self.module), len(microbatches), train, self.weight_delays
         )[self.pp_rank]
         if train:
             for stage in self.module:
