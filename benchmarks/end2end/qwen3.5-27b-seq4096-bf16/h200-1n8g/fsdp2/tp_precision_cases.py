@@ -5,7 +5,7 @@ from functools import partial
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from tp_delta_trace import capture
+from tp_delta_trace import DECODER_TRACE_CASES, capture
 
 from pithtrain.kernels import cross_entropy_fwd_bwd, stage_compile_options
 from pithtrain.models.qwen35_moe import Qwen35MoeRMSNorm, Qwen35MoeRMSNormGated
@@ -63,6 +63,8 @@ COMPILED_DECAY_CASES = (
     "residual-round-stock-loss-compiled",
     "residual-round-out32-compiled",
     "trace-decoder-compiled",
+    "residual-round-trace-compiled",
+    "residual-fp32-norm-compiled",
 )
 
 
@@ -101,14 +103,22 @@ class DecayProbeTP(dense_tp.DenseTP):
             return materialize(residual)
         return residual
 
+    def decoder(self, layer, hidden, rotary):
+        if self.case != "residual-fp32-norm-compiled":
+            return super().decoder(layer, hidden, rotary)
+        contribution = self.token_mixing(layer, hidden, rotary)
+        residual = hidden.float() + contribution.float()
+        mlp_input = layer.post_attention_layernorm(residual).to(hidden.dtype)
+        return residual.to(hidden.dtype) + self.mlp(layer, mlp_input)
+
     def delta_attention(self, delta, x, batch, seq):
         output = super().delta_attention(delta, x, batch, seq)
-        if self.case == "trace-decoder-compiled":
+        if self.case in DECODER_TRACE_CASES:
             return capture(output, self.case, "gdn_row", self.rank, self.size)
         return output
 
     def mlp(self, layer, x):
-        if self.case != "trace-decoder-compiled" or not layer.is_linear:
+        if self.case not in DECODER_TRACE_CASES or not layer.is_linear:
             return super().mlp(layer, x)
         x = capture(x, self.case, "mlp_input", self.rank, self.size)
         return capture(super().mlp(layer, x), self.case, "mlp_output", self.rank, self.size)

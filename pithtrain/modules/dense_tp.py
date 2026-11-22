@@ -197,7 +197,7 @@ class DenseTP:
         x = delta.norm(x.reshape(-1, delta.head_v_dim), z.reshape(-1, delta.head_v_dim))
         return self.rows(x.view(batch * seq, -1), delta.out_proj)
 
-    def attention(
+    def token_mixing(
         self,
         layer: Qwen35DecoderLayer,
         hidden: torch.Tensor,
@@ -223,7 +223,15 @@ class DenseTP:
             x = flash_attn_func(q, k, v.view(kv_shape), softmax_scale=attn.scaling, causal=True)
             x = x.reshape(batch * seq, -1) * gate.reshape(batch * seq, -1).sigmoid()
             x = self.rows(x, attn.o_proj)
-        return hidden + x
+        return x
+
+    def attention(
+        self,
+        layer: Qwen35DecoderLayer,
+        hidden: torch.Tensor,
+        rotary: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        return hidden + self.token_mixing(layer, hidden, rotary)
 
     def mlp(self, layer: Qwen35DecoderLayer, x: torch.Tensor) -> torch.Tensor:
         mlp = layer.mlp

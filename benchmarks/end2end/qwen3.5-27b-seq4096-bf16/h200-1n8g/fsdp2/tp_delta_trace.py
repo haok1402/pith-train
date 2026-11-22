@@ -7,7 +7,11 @@ import torch
 import torch.distributed as dist
 
 GQA_TRACE_CASES = ("trace-gqa-compiled", "restore-gqa-k-compiled", "restore-gqa-adjoint-compiled")
-DECODER_TRACE_CASES = ("trace-decoder-compiled",)
+DECODER_TRACE_CASES = (
+    "trace-decoder-compiled",
+    "residual-round-trace-compiled",
+    "residual-fp32-norm-compiled",
+)
 TRACE_CASES = (
     "trace-gdn-compiled",
     "restore-gdn-adjoint-compiled",
