@@ -68,6 +68,9 @@ COMPILED_DECAY_CASES = (
     "fp32-residual-stream-compiled",
     "fp32-residual-stream-stock-loss-compiled",
     "fp32-residual-stream-out32-compiled",
+    "fp32-residual-stream-row-dgrad-compiled",
+    "fp32-residual-stream-row-out32-compiled",
+    "fp32-residual-stream-all-row-out32-compiled",
 )
 
 
@@ -95,6 +98,7 @@ class DecayProbeTP(dense_tp.DenseTP):
             if not layer.is_linear:
                 continue
             delta = layer.linear_attn
+            delta.out_proj.audit_delta_row = True
             if self.master:
                 delta.audit_master_A_log = delta.A_log.detach().clone()
                 delta.audit_master_dt_bias = delta.dt_bias.detach().clone()
@@ -201,6 +205,30 @@ class DecayProbeTP(dense_tp.DenseTP):
             *(module.weight for module in modules),
         )
 
+    def rows(self, x, module):
+        use_fp32_dgrad = (
+            self.case == "fp32-residual-stream-all-row-out32-compiled"
+            or self.case
+            in (
+                "fp32-residual-stream-row-dgrad-compiled",
+                "fp32-residual-stream-row-out32-compiled",
+            )
+            and getattr(module, "audit_delta_row", False)
+        )
+        if not use_fp32_dgrad:
+            return super().rows(x, module)
+        return ProbeRow.apply(
+            x,
+            module.weight,
+            module.main_grad,
+            self.size,
+            self.name,
+            self.rank,
+            False,
+            True,
+            self.case.endswith("-out32-compiled"),
+        )
+
     def loss(self, logits, labels):
         if self.case in (
             "stock-loss-compiled",
@@ -290,6 +318,7 @@ class PrecisionTP(dense_tp.DenseTP):
                 self.rank,
                 stock_row,
                 fp32_dgrad,
+                False,
             )
         return super().rows(x, module)
 
@@ -364,10 +393,11 @@ def norm_with_fp32_grad(module, x, gate=None):
 
 class ProbeRow(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, main_grad, size, name, rank, stock_row, fp32_dgrad):
+    def forward(ctx, x, weight, main_grad, size, name, rank, stock_row, fp32_dgrad, out32_dgrad):
         ctx.save_for_backward(x, weight)
         ctx.main_grad, ctx.size, ctx.name = main_grad, size, name
         ctx.fp32_dgrad = fp32_dgrad
+        ctx.out32_dgrad = out32_dgrad
         if stock_row:
             full_x = dense_tp._gather(x.t().contiguous(), size, name).t()
             full_weight = dense_tp._gather(weight.t().contiguous(), size, name).t()
@@ -382,10 +412,13 @@ class ProbeRow(torch.autograd.Function):
         x, weight = ctx.saved_tensors
         gathered = dense_tp._gather(dout, ctx.size, ctx.name)
         dw = dense_tp._weight_grad(ctx.main_grad, gathered, x)
-        dx = (
-            (gathered.float() @ weight.float()).to(x.dtype) if ctx.fp32_dgrad else gathered @ weight
-        )
-        return dx, dw, None, None, None, None, None, None
+        if ctx.out32_dgrad:
+            dx = dense_tp._mm_fp32(gathered, weight).to(x.dtype)
+        elif ctx.fp32_dgrad:
+            dx = (gathered.float() @ weight.float()).to(x.dtype)
+        else:
+            dx = gathered @ weight
+        return dx, dw, None, None, None, None, None, None, None
 
 
 class ProbeColumns(torch.autograd.Function):
