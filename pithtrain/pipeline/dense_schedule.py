@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.fsdp import FSDPModule
+from torch.distributed.pipelining._p2p import _build_p2p_edge_groups, _preconnect_p2p_edge_groups
 from torch.distributed.pipelining.schedules import (
     BACKWARD_INPUT,
     BACKWARD_WEIGHT,
@@ -23,6 +24,7 @@ from torch.distributed.pipelining.schedules import (
     _Action,
     _add_send_recv,
     _add_wait_send,
+    _add_wait_send_budget,
     _get_1f1b_rank_ops,
     _get_warmup_ops,
 )
@@ -132,7 +134,8 @@ def dense_pipeline_actions(
             ]
             for rank in range(pp_size)
         }
-    return _add_wait_send(_add_send_recv(actions, owner, stage_count))
+    transfers = _add_wait_send(_add_send_recv(actions, owner, stage_count))
+    return _add_wait_send_budget(transfers, owner, max_outstanding_sends=2 * stage_count)
 
 
 class ScheduledDensePipeline(nn.Module):
@@ -152,8 +155,26 @@ class ScheduledDensePipeline(nn.Module):
         self.grad_sync_layers = grad_sync_layers
         self.hidden_size = stages[0].hidden_size
         self.pp_size = distributed.pp_size
+        self.pp_rank = distributed.pp_rank
+        self.pp_group = distributed.pp_group
         self.last_stage = self.pp_size * len(stages) - 1
         self.objective_pp_rank = stage_to_rank(self.last_stage, self.pp_size, schedule)
+        self.peers = dist.get_process_group_ranks(self.pp_group)
+        self.edge_groups = {}
+        device = distributed.device
+        if (
+            self.pp_size > 1
+            and device.type == "cuda"
+            and self.pp_group._get_backend(device).supports_splitting
+        ):
+            # Eager NCCL otherwise puts all raw P2P traffic on the same communicator.
+            dist.all_reduce(torch.zeros(1, dtype=torch.int32, device=device), group=self.pp_group)
+            assignment = {
+                stage: stage_to_rank(stage, self.pp_size, schedule)
+                for stage in range(self.last_stage + 1)
+            }
+            self.edge_groups, rounds = _build_p2p_edge_groups(self.pp_group, assignment, device)
+            _preconnect_p2p_edge_groups(self.pp_group, self.edge_groups, rounds, device)
 
     def step(self, microbatches: list[Microbatch], objective: Callable | None = None) -> list[Any]:
         if training.offloaded and self is training.model:
@@ -166,7 +187,7 @@ class ScheduledDensePipeline(nn.Module):
         train = torch.is_grad_enabled()
         actions = dense_pipeline_actions(
             self.schedule, self.pp_size, len(self.module), len(microbatches), train
-        )[distributed.pp_rank]
+        )[self.pp_rank]
         if train:
             for stage in self.module:
                 if isinstance(stage, FSDPModule):
@@ -186,7 +207,6 @@ class ScheduledDensePipeline(nn.Module):
         results = {}
         deferred_wgrads = {}
         reductions = []
-        group = distributed.pp_group
 
         def receive(operation, stage, index):
             tensor, work = receives.pop((operation, stage, index))
@@ -205,12 +225,14 @@ class ScheduledDensePipeline(nn.Module):
                 if operation in (SEND_F, SEND_B):
                     neighbor = stage_index + (1 if operation == SEND_F else -1)
                     peer = stage_to_rank(neighbor, self.pp_size, self.schedule)
+                    group = self.edge_groups.get((self.pp_rank, peer), self.pp_group)
                     tensor = outgoing.pop((operation, *key)).detach().contiguous()
-                    work = dist.isend(tensor, group=group, group_dst=peer)
+                    work = dist.isend(tensor, group=group, dst=self.peers[peer])
                     sends[operation, *key] = (tensor, work)
                 elif operation in (RECV_F, RECV_B):
                     neighbor = stage_index + (-1 if operation == RECV_F else 1)
                     peer = stage_to_rank(neighbor, self.pp_size, self.schedule)
+                    group = self.edge_groups.get((peer, self.pp_rank), self.pp_group)
                     (tokens,) = microbatch.model_inputs
                     tensor = torch.empty(
                         (*tokens.shape[:2], self.hidden_size),
@@ -219,7 +241,7 @@ class ScheduledDensePipeline(nn.Module):
                     )
                     receives[operation, *key] = (
                         tensor,
-                        dist.irecv(tensor, group=group, group_src=peer),
+                        dist.irecv(tensor, group=group, src=self.peers[peer]),
                     )
                 elif operation in (WAIT_SEND_F, WAIT_SEND_B):
                     send = SEND_F if operation == WAIT_SEND_F else SEND_B
