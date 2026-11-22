@@ -59,6 +59,7 @@ def main():
     parser.add_argument("--seq", type=int, default=4096)
     parser.add_argument("--gpus", type=int, default=8)
     parser.add_argument("--first", type=int, default=5)
+    parser.add_argument("--target-mfu", type=float, default=50)
     args = parser.parse_args()
     path = (
         Path(__file__).resolve().parent.parent
@@ -69,8 +70,9 @@ def main():
         print(f"{name:26} {flops / 1e9:8.4f} GFLOP/token")
     flops = sum(breakdown.values())
     peak = args.gpus * 989e12
+    target_flops = args.target_mfu * peak / 100
     print(f"Total {flops / 1e9:.4f} GFLOP/token")
-    print(f"50% target {0.5 * peak / flops:,.0f} aggregate tokens/s")
+    print(f"{args.target_mfu:g}% target {target_flops / flops:,.0f} aggregate tokens/s")
     if args.log is None:
         return
     rows = [
@@ -82,13 +84,16 @@ def main():
         parser.error(f"No completed step at or after {args.first} in {args.log}")
     rates = [row[2] for row in rows]
     tps = median(rates)
-    steps_at_target = sum(rate * flops >= 0.5 * peak for rate in rates)
+    steps_at_target = sum(rate * flops >= target_flops for rate in rates)
     print(f"Steps {rows[0][0]}–{rows[-1][0]} ({len(rows)} measured)")
     print(f"Median step time {median(row[1] for row in rows):.3f} s")
     print(f"Median throughput {tps:,.0f} tokens/s aggregate, {tps / args.gpus:,.0f} per GPU")
     print(f"Throughput range {min(rates):,}–{max(rates):,} tokens/s aggregate")
     print(f"Max peak allocated memory {max(row[3] for row in rows):.2f} GiB per GPU")
-    print(f"MFU {100 * tps * flops / peak:.2f}%, {steps_at_target}/{len(rows)} steps at or above 50%")
+    print(
+        f"MFU {100 * tps * flops / peak:.2f}%, "
+        f"{steps_at_target}/{len(rows)} steps at or above {args.target_mfu:g}%"
+    )
 
 
 if __name__ == "__main__":

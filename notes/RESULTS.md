@@ -1,10 +1,10 @@
 # Qwen3.5-27B BF16 integration results
 
-The target is at least 50% MFU on one eight-H200 node at sequence length 4,096, with real-text loss checked against the released HF model. MFU is aggregate tokens/s × 156.9905 GFLOP/token ÷ (8 × 989 TFLOP/s). The count includes 48 Gated DeltaNet layers and 16 causal gated GQA layers. The exact 50% cutoff is approximately 25,199 aggregate tokens/s. [Calculator](../bench/summarize.py), [survey](survey.md).
+The target is a stable 51% MFU or higher over 30 timed steps on one eight-H200 node, at sequence length 4,096 with real-text loss checked against the released HF model. MFU is aggregate tokens/s × 156.9905 GFLOP/token ÷ (8 × 989 TFLOP/s). The count includes 48 Gated DeltaNet layers and 16 causal gated GQA layers. The 50% and 51% cutoffs are approximately 25,199 and 25,703 aggregate tokens/s. [Calculator](../bench/summarize.py), [survey](survey.md).
 
 The matched integration runs use fused AdamW, learning rate 1e-5, global batch 64 and the same WikiText-103 train fixture. Peak is the maximum allocated GiB on any GPU in the timed window. The real-text comparison records pre-update mean loss against HF on the same tokens and checks training for finite loss and gradients. The initial eight-sample 4K WikiText-103 test reference is **1.793438 nats**, job `1263942`. [HF reference log](../logs/fsdp2-hf-reference-gated.log). The dense FSDP2 control scored **1.7957** on those eight examples, a difference of **+0.002262 nats**, with finite gradient norm 30.7754. [FSDP2 check, 1264087](../logs/fsdp2-real-wikitext-1264087.log).
 
-The released HF model scored **1.813772 nats** on the first 16 seeded 4K WikiText test samples for the B2 comparison. The identical integrated FSDP2 test batch is waiting for resources as job `1266084`. [HF reference, 1264958](../logs/hf-wikitext-reference16-submit.log), [FSDP2 B2 submission](../logs/fsdp2-integration-b2-gates-loss16.log).
+On the same 16 seeded 4K WikiText test samples, the released HF model scored **1.813772 nats** and integrated B2 FSDP2 scored **1.8151 nats**. The difference was approximately **+0.00133 nats** and the FSDP2 gradient norm was finite at 37.3831. [HF reference, 1264958](../logs/hf-wikitext-reference16-submit.log), [FSDP2 B2 check, 1266084](../logs/fsdp2-integration-b2-gates-loss16.log).
 
 | Technique | Batch / microbatch | Workload and timing | Step, s | Aggregate tok/s | Peak GiB/GPU | MFU | Δ MFU vs matched control | Real-text sanity | Job / evidence |
 | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
@@ -20,14 +20,22 @@ The released HF model scored **1.813772 nats** on the first 16 seeded 4K WikiTex
 | Exact 32-step integrated FSDP2 repeat | 64 / 2 | WikiText train, median steps 3–32 on pool1-00793 | **10.508** | **24,946** | **127.72** | **49.50%** | −0.56 pp vs the short run on a different node | 1.9208 → 1.6942, finite loss and gradients throughout | [1265084](../logs/fsdp2-integration-b2-gates-repeat32.log) |
 | Integrated B2 with the default CUDA allocator | 64 / 2 | WikiText train, median steps 3–6 | 11.712 | 22,382 | 127.90 | 44.41% | −5.65 pp vs the expandable-segments short run, on a different node | 1.9208 → 1.6987, finite | [1265114](../logs/fsdp2-integration-b2-default-alloc-1265114.log), [submission](../logs/fsdp2-integration-b2-default-alloc-submit.log) |
 | Integrated B2 with `NCCL_MAX_CTAS=16` | 64 / 2 | WikiText train, median steps 3–6 on pool1-00624 | 10.505 | 24,954 | 127.72 | 49.51% | Within 0.02 pp of the repeat, on a different node | 1.9208 → 1.6992, finite | [1265777](../logs/fsdp2-integration-b2-nccl16-1265777.log), [submission](../logs/fsdp2-integration-b2-nccl16-submit.log) |
-| Integrated B2 with the LM-head all-gather retained across microbatches | 64 / 2 | WikiText train. Same-node, same-commit A/B at `0a2cf9f`, queued. | — | — | — | — | Pending | Pending | [Submission](../logs/fsdp2-integration-b2-head-ablate-submit.log) |
-| FSDP2 compact or larger communication buckets, BF16 gradient shards | 64 / 2 | WikiText train on pool1-00090. 1, 2 and 4 consecutive blocks per bucket, plus DeltaNet triples with attention singletons. | — | — | — | — | Pending | Pending | [1265621](../logs/fsdp2-full-tune-lease.log) |
-| FSDP2 forward all-gather copy-out on a side stream | 64 / 2 planned | WikiText full-node comparison follows proxy correctness and timing. | — | — | — | — | Pending | Pending | [Proxy submission](../logs/fsdp2-copyout-proxy-submit.log) |
+| Two-block FSDP2 control plus LM-head retention | 64 / 2 | WikiText train. Same-node paired test at `32cd6f4`, queued. | — | — | — | — | Pending | Pending | [Submission](../logs/fsdp2-integration-retention-ablation-submit.log) |
+| Two-block FSDP2 control plus last four decoder blocks retained | 64 / 2 | WikiText train. Same-node paired test at `32cd6f4`, queued. | — | — | — | — | Pending | Pending | [Submission](../logs/fsdp2-integration-retention-ablation-submit.log) |
+| Two-block FSDP2 control plus LM head and last four decoder blocks retained | 64 / 2 | WikiText train. Same-node paired test at `32cd6f4`, queued. | — | — | — | — | Pending | Pending | [Submission](../logs/fsdp2-integration-retention-ablation-submit.log) |
+| FSDP2 single-block buckets and FP32 sharded gradient accumulation | 64 / 2 | WikiText train, median steps 3–6 on pool1-00090 | 10.441 | 25,108 | 127.72 | 49.82% | Same-node reference | 1.9208 → 1.6514 by step 7, finite | [1265621](../logs/fsdp2-integrated-fp32-grad-control-1265621.log) |
+| FSDP2 single-block buckets and BF16 sharded gradient accumulation | 64 / 2 | WikiText train, median steps 3–6 on pool1-00090 | 10.436 | 25,120 | 121.46 | 49.84% | +0.02 pp, 6.26 GiB less vs same-node FP32 grad arm | 1.9208 → 1.6520 by step 7, finite | [1265621](../logs/fsdp2-integrated-grad-control-1265621.log) |
+| FSDP2 two-block buckets and BF16 sharded gradient accumulation | 64 / 2 | WikiText train, median steps 3–6 on pool1-00090 | 10.344 | 25,343 | 122.17 | **50.29%** | +0.44 pp vs same-node single-block BF16 grad arm | 1.9208 → 1.6516 by step 7, finite | [1265621](../logs/fsdp2-integrated-group2-1265621.log) |
+| FSDP2 DeltaNet triples and attention singletons, BF16 sharded gradients | 64 / 2 | WikiText train, median steps 3–6 on pool1-00090 | 10.389 | 25,232 | 121.46 | 50.07% | −0.22 pp vs same-node two-block control | 1.9208 → 1.6990, finite | [1265621](../logs/fsdp2-integrated-uniform-1265621.log) |
+| FSDP2 four-block buckets, BF16 sharded gradients | 64 / 2 | WikiText train, median steps 3–6 on pool1-00090 | 10.404 | 25,198 | 123.60 | 50.00% | −0.29 pp vs same-node two-block control | 1.9208 → 1.6991, finite | [1265621](../logs/fsdp2-integrated-group4-1265621.log) |
+| FSDP2 forward all-gather copy-out on a side stream | 64 / 2 planned | First B1 proxy measured 42.69% vs 42.88% control. The native variant and B2 stack proxy are pending. | — | — | — | — | Pending full-node result | B1 proxy loss and gradients finite | [Proxy 1266265](../logs/fsdp2-copyout-proxy-submit.log), [native proxy](../logs/fsdp2-native-copyout-proxy-submit.log) |
 | FSDP2 B2, matched selective-checkpoint control with separate gate projections | 64 / 2 | WikiText train, median steps 3–6 on pool1-00651 | 10.506 | 24,952 | 127.72 | 49.51% | Within 0.02 pp of the fused repeat, on a different node | 1.9208 → 1.6990, finite | [1265794](../logs/fsdp2-integration-b2-control-real.log) |
-| Integration candidate, B2 with BF16 sharded gradients and reduction overlap, checkpointing disabled | 64 / 2 | WikiText train. Waiting for resources. | — | — | — | — | Pending | Pending | [1266023](../logs/fsdp2-integration-b2-no-ac-real.log) |
+| Integration candidate, B2 with BF16 sharded gradients and reduction overlap, checkpointing disabled | 64 / 2 | WikiText train. HBM OOM in the first step on pool1-00391. | — | — | 134.85 at OOM | — | — | No completed step | [1266023](../logs/fsdp2-integration-b2-no-ac-real.log) |
 | Tensor parallelism | — | Parity and proxy work in progress | — | — | — | — | — | Pending | [TP ledger](tp.md) |
-| KDA Gated DeltaNet forward candidate | — / 2 | 4K operator timing 1.095×; full-node ablation pending the branch | — | — | — | — | — | Pending full-model check | [Operator timing](../../kda-tasks/gated_delta_rule_pinned_fwd/runs/c1-timing-repeat.log) |
+| KDA Gated DeltaNet forward candidate | — / 2 | 4K operator timing 1.095×; full-node ablation pending the branch | — | — | — | — | — | B2 saved tensors and five gradients passed; full-model check pending | [Operator timing](../../kda-tasks/gated_delta_rule_pinned_fwd/runs/c1-timing-repeat.log), [correctness 1265934](../../kda-tasks/gated_delta_rule_pinned_fwd/runs/c1-b2-validate.log) |
+| KDA causal convolution candidate `cf8d5c85` | — / 1, 2 | 4K operator timing about 1.09× at B1 and 1.055× at B2 for two forwards and one backward. Full-node ablation pending the branch. | — | — | — | — | — | B2 operator validation and 44 PithTrain tests passed | [Timing](../../kda-tasks/causal_conv1d/runs/cf8d5c85-benchmark-01.log), [repeat](../../kda-tasks/causal_conv1d/runs/cf8d5c85-benchmark-02.log), [PithTrain tests](../../kda-tasks/causal_conv1d/runs/cf8d5c85-pithtrain-tests.log) |
 | KDA cross-entropy first candidate | — / 2 | 4K operator timing 0.971×; original kernel remains the control | — | — | — | — | — | — | [Operator timing](../../kda-tasks/cross_entropy/runs/c01-dense.log) |
+| KDA FP8 activation quantization, `kda-fp8-rbt` at `34f26b0` | — | 1.04× operator geomean. Reserved for FP8 integration. | — | — | — | FP8 only | — | Byte-exact quantization and 119 tests passed | [Fork commit](https://github.com/haok1402/pith-train/commit/34f26b0e49d41bb0c71d383bf2dcd7038b0ac9de), [test log](../../kda-tasks/fp8_rowwise_blockwise_transpose/runs/port-tests.log) |
 | Integrated FSDP2 and selected KDA kernels | — | Full-node trial pending kernel branches | — | — | — | — | — | Pending | Branch `e2efp8-integration` |
 
 The WikiText-103 train fixture is pinned to revision `b08601e04326c79dfdd32d625aee71d232d685c3`. The real-text sanity fixture uses the raw test split. [Dataset](https://huggingface.co/datasets/Salesforce/wikitext/tree/b08601e04326c79dfdd32d625aee71d232d685c3/wikitext-103-raw-v1). The detailed proxy and operator measurements remain in [fsdp2.md](fsdp2.md), [ppdense.md](ppdense.md), and [kernels.md](kernels.md). Proxy MFU and operator speedups guide which changes to run at 27B.
@@ -38,9 +46,13 @@ The first AdamW launchers exited before Slurm submission because the local gate 
 
 ## Full-model profile
 
-Nsight Systems captured one training step of 27B B1 FSDP2 with BF16 reduction on eight H200s. Across ranks, the median GPU window was 11.761 s. Compute kernels occupied 11.392 s and NCCL occupied 6.195 s, with 0.273 s of NCCL outside compute. All-gather occupied 4.153 s and reduce-scatter 2.042 s. These are unions of kernel intervals. GEMMs occupy 73.5–73.8% of each GPU window. FSDP packing and copy-out sum to 6.246 s across eight GPUs, which may overlap with compute. The matched B2 CTA-cap trial tests whether lowering NCCL occupancy reduces contention during overlap. A B2 profile is queued on the instrumented `d155195` checkout with the same training flags. [Profile run 1264719](../logs/fsdp2-nsys-1264719.log), [interval analysis 1265088](../logs/integration-trace-1265088.log), [GEMM breakdown 1265124](../logs/fsdp2-step-1264719-corrected-1265124.log), [B2 profile submission](../logs/fsdp2-integration-b2-nsys-submit.log).
+Nsight Systems captured one training step of 27B B1 FSDP2 with BF16 reduction on eight H200s. Across ranks, the median GPU window was 11.761 s. Compute kernels occupied 11.392 s and NCCL occupied 6.195 s, with 0.273 s of NCCL outside compute. All-gather occupied 4.153 s and reduce-scatter 2.042 s. These are unions of kernel intervals. GEMMs occupy 73.5–73.8% of each GPU window. FSDP packing and copy-out sum to 6.246 s across eight GPUs, which may overlap with compute. [Profile run 1264719](../logs/fsdp2-nsys-1264719.log), [interval analysis 1265088](../logs/integration-trace-1265088.log), [GEMM breakdown 1265124](../logs/fsdp2-step-1264719-corrected-1265124.log).
+
+The full-node sweep captured a matched B2 trace on `0a9a77f` in job `1265621`. The median GPU window was 10.496 s with 113 ms exposed NCCL. GPU 0 spent 232 ms on 528 all-gather copy-outs, without overlap with other compute. FSDP copy-out and reduce-scatter packing sum to 3.136 GPU-seconds across eight devices. The separate B2 capture was canceled before it acquired GPUs. [Capture log](../logs/fsdp2-integrated-fp32-grad-control-1265621.log), [B2 interval analysis 1266270](../logs/integration-b2-trace-1265621.log), [copy-out audit](../logs/fsdp2-copy-fp32-grad-control-1265621-analysis.log).
 
 The two-GPU B2 `max-autotune-no-cudagraphs` arm timed out during compilation. Inductor's ATen GEMM candidate led 51 of the 58 logged shape trials, including the main SwiGLU forward shapes. End-to-end compile mode remains unmeasured. [Autotune log, 1264787](../logs/fsdp2-max-autotune-1264787.log).
+
+The isolated integration preview `32cd6f4` combines the `6b3241d` FSDP2 copy-out branch with the LM-head retention flag. A paired two-H200 shape-matched proxy checks their interaction with microbatch 2, two blocks per bucket and AdamW. [Stacked proxy, 1266273 task 121](../logs/fsdp2-integration-stack-proxy-submit.log).
 
 ## Reproduce the 50.06% run
 
@@ -56,4 +68,18 @@ setsid nohup env E2EFP8_INTEGRATION_TREE=wt-integration PYTORCH_ALLOC_CONF=expan
   bash bench/run-integration.sh train --steps 32 --micro-batch 2 --checkpoint selective \
   --reduce-dtype bf16 --skip-embedding-backward-gather \
   > logs/fsdp2-integration-b2-gates-repeat32.log 2>&1 < /dev/null &
+```
+
+## Same-node headroom ablations
+
+The two-block control and retention arms use `wt-integration-stack` at `32cd6f450614233dcafdaa45e969d9b79f908c43`. The same node runs all arms at 4K with batch 64, microbatch 2, two decoder blocks per bucket, selective checkpointing, BF16 reduction and sharded gradient accumulation, skipped embedding backward gather and expandable allocator segments. Two retained buckets correspond to four decoder blocks. Add the validated side-stream and KDA candidates individually against this two-block control, then use the high-priority lane for the combined 32-step confirmation. The older one-block head A/B and the standalone two-block confirmation were canceled before start.
+
+```bash
+setsid nohup bench/gpu-run.sh --gpus 8 --time 00:25:00 -- \
+  bash bench/run-integration-ablation.sh wt-integration-stack \
+  head wt-integration-stack --keep-head-gathered -- \
+  tail4 wt-integration-stack --keep-last-groups 2 --keep-gathered-across-microbatches -- \
+  head-tail4 wt-integration-stack --keep-head-gathered --keep-last-groups 2 \
+  --keep-gathered-across-microbatches \
+  > logs/fsdp2-integration-retention-ablation-submit.log 2>&1 < /dev/null &
 ```
