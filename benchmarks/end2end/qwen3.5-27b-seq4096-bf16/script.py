@@ -18,7 +18,9 @@ def main() -> None:
     parser.add_argument("--schedule", choices=("dualpipev", "1f1b"), default="dualpipev")
     parser.add_argument("--layer-counts", type=int, nargs="+")
     parser.add_argument("--compile-mode", choices=("layer", "attention", "eager"), default="layer")
-    parser.add_argument("--recompute-mlp", action="store_true")
+    recompute = parser.add_mutually_exclusive_group()
+    recompute.add_argument("--recompute-mlp", action="store_true")
+    recompute.add_argument("--recompute-mlp-layers", type=int, nargs="+")
     parser.add_argument("--batch", type=int, default=256)
     parser.add_argument("--micro-batch", type=int, default=1)
     parser.add_argument("--steps", type=int, default=8)
@@ -40,7 +42,9 @@ def main() -> None:
     training.pipeline_schedule = args.schedule
     training.pipeline_layer_counts = tuple(args.layer_counts) if args.layer_counts else None
     training.pipeline_compile = args.compile_mode
-    training.pipeline_recompute_mlp = args.recompute_mlp
+    training.pipeline_recompute_mlp = (
+        tuple(args.recompute_mlp_layers) if args.recompute_mlp_layers else args.recompute_mlp
+    )
     training.optimizer = make_muon_optimizer if args.optimizer == "muon" else make_adamw_optimizer
     training.scheduler = partial(
         make_wsd_scheduler, start_lr=1e-5, warmup_ratio=0.03, final_lr=1e-5

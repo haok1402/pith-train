@@ -226,8 +226,8 @@ class TrainingCfg(SlottedDefault):
     pipeline_compile: Literal["layer", "attention", "eager"] = "layer"
     """For 1F1B, compile the whole decoder layer, just its attention and residual, or neither."""
 
-    pipeline_recompute_mlp: bool = False
-    """For 1F1B, checkpoint the dense SwiGLU MLP to reduce live activation memory."""
+    pipeline_recompute_mlp: bool | tuple[int, ...] = False
+    """Checkpoint SwiGLU in every 1F1B decoder layer or in the given global layer indices."""
 
     fp8: bool = False
     """

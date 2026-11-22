@@ -136,7 +136,7 @@ class Qwen35DenseStage(Qwen35Model):
         config: Qwen3_5TextConfig,
         layer_counts: tuple[int, ...] | None,
         compile_mode: str,
-        recompute_mlp: bool,
+        recompute_mlp: bool | tuple[int, ...],
     ):
         nn.Module.__init__(self)
         count, index = distributed.pp_size, distributed.pp_rank
@@ -151,11 +151,19 @@ class Qwen35DenseStage(Qwen35Model):
                 f"pipeline_layer_counts must assign {config.num_hidden_layers} layers "
                 f"to {count} nonempty stages, got {layer_counts}"
             )
+        if isinstance(recompute_mlp, tuple) and any(
+            not 0 <= layer < config.num_hidden_layers for layer in recompute_mlp
+        ):
+            raise ValueError(
+                f"Invalid decoder layer indices for MLP recomputation: {recompute_mlp}"
+            )
         start = sum(layer_counts[:index])
         self._build_stage(config, index, count, range(start, start + layer_counts[index]))
         for layer in self.layers.values():
             layer.compile_mode = compile_mode
-            layer.recompute_mlp = recompute_mlp
+            layer.recompute_mlp = (
+                layer.idx in recompute_mlp if isinstance(recompute_mlp, tuple) else recompute_mlp
+            )
 
     def forward(
         self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None
