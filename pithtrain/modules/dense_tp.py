@@ -281,16 +281,16 @@ class DenseTP:
     def mlp(self, layer: Qwen35DecoderLayer, x: torch.Tensor) -> torch.Tensor:
         mlp = layer.mlp
         if layer.idx < self.mlp_replay_blocks:
-            columns = (mlp.gate_proj, mlp.up_proj)
-            product = _RecomputedSwiGLU.apply(
+            projections = (mlp.gate_proj, mlp.up_proj, mlp.down_proj)
+            return _RecomputedMLP.apply(
                 x,
                 self.size,
                 self.name,
                 self.overwrite_wgrad,
-                tuple(module.main_grad for module in columns),
-                *(module.weight for module in columns),
+                self.bulk_row_reduce,
+                tuple(module.main_grad for module in projections),
+                *(module.weight for module in projections),
             )
-            return self.rows(product, mlp.down_proj)
         gate, up = self.columns(x, mlp.gate_proj, mlp.up_proj)
         return self.rows(silu_mul(gate, up), mlp.down_proj)
 
@@ -483,32 +483,39 @@ class _ColumnParallel(torch.autograd.Function):
         return dx, None, None, None, None, None, None, None, *dweights
 
 
-class _RecomputedSwiGLU(torch.autograd.Function):
+class _RecomputedMLP(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, size, name, overwrite, main_grads, gate_weight, up_weight):
-        _, (gate, up) = torch.ops.symm_mem.fused_all_gather_matmul(
-            x, [gate_weight.t(), up_weight.t()], 0, name, return_A=False
-        )
-        ctx.save_for_backward(x, gate_weight, up_weight)
+    def forward(ctx, x, size, name, overwrite, bulk_reduce, main_grads, gate, up, down):
+        ctx.save_for_backward(x, gate, up, down)
         ctx.size, ctx.name, ctx.overwrite = size, name, overwrite
         ctx.main_grads = main_grads
-        return silu_mul_fwd(gate, up)
+        _, (gate, up) = torch.ops.symm_mem.fused_all_gather_matmul(
+            x, [gate.t(), up.t()], 0, name, return_A=False
+        )
+        product = silu_mul_fwd(gate, up)
+        return _mm_scatter(product, down.t(), size, name, not bulk_reduce)
 
     @staticmethod
-    def backward(ctx, grad):
-        x, *weights = ctx.saved_tensors
-        # The replay gather also provides the input for both weight gradients.
+    def backward(ctx, dout):
+        x, gate_weight, up_weight, down_weight = ctx.saved_tensors
+        weights = (gate_weight, up_weight)
         gathered, (gate, up) = torch.ops.symm_mem.fused_all_gather_matmul(
             x, [weight.t() for weight in weights], 0, ctx.name
         )
-        grads = silu_mul_bwd(grad, gate, up)
+        # Reuse one replay for the down weight gradient and both column adjoints.
+        product = silu_mul_fwd(gate, up)
+        grad, (dproduct,) = torch.ops.symm_mem.fused_all_gather_matmul(
+            dout, [down_weight], 0, ctx.name
+        )
+        grads = silu_mul_bwd(dproduct, gate, up)
         dx = _column_dgrad(grads, weights, ctx.size, ctx.name)
         dweights = tuple(
             _weight_grad(main_grad, derivative, gathered, ctx.overwrite)
-            for main_grad, derivative in zip(ctx.main_grads, grads, strict=True)
+            for main_grad, derivative in zip(ctx.main_grads[:2], grads, strict=True)
         )
+        ddown = _weight_grad(ctx.main_grads[2], grad, product, ctx.overwrite)
         dx = torch.ops._c10d_functional.wait_tensor(dx).to(x.dtype)
-        return dx, None, None, None, None, *dweights
+        return dx, None, None, None, None, None, *dweights, ddown
 
 
 class _RowParallel(torch.autograd.Function):
