@@ -208,10 +208,10 @@ def check_row_partials(layout, device):
     x = torch.zeros(2 * size, 32, device=device, dtype=torch.bfloat16)
     weight = torch.zeros(32, 32, device=device, dtype=torch.bfloat16)
     x[:, 0] = 1
-    weight[:, 0] = 1 if rank == 0 else -1 if rank == 1 else 0
+    weight[0, :] = 1 if rank == 0 else -1 if rank == 1 else 0
     if rank == 0:
         x[:, 1] = 1
-        weight[:, 1] = 2**-8
+        weight[1, :] = 2**-8
     for overlap in (False, True):
         actual = dense_tp._mm_scatter(x, weight, size, name, overlap)
         assert torch.equal(actual, torch.full_like(actual, 2**-8)), (rank, overlap, actual)
