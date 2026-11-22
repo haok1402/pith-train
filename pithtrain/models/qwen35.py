@@ -21,26 +21,6 @@ from pithtrain.pipeline.dualpipev import layer_sizes
 __all__ = ["Qwen35Model", "Qwen35DenseStage"]
 
 
-class _DeltaGateProjection(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, hidden, weight, main_grad_b, main_grad_a):
-        ctx.save_for_backward(hidden, weight)
-        ctx.main_grad_b = main_grad_b
-        ctx.main_grad_a = main_grad_a
-        return F.linear(hidden, weight)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        hidden, weight = ctx.saved_tensors
-        flat_grad = grad_output.flatten(0, -2)
-        grad_hidden = (flat_grad @ weight).view_as(hidden)
-        grad_b, grad_a = flat_grad.chunk(2, dim=-1)
-        flat_hidden = hidden.flatten(0, -2)
-        torch.ops.pithtrain.wgrad_accumulate_(ctx.main_grad_b, grad_b.t(), flat_hidden)
-        torch.ops.pithtrain.wgrad_accumulate_(ctx.main_grad_a, grad_a.t(), flat_hidden)
-        return grad_hidden, None, None, None
-
-
 class Qwen35GatedDeltaNet(Qwen35MoeGatedDeltaNet):
     fuse_gates = False
 
@@ -49,12 +29,7 @@ class Qwen35GatedDeltaNet(Qwen35MoeGatedDeltaNet):
             return super().project_gates(hidden_states)
         # Keep the checkpoint tensors and compute both gates in one BF16 GEMM.
         weight = torch.cat((self.in_proj_b.weight, self.in_proj_a.weight), dim=0)
-        main_grad_b, main_grad_a = self.in_proj_b.main_grad, self.in_proj_a.main_grad
-        if torch.is_grad_enabled() and main_grad_b is not None and main_grad_a is not None:
-            gates = _DeltaGateProjection.apply(hidden_states, weight, main_grad_b, main_grad_a)
-        else:
-            gates = F.linear(hidden_states, weight)
-        b, a = gates.chunk(2, dim=-1)
+        b, a = F.linear(hidden_states, weight).chunk(2, dim=-1)
         return b, a
 
 
