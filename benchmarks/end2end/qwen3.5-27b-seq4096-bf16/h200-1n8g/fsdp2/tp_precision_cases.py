@@ -136,19 +136,21 @@ class ForwardMaster(torch.autograd.Function):
 class PrecisionTP(dense_tp.DenseTP):
     def __init__(self, mesh, case, *, async_tp=False):
         super().__init__(mesh, async_tp=async_tp)
-        self.case = case
-        self.names = {}
+        self.case = case.removesuffix("-staged")
 
     def shard_model(self, model):
         super().shard_model(model)
-        self.names = {id(module): name for name, module in model.named_modules()}
+        for name, module in model.named_modules():
+            module.audit_name = name
+            if spec := self.shards.get(name + ".weight"):
+                module.audit_spans = tuple(len(span) for span in spec.spans)
         if self.case == "fp32-norm-grads":
             for module in model.modules():
                 if isinstance(module, (Qwen35MoeRMSNorm, Qwen35MoeRMSNormGated)):
                     module.forward = partial(norm_with_fp32_grad, module)
 
     def selects(self, module):
-        return self.names[id(module)].endswith(self.case)
+        return module.audit_name.endswith(self.case)
 
     def rows(self, x, module):
         stock_row = self.case in ("stock-row", "stock-linear-loss")
@@ -174,9 +176,7 @@ class PrecisionTP(dense_tp.DenseTP):
                     self.size,
                     self.name,
                     self.rank,
-                    tuple(
-                        len(span) for span in self.shards[self.names[id(module)] + ".weight"].spans
-                    ),
+                    module.audit_spans,
                     self.case != "stock-column-backward",
                     self.case != "stock-column-forward",
                 )
@@ -186,7 +186,7 @@ class PrecisionTP(dense_tp.DenseTP):
         selected = tuple(
             self.selects(module)
             or fp32_decay
-            and self.names[id(module)].endswith("linear_attn.in_proj_a")
+            and module.audit_name.endswith("linear_attn.in_proj_a")
             for module in modules
         )
         split_dgrad = self.case == "separate-dgrad"
