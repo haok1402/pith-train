@@ -76,6 +76,8 @@ COMPILED_DECAY_CASES = (
     "fp32-residual-stream-row-adjoints-compiled",
     "fp32-residual-stream-bf16-forward-compiled",
     "fp32-residual-stream-bf16-forward-row-adjoints-compiled",
+    "async-fp32-residual-stream-bf16-forward-compiled",
+    "async-fp32-residual-stream-bf16-forward-mlp-gate-out32-compiled",
 )
 
 MODULE_TP_CASES = ("module-tp-compiled", "module-tp-staged")
@@ -153,7 +155,8 @@ class ModuleColumn(torch.autograd.Function):
 
 class DecayProbeTP(dense_tp.DenseTP):
     def __init__(self, mesh, case):
-        super().__init__(mesh, async_tp=False)
+        super().__init__(mesh, async_tp=case.startswith("async-"))
+        case = case.removeprefix("async-")
         self.case = case
         self.master = case in ("fp32-decay-master-compiled", "fp32-decay-combined-compiled")
         self.fp32_residual = case.startswith("fp32-residual-stream-")
@@ -262,6 +265,7 @@ class DecayProbeTP(dense_tp.DenseTP):
             "gqa-k-mlp-gate-out32-compiled",
             "residual-round-out32-compiled",
             "fp32-residual-stream-out32-compiled",
+            "fp32-residual-stream-bf16-forward-mlp-gate-out32-compiled",
         ):
             selected = (True, False)
         split = (
