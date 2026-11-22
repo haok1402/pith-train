@@ -232,6 +232,9 @@ class TrainingCfg(SlottedDefault):
     pipeline_grad_sync_layers: tuple[int, ...] = ()
     """Reduce gradients for these 1F1B decoder layers after each microbatch."""
 
+    pipeline_fuse_delta_gates: bool = False
+    """Fuse the two BF16 DeltaNet gate projections in dense 1F1B."""
+
     fp8: bool = False
     """
     Train the linear layers in FP8 through DeepGEMM with 128-element block scaling; False is BF16.
@@ -431,6 +434,7 @@ def setup_model(
                 cfg.pipeline_layer_counts,
                 cfg.pipeline_compile,
                 cfg.pipeline_recompute_mlp,
+                fuse_delta_gates=cfg.pipeline_fuse_delta_gates,
             )
         )
     elif cfg.pipeline_schedule == "dualpipev":
@@ -439,6 +443,7 @@ def setup_model(
             or cfg.pipeline_compile != "layer"
             or cfg.pipeline_recompute_mlp
             or cfg.pipeline_grad_sync_layers
+            or cfg.pipeline_fuse_delta_gates
         ):
             raise ValueError("Dense pipeline tuning options require 1f1b")
         modules = nn.Sequential(

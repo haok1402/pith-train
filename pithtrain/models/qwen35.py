@@ -1,6 +1,7 @@
 """Dense Qwen3.5 text tower, including checkpoints published as Qwen3.8-27B."""
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
@@ -18,6 +19,18 @@ from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.pipeline.dualpipev import layer_sizes
 
 __all__ = ["Qwen35Model", "Qwen35DenseStage"]
+
+
+class Qwen35GatedDeltaNet(Qwen35MoeGatedDeltaNet):
+    fuse_gates = False
+
+    def project_gates(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.fuse_gates or training.fp8:
+            return super().project_gates(hidden_states)
+        # Keep the checkpoint tensors and compute both gates in one BF16 GEMM.
+        weight = torch.cat((self.in_proj_b.weight, self.in_proj_a.weight), dim=0)
+        b, a = F.linear(hidden_states, weight).chunk(2, dim=-1)
+        return b, a
 
 
 class Qwen35MLP(nn.Module):
@@ -43,7 +56,7 @@ class Qwen35DecoderLayer(nn.Module):
         self.layer_type = config.layer_types[layer_idx]
         self.is_linear = self.layer_type == "linear_attention"
         if self.is_linear:
-            self.linear_attn = Qwen35MoeGatedDeltaNet(config, layer_idx)
+            self.linear_attn = Qwen35GatedDeltaNet(config, layer_idx)
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen35MoeAttention(config)
         else:
@@ -137,6 +150,7 @@ class Qwen35DenseStage(Qwen35Model):
         layer_counts: tuple[int, ...] | None,
         compile_mode: str,
         recompute_mlp: bool | tuple[int, ...],
+        fuse_delta_gates: bool = False,
     ):
         nn.Module.__init__(self)
         count, index = distributed.pp_size, distributed.pp_rank
@@ -164,6 +178,8 @@ class Qwen35DenseStage(Qwen35Model):
             layer.recompute_mlp = (
                 layer.idx in recompute_mlp if isinstance(recompute_mlp, tuple) else recompute_mlp
             )
+            if layer.is_linear:
+                layer.linear_attn.fuse_gates = fuse_delta_gates
 
     def forward(
         self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None
