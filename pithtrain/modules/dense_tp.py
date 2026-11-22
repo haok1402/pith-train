@@ -53,6 +53,7 @@ class DenseTP:
         self.async_tp = async_tp
         self.bulk_row_reduce = False
         self.recompute_mlp_once = False
+        self.no_delta_checkpoint = False
         self.regather_inputs = regather_inputs
         self.head_chunk_tokens = head_chunk_tokens
         self.bf16_activations = False
@@ -220,7 +221,11 @@ class DenseTP:
 
     def delta_attention(self, delta, x, batch, seq):
         qkv, z, b, a = self.delta_project(delta, x)
-        q, k, v = delta.conv_qkv(qkv.view(batch, seq, -1), 0)
+        mixed_qkv = qkv.view(batch, seq, -1)
+        if self.no_delta_checkpoint:
+            q, k, v = delta.conv_qkv(mixed_qkv, 0, silu=_materialized_silu)
+        else:
+            q, k, v = delta.conv_qkv(mixed_qkv, 0)
         beta = b.view(batch, seq, -1).sigmoid().to(qkv.dtype)
         decay = self.delta_decay(delta, a)
         x = gated_delta_rule(q, k, v, decay.view(batch, seq, -1), beta)
@@ -238,7 +243,11 @@ class DenseTP:
         x = self.attention_input(layer, hidden)
         if layer.is_linear:
             delta = layer.linear_attn
-            if x.dtype == torch.bfloat16 and torch.is_grad_enabled():
+            if (
+                not self.no_delta_checkpoint
+                and x.dtype == torch.bfloat16
+                and torch.is_grad_enabled()
+            ):
                 # The stock DeltaNet checkpoint preserves BF16 rounding between
                 # convolution/SiLU and Q/K normalization in compiled execution.
                 x = delta.checkpoint_block(partial(self.delta_attention, delta), x, batch, seq)
@@ -316,6 +325,30 @@ class DenseTP:
                 replicated, torch._utils._unflatten_dense_tensors(flat, replicated)
             )
         return sharded if self.rank else sharded + replicated
+
+
+@torch.library.custom_op("pithtrain::tp_materialized_silu", mutates_args=())
+def _materialized_silu(x: torch.Tensor) -> torch.Tensor:
+    # Keep the BF16 rounding between convolution/SiLU and Q/K normalization
+    # when there is no DeltaNet checkpoint boundary to separate them.
+    return F.silu(x)
+
+
+@_materialized_silu.register_fake
+def _materialized_silu_fake(x):
+    return torch.empty_like(x)
+
+
+def _save_silu_input(ctx, inputs, output):
+    ctx.save_for_backward(*inputs)
+
+
+def _materialized_silu_backward(ctx, grad):
+    (x,) = ctx.saved_tensors
+    return torch.ops.aten.silu_backward.default(grad, x)
+
+
+_materialized_silu.register_autograd(_materialized_silu_backward, setup_context=_save_silu_input)
 
 
 def _gather(x: torch.Tensor, size: int, name: str) -> torch.Tensor:

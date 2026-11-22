@@ -186,7 +186,9 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         value = value.reshape(B, S, -1, self.head_v_dim).contiguous()
         return query, key, value
 
-    def conv_qkv(self, mixed_qkv: torch.Tensor, offset: int) -> tuple[torch.Tensor, ...]:
+    def conv_qkv(
+        self, mixed_qkv: torch.Tensor, offset: int, *, silu=F.silu
+    ) -> tuple[torch.Tensor, ...]:
         """
         The channels-last conv is bit-identical to self.conv1d on the transposed input sliced to
         [offset, offset + S).
@@ -195,7 +197,7 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         if self.tp_round_conv:
             weight = stock_bf16_value(weight)
         conv_out = causal_conv1d(mixed_qkv, weight, offset)
-        return self.split_qkv(F.silu(conv_out))
+        return self.split_qkv(silu(conv_out))
 
     def decay(self, a):
         scale, bias = self.A_log, self.dt_bias

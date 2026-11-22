@@ -55,6 +55,7 @@ if __name__ == "__main__":
     parser.add_argument("--tp-recompute-mlp-columns", action="store_true")
     parser.add_argument("--tp-recompute-mlp-once", action="store_true")
     parser.add_argument("--tp-bulk-row-reduce", action="store_true")
+    parser.add_argument("--tp-no-delta-checkpoint", action="store_true")
     args = parser.parse_args()
     if args.tp > 1 and any(
         name in os.environ for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
@@ -91,6 +92,7 @@ if __name__ == "__main__":
     train.dense_fsdp.tp_recompute_mlp_columns = args.tp_recompute_mlp_columns
     train.dense_fsdp.tp_recompute_mlp_once = args.tp_recompute_mlp_once
     train.dense_fsdp.tp_bulk_row_reduce = args.tp_bulk_row_reduce
+    train.dense_fsdp.tp_no_delta_checkpoint = args.tp_no_delta_checkpoint
     train.dense_fsdp.blocks_per_group = args.blocks_per_group
     train.dense_fsdp.group_by_attention_type = args.group_by_attention_type
     train.dense_fsdp.edge_sharding = args.edge_sharding
