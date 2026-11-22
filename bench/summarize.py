@@ -80,12 +80,15 @@ def main():
     ]
     if not rows:
         parser.error(f"No completed step at or after {args.first} in {args.log}")
-    tps = median(row[2] for row in rows)
-    print(f"Steps {rows[0][0]}–{rows[-1][0]}")
+    rates = [row[2] for row in rows]
+    tps = median(rates)
+    steps_at_target = sum(rate * flops >= 0.5 * peak for rate in rates)
+    print(f"Steps {rows[0][0]}–{rows[-1][0]} ({len(rows)} measured)")
     print(f"Median step time {median(row[1] for row in rows):.3f} s")
     print(f"Median throughput {tps:,.0f} tokens/s aggregate, {tps / args.gpus:,.0f} per GPU")
+    print(f"Throughput range {min(rates):,}–{max(rates):,} tokens/s aggregate")
     print(f"Max peak allocated memory {max(row[3] for row in rows):.2f} GiB per GPU")
-    print(f"MFU {100 * tps * flops / peak:.2f}%")
+    print(f"MFU {100 * tps * flops / peak:.2f}%, {steps_at_target}/{len(rows)} steps at or above 50%")
 
 
 if __name__ == "__main__":

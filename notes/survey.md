@@ -16,7 +16,7 @@ Add an opt-in dense model and trainer entry point. Build the full text tower wit
 
 ## Dense benchmark choices
 
-Keep the 4K BF16 DualPipeV run as the control. Match weights, sequence length, global tokens and optimizer for each paired comparison. Track steady-state step time, peak allocated and reserved memory, and time spent in compute, collectives and optimizer work.
+Use fused AdamW for the 4K BF16 DualPipeV control and all dense comparisons. Match weights, sequence length, global tokens and optimizer for each paired comparison. Track steady-state step time, peak allocated and reserved memory, and time spent in compute, collectives and optimizer work.
 
 | Inherited choice | Dense comparison and expected effect |
 | --- | --- |
@@ -31,6 +31,6 @@ These gains are conditional estimates. At 4K the 50% target is approximately 25,
 
 ## Measured dense comparisons
 
-- Compiled FSDP2 reached 42.66% MFU at 4K on the full pretrained text tower with eight H200s, global batch 64 and FP32 gradient reduction. The stock PP8 control used batch 256 and Muon, and hit a rank-0 OOM on its second step. These runs establish feasibility and memory pressure for their respective configurations. [FSDP2 results](fsdp2.md), [PP8 control log](../logs/bf16-1263388.log).
+- On eight H200s at 4K and global batch 64, stock PP8 with fused AdamW hit a rank-0 OOM on its second step at 135.18 GiB allocated. Compiled FSDP2 with FP32 reduction reached 42.24% MFU on the matched WikiText training fixture. The combination of microbatch 2, BF16 reduction, selective checkpointing, skipping the embedding backward gather, expandable allocator segments and fused DeltaNet gate projections reached 50.06% MFU over four timed steps. The matched microbatch-2 control isolates the gate projection change. [Full-node results](RESULTS.md), [PP8 control log](../logs/bf16-1264441.log).
 - On the two-H200 eight-layer FSDP2 proxy, full-block compilation increased throughput by 12.8% over eager. BF16 gradient reduction increased throughput by 5.6% at fixed prefetch, and increasing the microbatch from one to two increased it by 17.8% at fixed global tokens. Full block checkpointing reduced the peak allocation by 7.24 GiB and reduced throughput by 11.7% in the matched one-sequence proxy. These measurements support enabling compilation and measuring the memory trade-offs at full scale. [FSDP2 ablations](fsdp2.md).
 - At the 4K operator shapes, FA4 took 2.20 ms for gated attention forward and backward versus 3.12 ms with SDPA. The in-place cross-entropy path took 49.34 ms for LM head and loss versus 55.82 ms for the native loss path, with 8.59 versus 15.63 GiB peak allocated. [Hopper kernel measurements](kernels.md).
