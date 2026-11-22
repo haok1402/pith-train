@@ -14,6 +14,7 @@ from pithtrain.models.qwen35_moe import (
     Qwen35MoeRMSNorm,
 )
 from pithtrain.operators.cp_sequence import contiguous_to_zigzag, zigzag_to_contiguous
+from pithtrain.operators.embedding import CompactEmbedding
 from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.pipeline.dualpipev import layer_sizes
@@ -146,6 +147,7 @@ class Qwen35DenseStage(Qwen35Model):
         stage_count: int | None = None,
         defer_wgrad: bool = False,
         recompute_mlp_up_only: bool = False,
+        compact_embedding_grad: bool = False,
     ):
         nn.Module.__init__(self)
         count = distributed.pp_size if stage_count is None else stage_count
@@ -169,6 +171,10 @@ class Qwen35DenseStage(Qwen35Model):
             )
         start = sum(layer_counts[:index])
         self._build_stage(config, index, count, range(start, start + layer_counts[index]))
+        if compact_embedding_grad and self.embed_tokens is not None:
+            self.embed_tokens = CompactEmbedding(
+                config.vocab_size, config.hidden_size, _weight=self.embed_tokens.weight
+            )
         for layer in self.layers.values():
             layer.compile_mode = compile_mode
             layer.recompute_mlp = (

@@ -31,6 +31,7 @@ def main():
     parser.add_argument("--arms", nargs="+", default=["1f1b-attention", "interleaved-attention"])
     parser.add_argument("--repeat-stock", action="store_true")
     parser.add_argument("--compute-stream-grad-buffers", action="store_true")
+    parser.add_argument("--compact-embedding-grad", action="store_true")
     parser.add_argument("--virtual-layer-counts", type=int, nargs=4)
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -133,6 +134,9 @@ def main():
         cfg.training.pipeline_compile = compile_mode
         cfg.training.pipeline_compute_stream_grad_buffers = (
             args.compute_stream_grad_buffers and arm not in controls
+        )
+        cfg.training.pipeline_compact_embedding_grad = (
+            args.compact_embedding_grad and arm not in controls
         )
         cfg.training.pipeline_recompute_mlp = replay_up
         cfg.training.pipeline_recompute_mlp_up_only = replay_up

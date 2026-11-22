@@ -29,6 +29,7 @@ def main() -> None:
     parser.add_argument("--recompute-mlp-up-only", action="store_true")
     parser.add_argument("--grad-sync-layers", type=int, nargs="+", default=())
     parser.add_argument("--compute-stream-grad-buffers", action="store_true")
+    parser.add_argument("--compact-embedding-grad", action="store_true")
     parser.add_argument("--batch", type=int, default=256)
     parser.add_argument("--micro-batch", type=int, default=1)
     parser.add_argument("--steps", type=int, default=8)
@@ -76,6 +77,7 @@ def main() -> None:
     )
     training.pipeline_grad_sync_layers = tuple(args.grad_sync_layers)
     training.pipeline_compute_stream_grad_buffers = args.compute_stream_grad_buffers
+    training.pipeline_compact_embedding_grad = args.compact_embedding_grad
     training.pipeline_recompute_mlp_up_only = args.recompute_mlp_up_only
     training.optimizer = make_muon_optimizer if args.optimizer == "muon" else make_adamw_optimizer
     training.scheduler = partial(

@@ -246,6 +246,9 @@ class TrainingCfg(SlottedDefault):
     pipeline_compute_stream_grad_buffers: bool = False
     """Allocate FSDP reduction buffers on the model compute stream."""
 
+    pipeline_compact_embedding_grad: bool = False
+    """Use a microbatch-sized temporary for embedding backward."""
+
     fp8: bool = False
     """
     Train the linear layers in FP8 through DeepGEMM with 128-element block scaling; False is BF16.
@@ -470,6 +473,7 @@ def setup_model(
                 stage_count=stage_count,
                 defer_wgrad=split_backward,
                 recompute_mlp_up_only=cfg.pipeline_recompute_mlp_up_only,
+                compact_embedding_grad=cfg.pipeline_compact_embedding_grad,
             )
             for stage_index in range(stage_count)
             if stage_to_rank(stage_index, distributed.pp_size, schedule) == distributed.pp_rank
@@ -484,6 +488,7 @@ def setup_model(
             or cfg.pipeline_recompute_mlp_up_only
             or cfg.pipeline_grad_sync_layers
             or cfg.pipeline_compute_stream_grad_buffers
+            or cfg.pipeline_compact_embedding_grad
         ):
             raise ValueError("Dense pipeline tuning options require a dense schedule")
         modules = nn.Sequential(
