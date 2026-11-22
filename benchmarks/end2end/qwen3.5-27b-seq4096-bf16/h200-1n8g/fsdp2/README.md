@@ -14,7 +14,8 @@ activation boundary. Linear weight GEMMs write FP32 gradients, and
 FSDP2 reduces and accumulates FP32 shards. Master weights and both
 AdamW moments remain FP32.
 
-On the project cluster, launch from the project workspace with the GPU pool:
+After the precision audit passes, launch the benchmark from the project
+workspace with the GPU pool:
 
 ```bash
 model="$PWD/inputs/Qwen3.5-27B"
@@ -40,8 +41,12 @@ bench/gpu-run.sh --gpus 4 --time 00:12:00 --non-timing -- \
   bash bench/run-tp.sh exact 4 parity --async-tp --compile-blocks --checkpoint selective
 ```
 
-The audit reports relative L2 error for every parameter against the
-unsharded FP32 model, alongside the stock BF16 gradient error and an
-FP32 TP layout check. It includes both attention types and masked tokens,
-accumulates two microbatches, and verifies FP32 master weights, gradients,
-and fused AdamW state.
+The audit reports relative L2 error for every parameter and TP shard
+against the unsharded FP32 model. It fails if any error exceeds the
+corresponding stock BF16 error. Both attention types and masked tokens
+are exercised across two microbatches. The audit also checks the FP32
+shard mapping, master weights, gradients, and fused AdamW state.
+
+`tp_parity.py --bisect --cases sync-compiled async-compiled` compares
+sync and async TP on one fixture and mesh. The cancellation probe checks
+FP32 row GEMM outputs and reduce-scatter in both modes.
