@@ -35,6 +35,7 @@ def main():
     parser.add_argument("--preallocate-grad-buffers", choices=("input", "output", "both"))
     parser.add_argument("--preallocate-grad-output-layers", type=int, nargs="+", default=())
     parser.add_argument("--split-mlp-shard-layers", type=int, nargs="+", default=())
+    parser.add_argument("--split-mlp-shard-projections", choices=("all", "down"), default="all")
     parser.add_argument("--preallocate-edge-wgrads", action="store_true")
     parser.add_argument("--compact-embedding-grad", action="store_true")
     parser.add_argument("--virtual-layer-counts", type=int, nargs=4)
@@ -168,6 +169,7 @@ def main():
         cfg.training.pipeline_split_mlp_shard_layers = (
             tuple(args.split_mlp_shard_layers) if schedule in ("zb-h1", "zbv") else ()
         )
+        cfg.training.pipeline_split_mlp_shard_projections = args.split_mlp_shard_projections
         cfg.training.pipeline_preallocate_edge_wgrads = (
             args.preallocate_edge_wgrads and schedule in ("zb-h1", "zbv")
         )

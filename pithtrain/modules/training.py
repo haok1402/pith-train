@@ -268,6 +268,9 @@ class TrainingCfg(SlottedDefault):
     pipeline_split_mlp_shard_layers: tuple[int, ...] = ()
     """Use separate FSDP groups for MLP projections in these dense decoder layers."""
 
+    pipeline_split_mlp_shard_projections: Literal["all", "down"] = "all"
+    """Select which MLP projections to separate from the decoder group."""
+
     pipeline_preallocate_edge_wgrads: bool = False
     """Keep the dense embedding and LM-head FP32 accumulation buffers resident."""
 
@@ -362,6 +365,7 @@ def apply_fsdp(
     *,
     compute_stream_grad_buffers: bool = False,
     split_mlp_shard_layers: tuple[int, ...] = (),
+    split_mlp_shard_projections: Literal["all", "down"] = "all",
 ):
     """
     Shard the pipeline chunks in model with FSDP2 in place and return model. The routed expert
@@ -398,7 +402,12 @@ def apply_fsdp(
             if dense_stage and layer.idx in split_mlp_shard_layers:
                 # Small packing/output groups can reuse fragmented cached blocks without
                 # keeping every sharded gradient resident throughout the next backward.
-                for projection in (layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj):
+                projections = (
+                    (layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj)
+                    if split_mlp_shard_projections == "all"
+                    else (layer.mlp.down_proj,)
+                )
+                for projection in projections:
                     fully_shard(
                         projection, mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp
                     )
@@ -504,6 +513,8 @@ def setup_model(
         or any(not 0 <= index < module_config.num_hidden_layers for index in split_mlp_shard_layers)
     ):
         raise ValueError("MLP sharding requires valid dense ZB-H1 or ZB-V decoder indices")
+    if cfg.pipeline_split_mlp_shard_projections not in ("all", "down"):
+        raise ValueError("MLP sharding projections must be all or down")
     if cfg.pipeline_preallocate_edge_wgrads and (
         schedule not in ("zb-h1", "zbv") or not cfg.pipeline_compact_embedding_grad
     ):
@@ -600,6 +611,7 @@ def setup_model(
         distributed_cfg.hsdp_replica,
         compute_stream_grad_buffers=cfg.pipeline_compute_stream_grad_buffers,
         split_mlp_shard_layers=split_mlp_shard_layers,
+        split_mlp_shard_projections=cfg.pipeline_split_mlp_shard_projections,
     )
     if grad_buffers is not None:
         decoder_layers = {layer for stage in modules for layer in stage.layers.values()}
