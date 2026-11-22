@@ -215,6 +215,15 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         num_tokens = local_count * dp_size * cp_size
 
     # FSDP reduces with a plain sum. Normalize by the global token count before clipping.
+    upcast_params = []
+    if dense_fsdp is not None and dense_fsdp.bf16_sharded_gradients:
+        for param in model.parameters():
+            if param.grad is not None:
+                grad = param.grad.to(torch.float32)
+                param.grad = None
+                param.grad_dtype = torch.float32
+                param.grad = grad
+                upcast_params.append(param)
     norm_grads = tp.sync_replicated_grads(model) if tp is not None else None
     scale_grads_(local_grads(model), 1.0 / num_tokens)
 
@@ -230,6 +239,8 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
+    for param in upcast_params:
+        param.grad_dtype = torch.bfloat16
     if training.fp8:
         precompute_fp8_param_scales()
     MoELoadBalanceLossTracker.reset()

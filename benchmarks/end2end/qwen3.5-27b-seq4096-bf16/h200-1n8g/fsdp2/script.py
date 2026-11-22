@@ -34,6 +34,7 @@ if __name__ == "__main__":
     parser.add_argument("--skip-embedding-backward-gather", action="store_true")
     parser.add_argument("--prefetch", type=int, default=0)
     parser.add_argument("--reduce-dtype", choices=("fp32", "bf16"), default="fp32")
+    parser.add_argument("--bf16-sharded-gradients", action="store_true")
     parser.add_argument("--reduce-at-step-end", action="store_true")
     parser.add_argument("--reduce-scatter-buffers", type=int, default=1)
     parser.add_argument("--separate-reduce-scatter", action="store_true")
@@ -74,6 +75,7 @@ if __name__ == "__main__":
     train.dense_fsdp.skip_embedding_backward_gather = args.skip_embedding_backward_gather
     train.dense_fsdp.prefetch = args.prefetch
     train.dense_fsdp.reduce_dtype = args.reduce_dtype
+    train.dense_fsdp.bf16_sharded_gradients = args.bf16_sharded_gradients
     train.dense_fsdp.reduce_at_step_end = args.reduce_at_step_end
     train.dense_fsdp.reduce_scatter_buffers = args.reduce_scatter_buffers
     train.dense_fsdp.separate_reduce_scatter = args.separate_reduce_scatter
