@@ -152,7 +152,7 @@ def capture_parameter_partials(model):
     return partials, groups
 
 
-def check_parameter_partials(model, tp, partials, groups):
+def check_parameter_partials(model, tp, partials, groups, case):
     for group, post_backward in groups.items():
         group.post_backward = post_backward
     for name, param in model.named_parameters():
@@ -164,7 +164,7 @@ def check_parameter_partials(model, tp, partials, groups):
         error = rel_l2(param.grad.full_tensor(), partial)
         assert error < 2e-6, (name, error)
         print(
-            f"token_sums rank={dist.get_rank()} grad={name} before_fsdp={partial.dtype} "
+            f"token_sums case={case} rank={dist.get_rank()} grad={name} before_fsdp={partial.dtype} "
             f"tp_reduce={'fp32' if replicated else 'head-or-vocab-sharded'} "
             f"reduction_error={error:.8f}",
             flush=True,
@@ -466,7 +466,7 @@ def main():
         if case == "stock-adjoint-compiled":
             override.remove()
         if args.token_sums_audit:
-            check_parameter_partials(parallel, layout, partials, groups)
+            check_parameter_partials(parallel, layout, partials, groups, case)
 
         max_bf16_error = max_layout_error = max_excess = 0.0
         exceeding = 0

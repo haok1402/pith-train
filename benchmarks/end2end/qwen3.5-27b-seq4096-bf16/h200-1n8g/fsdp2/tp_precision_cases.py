@@ -11,6 +11,7 @@ from pithtrain.kernels import cross_entropy_fwd_bwd, stage_compile_options
 from pithtrain.models.qwen35_moe import Qwen35MoeRMSNorm, Qwen35MoeRMSNormGated
 from pithtrain.modules import dense_tp
 from pithtrain.operators.causal_conv1d import causal_conv1d
+from pithtrain.operators.parameter_rounding import stock_bf16_value
 
 PROJECTION_CASES = (
     "linear_attn.in_proj_qkv",
@@ -73,6 +74,8 @@ COMPILED_DECAY_CASES = (
     "fp32-residual-stream-all-row-out32-compiled",
     "fp32-residual-stream-delta-adjoint-compiled",
     "fp32-residual-stream-row-adjoints-compiled",
+    "fp32-residual-stream-bf16-forward-compiled",
+    "fp32-residual-stream-bf16-forward-row-adjoints-compiled",
 )
 
 MODULE_TP_CASES = ("module-tp-compiled", "module-tp-staged")
@@ -154,6 +157,7 @@ class DecayProbeTP(dense_tp.DenseTP):
         self.case = case
         self.master = case in ("fp32-decay-master-compiled", "fp32-decay-combined-compiled")
         self.fp32_residual = case.startswith("fp32-residual-stream-")
+        self.round_residual = case.startswith("fp32-residual-stream-bf16-forward-")
 
     def embed(self, module, tokens):
         hidden = super().embed(module, tokens)
@@ -192,6 +196,8 @@ class DecayProbeTP(dense_tp.DenseTP):
 
     def attention(self, layer, hidden, rotary):
         residual = super().attention(layer, hidden, rotary)
+        if self.round_residual:
+            return stock_bf16_value(residual)
         if self.case.startswith("residual-round-"):
             return materialize(residual)
         return residual
@@ -200,7 +206,8 @@ class DecayProbeTP(dense_tp.DenseTP):
         if self.fp32_residual:
             residual = self.attention(layer, hidden, rotary)
             mlp_input = layer.post_attention_layernorm(residual).to(torch.bfloat16)
-            return residual + self.mlp(layer, mlp_input)
+            output = residual + self.mlp(layer, mlp_input)
+            return stock_bf16_value(output) if self.round_residual else output
         if self.case != "residual-fp32-norm-compiled":
             return super().decoder(layer, hidden, rotary)
         contribution = self.token_mixing(layer, hidden, rotary)
@@ -280,7 +287,10 @@ class DecayProbeTP(dense_tp.DenseTP):
         )
 
     def rows(self, x, module):
-        if self.case == "fp32-residual-stream-row-adjoints-compiled" or (
+        if self.case in (
+            "fp32-residual-stream-row-adjoints-compiled",
+            "fp32-residual-stream-bf16-forward-row-adjoints-compiled",
+        ) or (
             self.case == "fp32-residual-stream-delta-adjoint-compiled"
             and getattr(module, "audit_delta_row", False)
         ):
