@@ -258,9 +258,6 @@ class TrainingCfg(SlottedDefault):
     pipeline_compute_stream_grad_buffers: bool = False
     """Allocate FSDP reduction buffers on the model compute stream."""
 
-    pipeline_separate_reduce_output_stream: bool = False
-    """Give FSDP reduction outputs an allocation stream separate from model temporaries."""
-
     pipeline_compact_embedding_grad: bool = False
     """Use a microbatch-sized temporary for embedding backward."""
 
@@ -346,13 +343,7 @@ def split_replicas(mesh: DeviceMesh, hsdp_replica: int) -> DeviceMesh:
     return mesh._unflatten(0, (hsdp_replica, size // hsdp_replica), ("replica", "shard"))
 
 
-def apply_fsdp(
-    model,
-    hsdp_replica: int = 1,
-    *,
-    compute_stream_grad_buffers: bool = False,
-    separate_reduce_output_stream: bool = False,
-):
+def apply_fsdp(model, hsdp_replica: int = 1, *, compute_stream_grad_buffers: bool = False):
     """
     Shard the pipeline chunks in model with FSDP2 in place and return model. The routed expert
     weights shard over the dp axis of the expert mesh, everything else over the dp x cp stage, and
@@ -404,11 +395,7 @@ def apply_fsdp(
     # Sum, not average: the two classes reduce over groups of different size, yet each sum is the
     # global gradient, so the step's single divide by the global token count normalizes both.
     reduce_scatter = (
-        ComputeStreamReduceScatter(
-            distributed.device, separate_output_stream=separate_reduce_output_stream
-        )
-        if compute_stream_grad_buffers
-        else None
+        ComputeStreamReduceScatter(distributed.device) if compute_stream_grad_buffers else None
     )
     for module in model.modules():
         if isinstance(module, FSDPModule):
@@ -463,8 +450,6 @@ def setup_model(
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")
 
     schedule = cfg.pipeline_schedule
-    if cfg.pipeline_separate_reduce_output_stream and not cfg.pipeline_compute_stream_grad_buffers:
-        raise ValueError("A separate reduction output stream requires compute-stream gradient buffers")
     weight_delays = cfg.pipeline_zb_h1_weight_delays
     if weight_delays is not None and (
         schedule != "zb-h1"
@@ -554,7 +539,6 @@ def setup_model(
         modules,
         distributed_cfg.hsdp_replica,
         compute_stream_grad_buffers=cfg.pipeline_compute_stream_grad_buffers,
-        separate_reduce_output_stream=cfg.pipeline_separate_reduce_output_stream,
     )
     install_wgrad_accumulation(modules)
     install_raw_main_grad(modules)  # gpt-oss raw expert weights; no-op elsewhere

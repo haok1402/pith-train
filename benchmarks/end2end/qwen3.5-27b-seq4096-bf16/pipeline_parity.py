@@ -31,8 +31,6 @@ def main():
     parser.add_argument("--arms", nargs="+", default=["1f1b-attention", "interleaved-attention"])
     parser.add_argument("--repeat-stock", action="store_true")
     parser.add_argument("--compute-stream-grad-buffers", action="store_true")
-    parser.add_argument("--separate-reduce-output-stream", action="store_true")
-    parser.add_argument("--backward-repeats", type=int, choices=(1, 2), default=1)
     parser.add_argument("--compact-embedding-grad", action="store_true")
     parser.add_argument("--virtual-layer-counts", type=int, nargs=4)
     parser.add_argument("--microbatch-size", type=int, choices=(1, 2), default=2)
@@ -153,9 +151,6 @@ def main():
         cfg.training.pipeline_compute_stream_grad_buffers = (
             args.compute_stream_grad_buffers and arm not in controls
         )
-        cfg.training.pipeline_separate_reduce_output_stream = (
-            args.separate_reduce_output_stream and arm not in controls
-        )
         cfg.training.pipeline_compact_embedding_grad = (
             args.compact_embedding_grad and arm not in controls
         )
@@ -178,10 +173,7 @@ def main():
                 ]
                 local(param).copy_(shard)
         print(f"rank={rank} starting {arm}", flush=True)
-        for attempt in range(args.backward_repeats):
-            losses = model.step(batches, objective)
-            if attempt + 1 < args.backward_repeats:
-                model.zero_grad(set_to_none=True)
+        losses = model.step(batches, objective)
         loss = torch.stack(losses).sum() if losses else torch.zeros((), device=device)
         dist.all_reduce(loss)
         torch.testing.assert_close(loss / num_tokens, reference_loss, rtol=0.002, atol=0.002)

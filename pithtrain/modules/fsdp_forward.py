@@ -45,23 +45,16 @@ __all__ = ["ComputeStreamReduceScatter", "install_lean_hooks", "register_fsdp_fo
 class ComputeStreamReduceScatter(DefaultReduceScatter):
     """Let FP32 reduction outputs reuse blocks released by model compute."""
 
-    def __init__(self, device: torch.device, *, separate_output_stream: bool = False) -> None:
+    def __init__(self, device: torch.device) -> None:
         self.compute_stream = torch.cuda.current_stream(device)
-        self.output_stream = (
-            torch.cuda.Stream(device=device) if separate_output_stream else self.compute_stream
-        )
 
     def allocate(self, size, *, dtype, device):
         caller = torch.cuda.current_stream(device)
-        # Packing inputs use compute. Isolating outputs preserves their size classes across steps.
-        allocation_stream = self.compute_stream if caller == self.compute_stream else self.output_stream
-        with torch.cuda.stream(allocation_stream):
+        with torch.cuda.stream(self.compute_stream):
             buffer = super().allocate(size, dtype=dtype, device=device)
-        if caller != allocation_stream:
-            caller.wait_stream(allocation_stream)
+        if caller != self.compute_stream:
+            caller.wait_stream(self.compute_stream)
             buffer.record_stream(caller)
-        if allocation_stream != self.compute_stream:
-            buffer.record_stream(self.compute_stream)
         return buffer
 
 
