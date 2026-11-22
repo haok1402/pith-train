@@ -56,6 +56,9 @@ class PretrainLMCfg(SlottedDefault):
     log_first_microbatch_loss: bool = False
     """Log the first data replica's first loss for reference-model checks."""
 
+    allocator_retry_warmup_steps: int | None = None
+    """Log allocator statistics every step and fail on retries after this many warmup steps."""
+
 
 def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset:
     if cfg.training.benchmark:
@@ -157,6 +160,8 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     step_start_time = time.time()
 
     torch.cuda.memory.reset_peak_memory_stats()
+    retry_warmup = cfg.allocator_retry_warmup_steps
+    initial_memory = torch.cuda.memory_stats() if retry_warmup is not None else None
 
     model, optimizers, schedulers = training.model, training.optimizers, training.schedulers
     model.train()
@@ -228,9 +233,32 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     torch.distributed.all_reduce(elapsed_tensor, op=torch.distributed.ReduceOp.MAX)
     elapsed = elapsed_tensor.item()
 
-    peak_gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
-    peak_gpu_mem = torch.tensor(peak_gpu_mem, device=device)
-    torch.distributed.all_reduce(peak_gpu_mem, op=torch.distributed.ReduceOp.MAX)
+    rank_memory = []
+    if initial_memory is None:
+        peak_gpu_mem = torch.tensor(torch.cuda.max_memory_allocated() / 1024**3, device=device)
+        torch.distributed.all_reduce(peak_gpu_mem, op=torch.distributed.ReduceOp.MAX)
+    else:
+        memory = torch.cuda.memory_stats()
+        local_memory = torch.tensor(
+            [
+                memory["num_alloc_retries"],
+                memory["num_alloc_retries"] - initial_memory["num_alloc_retries"],
+                memory["allocated_bytes.all.peak"],
+                memory["reserved_bytes.all.peak"],
+                memory["inactive_split_bytes.all.peak"],
+                memory["num_device_alloc"] - initial_memory["num_device_alloc"],
+                memory["num_device_free"] - initial_memory["num_device_free"],
+            ],
+            dtype=torch.int64,
+            device=device,
+        )
+        gathered = local_memory.new_empty(
+            (torch.distributed.get_world_size(), local_memory.numel())
+        )
+        torch.distributed.all_gather_into_tensor(gathered, local_memory)
+        rank_memory = gathered.tolist()
+        peak_gpu_mem = max(row[2] for row in rank_memory) / 1024**3
+    step_retries = max((row[1] for row in rank_memory), default=0)
 
     # The tracked values include the coefficient; dividing it out logs E * dot(f, p), where 1.0
     # is perfect balance (the Megatron-LM convention).
@@ -258,7 +286,25 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         statements.append("gradient-norm %.4f" % gradient_norm.item())
         statements.append("tokens-per-second %s" % format(tokens_per_second, ",.0f"))
         statements.append("peak-gpu-memory %.2f GB" % peak_gpu_mem)
+        if rank_memory:
+            statements.append("num_alloc_retries %d" % step_retries)
+            statements.append("num_alloc_retries_total %d" % max(row[0] for row in rank_memory))
         logger.info(" | ".join(statements))
+        for rank, (_, retries, allocated, reserved, inactive, allocs, frees) in enumerate(
+            rank_memory
+        ):
+            if retries:
+                logger.info(
+                    "allocator-retry rank=%d retries=%d allocated_peak=%.2fGiB "
+                    "reserved_peak=%.2fGiB inactive_split_peak=%.2fGiB device_allocs=%d device_frees=%d",
+                    rank,
+                    retries,
+                    allocated / 1024**3,
+                    reserved / 1024**3,
+                    inactive / 1024**3,
+                    allocs,
+                    frees,
+                )
         activate_wandb(cfg)
         if logging.wandb is not None:
             metrics = dict()
@@ -274,6 +320,8 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
             wandb.log(metrics)
 
     completed = step + 1
+    if retry_warmup is not None and completed > retry_warmup and step_retries:
+        raise RuntimeError(f"Invalid benchmark: CUDA allocator retried at step {completed}")
 
     stop = cfg.training.nsys_stop
     if stop is not None and completed == stop:

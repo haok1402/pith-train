@@ -44,6 +44,7 @@ def main() -> None:
     cfg = PretrainLMCfg()
     cfg.dataset = args.dataset or Path(".")
     cfg.log_first_microbatch_loss = args.log_first_microbatch_loss
+    cfg.allocator_retry_warmup_steps = 3
     cfg.distributed.pipeline_parallel_size = args.pp
     cfg.distributed.context_parallel_size = 1
     cfg.distributed.expert_parallel_size = 1
