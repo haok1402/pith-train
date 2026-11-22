@@ -31,7 +31,6 @@ from pithtrain.modules.fp8_param_gather import (
 )
 from pithtrain.modules.fsdp_forward import (
     ComputeStreamReduceScatter,
-    PersistentReduceScatterOutput,
     install_lean_hooks,
     register_fsdp_forward_method,
 )
@@ -259,8 +258,8 @@ class TrainingCfg(SlottedDefault):
     pipeline_compute_stream_grad_buffers: bool = False
     """Allocate FSDP reduction buffers on the model compute stream."""
 
-    pipeline_persistent_reduce_output_layers: tuple[int, ...] = ()
-    """Keep each selected decoder FSDP group's FP32 reduction output across steps."""
+    pipeline_separate_reduce_output_stream: bool = False
+    """Give FSDP reduction outputs an allocation stream separate from model temporaries."""
 
     pipeline_compact_embedding_grad: bool = False
     """Use a microbatch-sized temporary for embedding backward."""
@@ -352,7 +351,7 @@ def apply_fsdp(
     hsdp_replica: int = 1,
     *,
     compute_stream_grad_buffers: bool = False,
-    persistent_reduce_output_layers: tuple[int, ...] = (),
+    separate_reduce_output_stream: bool = False,
 ):
     """
     Shard the pipeline chunks in model with FSDP2 in place and return model. The routed expert
@@ -405,26 +404,16 @@ def apply_fsdp(
     # Sum, not average: the two classes reduce over groups of different size, yet each sum is the
     # global gradient, so the step's single divide by the global token count normalizes both.
     reduce_scatter = (
-        ComputeStreamReduceScatter(distributed.device) if compute_stream_grad_buffers else None
-    )
-    persistent_layers = (
-        {
-            layer
-            for stage in model
-            for layer in stage.layers.values()
-            if layer.idx in persistent_reduce_output_layers
-        }
-        if persistent_reduce_output_layers
-        else set()
+        ComputeStreamReduceScatter(
+            distributed.device, separate_output_stream=separate_reduce_output_stream
+        )
+        if compute_stream_grad_buffers
+        else None
     )
     for module in model.modules():
         if isinstance(module, FSDPModule):
             module.set_gradient_divide_factor(1.0)
-            if module in persistent_layers:
-                module.set_custom_reduce_scatter(
-                    PersistentReduceScatterOutput(distributed.device, tuple(module.parameters()))
-                )
-            elif reduce_scatter is not None:
+            if reduce_scatter is not None:
                 module.set_custom_reduce_scatter(reduce_scatter)
 
     # Gathering FP8 weights in FP8 gives the same operands as quantizing the gathered bf16 weight.
@@ -474,6 +463,8 @@ def setup_model(
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")
 
     schedule = cfg.pipeline_schedule
+    if cfg.pipeline_separate_reduce_output_stream and not cfg.pipeline_compute_stream_grad_buffers:
+        raise ValueError("A separate reduction output stream requires compute-stream gradient buffers")
     weight_delays = cfg.pipeline_zb_h1_weight_delays
     if weight_delays is not None and (
         schedule != "zb-h1"
@@ -489,16 +480,6 @@ def setup_model(
         or any(left < right for left, right in zip(forward_warmups, forward_warmups[1:]))
     ):
         raise ValueError("ZB-H1 forward warmups require a nonincreasing value per rank ending at zero")
-    persistent_reduce_output_layers = cfg.pipeline_persistent_reduce_output_layers
-    if persistent_reduce_output_layers and (
-        schedule != "zb-h1"
-        or not cfg.pipeline_compute_stream_grad_buffers
-        or any(
-            not 0 <= index < module_config.num_hidden_layers
-            for index in persistent_reduce_output_layers
-        )
-    ):
-        raise ValueError("Persistent output layers require valid ZB-H1 indices and compute-stream buffers")
     if schedule in ("1f1b", "interleaved", "zb-h1", "zbv"):
         if ModelClass is not Qwen35Model or distributed.ep_size != 1:
             raise ValueError("Dense pipeline schedules require Qwen3.5 with expert_parallel_size=1")
@@ -573,7 +554,7 @@ def setup_model(
         modules,
         distributed_cfg.hsdp_replica,
         compute_stream_grad_buffers=cfg.pipeline_compute_stream_grad_buffers,
-        persistent_reduce_output_layers=persistent_reduce_output_layers,
+        separate_reduce_output_stream=cfg.pipeline_separate_reduce_output_stream,
     )
     install_wgrad_accumulation(modules)
     install_raw_main_grad(modules)  # gpt-oss raw expert weights; no-op elsewhere

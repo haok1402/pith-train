@@ -12,7 +12,6 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
-from torch.distributed.fsdp import FSDPModule, fully_shard
 from torch.distributed.tensor import DTensor
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
@@ -32,21 +31,20 @@ def main():
     parser.add_argument("--arms", nargs="+", default=["1f1b-attention", "interleaved-attention"])
     parser.add_argument("--repeat-stock", action="store_true")
     parser.add_argument("--compute-stream-grad-buffers", action="store_true")
+    parser.add_argument("--separate-reduce-output-stream", action="store_true")
+    parser.add_argument("--backward-repeats", type=int, choices=(1, 2), default=1)
     parser.add_argument("--compact-embedding-grad", action="store_true")
     parser.add_argument("--virtual-layer-counts", type=int, nargs=4)
     parser.add_argument("--microbatch-size", type=int, choices=(1, 2), default=2)
     parser.add_argument("--zb-h1-weight-delays", type=int, nargs=2)
     parser.add_argument("--zb-h1-forward-warmups", type=int, nargs=2)
     parser.add_argument("--recompute-mlp-up-layers", type=int, nargs="+", default=())
-    parser.add_argument("--persistent-reduce-output-layers", type=int, nargs="+", default=())
-    parser.add_argument("--backward-repeats", type=int, choices=(1, 2), default=1)
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     from pithtrain.contexts import distributed, logging, training
     from pithtrain.models.qwen35 import Qwen35Model
     from pithtrain.modules import training as train
     from pithtrain.modules.distributed import setup_distributed
-    from pithtrain.modules.fsdp_forward import PersistentReduceScatterOutput
     from pithtrain.modules.optimizer import clip_grad_norm, local_grads, scale_grads_
     from pithtrain.operators.linear import BF16Linear
     from pithtrain.pipeline import Microbatch
@@ -155,8 +153,8 @@ def main():
         cfg.training.pipeline_compute_stream_grad_buffers = (
             args.compute_stream_grad_buffers and arm not in controls
         )
-        cfg.training.pipeline_persistent_reduce_output_layers = (
-            tuple(args.persistent_reduce_output_layers) if schedule == "zb-h1" else ()
+        cfg.training.pipeline_separate_reduce_output_stream = (
+            args.separate_reduce_output_stream and arm not in controls
         )
         cfg.training.pipeline_compact_embedding_grad = (
             args.compact_embedding_grad and arm not in controls
@@ -180,22 +178,8 @@ def main():
                 ]
                 local(param).copy_(shard)
         print(f"rank={rank} starting {arm}", flush=True)
-        persistent_outputs = [
-            group._reduce_scatter_comm
-            for module in model.modules()
-            if isinstance(module, FSDPModule)
-            for group in fully_shard.state(module)._fsdp_param_groups
-            if isinstance(group._reduce_scatter_comm, PersistentReduceScatterOutput)
-        ]
         for attempt in range(args.backward_repeats):
             losses = model.step(batches, objective)
-            for comm in persistent_outputs:
-                assert comm.output is not None
-                address = comm.output.untyped_storage().data_ptr()
-                assert all(
-                    local(param.grad).untyped_storage().data_ptr() == address
-                    for param in comm.parameters
-                ), (arm, attempt)
             if attempt + 1 < args.backward_repeats:
                 model.zero_grad(set_to_none=True)
         loss = torch.stack(losses).sum() if losses else torch.zeros((), device=device)

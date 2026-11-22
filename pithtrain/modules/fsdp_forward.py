@@ -39,51 +39,30 @@ from torch.distributed.fsdp._fully_shard._fsdp_param_group import (
 )
 from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
 
-__all__ = [
-    "ComputeStreamReduceScatter",
-    "PersistentReduceScatterOutput",
-    "install_lean_hooks",
-    "register_fsdp_forward_method",
-]
+__all__ = ["ComputeStreamReduceScatter", "install_lean_hooks", "register_fsdp_forward_method"]
 
 
 class ComputeStreamReduceScatter(DefaultReduceScatter):
     """Let FP32 reduction outputs reuse blocks released by model compute."""
 
-    def __init__(self, device: torch.device) -> None:
+    def __init__(self, device: torch.device, *, separate_output_stream: bool = False) -> None:
         self.compute_stream = torch.cuda.current_stream(device)
+        self.output_stream = (
+            torch.cuda.Stream(device=device) if separate_output_stream else self.compute_stream
+        )
 
     def allocate(self, size, *, dtype, device):
         caller = torch.cuda.current_stream(device)
-        with torch.cuda.stream(self.compute_stream):
+        # Packing inputs use compute. Isolating outputs preserves their size classes across steps.
+        allocation_stream = self.compute_stream if caller == self.compute_stream else self.output_stream
+        with torch.cuda.stream(allocation_stream):
             buffer = super().allocate(size, dtype=dtype, device=device)
-        if caller != self.compute_stream:
-            caller.wait_stream(self.compute_stream)
+        if caller != allocation_stream:
+            caller.wait_stream(allocation_stream)
             buffer.record_stream(caller)
+        if allocation_stream != self.compute_stream:
+            buffer.record_stream(self.compute_stream)
         return buffer
-
-
-class PersistentReduceScatterOutput(ComputeStreamReduceScatter):
-    """Reuse one FSDP group's FP32 output after its sharded gradients are cleared."""
-
-    def __init__(self, device: torch.device, parameters: tuple[nn.Parameter, ...]) -> None:
-        super().__init__(device)
-        self.parameters = parameters
-        self.output: torch.Tensor | None = None
-
-    def allocate(self, size, *, dtype, device):
-        caller = torch.cuda.current_stream(device)
-        if caller == self.compute_stream or any(param.grad is not None for param in self.parameters):
-            # The packing input and additional reductions into live grads need their own storage.
-            return super().allocate(size, dtype=dtype, device=device)
-        if self.output is None:
-            self.output = super().allocate(size, dtype=dtype, device=device)
-            return self.output
-        if self.output.shape != size or self.output.dtype != dtype or self.output.device != device:
-            return super().allocate(size, dtype=dtype, device=device)
-        caller.wait_stream(self.compute_stream)
-        self.output.record_stream(caller)
-        return self.output
 
 
 def is_sequence(x: Any) -> bool:
