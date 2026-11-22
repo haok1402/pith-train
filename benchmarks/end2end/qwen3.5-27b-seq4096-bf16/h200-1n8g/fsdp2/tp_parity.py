@@ -86,11 +86,13 @@ def rel_l2(actual, expected):
     return (error / expected.float().norm().clamp_min(1e-6)).item()
 
 
-def backward(model, tokens, labels, dp, tp=None):
+def backward(model, tokens, labels, dp, tp=None, begin_microbatch=None):
     from pithtrain.tasks.pretrain_lm import objective
 
     losses = []
-    for x, y in zip(tokens[:, dp.rank()], labels[:, dp.rank()], strict=True):
+    for i, (x, y) in enumerate(zip(tokens[:, dp.rank()], labels[:, dp.rank()], strict=True)):
+        if begin_microbatch is not None:
+            begin_microbatch(i)
         if tp is None:
             loss, _ = objective((model(x),), (y,))
         else:
@@ -206,7 +208,15 @@ def main():
     stock_adjoints = []
     if args.cases and "stock-adjoint-compiled" in args.cases:
         capture = record_block_adjoints(stock.layers[0], stock_adjoints)
-    stock_loss = backward(stock, tokens, labels, dp)
+    from tp_delta_trace import TRACE_CASES, begin_microbatch, report, trace_core
+
+    if args.cases and any(case in TRACE_CASES for case in args.cases):
+        with patch.object(
+            qwen35_moe, "gated_delta_rule", trace_core(qwen35_moe.gated_delta_rule, "stock")
+        ):
+            stock_loss = backward(stock, tokens, labels, dp, begin_microbatch=begin_microbatch)
+    else:
+        stock_loss = backward(stock, tokens, labels, dp)
     if stock_adjoints:
         capture.remove()
 
@@ -291,6 +301,8 @@ def main():
                 "async-staged",
             ):
                 layout = dense_tp.DenseTP(mesh, async_tp=overlap)
+            elif case in TRACE_CASES:
+                layout = dense_tp.DenseTP(mesh, async_tp=False)
             elif case in COMPILED_DECAY_CASES:
                 layout = DecayProbeTP(mesh, case)
             else:
@@ -310,7 +322,16 @@ def main():
         install_wgrad_accumulation(parallel)
         if case == "stock-adjoint-compiled":
             override = use_stock_block_adjoints(parallel.layers[0], stock_adjoints, layout)
-        tp_loss = backward(parallel, tokens, labels, dp, layout)
+        if case in TRACE_CASES:
+            with patch.object(
+                dense_tp,
+                "gated_delta_rule",
+                trace_core(dense_tp.gated_delta_rule, case, layout.rank, layout.size),
+            ):
+                tp_loss = backward(parallel, tokens, labels, dp, layout, begin_microbatch)
+            report(case, layout.rank, layout.size, rel_l2)
+        else:
+            tp_loss = backward(parallel, tokens, labels, dp, layout)
         if case == "stock-adjoint-compiled":
             override.remove()
 
