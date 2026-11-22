@@ -429,7 +429,11 @@ def setup_model(
             tp_mesh = init_device_mesh(
                 "cuda", (world_size // tp_size, tp_size), mesh_dim_names=("dp", "tp")
             )
-            tp = DenseTP(tp_mesh, async_tp=dense.async_tensor_parallel)
+            tp = DenseTP(
+                tp_mesh,
+                async_tp=dense.async_tensor_parallel,
+                regather_inputs=dense.tp_regather_inputs,
+            )
             mesh = tp_mesh["dp"]
             distributed.dp_size, distributed.dp_rank = mesh.size(), mesh.get_local_rank()
         else:
@@ -441,6 +445,8 @@ def setup_model(
         from_hf = cfg.hf_import_path is not None and cfg.save_location is None
         with torch.device("meta") if from_hf else nullcontext():
             model = Qwen35TextModel(module_config)
+        if any(param.dtype != torch.float32 for param in model.parameters()):
+            raise ValueError("Dense BF16 training requires FP32 master parameters")
         if not from_hf:
             init_weights(
                 model,
@@ -455,6 +461,8 @@ def setup_model(
         if from_hf:
             model.to_empty(device=distributed.device)
             model.rotary_emb = Qwen35MoeRotaryEmbedding(module_config).to(distributed.device)
+        if tp is not None:
+            install_wgrad_accumulation(model)
         training.model = model
         return
 

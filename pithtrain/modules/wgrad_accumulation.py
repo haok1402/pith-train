@@ -52,11 +52,15 @@ def install_wgrad_accumulation(model: nn.Module) -> None:
     Give every BF16Linear, GroupedLinear and FP8GroupedLinear weight in the model a main_grad,
     after fully_shard.
     """
+    seen_groups = set()
     for module in model.modules():
         if not isinstance(module, FSDPModule):
             continue
         for group in fully_shard.state(module)._fsdp_param_groups:
             assert isinstance(group, FSDPParamGroup)
+            if group in seen_groups:
+                continue
+            seen_groups.add(group)
             pairs = []
             for fsdp_param in group.fsdp_params:
                 assert isinstance(fsdp_param, FSDPParam)

@@ -1,18 +1,14 @@
-"""Compare full and sequence-sharded BF16 Qwen3.5 loss and all parameter gradients."""
+"""Audit stock BF16 and sequence-parallel training against unsharded FP32."""
 
 import argparse
 import copy
-import json
 import logging as std_logging
 import os
-from pathlib import Path
-from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from safetensors.torch import save_file
 from torch.distributed.device_mesh import init_device_mesh
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
@@ -52,149 +48,6 @@ def torch_attention(q, k, v, softmax_scale, causal):
     ).transpose(1, 2)
 
 
-def split_row_forward(projection):
-    def forward(x, quantized_input=None):
-        x0, x1 = x.chunk(2, dim=-1)
-        w0, w1 = projection.weight.chunk(2, dim=-1)
-        partial = F.linear(x0.contiguous(), w0.contiguous()) + F.linear(
-            x1.contiguous(), w1.contiguous()
-        )
-        return partial if projection.bias is None else partial + projection.bias
-
-    return forward
-
-
-def unsharded_bf16_split_k(reference, tokens, labels):
-    model = copy.deepcopy(reference)
-    model.zero_grad(set_to_none=True)
-    for layer in model.layers:
-        out = layer.linear_attn.out_proj if layer.is_linear else layer.self_attn.o_proj
-        for projection in (out, layer.mlp.down_proj):
-            projection.forward = split_row_forward(projection)
-    logits = model(tokens).flatten(0, 1)
-    F.cross_entropy(logits.float(), labels.flatten(), reduction="sum").backward()
-    return model
-
-
-def fp32_tp(reference, tp, tokens, labels, shard_dense_model, fsdp_cfg):
-    from pithtrain.contexts import training
-    from pithtrain.models import qwen35_moe
-    from pithtrain.modules import dense_tp
-
-    model = copy.deepcopy(reference).float()
-    model.zero_grad(set_to_none=True)
-    layout = dense_tp.DenseTP(tp.mesh, async_tp=False)
-    layout.shard_model(model)
-    with patch.object(training, "PARAM_DTYPE", torch.float32):
-        shard_dense_model(model, tp.mesh["dp"], fsdp_cfg)
-    with (
-        patch.multiple(
-            dense_tp,
-            gated_delta_rule=recurrent_delta,
-            flash_attn_func=torch_attention,
-            silu_mul=lambda gate, up: F.silu(gate) * up,
-        ),
-        patch.object(qwen35_moe, "causal_conv1d", torch_conv),
-    ):
-        logits = model(tokens)
-        layout.loss(logits, labels).backward()
-    layout.sync_replicated_grads(model)
-    return model
-
-
-def check_bf16_local_heads(reference, tp, tokens):
-    from pithtrain.operators.causal_conv1d import causal_conv1d
-    from pithtrain.operators.gated_delta_rule import gated_delta_rule
-
-    layer = reference.layers[0]
-    delta = layer.linear_attn
-    conv_shard = tp.shards["layers.0.linear_attn.conv1d.weight"]
-    with torch.no_grad():
-        x = layer.input_layernorm(reference.embed_tokens(tokens))
-        mixed = delta.in_proj_qkv(x)
-        convolved = causal_conv1d(mixed, delta.conv1d.weight)
-        local_mixed = torch.cat(
-            [mixed[..., span.start : span.stop] for span in conv_shard.spans], -1
-        )
-        local_convolved = causal_conv1d(local_mixed, conv_shard.select(delta.conv1d.weight))
-        expected_conv = torch.cat(
-            [convolved[..., span.start : span.stop] for span in conv_shard.spans], -1
-        )
-        q, k, v = delta.split_qkv(F.silu(convolved))
-        beta = delta.in_proj_b(x).sigmoid()
-        advance = F.softplus(delta.in_proj_a(x).float() + delta.dt_bias.float())
-        generator = torch.Generator(device=x.device).manual_seed(71)
-        dout = torch.randn(v.shape, device=v.device, dtype=v.dtype, generator=generator)
-
-    alpha = delta.A_log.detach().requires_grad_(True)
-    full = gated_delta_rule(q, k, v, -alpha.float().exp() * advance, beta)
-    (full_grad,) = torch.autograd.grad(full, alpha, dout)
-    local_alpha = alpha.detach().chunk(tp.size)[tp.rank].contiguous().requires_grad_(True)
-    q_local, k_local, v_local, adv_local, beta_local, do_local = (
-        value.chunk(tp.size, dim=2)[tp.rank].contiguous()
-        for value in (q, k, v, advance, beta, dout)
-    )
-    local = gated_delta_rule(
-        q_local, k_local, v_local, -local_alpha.float().exp() * adv_local, beta_local
-    )
-    (local_grad,) = torch.autograd.grad(local, local_alpha, do_local)
-    values = (
-        rel_l2(local_convolved, expected_conv),
-        rel_l2(local, full.chunk(tp.size, dim=2)[tp.rank]),
-        rel_l2(local_grad, full_grad.chunk(tp.size)[tp.rank]),
-    )
-    print(
-        f"rank={tp.rank} same_input_bf16 conv_rel_l2={values[0]:.8f} "
-        f"gdn_rel_l2={values[1]:.8f} A_log_rel_l2={values[2]:.8f}",
-        flush=True,
-    )
-
-
-def check_bf16_fp32_partials(reference, tp, tokens, labels, shard_dense_model, fsdp_cfg, oracle):
-    from pithtrain.modules import dense_tp
-
-    def precise_row_forward(ctx, x, weight, size, name, overlap):
-        ctx.save_for_backward(x, weight)
-        ctx.size, ctx.name, ctx.overlap = size, name, False
-        partial = torch.mm(x, weight.t(), out_dtype=torch.float32)
-        return dense_tp._scatter_sum(partial, size, name).to(x.dtype)
-
-    def precise_column_backward(ctx, *grads):
-        x, *weights = ctx.saved_tensors
-        grads = tuple(grad.contiguous() for grad in grads)
-        partials = [
-            torch.mm(grad, weight, out_dtype=torch.float32)
-            for grad, weight in zip(grads, weights, strict=True)
-        ]
-        total = sum(partials[1:], partials[0])
-        dx = dense_tp._scatter_sum(total, ctx.size, ctx.name).to(x.dtype)
-        dw = tuple(grad.t() @ x for grad in grads)
-        return dx, None, None, None, *dw
-
-    for patch_backward in (False, True):
-        model = copy.deepcopy(reference)
-        model.zero_grad(set_to_none=True)
-        layout = dense_tp.DenseTP(tp.mesh, async_tp=False)
-        layout.shard_model(model)
-        shard_dense_model(model, tp.mesh["dp"], fsdp_cfg)
-        backward = precise_column_backward if patch_backward else dense_tp._ColumnParallel.backward
-        with (
-            patch.object(dense_tp._RowParallel, "forward", staticmethod(precise_row_forward)),
-            patch.object(dense_tp._ColumnParallel, "backward", staticmethod(backward)),
-        ):
-            layout.loss(model(tokens), labels).backward()
-        layout.sync_replicated_grads(model)
-        for attr in ("A_log", "dt_bias"):
-            name = "layers.0.linear_attn." + attr
-            expected = layout.shards[name].select(oracle.get_parameter(name).grad)
-            actual = model.get_parameter(name).grad.to_local()
-            print(
-                f"rank={tp.rank} fp32_partials {name} column_backward={patch_backward} "
-                f"tp_to_fp32={rel_l2(actual, expected):.8f}",
-                flush=True,
-            )
-
-
 def fp32_reference(model, tokens):
     batch, seq = tokens.shape
     hidden = model.embed_tokens(tokens)
@@ -232,96 +85,48 @@ def rel_l2(actual, expected):
     return (error / expected.float().norm().clamp_min(1e-6)).item()
 
 
-def precision_check(
-    reference, parallel, tp, tokens, labels, shard_dense_model, fsdp_cfg, check_partials=False
-):
-    # The two BF16 controls use the same batch, either one local B=2 backward or
-    # two local B=1 backwards followed by FSDP2's cross-rank reduction.
-    dp = copy.deepcopy(reference)
-    dp.zero_grad(set_to_none=True)
-    shard_dense_model(dp, tp.mesh["tp"], fsdp_cfg)
-    dp_logits = dp(tokens[tp.rank : tp.rank + 1]).flatten(0, 1)
-    dp_labels = labels[tp.rank].flatten()
-    F.cross_entropy(dp_logits.float(), dp_labels, reduction="sum").backward()
+def backward(model, tokens, labels, dp, tp=None):
+    from pithtrain.tasks.pretrain_lm import objective
 
-    oracle = copy.deepcopy(reference).float()
-    oracle.zero_grad(set_to_none=True)
-    torch.set_float32_matmul_precision("highest")
-    torch.backends.cudnn.allow_tf32 = False
-    oracle_logits = fp32_reference(oracle, tokens)
-    oracle_loss = F.cross_entropy(oracle_logits, labels.flatten(), reduction="sum")
-    oracle_loss.backward()
-
-    split_k = unsharded_bf16_split_k(reference, tokens, labels)
-    precise_sharded = fp32_tp(reference, tp, tokens, labels, shard_dense_model, fsdp_cfg)
-    original = dict(reference.named_parameters())
-    reordered = dict(dp.named_parameters())
-    sharded = dict(parallel.named_parameters())
-    fp32 = dict(oracle.named_parameters())
-    split_k_params = dict(split_k.named_parameters())
-    precise_tp_params = dict(precise_sharded.named_parameters())
-    for name in (
-        "layers.0.linear_attn.A_log",
-        "layers.0.linear_attn.dt_bias",
-        "layers.0.linear_attn.conv1d.weight",
-        "layers.0.linear_attn.in_proj_qkv.weight",
-        "layers.0.linear_attn.in_proj_a.weight",
-        "layers.0.linear_attn.in_proj_b.weight",
-        "layers.0.linear_attn.norm.weight",
-        "layers.1.self_attn.q_norm.weight",
-    ):
-        baseline = original[name].grad
-        alternate = reordered[name].grad.full_tensor()
-        precise = fp32[name].grad
-        split = split_k_params[name].grad
-        layout = tp.shards.get(name)
-        if layout is not None:
-            baseline, alternate, precise, split = map(
-                layout.select, (baseline, alternate, precise, split)
-            )
-        actual = sharded[name].grad.to_local()
-        precise_tp = precise_tp_params[name].grad.to_local()
-        print(
-            f"rank={tp.rank} precision {name} "
-            f"bf16_to_fp32={rel_l2(baseline, precise):.6f} "
-            f"reordered_bf16_to_fp32={rel_l2(alternate, precise):.6f} "
-            f"tp_to_fp32={rel_l2(actual, precise):.6f} "
-            f"bf16_reorder={rel_l2(alternate, baseline):.6f} "
-            f"tp_to_bf16={rel_l2(actual, baseline):.6f} "
-            f"split_k_to_bf16={rel_l2(split, baseline):.6f} "
-            f"split_k_to_fp32={rel_l2(split, precise):.6f} "
-            f"tp_to_split_k={rel_l2(actual, split):.6f} "
-            f"fp32_tp_to_fp32={rel_l2(precise_tp, precise):.8f} "
-            f"fp32_norm={precise.norm().item():.9f}",
-            flush=True,
-        )
-
-    if check_partials:
-        check_bf16_local_heads(reference, tp, tokens)
-        check_bf16_fp32_partials(reference, tp, tokens, labels, shard_dense_model, fsdp_cfg, oracle)
+    losses = []
+    for x, y in zip(tokens[:, dp.rank()], labels[:, dp.rank()], strict=True):
+        logits = model(x)
+        if tp is None:
+            loss, _ = objective((logits,), (y,))
+        else:
+            loss = tp.loss(logits, y)
+        loss.backward()
+        losses.append(loss.detach())
+    if tp is not None:
+        tp.sync_replicated_grads(model)
+    loss = torch.stack(losses).sum()
+    dist.all_reduce(loss, group=dp)
+    return loss
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tp", type=int, default=2)
     parser.add_argument("--async-tp", action="store_true")
+    parser.add_argument("--tp-regather-inputs", action="store_true")
     parser.add_argument("--compile-blocks", action="store_true")
-    parser.add_argument("--hf-roundtrip", action="store_true")
-    parser.add_argument("--precision-reference", action="store_true")
-    parser.add_argument("--check-tp-partials", action="store_true")
+    parser.add_argument("--blocks-per-group", type=int, default=2)
+    parser.add_argument("--checkpoint", choices=("none", "selective", "full"), default="none")
     args = parser.parse_args()
 
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
     dist.init_process_group("nccl", device_id=device)
-    if (args.precision_reference or args.check_tp_partials) and dist.get_world_size() != 2:
-        raise ValueError("The two-sample precision comparison requires two GPUs")
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cudnn.allow_tf32 = False
 
     from pithtrain.contexts import distributed, logging, training
+    from pithtrain.models import qwen35_moe
     from pithtrain.models.qwen35 import Qwen35TextModel
+    from pithtrain.modules import dense_tp
     from pithtrain.modules.dense_fsdp import DenseFSDPCfg, shard_dense_model
-    from pithtrain.modules.dense_tp import DenseTP
-    from pithtrain.modules.hf_loader import load_hf_into_model
     from pithtrain.modules.training import init_weights
+    from pithtrain.modules.wgrad_accumulation import install_wgrad_accumulation
     from pithtrain.operators.linear import BF16Linear
 
     training.fp8, training.Linear = False, BF16Linear
@@ -350,90 +155,103 @@ def main():
             "partial_rotary_factor": 0.25,
         },
     )
-    reference = Qwen35TextModel(config).to(device=device, dtype=torch.bfloat16)
-    init_weights(reference, config.num_hidden_layers, seed=17, pipeline_chunks=False)
-    parallel = copy.deepcopy(reference)
-    mesh = init_device_mesh("cuda", (1, dist.get_world_size()), mesh_dim_names=("dp", "tp"))
-    tp = DenseTP(mesh, async_tp=args.async_tp)
-    tp.shard_model(parallel)
-    fsdp = DenseFSDPCfg()
-    fsdp.compile_blocks = args.compile_blocks
-    shard_dense_model(parallel, mesh["dp"], fsdp)
-    if args.hf_roundtrip:
-        fixture = [None]
-        if dist.get_rank() == 0:
-            scratch = TemporaryDirectory(dir=os.environ.get("TMPDIR", "."), prefix="tp-parity-")
-            fixture[0] = scratch.name
-            folder = Path(scratch.name)
-            filename = "model.safetensors"
-            weights = {
-                "model.language_model." + name
-                if name != "lm_head.weight"
-                else name: param.detach().cpu()
-                for name, param in reference.named_parameters()
-            }
-            save_file(weights, folder / filename)
-            (folder / "config.json").write_text(json.dumps({"model_type": "qwen3_5_text"}))
-            (folder / "model.safetensors.index.json").write_text(
-                json.dumps({"weight_map": dict.fromkeys(weights, filename)})
-            )
-        dist.broadcast_object_list(fixture)
-        with torch.no_grad():
-            for param in parallel.parameters():
-                param.to_local().fill_(float("nan"))
-            load_hf_into_model(Path(fixture[0]), parallel)
-        if dist.get_rank() == 0:
-            scratch.cleanup()
-
-    tokens = torch.randint(config.vocab_size, (2, 512), device=device)
-    labels = torch.randint(config.vocab_size, tokens.shape, device=device)
-    labels[:, 3::11] = -100
-
-    reference_logits = reference(tokens).flatten(0, 1)
-    reference_loss = torch.nn.functional.cross_entropy(
-        reference_logits.float(), labels.flatten(), reduction="sum"
+    oracle = Qwen35TextModel(config).to(device)
+    init_weights(oracle, config.num_hidden_layers, seed=17, pipeline_chunks=False)
+    parallel, stock, fp32_tp = (copy.deepcopy(oracle) for _ in range(3))
+    mesh = init_device_mesh(
+        "cuda", (dist.get_world_size() // args.tp, args.tp), mesh_dim_names=("dp", "tp")
     )
-    reference_loss.backward()
-    parallel_logits = parallel(tokens)
-    parallel_loss = tp.loss(parallel_logits, labels)
-    parallel_loss.backward()
-    tp.sync_replicated_grads(parallel)
+    dp_mesh = mesh["dp"]
+    dp = dp_mesh.get_group()
+    layout = dense_tp.DenseTP(mesh, async_tp=args.async_tp, regather_inputs=args.tp_regather_inputs)
+    layout.shard_model(parallel)
+    config_fsdp = DenseFSDPCfg()
+    config_fsdp.tensor_parallel_size = args.tp
+    config_fsdp.compile_blocks = args.compile_blocks
+    config_fsdp.activation_checkpoint = args.checkpoint
+    config_fsdp.blocks_per_group = args.blocks_per_group
+    config_fsdp.skip_embedding_backward_gather = True
+    shard_dense_model(parallel, dp_mesh, config_fsdp)
+    install_wgrad_accumulation(parallel)
 
-    expected_logits = reference_logits.chunk(tp.size, dim=-1)[tp.rank]
-    logit_error = rel_l2(parallel_logits, expected_logits)
-    loss_error = ((parallel_loss - reference_loss).abs() / reference_loss).item()
-    worst = 0.0
-    for (name, actual), (expected_name, expected) in zip(
-        parallel.named_parameters(), reference.named_parameters(), strict=True
+    for layer in stock.layers:
+        layer.forward = layer.forward_stock_stages
+    stock_fsdp = DenseFSDPCfg()
+    stock_fsdp.blocks_per_group = args.blocks_per_group
+    shard_dense_model(stock, dp_mesh, stock_fsdp)
+    install_wgrad_accumulation(stock)
+
+    tokens = torch.randint(config.vocab_size, (2, dp.size(), 1, 512), device=device)
+    labels = torch.randint(config.vocab_size, tokens.shape, device=device)
+    labels[..., 3::11] = -100
+    tp_loss = backward(parallel, tokens, labels, dp, layout)
+    stock_loss = backward(stock, tokens, labels, dp)
+
+    dense_tokens = tokens.reshape(-1, tokens.size(-1))
+    dense_labels = labels.reshape(-1, labels.size(-1))
+    oracle_loss = F.cross_entropy(
+        fp32_reference(oracle, dense_tokens), dense_labels.flatten(), reduction="sum"
+    )
+    oracle_loss.backward()
+
+    fp32_layout = dense_tp.DenseTP(mesh, async_tp=False)
+    fp32_layout.shard_model(fp32_tp)
+    with patch.object(training, "PARAM_DTYPE", torch.float32):
+        shard_dense_model(fp32_tp, dp_mesh, DenseFSDPCfg())
+    with (
+        patch.multiple(
+            dense_tp,
+            gated_delta_rule=recurrent_delta,
+            flash_attn_func=torch_attention,
+            silu_mul=lambda gate, up: F.silu(gate) * up,
+        ),
+        patch.object(qwen35_moe, "causal_conv1d", torch_conv),
     ):
-        assert name == expected_name
-        spec = tp.shards.get(name)
-        expected_grad = spec.select(expected.grad) if spec else expected.grad
-        error = rel_l2(actual.grad.to_local(), expected_grad)
-        worst = max(worst, error)
-        print(f"rank={tp.rank} grad {name} relative-L2={error:.6f}", flush=True)
+        fp32_loss = backward(fp32_tp, tokens, labels, dp, fp32_layout)
 
+    rank = dist.get_rank()
+    max_bf16_error = max_layout_error = 0.0
+    for name, param in parallel.named_parameters():
+        assert param.dtype == param.grad.dtype == torch.float32, name
+        actual = param.grad.full_tensor()
+        baseline = stock.get_parameter(name).grad.full_tensor()
+        expected = oracle.get_parameter(name).grad
+        fp32_actual = fp32_tp.get_parameter(name).grad.full_tensor()
+        if spec := layout.shards.get(name):
+            baseline, expected = spec.select(baseline), spec.select(expected)
+        assert torch.isfinite(actual).all()
+        bf16_error = rel_l2(actual, expected)
+        layout_error = rel_l2(fp32_actual, expected)
+        max_bf16_error = max(max_bf16_error, bf16_error)
+        max_layout_error = max(max_layout_error, layout_error)
+        print(
+            f"rank={rank} grad={name} tp_to_fp32={bf16_error:.8f} "
+            f"stock_to_fp32={rel_l2(baseline, expected):.8f} "
+            f"tp_to_stock={rel_l2(actual, baseline):.8f} fp32_layout={layout_error:.8f}",
+            flush=True,
+        )
+
+    optimizer = torch.optim.AdamW(parallel.parameters(), lr=1e-5, fused=True)
+    before = parallel.lm_head.weight.to_local().detach().clone()
+    optimizer.step()
+    assert not torch.equal(before, parallel.lm_head.weight.to_local())
+    for param in parallel.parameters():
+        state = optimizer.state[param]
+        assert state["exp_avg"].dtype == state["exp_avg_sq"].dtype == torch.float32
+    loss_rel = ((tp_loss - stock_loss).abs() / stock_loss).item()
+    oracle_rel = ((fp32_loss - oracle_loss).abs() / oracle_loss).item()
     print(
-        f"rank={tp.rank} TP={tp.size} async={args.async_tp} compiled={args.compile_blocks} "
-        f"hf_roundtrip={args.hf_roundtrip} "
-        f"reference_loss={reference_loss.item():.6f} tp_loss={parallel_loss.item():.6f} "
-        f"loss_rel={loss_error:.6f} logits_rel_l2={logit_error:.6f} max_grad_rel_l2={worst:.6f}",
+        f"rank={rank} TP={layout.size} FSDP={dp.size()} async={args.async_tp} "
+        f"compiled={args.compile_blocks} checkpoint={args.checkpoint} "
+        f"stock_loss={stock_loss.item():.8f} tp_loss={tp_loss.item():.8f} "
+        f"fp32_loss={oracle_loss.item():.8f} max_tp_to_fp32={max_bf16_error:.8f} "
+        f"max_fp32_layout={max_layout_error:.8f} fp32_adamw=passed",
         flush=True,
     )
-    if args.precision_reference or args.check_tp_partials:
-        precision_check(
-            reference,
-            parallel,
-            tp,
-            tokens,
-            labels,
-            shard_dense_model,
-            DenseFSDPCfg(),
-            check_partials=args.check_tp_partials,
-        )
-    assert loss_error < 0.001
-    assert logit_error < 0.025
-    assert worst < 0.06
+    assert loss_rel < 0.001
+    assert oracle_rel < 1e-5
+    assert max_layout_error < 2e-4
+    assert max_bf16_error < 0.06
     dist.destroy_process_group()
 
 

@@ -172,23 +172,28 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     dense_fsdp = cfg.training.dense_fsdp
     tp = getattr(model, "tensor_parallel", None)
     if tp is not None:
-        start_retries = torch.cuda.memory_stats()["num_alloc_retries"]
+        initial_memory = torch.cuda.memory_stats()
     if dense_fsdp is not None:
         batches = get_batch_tensors(cfg, dataset, step, device)
         delay_reduce = dense_fsdp.reduce_at_step_end and len(batches) > 1
+        retained = model.retained_fsdp_units if len(batches) > 1 else ()
         if delay_reduce:
             model.set_requires_gradient_sync(False)
             model.set_is_last_backward(False)
+        for unit in retained:
+            unit.set_reshard_after_backward(False, recurse=False)
         losses, counts = [], []
         for i, (tokens, labels) in enumerate(batches):
-            if delay_reduce and i == len(batches) - 1:
-                model.set_requires_gradient_sync(True)
-                model.set_is_last_backward(True)
-            logits = model(tokens)
+            if i == len(batches) - 1:
+                if delay_reduce:
+                    model.set_requires_gradient_sync(True)
+                    model.set_is_last_backward(True)
+                for unit in retained:
+                    unit.set_reshard_after_backward(True, recurse=False)
             if tp is None:
-                loss, detached = objective((logits,), (labels,))
+                loss, detached = objective((model(tokens),), (labels,))
             else:
-                loss = tp.loss(logits, labels)
+                loss = tp.loss(model(tokens), labels)
                 detached = loss.detach()
             loss.backward()
             losses.append(detached)
@@ -253,15 +258,21 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     torch.distributed.all_reduce(elapsed_tensor, op=torch.distributed.ReduceOp.MAX)
     elapsed = elapsed_tensor.item()
 
-    peak_gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
+    gib = 1024**3
+    memory = [torch.cuda.max_memory_allocated() / gib]
     if tp is not None:
-        retries = torch.cuda.memory_stats()["num_alloc_retries"] - start_retries
-        memory = torch.tensor((peak_gpu_mem, retries), device=device)
-        torch.distributed.all_reduce(memory, op=torch.distributed.ReduceOp.MAX)
-        peak_gpu_mem, retries = memory.unbind()
-    else:
-        peak_gpu_mem = torch.tensor(peak_gpu_mem, device=device)
-        torch.distributed.all_reduce(peak_gpu_mem, op=torch.distributed.ReduceOp.MAX)
+        stats = torch.cuda.memory_stats()
+        memory += [
+            stats["reserved_bytes.all.peak"] / gib,
+            stats["num_alloc_retries"] - initial_memory["num_alloc_retries"],
+            stats["num_alloc_retries"],
+            stats["inactive_split_bytes.all.peak"] / gib,
+            stats["num_device_alloc"] - initial_memory["num_device_alloc"],
+            stats["num_device_free"] - initial_memory["num_device_free"],
+        ]
+    peak_gpu_stats = torch.tensor(memory, device=device)
+    torch.distributed.all_reduce(peak_gpu_stats, op=torch.distributed.ReduceOp.MAX)
+    peak_gpu_mem = peak_gpu_stats[0]
 
     # The tracked values include the coefficient; dividing it out logs E * dot(f, p), where 1.0
     # is perfect balance (the Megatron-LM convention).
@@ -290,7 +301,13 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         statements.append("tokens-per-second %s" % format(tokens_per_second, ",.0f"))
         statements.append("peak-gpu-memory %.2f GB" % peak_gpu_mem)
         if tp is not None:
+            reserved, retries, total_retries, inactive, allocs, frees = peak_gpu_stats[1:].tolist()
+            statements.append("peak-gpu-reserved %.2f GiB" % reserved)
             statements.append("allocator-retries %d" % retries)
+            statements.append("num_alloc_retries %d" % total_retries)
+            statements.append("peak-cuda-inactive-split %.2f GiB" % inactive)
+            statements.append("cuda-device-allocs %d" % allocs)
+            statements.append("cuda-device-frees %d" % frees)
         logger.info(" | ".join(statements))
         activate_wandb(cfg)
         if logging.wandb is not None:
@@ -307,6 +324,8 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
             wandb.log(metrics)
 
     completed = step + 1
+    if tp is not None and completed > 2 and peak_gpu_stats[2].item():
+        raise RuntimeError("CUDA allocator retried after warmup")
 
     stop = cfg.training.nsys_stop
     if stop is not None and completed == stop:

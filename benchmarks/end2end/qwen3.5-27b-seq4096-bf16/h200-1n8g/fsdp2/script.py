@@ -31,6 +31,7 @@ if __name__ == "__main__":
     parser.add_argument("--reshard", type=reshard, default=True)
     parser.add_argument("--keep-last-groups", type=int, default=0)
     parser.add_argument("--keep-last-group", dest="keep_last_groups", action="store_const", const=1)
+    parser.add_argument("--keep-gathered-across-microbatches", action="store_true")
     parser.add_argument("--skip-embedding-backward-gather", action="store_true")
     parser.add_argument("--prefetch", type=int, default=0)
     parser.add_argument("--reduce-dtype", choices=("fp32", "bf16"), default="fp32")
@@ -39,11 +40,17 @@ if __name__ == "__main__":
     parser.add_argument("--reduce-scatter-buffers", type=int, default=1)
     parser.add_argument("--separate-reduce-scatter", action="store_true")
     parser.add_argument("--checkpoint", choices=("none", "selective", "full"), default="none")
+    parser.add_argument("--checkpoint-blocks", type=int)
     parser.add_argument("--compile-blocks", action="store_true")
     parser.add_argument("--unfused-adamw", action="store_true")
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--async-tp", action="store_true")
+    parser.add_argument("--tp-regather-inputs", action="store_true")
     args = parser.parse_args()
+    if args.tp > 1 and any(
+        name in os.environ for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
+    ):
+        parser.error("Dense TP requires the default CUDA allocator")
 
     # PithTrain's kernel imports query the current GPU.
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -67,11 +74,13 @@ if __name__ == "__main__":
     train.dense_fsdp = DenseFSDPCfg()
     train.dense_fsdp.tensor_parallel_size = args.tp
     train.dense_fsdp.async_tensor_parallel = args.async_tp
+    train.dense_fsdp.tp_regather_inputs = args.tp_regather_inputs
     train.dense_fsdp.blocks_per_group = args.blocks_per_group
     train.dense_fsdp.group_by_attention_type = args.group_by_attention_type
     train.dense_fsdp.edge_sharding = args.edge_sharding
     train.dense_fsdp.reshard_after_forward = args.reshard
     train.dense_fsdp.keep_last_groups = args.keep_last_groups
+    train.dense_fsdp.keep_gathered_across_microbatches = args.keep_gathered_across_microbatches
     train.dense_fsdp.skip_embedding_backward_gather = args.skip_embedding_backward_gather
     train.dense_fsdp.prefetch = args.prefetch
     train.dense_fsdp.reduce_dtype = args.reduce_dtype
@@ -80,5 +89,6 @@ if __name__ == "__main__":
     train.dense_fsdp.reduce_scatter_buffers = args.reduce_scatter_buffers
     train.dense_fsdp.separate_reduce_scatter = args.separate_reduce_scatter
     train.dense_fsdp.activation_checkpoint = args.checkpoint
+    train.dense_fsdp.checkpoint_blocks = args.checkpoint_blocks
     train.dense_fsdp.compile_blocks = args.compile_blocks
     launch(cfg)

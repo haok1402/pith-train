@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -13,6 +14,7 @@ from torch.distributed import DeviceMesh
 
 from pithtrain.operators.flash_attn_v4 import flash_attn_func
 from pithtrain.operators.gated_delta_rule import gated_delta_rule
+from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.silu_mul import silu_mul
 
 if TYPE_CHECKING:
@@ -32,7 +34,7 @@ class DenseTPShard:
 
 
 class DenseTP:
-    def __init__(self, mesh: DeviceMesh, *, async_tp: bool):
+    def __init__(self, mesh: DeviceMesh, *, async_tp: bool, regather_inputs: bool = False):
         self.mesh = mesh
         self.group = mesh.get_group("tp")
         self.dp_group = mesh.get_group("dp")
@@ -40,6 +42,7 @@ class DenseTP:
         self.size = self.group.size()
         self.name = self.group.group_name
         self.async_tp = async_tp
+        self.regather_inputs = regather_inputs
         if async_tp:
             # Import registers the symmetric-memory operators.
             import torch.distributed._symmetric_memory  # noqa: F401
@@ -77,6 +80,8 @@ class DenseTP:
 
         shard("embed_tokens.weight")
         linear("lm_head")
+        # Keep the FSDP pre-forward hook on the head: it supplies the gathered weight.
+        model.lm_head.forward = partial(self.head, model.lm_head)
         model.embed_tokens.num_embeddings //= self.size
 
         for i, layer in enumerate(model.layers):
@@ -126,21 +131,34 @@ class DenseTP:
         embedded = module(indices.clamp(0, shard_vocab - 1))
         return _ScatterSum.apply(embedded * owned[:, None], self.size, self.name)
 
-    def gather(self, x: torch.Tensor) -> torch.Tensor:
-        return _Gather.apply(x, self.size, self.name)
-
-    def column_weights(self, x: torch.Tensor, *weights: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        return _ColumnParallel.apply(x, self.size, self.name, self.async_tp, *weights)
-
     def columns(self, x: torch.Tensor, *modules: nn.Linear) -> tuple[torch.Tensor, ...]:
-        outputs = self.column_weights(x, *(module.weight for module in modules))
+        main_grads = tuple(getattr(module, "main_grad", None) for module in modules)
+        outputs = _ColumnParallel.apply(
+            x,
+            self.size,
+            self.name,
+            self.async_tp,
+            self.regather_inputs,
+            main_grads,
+            *(m.weight for m in modules),
+        )
         return tuple(
             output if module.bias is None else output + module.bias
             for output, module in zip(outputs, modules)
         )
 
+    def head(self, module: BF16Linear, x: torch.Tensor) -> torch.Tensor:
+        return self.columns(x, module)[0]
+
     def rows(self, x: torch.Tensor, module: nn.Linear) -> torch.Tensor:
-        output = _RowParallel.apply(x, module.weight, self.size, self.name, self.async_tp)
+        output = _RowParallel.apply(
+            x,
+            module.weight,
+            getattr(module, "main_grad", None),
+            self.size,
+            self.name,
+            self.async_tp,
+        )
         return output if module.bias is None else output + module.bias
 
     def decoder(
@@ -154,13 +172,9 @@ class DenseTP:
         x = layer.input_layernorm(hidden)
         if layer.is_linear:
             delta = layer.linear_attn
-            # Both gates use the same gathered input. A combined small GEMM also
-            # combines their input gradients before rounding to BF16.
-            gate_weights = torch.cat((delta.in_proj_b.weight, delta.in_proj_a.weight), dim=0)
-            qkv, z, gates = self.column_weights(
-                x, delta.in_proj_qkv.weight, delta.in_proj_z.weight, gate_weights
+            qkv, z, b, a = self.columns(
+                x, delta.in_proj_qkv, delta.in_proj_z, delta.in_proj_b, delta.in_proj_a
             )
-            b, a = gates.chunk(2, dim=-1)
             q, k, v = delta.conv_qkv(qkv.view(batch, seq, -1), 0)
             beta = b.view(batch, seq, -1).sigmoid()
             decay = -delta.A_log.float().exp() * F.softplus(a.float() + delta.dt_bias.float())
@@ -213,46 +227,90 @@ def _scatter_sum(x: torch.Tensor, size: int, name: str) -> torch.Tensor:
     return torch.ops._c10d_functional.wait_tensor(output)
 
 
+def _mm_fp32(a, b):
+    if a.dtype == torch.float32:
+        return a @ b
+    return torch.mm(a, b, out_dtype=torch.float32)
+
+
+@torch.library.custom_op("pithtrain::tp_fp32_matmul_reduce_scatter", mutates_args=())
+def _mm_scatter(
+    a: torch.Tensor, b: torch.Tensor, size: int, name: str, overlap: bool
+) -> torch.Tensor:
+    if overlap and a.dtype == torch.bfloat16:
+        from torch.distributed._symmetric_memory import _fused_matmul_reduce_scatter_impl
+
+        shard = _fused_matmul_reduce_scatter_impl(
+            mm_out_op=torch.ops.aten.mm.dtype_out,
+            A=a,
+            B=b,
+            kwargs={"out_dtype": torch.float32},
+            out_dtype=torch.float32,
+            reduce_op="sum",
+            scatter_dim=0,
+            group_name=name,
+        )
+    else:
+        shard = _scatter_sum(_mm_fp32(a, b), size, name)
+    return shard.to(a.dtype)
+
+
+@_mm_scatter.register_fake
+def _mm_scatter_fake(a, b, size, name, overlap):
+    return a.new_empty((a.size(0) // size, b.size(1)))
+
+
+def _weight_grad(main_grad, grad, x):
+    if main_grad is None:
+        return _mm_fp32(grad.t(), x)
+    torch.ops.pithtrain.wgrad_accumulate_(main_grad, grad.t(), x)
+    return None
+
+
 class _ColumnParallel(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, size, name, overlap, *weights):
+    def forward(ctx, x, size, name, overlap, regather, main_grads, *weights):
         if overlap:
             gathered, outputs = torch.ops.symm_mem.fused_all_gather_matmul(
-                x, [w.t() for w in weights], 0, name
+                x, [w.t() for w in weights], 0, name, return_A=not regather
             )
         else:
             gathered = _gather(x, size, name)
             outputs = tuple(F.linear(gathered, w) for w in weights)
-        ctx.save_for_backward(gathered, *weights)
-        ctx.size, ctx.name, ctx.overlap = size, name, overlap
+        ctx.save_for_backward(x if regather else gathered, *weights)
+        ctx.size, ctx.name, ctx.overlap, ctx.regather = size, name, overlap, regather
+        ctx.main_grads = main_grads
         return tuple(outputs)
 
     @staticmethod
     def backward(ctx, *grads):
         x, *weights = ctx.saved_tensors
         grads = tuple(grad.contiguous() for grad in grads)
-        if ctx.overlap and len(weights) == 1:
-            dx = torch.ops.symm_mem.fused_matmul_reduce_scatter(
-                grads[0], weights[0], "sum", 0, ctx.name
+        if ctx.regather:
+            x = torch.ops._c10d_functional.all_gather_into_tensor(
+                x.contiguous(), ctx.size, ctx.name
             )
+        if len(weights) == 1:
+            dx = _mm_scatter(grads[0], weights[0], ctx.size, ctx.name, ctx.overlap)
         else:
-            contributions = (grad @ weight for grad, weight in zip(grads, weights))
+            contributions = (_mm_fp32(grad, weight) for grad, weight in zip(grads, weights))
             total = next(contributions)
             for contribution in contributions:
                 total = total + contribution
-            dx = _scatter_sum(total, ctx.size, ctx.name)
-        dweights = tuple(grad.t() @ x for grad in grads)
-        return dx, None, None, None, *dweights
+            dx = _scatter_sum(total, ctx.size, ctx.name).to(x.dtype)
+        if ctx.regather:
+            x = torch.ops._c10d_functional.wait_tensor(x)
+        dweights = tuple(_weight_grad(mg, grad, x) for mg, grad in zip(ctx.main_grads, grads))
+        return dx, None, None, None, None, None, *dweights
 
 
 class _RowParallel(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, size, name, overlap):
+    def forward(ctx, x, weight, main_grad, size, name, overlap):
         ctx.save_for_backward(x, weight)
         ctx.size, ctx.name, ctx.overlap = size, name, overlap
-        if overlap:
-            return torch.ops.symm_mem.fused_matmul_reduce_scatter(x, weight.t(), "sum", 0, name)
-        return _scatter_sum(F.linear(x, weight), size, name)
+        ctx.main_grad = main_grad
+        return _mm_scatter(x, weight.t(), size, name, overlap)
 
     @staticmethod
     def backward(ctx, dout):
@@ -262,18 +320,7 @@ class _RowParallel(torch.autograd.Function):
         else:
             grad = _gather(dout, ctx.size, ctx.name)
             dx = grad @ weight
-        return dx, grad.t() @ x, None, None, None
-
-
-class _Gather(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, size, name):
-        ctx.size, ctx.name = size, name
-        return _gather(x, size, name)
-
-    @staticmethod
-    def backward(ctx, grad):
-        return _scatter_sum(grad, ctx.size, ctx.name), None, None
+        return dx, _weight_grad(ctx.main_grad, grad, x), None, None, None, None
 
 
 class _ScatterSum(torch.autograd.Function):
@@ -300,7 +347,8 @@ def _local_loss_gradient(logits, lse, local_label, owned, valid, grad):
     columns = torch.arange(logits.size(1), device=logits.device)
     target = owned[:, None] & (columns == local_label[:, None])
     result = (probs - target.float()) * valid[:, None] * grad
-    return result.to(logits.dtype)
+    # The loss consumes the logits. Reuse their buffer for the gradient, as stock CE does.
+    return logits.copy_(result)
 
 
 class _VocabCrossEntropy(torch.autograd.Function):

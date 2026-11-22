@@ -33,7 +33,10 @@ class DenseFSDPCfg(SlottedDefault):
     tensor_parallel_size: int = 1
 
     async_tensor_parallel: bool = False
-    """Overlap sequence collectives and BF16 GEMMs via CUDA symmetric memory."""
+    """Overlap sequence collectives and tensor-core GEMMs via CUDA symmetric memory."""
+
+    tp_regather_inputs: bool = False
+    """Save only local column inputs and gather them again before the weight gradient."""
 
     blocks_per_group: int = 1
     """Number of consecutive decoder blocks per communication bucket."""
@@ -49,6 +52,9 @@ class DenseFSDPCfg(SlottedDefault):
 
     keep_last_groups: int = 0
     """Keep this many final decoder buckets materialized until backward."""
+
+    keep_gathered_across_microbatches: bool = False
+    """Keep the selected buckets materialized until the final backward of the step."""
 
     skip_embedding_backward_gather: bool = False
     """Skip gathering the embedding weight in backward when it is its own bucket."""
@@ -72,6 +78,9 @@ class DenseFSDPCfg(SlottedDefault):
 
     activation_checkpoint: Literal["none", "selective", "full"] = "none"
 
+    checkpoint_blocks: int | None = None
+    """Checkpoint this many leading decoder blocks, or all by default."""
+
     compile_blocks: bool = False
 
 
@@ -79,11 +88,12 @@ def checkpoint_policy(ctx, op, *args, **kwargs):
     # The combined TP operators contain GEMMs just like aten.mm.
     if op.name() in {
         "symm_mem::fused_all_gather_matmul",
-        "symm_mem::fused_matmul_reduce_scatter",
+        "pithtrain::tp_fp32_matmul_reduce_scatter",
     }:
         return CheckpointPolicy.MUST_SAVE
     if op in {
         torch.ops.aten.mm.default,
+        torch.ops.aten.mm.dtype,
         torch.ops.aten.addmm.default,
         torch.ops.pithtrain.gated_delta_rule_dense_fwd.default,
         torch.ops.pithtrain.flash_attn4_mha_fwd.default,
@@ -133,6 +143,14 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError("dense_fsdp.reduce_dtype must be fp32 or bf16")
     if cfg.activation_checkpoint not in ("none", "selective", "full"):
         raise ValueError("dense_fsdp.activation_checkpoint must be none, selective or full")
+    if cfg.tensor_parallel_size > 1 and (cfg.reduce_dtype != "fp32" or cfg.bf16_sharded_gradients):
+        raise ValueError("Dense TP requires FP32 reduction and gradient shards")
+    if cfg.keep_gathered_across_microbatches and not cfg.keep_last_groups:
+        raise ValueError("Keeping weights across microbatches requires --keep-last-groups")
+    if cfg.checkpoint_blocks is not None and not (
+        cfg.activation_checkpoint != "none" and 1 <= cfg.checkpoint_blocks <= len(model.layers)
+    ):
+        raise ValueError("Checkpoint prefix requires activation checkpointing and a valid depth")
 
     reduce_dtype = torch.float32 if cfg.reduce_dtype == "fp32" else torch.bfloat16
     if cfg.bf16_sharded_gradients:
@@ -145,8 +163,9 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         reduce_dtype=reduce_dtype,
         cast_forward_inputs=False,
     )
-    for layer in model.layers:
-        if cfg.activation_checkpoint != "none":
+    checkpoint_blocks = cfg.checkpoint_blocks or len(model.layers)
+    for i, layer in enumerate(model.layers):
+        if i < checkpoint_blocks and cfg.activation_checkpoint != "none":
             ctx = (
                 {"context_fn": selective_checkpoint_contexts}
                 if cfg.activation_checkpoint == "selective"
@@ -197,6 +216,9 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
 
     # One FSDP state per communication bucket, even when several blocks share it.
     order = [group[0] for group in decoder_groups]
+    model.retained_fsdp_units = (
+        tuple(order[-cfg.keep_last_groups :]) if cfg.keep_gathered_across_microbatches else ()
+    )
     if cfg.edge_sharding == "separate":
         fully_shard(model.embed_tokens, mesh=mesh, reshard_after_forward=True, mp_policy=mp)
         fully_shard(model.lm_head, mesh=mesh, reshard_after_forward=True, mp_policy=mp)

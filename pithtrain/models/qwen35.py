@@ -97,6 +97,11 @@ class Qwen35DecoderLayer(nn.Module):
     def reference_forward(self, hidden_states, rotary_posemb, cu_seqlens=None):
         return self.forward(hidden_states, rotary_posemb, cu_seqlens, checkpoint_delta=True)
 
+    def forward_stock_stages(self, hidden_states, rotary_posemb, cu_seqlens=None):
+        hidden_states, residual, _ = self.forward_stage1(hidden_states, rotary_posemb, cu_seqlens)
+        hidden_states = self.forward_stage3(hidden_states)
+        return self.forward_stage5(hidden_states, None, None, residual)
+
     def forward(self, hidden_states, rotary_posemb, cu_seqlens=None, *, checkpoint_delta=False):
         if self.tensor_parallel is not None:
             return self.tensor_parallel.decoder(self, hidden_states, rotary_posemb)
@@ -146,7 +151,4 @@ class Qwen35TextModel(nn.Module):
         rotary_posemb = tuple(t.unsqueeze(0) for t in self.rotary_emb(tokens.size(1)))
         for layer in self.layers:
             hidden_states = layer(hidden_states, rotary_posemb)
-        hidden_states = self.norm(hidden_states)
-        if tp is not None:
-            hidden_states = tp.gather(hidden_states)
-        return self.lm_head(hidden_states)
+        return self.lm_head(self.norm(hidden_states))
