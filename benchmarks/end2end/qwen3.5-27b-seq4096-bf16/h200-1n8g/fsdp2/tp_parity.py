@@ -107,6 +107,70 @@ def backward(model, tokens, labels, dp, tp=None, begin_microbatch=None):
     return loss
 
 
+def capture_parameter_partials(model):
+    """Capture gradient producers before FSDP overwrites or releases them."""
+    from torch.distributed.fsdp import FSDPModule, fully_shard
+
+    names = {id(module): name for name, module in model.named_modules()}
+    partials = {}
+    groups = {}
+    for module in model.modules():
+        if isinstance(module, FSDPModule):
+            for group in fully_shard.state(module)._fsdp_param_groups:
+                groups[group] = group.post_backward
+
+    def wrap(group, post_backward):
+        def capture():
+            for fsdp_param in group.fsdp_params:
+                info = fsdp_param._module_info
+                name = f"{names[id(info.module)]}.{info.param_name}"
+                param = fsdp_param.unsharded_param
+                main_grad = getattr(info.module, "main_grad", None)
+                main_grad = (
+                    main_grad
+                    if info.param_name == "weight"
+                    and main_grad is not None
+                    and main_grad.untyped_storage().size()
+                    else None
+                )
+                if param.grad is None and main_grad is None:
+                    continue
+                for grad in (param.grad, main_grad):
+                    if grad is None:
+                        continue
+                    assert grad.dtype == torch.float32, (name, grad.dtype)
+                    if name in partials:
+                        partials[name].add_(grad.detach())
+                    else:
+                        partials[name] = grad.detach().clone()
+            return post_backward()
+
+        return capture
+
+    for group, post_backward in groups.items():
+        group.post_backward = wrap(group, post_backward)
+    return partials, groups
+
+
+def check_parameter_partials(model, tp, partials, groups):
+    for group, post_backward in groups.items():
+        group.post_backward = post_backward
+    for name, param in model.named_parameters():
+        partial = partials[name]
+        dist.all_reduce(partial, group=tp.dp_group)
+        replicated = name not in tp.shards
+        if replicated:
+            dist.all_reduce(partial, group=tp.group)
+        error = rel_l2(param.grad.full_tensor(), partial)
+        assert error < 2e-6, (name, error)
+        print(
+            f"token_sums rank={dist.get_rank()} grad={name} before_fsdp={partial.dtype} "
+            f"tp_reduce={'fp32' if replicated else 'head-or-vocab-sharded'} "
+            f"reduction_error={error:.8f}",
+            flush=True,
+        )
+
+
 def record_block_adjoints(layer, adjoints):
     def record_output(_layer, _inputs, output):
         def record_grad(grad):
@@ -168,6 +232,8 @@ def main():
     parser.add_argument("--blocks-per-group", type=int, default=2)
     parser.add_argument("--checkpoint", choices=("none", "selective", "full"), default="none")
     parser.add_argument("--full-checkpoint-blocks", type=int, default=0)
+    parser.add_argument("--token-sums-audit", action="store_true")
+    parser.add_argument("--attention-bias", action="store_true")
     args = parser.parse_args()
 
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
@@ -200,6 +266,7 @@ def main():
         head_dim=256,
         num_attention_heads=8,
         num_key_value_heads=4,
+        attention_bias=args.attention_bias,
         linear_num_key_heads=4,
         linear_num_value_heads=12,
         linear_key_head_dim=128,
@@ -379,6 +446,8 @@ def main():
         config_fsdp.skip_embedding_backward_gather = True
         shard_dense_model(parallel, dp_mesh, config_fsdp)
         install_wgrad_accumulation(parallel)
+        if args.token_sums_audit:
+            partials, groups = capture_parameter_partials(parallel)
         if case == "stock-adjoint-compiled":
             override = use_stock_block_adjoints(parallel.layers[0], stock_adjoints, layout)
         if case in TRACE_CASES:
@@ -396,6 +465,8 @@ def main():
                 tp_loss = backward(parallel, tokens, labels, dp, layout)
         if case == "stock-adjoint-compiled":
             override.remove()
+        if args.token_sums_audit:
+            check_parameter_partials(parallel, layout, partials, groups)
 
         max_bf16_error = max_layout_error = max_excess = 0.0
         exceeding = 0

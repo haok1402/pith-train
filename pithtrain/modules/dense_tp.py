@@ -15,6 +15,7 @@ from torch.distributed import DeviceMesh
 from pithtrain.operators.flash_attn_v4 import flash_attn_func
 from pithtrain.operators.gated_delta_rule import gated_delta_rule
 from pithtrain.operators.linear import BF16Linear
+from pithtrain.operators.parameter_rounding import stock_bf16_value
 from pithtrain.operators.silu_mul import silu_mul
 
 if TYPE_CHECKING:
@@ -51,6 +52,7 @@ class DenseTP:
         self.async_tp = async_tp
         self.regather_inputs = regather_inputs
         self.head_chunk_tokens = head_chunk_tokens
+        self.bf16_activations = False
         if async_tp:
             # Import registers the symmetric-memory operators.
             import torch.distributed._symmetric_memory  # noqa: F401
@@ -132,11 +134,33 @@ class DenseTP:
 
         model.tensor_parallel = self
 
+    def configure_fp32_token_sums(self, model: Qwen35TextModel, *, round_affine: bool):
+        """Keep token reductions on FP32 parameter leaves before FSDP/TP communication."""
+        self.bf16_activations = True
+        params = {model.embed_tokens.weight}
+        model.norm.tp_round_weight = round_affine
+        for layer in model.layers:
+            layer.input_layernorm.tp_round_weight = round_affine
+            layer.post_attention_layernorm.tp_round_weight = round_affine
+            if layer.is_linear:
+                delta = layer.linear_attn
+                delta.tp_round_affine = round_affine
+                delta.tp_round_conv = True
+                delta.norm.tp_round_weight = round_affine
+                params.add(delta.conv1d.weight)
+            else:
+                layer.self_attn.q_norm.tp_round_weight = round_affine
+                layer.self_attn.k_norm.tp_round_weight = round_affine
+        params.update(p for p in model.parameters() if p.ndim == 1)
+        return params
+
     def embed(self, module: nn.Embedding, tokens: torch.Tensor) -> torch.Tensor:
         shard_vocab = module.num_embeddings
         indices = tokens.flatten() - self.rank * shard_vocab
         owned = (indices >= 0) & (indices < shard_vocab)
         embedded = module(indices.clamp(0, shard_vocab - 1))
+        if self.bf16_activations:
+            embedded = embedded.to(torch.bfloat16)
         return _ScatterSum.apply(embedded * owned[:, None], self.size, self.name)
 
     def columns(self, x: torch.Tensor, *modules: nn.Linear) -> tuple[torch.Tensor, ...]:
@@ -150,10 +174,7 @@ class DenseTP:
             main_grads,
             *(m.weight for m in modules),
         )
-        return tuple(
-            output if module.bias is None else output + module.bias
-            for output, module in zip(outputs, modules)
-        )
+        return tuple(_add_bias(output, module.bias) for output, module in zip(outputs, modules))
 
     def head(
         self, module: BF16Linear, x: torch.Tensor, labels: torch.Tensor | None = None
@@ -180,10 +201,10 @@ class DenseTP:
             self.name,
             self.async_tp,
         )
-        return output if module.bias is None else output + module.bias
+        return _add_bias(output, module.bias)
 
     def delta_decay(self, delta, a):
-        return -delta.A_log.float().exp() * F.softplus(a.float() + delta.dt_bias.float())
+        return delta.decay(a)
 
     def delta_project(self, delta, x):
         return self.columns(x, delta.in_proj_qkv, delta.in_proj_z, delta.in_proj_b, delta.in_proj_a)
@@ -282,6 +303,14 @@ def _gather(x: torch.Tensor, size: int, name: str) -> torch.Tensor:
     return torch.ops._c10d_functional.wait_tensor(output)
 
 
+def _add_bias(output, bias):
+    if bias is None:
+        return output
+    if bias.dtype == torch.float32 and output.dtype == torch.bfloat16:
+        return (output.float() + stock_bf16_value(bias)).to(output.dtype)
+    return output + bias
+
+
 def _scatter_sum(x: torch.Tensor, size: int, name: str) -> torch.Tensor:
     output = torch.ops._c10d_functional.reduce_scatter_tensor(x.contiguous(), "sum", size, name)
     return torch.ops._c10d_functional.wait_tensor(output)
@@ -342,7 +371,10 @@ def _mm_scatter_fake(a, b, size, name, overlap):
 def _weight_grad(main_grad, grad, x):
     if main_grad is None:
         return _mm_fp32(grad.t(), x)
-    torch.ops.pithtrain.wgrad_accumulate_(main_grad, grad.t(), x)
+    if grad.dtype == x.dtype == torch.bfloat16:
+        torch.ops.pithtrain.wgrad_accumulate_(main_grad, grad.t(), x)
+    else:
+        main_grad.addmm_(grad.float().t(), x.float())
     return None
 
 

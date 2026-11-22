@@ -173,7 +173,13 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         for param in model.parameters():
             param.grad_dtype = torch.bfloat16
     fp32_params = set()
-    if cfg.tp_fp32_affine:
+    if model.tensor_parallel is not None and training.PARAM_DTYPE == torch.bfloat16:
+        fp32_params.update(
+            model.tensor_parallel.configure_fp32_token_sums(
+                model, round_affine=not cfg.tp_fp32_affine
+            )
+        )
+    elif cfg.tp_fp32_affine:
         fp32_params.update(param for param in model.parameters() if param.ndim == 1)
     if cfg.tp_fp32_gates:
         for layer in model.layers:

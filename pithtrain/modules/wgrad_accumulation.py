@@ -52,6 +52,8 @@ def install_wgrad_accumulation(model: nn.Module) -> None:
     Give every BF16Linear, GroupedLinear and FP8GroupedLinear weight in the model a main_grad,
     after fully_shard.
     """
+    dense_tp = getattr(model, "tensor_parallel", None)
+    tp_linear = (nn.Linear,) if dense_tp is not None else ()
     seen_groups = set()
     for module in model.modules():
         if not isinstance(module, FSDPModule):
@@ -67,7 +69,7 @@ def install_wgrad_accumulation(model: nn.Module) -> None:
                 owner = fsdp_param._module_info.module
                 if fsdp_param._module_info.param_name != "weight":
                     continue
-                if not isinstance(owner, (BF16Linear, GroupedLinear, FP8GroupedLinear)):
+                if not isinstance(owner, (BF16Linear, GroupedLinear, FP8GroupedLinear, *tp_linear)):
                     continue
                 size, device = fsdp_param._orig_size, fsdp_param.device
                 if isinstance(owner, FP8GroupedLinear):

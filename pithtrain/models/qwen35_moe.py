@@ -36,6 +36,7 @@ from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen
 from pithtrain.operators.fp8_experts import fp8_scatter_quant, fp8_swiglu_gate_up_experts
 from pithtrain.operators.gated_delta_rule import gated_delta_rule
 from pithtrain.operators.linear import BF16Linear
+from pithtrain.operators.parameter_rounding import stock_bf16_value
 from pithtrain.operators.ring_attention import ring_attention_func
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
@@ -100,6 +101,8 @@ def document_positions(cu_seqlens: torch.Tensor, S: int) -> torch.Tensor:
 
 
 class Qwen35MoeRMSNorm(nn.Module):
+    tp_round_weight = False
+
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
@@ -108,11 +111,14 @@ class Qwen35MoeRMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_fp32 = x.float()
         output = x_fp32 * torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.eps)
-        output = output * (1.0 + self.weight.float())
+        weight = stock_bf16_value(self.weight) if self.tp_round_weight else self.weight.float()
+        output = output * (1.0 + weight)
         return output.type_as(x)
 
 
 class Qwen35MoeRMSNormGated(nn.Module):
+    tp_round_weight = False
+
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
@@ -121,7 +127,8 @@ class Qwen35MoeRMSNormGated(nn.Module):
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         x_fp32 = x.float()
         output = x_fp32 * torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.eps)
-        output = output * self.weight.float() * F.silu(gate.float())
+        weight = stock_bf16_value(self.weight) if self.tp_round_weight else self.weight.float()
+        output = output * weight * F.silu(gate.float())
         return output.type_as(x)
 
 
@@ -143,6 +150,9 @@ class Qwen35MoeRotaryEmbedding(nn.Module):
 
 
 class Qwen35MoeGatedDeltaNet(nn.Module):
+    tp_round_affine = False
+    tp_round_conv = False
+
     def __init__(self, config: Qwen3_5MoeTextConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -181,8 +191,17 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         The channels-last conv is bit-identical to self.conv1d on the transposed input sliced to
         [offset, offset + S).
         """
-        conv_out = causal_conv1d(mixed_qkv, self.conv1d.weight, offset)
+        weight = self.conv1d.weight
+        if self.tp_round_conv:
+            weight = stock_bf16_value(weight)
+        conv_out = causal_conv1d(mixed_qkv, weight, offset)
         return self.split_qkv(F.silu(conv_out))
+
+    def decay(self, a):
+        scale, bias = self.A_log, self.dt_bias
+        if self.tp_round_affine:
+            scale, bias = stock_bf16_value(scale), stock_bf16_value(bias)
+        return -scale.float().exp() * F.softplus(a.float() + bias.float())
 
     def forward(
         self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None
@@ -219,7 +238,7 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
             query, key, value = self.split_qkv(F.silu(conv_out).to(mixed_qkv.dtype).transpose(1, 2))
         beta = b.sigmoid()
         # .float() on A_log guards against -inf when loaded in low precision.
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
+        g = self.decay(a)
         if cu_seqlens is not None:
             # exp(-128) underflows fp32 to zero, resetting state at document boundaries. A finite
             # gate avoids FLA's inf-inf; its magnitude preserves chunk-cumsum precision.
