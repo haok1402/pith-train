@@ -142,11 +142,16 @@ def cublas_fp32_reduction(case):
         matmul.allow_bf16_reduced_precision_reduction,
         matmul.allow_bf16_reduced_precision_reduction_split_k,
     )
-    matmul.allow_bf16_reduced_precision_reduction = (False, "nosplit" not in case)
+    split_k = "nosplit" not in case
+    backend = torch.backends.cuda.preferred_blas_library()
+    if not split_k:
+        torch.backends.cuda.preferred_blas_library("cublaslt")
     try:
+        matmul.allow_bf16_reduced_precision_reduction = (False, split_k)
         yield
     finally:
         matmul.allow_bf16_reduced_precision_reduction = previous
+        torch.backends.cuda.preferred_blas_library(backend)
 
 
 def main():
@@ -339,6 +344,7 @@ def main():
                 "sync-cublas-fp32-compiled",
                 "async-cublas-fp32-compiled",
                 "sync-cublas-nosplit-compiled",
+                "async-cublas-nosplit-compiled",
                 *fp32_master_cases,
             ):
                 layout = dense_tp.DenseTP(mesh, async_tp=overlap)
