@@ -30,6 +30,7 @@ def main():
     parser.add_argument("--oracle", type=Path, required=True)
     parser.add_argument("--arms", nargs="+", default=["1f1b-attention", "interleaved-attention"])
     parser.add_argument("--verify-offload", action="store_true")
+    parser.add_argument("--repeat-stock", action="store_true")
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     from pithtrain.contexts import distributed, logging, training
@@ -113,9 +114,10 @@ def main():
 
     stock_grads = {}
     contiguous_grads = {}
-    records = []
-    for arm in ["stock", *args.arms]:
-        schedule, compile_mode = ("dualpipev", "layer") if arm == "stock" else arm.rsplit("-", 1)
+    controls = ["stock", "stock-repeat"] if args.repeat_stock else ["stock"]
+    for arm in [*controls, *args.arms]:
+        records = []
+        schedule, compile_mode = ("dualpipev", "layer") if arm in controls else arm.rsplit("-", 1)
         cfg.training.pipeline_schedule = schedule
         cfg.training.pipeline_virtual_stages = 2 if schedule in ("interleaved", "zbv") else 1
         cfg.training.pipeline_compile = compile_mode
@@ -146,9 +148,12 @@ def main():
             gradients[name] = gradient
 
         # Share the controls with every pipeline stage since a parameter can change owners.
-        for schedule_name, target in (("dualpipev", stock_grads), ("1f1b", contiguous_grads)):
-            if schedule != schedule_name:
-                continue
+        target = None
+        if arm == "stock":
+            target = stock_grads
+        elif schedule == "1f1b":
+            target = contiguous_grads.setdefault(compile_mode, {})
+        if target is not None:
             owners = [None] * distributed.pp_size
             group = distributed.pp_group
             dist.all_gather_object(owners, tuple(gradients), group=group)
@@ -159,6 +164,7 @@ def main():
                     )
                     dist.broadcast(tensor, group=group, group_src=owner)
                     target[name] = tensor
+        contiguous = contiguous_grads.get(compile_mode)
         for name, gradient in gradients.items():
             if distributed.dp_rank == 0:
                 records.append(
@@ -168,9 +174,7 @@ def main():
                         relative_error(gradient, expected[name]),
                         relative_error(stock_grads[name], expected[name]),
                         relative_error(gradient, stock_grads[name]),
-                        relative_error(gradient, contiguous_grads[name])
-                        if contiguous_grads
-                        else None,
+                        relative_error(gradient, contiguous[name]) if contiguous else None,
                     )
                 )
 
@@ -196,29 +200,31 @@ def main():
                 "masters/grads/moments=FP32 AdamW=updated",
                 flush=True,
             )
-        del model, optimizer, params, gradients, training.model
-        dist.barrier()
-
-    all_records = [None] * dist.get_world_size() if rank == 0 else None
-    dist.gather_object(records, all_records, dst=0)
-    if rank == 0:
-        records = sorted(row for rank_records in all_records for row in rank_records)
-        with (args.output / "gradients.csv").open("w", newline="") as stream:
-            writer = csv.writer(stream)
-            writer.writerow(
-                ("arm", "param", "vs_fp32", "stock_vs_fp32", "vs_stock", "vs_contiguous")
-            )
-            writer.writerows(records)
-        for arm in dict.fromkeys(row[0] for row in records):
-            rows = [row for row in records if row[0] == arm]
+        all_records = [None] * dist.get_world_size() if rank == 0 else None
+        dist.gather_object(records, all_records, dst=0)
+        if rank == 0:
+            rows = sorted(row for rank_records in all_records for row in rank_records)
             assert {row[1] for row in rows} == expected.keys() and len(rows) == len(expected)
+            with (args.output / "gradients.csv").open(
+                "w" if arm == "stock" else "a", newline=""
+            ) as stream:
+                writer = csv.writer(stream)
+                if arm == "stock":
+                    writer.writerow(
+                        ("arm", "param", "vs_fp32", "stock_vs_fp32", "vs_stock", "vs_contiguous")
+                    )
+                writer.writerows(rows)
             worst = max(rows, key=lambda row: row[4])
             same_layout = max((row[5] for row in rows if row[5] is not None), default=None)
+            excess = max(row[2] - row[3] for row in rows)
             print(
                 f"{arm}: {len(rows)} parameters, max rel_L2 vs stock={worst[4]:.8g} "
-                f"({worst[1]}), max vs contiguous={same_layout}",
+                f"({worst[1]}), max vs contiguous={same_layout}, "
+                f"max excess FP32 reference error={excess:.8g}",
                 flush=True,
             )
+        del model, optimizer, params, gradients, training.model
+        dist.barrier()
     dist.destroy_process_group()
 
 
