@@ -389,7 +389,7 @@ def _local_loss_stats(logits, maximum, local_label, owned):
 @torch.compile(
     fullgraph=True,
     dynamic=False,
-    options={"emulate_precision_casts": True, "triton.enable_fp_fusion": False},
+    options={"emulate_precision_casts": True},
 )
 def _local_loss_gradient(logits, maximum, sumexp, local_label, owned, valid, rcp_count, scale):
     probs = (logits.float() - maximum[:, None]).exp() * sumexp.reciprocal()[:, None]
