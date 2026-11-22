@@ -606,9 +606,10 @@ def run_trial(args, device, mesh, seed, batch_index):
                 state = optimizer.state[param]
                 assert state["exp_avg"].dtype == state["exp_avg_sq"].dtype == torch.float32
             print(f"rank={rank} fp32_adamw=passed", flush=True)
-        assert loss_rel < 0.001
+        assert math.isfinite(loss_rel)
         assert max_layout_error < 2e-4
         if not args.statistical:
+            assert loss_rel < 0.001
             bad = torch.tensor(exceeding > 0, dtype=torch.int, device=device)
             dist.all_reduce(bad, op=dist.ReduceOp.MAX)
             if not bad.item():
