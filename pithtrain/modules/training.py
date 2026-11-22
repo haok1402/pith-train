@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import random
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -405,7 +406,35 @@ def setup_model(
             raise ValueError("dense_fsdp requires BF16 dense Qwen3.5")
         if (distributed.pp_size, distributed.cp_size, distributed.ep_size) != (1, 1, 1):
             raise ValueError("dense_fsdp requires PP, CP and EP all 1")
-        mesh = distributed.attn_mesh["dp"]
+        dense = cfg.dense_fsdp
+        tp_size = dense.tensor_parallel_size
+        world_size = torch.distributed.get_world_size()
+        if tp_size < 1 or world_size % tp_size:
+            raise ValueError("dense TP size must evenly divide the world size")
+        if dense.async_tensor_parallel and tp_size == 1:
+            raise ValueError("asynchronous dense TP requires TP size > 1")
+        if tp_size > 1:
+            from torch.distributed.device_mesh import init_device_mesh
+
+            from pithtrain.modules.dense_tp import DenseTP
+
+            if distributed_cfg.hsdp_replica != 1 or cfg.save_location is not None:
+                raise ValueError(
+                    "dense TP currently supports FSDP and HF import without DCP or HSDP"
+                )
+            if cfg.sequence_length % tp_size:
+                raise ValueError("sequence length must be divisible by the dense TP size")
+            if int(os.environ.get("LOCAL_WORLD_SIZE", world_size)) % tp_size:
+                raise ValueError("dense TP groups must fit within a node")
+            tp_mesh = init_device_mesh(
+                "cuda", (world_size // tp_size, tp_size), mesh_dim_names=("dp", "tp")
+            )
+            tp = DenseTP(tp_mesh, async_tp=dense.async_tensor_parallel)
+            mesh = tp_mesh["dp"]
+            distributed.dp_size, distributed.dp_rank = mesh.size(), mesh.get_local_rank()
+        else:
+            tp = None
+            mesh = distributed.attn_mesh["dp"]
         if distributed_cfg.hsdp_replica > 1:
             mesh = split_replicas(mesh, distributed_cfg.hsdp_replica)
         # The HF loader fills every parameter shard when there is no resumable DCP location.
@@ -420,7 +449,9 @@ def setup_model(
                 cfg.seed,
                 pipeline_chunks=False,
             )
-        shard_dense_model(model, mesh, cfg.dense_fsdp)
+        if tp is not None:
+            tp.shard_model(model)
+        shard_dense_model(model, mesh, dense)
         if from_hf:
             model.to_empty(device=distributed.device)
             model.rotary_emb = Qwen35MoeRotaryEmbedding(module_config).to(distributed.device)

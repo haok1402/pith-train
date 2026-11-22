@@ -11,8 +11,12 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed import DeviceMesh
 
+from pithtrain.operators.flash_attn_v4 import flash_attn_func
+from pithtrain.operators.gated_delta_rule import gated_delta_rule
+from pithtrain.operators.silu_mul import silu_mul
+
 if TYPE_CHECKING:
-    from pithtrain.models.qwen35 import Qwen35TextModel
+    from pithtrain.models.qwen35 import Qwen35DecoderLayer, Qwen35TextModel
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,9 @@ class DenseTP:
         self.size = self.group.size()
         self.name = self.group.group_name
         self.async_tp = async_tp
+        if async_tp:
+            # Import registers the symmetric-memory operators.
+            import torch.distributed._symmetric_memory  # noqa: F401
         self.shards: dict[str, DenseTPShard] = {}
 
     def shard_model(self, model: Qwen35TextModel) -> None:
@@ -112,6 +119,69 @@ class DenseTP:
 
         model.tensor_parallel = self
 
+    def embed(self, module: nn.Embedding, tokens: torch.Tensor) -> torch.Tensor:
+        shard_vocab = module.num_embeddings
+        indices = tokens.flatten() - self.rank * shard_vocab
+        owned = (indices >= 0) & (indices < shard_vocab)
+        embedded = module(indices.clamp(0, shard_vocab - 1))
+        return _ScatterSum.apply(embedded * owned[:, None], self.size, self.name)
+
+    def gather(self, x: torch.Tensor) -> torch.Tensor:
+        return _Gather.apply(x, self.size, self.name)
+
+    def columns(self, x: torch.Tensor, *modules: nn.Linear) -> tuple[torch.Tensor, ...]:
+        outputs = _ColumnParallel.apply(
+            x, self.size, self.name, self.async_tp, *(module.weight for module in modules)
+        )
+        return tuple(
+            output if module.bias is None else output + module.bias
+            for output, module in zip(outputs, modules)
+        )
+
+    def rows(self, x: torch.Tensor, module: nn.Linear) -> torch.Tensor:
+        output = _RowParallel.apply(x, module.weight, self.size, self.name, self.async_tp)
+        return output if module.bias is None else output + module.bias
+
+    def decoder(
+        self,
+        layer: Qwen35DecoderLayer,
+        hidden: torch.Tensor,
+        rotary: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        seq = rotary[0].size(1)
+        batch = hidden.size(0) * self.size // seq
+        x = layer.input_layernorm(hidden)
+        if layer.is_linear:
+            delta = layer.linear_attn
+            qkv, z, b, a = self.columns(
+                x, delta.in_proj_qkv, delta.in_proj_z, delta.in_proj_b, delta.in_proj_a
+            )
+            q, k, v = delta.conv_qkv(qkv.view(batch, seq, -1), 0)
+            beta = b.view(batch, seq, -1).sigmoid()
+            decay = -delta.A_log.float().exp() * F.softplus(a.float() + delta.dt_bias.float())
+            x = gated_delta_rule(q, k, v, decay.view(batch, seq, -1), beta)
+            x = delta.norm(x.reshape(-1, delta.head_v_dim), z.reshape(-1, delta.head_v_dim))
+            x = self.rows(x.view(batch * seq, -1), delta.out_proj)
+        else:
+            attn = layer.self_attn
+            q, k, v = self.columns(x, attn.q_proj, attn.k_proj, attn.v_proj)
+            q, gate = q.view(batch, seq, attn.num_heads, 2 * attn.head_dim).chunk(2, dim=-1)
+            kv_shape = (batch, seq, attn.num_kv_heads, attn.head_dim)
+            q, k = attn.apply_rotary_posemb(attn.q_norm(q), attn.k_norm(k.view(kv_shape)), rotary)
+            x = flash_attn_func(q, k, v.view(kv_shape), softmax_scale=attn.scaling, causal=True)
+            x = x.reshape(batch * seq, -1) * gate.reshape(batch * seq, -1).sigmoid()
+            x = self.rows(x, attn.o_proj)
+        hidden = hidden + x
+
+        mlp = layer.mlp
+        gate, up = self.columns(layer.post_attention_layernorm(hidden), mlp.gate_proj, mlp.up_proj)
+        return hidden + self.rows(silu_mul(gate, up), mlp.down_proj)
+
+    def loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        return _VocabCrossEntropy.apply(
+            logits, labels.flatten(), self.rank * logits.size(1), self.group
+        )
+
     @torch.no_grad()
     def sync_replicated_grads(self, model: nn.Module) -> list[torch.Tensor]:
         """Sum the partial norm and row-bias gradients, then identify unique local shards."""
@@ -126,3 +196,124 @@ class DenseTP:
             dist.all_reduce(flat, group=self.group)
             torch._foreach_copy_(grads, torch._utils._unflatten_dense_tensors(flat, grads))
         return sharded if self.rank else sharded + replicated
+
+
+def _gather(x: torch.Tensor, size: int, name: str) -> torch.Tensor:
+    output = torch.ops._c10d_functional.all_gather_into_tensor(x.contiguous(), size, name)
+    return torch.ops._c10d_functional.wait_tensor(output)
+
+
+def _scatter_sum(x: torch.Tensor, size: int, name: str) -> torch.Tensor:
+    output = torch.ops._c10d_functional.reduce_scatter_tensor(x.contiguous(), "sum", size, name)
+    return torch.ops._c10d_functional.wait_tensor(output)
+
+
+class _ColumnParallel(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, size, name, overlap, *weights):
+        if overlap:
+            gathered, outputs = torch.ops.symm_mem.fused_all_gather_matmul(
+                x, [w.t() for w in weights], 0, name
+            )
+        else:
+            gathered = _gather(x, size, name)
+            outputs = tuple(F.linear(gathered, w) for w in weights)
+        ctx.save_for_backward(gathered, *weights)
+        ctx.size, ctx.name, ctx.overlap = size, name, overlap
+        return tuple(outputs)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        x, *weights = ctx.saved_tensors
+        grads = tuple(grad.contiguous() for grad in grads)
+        if ctx.overlap and len(weights) == 1:
+            dx = torch.ops.symm_mem.fused_matmul_reduce_scatter(
+                grads[0], weights[0], "sum", 0, ctx.name
+            )
+        else:
+            contributions = (grad @ weight for grad, weight in zip(grads, weights))
+            total = next(contributions)
+            for contribution in contributions:
+                total = total + contribution
+            dx = _scatter_sum(total, ctx.size, ctx.name)
+        dweights = tuple(grad.t() @ x for grad in grads)
+        return dx, None, None, None, *dweights
+
+
+class _RowParallel(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, size, name, overlap):
+        ctx.save_for_backward(x, weight)
+        ctx.size, ctx.name, ctx.overlap = size, name, overlap
+        if overlap:
+            return torch.ops.symm_mem.fused_matmul_reduce_scatter(x, weight.t(), "sum", 0, name)
+        return _scatter_sum(F.linear(x, weight), size, name)
+
+    @staticmethod
+    def backward(ctx, dout):
+        x, weight = ctx.saved_tensors
+        if ctx.overlap:
+            grad, (dx,) = torch.ops.symm_mem.fused_all_gather_matmul(dout, [weight], 0, ctx.name)
+        else:
+            grad = _gather(dout, ctx.size, ctx.name)
+            dx = grad @ weight
+        return dx, grad.t() @ x, None, None, None
+
+
+class _Gather(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, size, name):
+        ctx.size, ctx.name = size, name
+        return _gather(x, size, name)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return _scatter_sum(grad, ctx.size, ctx.name), None, None
+
+
+class _ScatterSum(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, size, name):
+        ctx.size, ctx.name = size, name
+        return _scatter_sum(x, size, name)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return _gather(grad, ctx.size, ctx.name), None, None
+
+
+@torch.compile(fullgraph=True, dynamic=False)
+def _local_loss_stats(logits, maximum, local_label, owned):
+    selected = logits.gather(1, local_label[:, None]).squeeze(1).float()
+    sumexp = (logits.float() - maximum[:, None]).exp().sum(1)
+    return torch.stack((sumexp, torch.where(owned, selected, 0)))
+
+
+@torch.compile(fullgraph=True, dynamic=False)
+def _local_loss_gradient(logits, lse, local_label, owned, valid, grad):
+    probs = (logits.float() - lse[:, None]).exp()
+    columns = torch.arange(logits.size(1), device=logits.device)
+    target = owned[:, None] & (columns == local_label[:, None])
+    result = (probs - target.float()) * valid[:, None] * grad
+    return result.to(logits.dtype)
+
+
+class _VocabCrossEntropy(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits, labels, offset, group):
+        valid = labels != -100
+        local_label = labels - offset
+        owned = valid & (local_label >= 0) & (local_label < logits.size(1))
+        local_label = local_label.clamp(0, logits.size(1) - 1)
+        maximum = logits.amax(1).float()
+        dist.all_reduce(maximum, op=dist.ReduceOp.MAX, group=group)
+        stats = _local_loss_stats(logits, maximum, local_label, owned)
+        dist.all_reduce(stats, group=group)
+        sumexp, selected = stats.unbind()
+        lse = maximum + sumexp.log()
+        ctx.save_for_backward(logits, lse, local_label, owned, valid)
+        return torch.where(valid, lse - selected, 0).sum()
+
+    @staticmethod
+    def backward(ctx, grad):
+        return _local_loss_gradient(*ctx.saved_tensors, grad), None, None, None

@@ -170,6 +170,7 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
 
     cp_size = distributed.cp_size
     dense_fsdp = cfg.training.dense_fsdp
+    tp = getattr(model, "tensor_parallel", None)
     if dense_fsdp is not None:
         batches = get_batch_tensors(cfg, dataset, step, device)
         delay_reduce = dense_fsdp.reduce_at_step_end and len(batches) > 1
@@ -181,13 +182,18 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
             if delay_reduce and i == len(batches) - 1:
                 model.set_requires_gradient_sync(True)
                 model.set_is_last_backward(True)
-            loss, detached = objective((model(tokens),), (labels,))
+            logits = model(tokens)
+            if tp is None:
+                loss, detached = objective((logits,), (labels,))
+            else:
+                loss = tp.loss(logits, labels)
+                detached = loss.detach()
             loss.backward()
             losses.append(detached)
             counts.append((labels != -100).sum())
 
         totals = torch.stack((torch.stack(losses).sum(), torch.stack(counts).sum()))
-        torch.distributed.all_reduce(totals)
+        torch.distributed.all_reduce(totals, group=tp.dp_group if tp is not None else None)
         loss_sum, num_tokens = totals.unbind()
         num_tokens = num_tokens.clamp_min(1)
         loss = loss_sum / num_tokens
@@ -209,10 +215,15 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         num_tokens = local_count * dp_size * cp_size
 
     # FSDP reduces with a plain sum. Normalize by the global token count before clipping.
+    norm_grads = tp.sync_replicated_grads(model) if tp is not None else None
     scale_grads_(local_grads(model), 1.0 / num_tokens)
 
     gradient_norm = clip_grad_norm(
-        model, max_norm=1.0, norm_type=2, hsdp_replica=cfg.distributed.hsdp_replica
+        model,
+        max_norm=1.0,
+        norm_type=2,
+        hsdp_replica=cfg.distributed.hsdp_replica,
+        norm_grads=norm_grads,
     )
 
     for optimizer, scheduler in zip(optimizers, schedulers):

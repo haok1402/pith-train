@@ -40,6 +40,8 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", choices=("none", "selective", "full"), default="none")
     parser.add_argument("--compile-blocks", action="store_true")
     parser.add_argument("--unfused-adamw", action="store_true")
+    parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument("--async-tp", action="store_true")
     args = parser.parse_args()
 
     # PithTrain's kernel imports query the current GPU.
@@ -62,6 +64,8 @@ if __name__ == "__main__":
     train.optimizer = partial(make_adamw_optimizer, fused=not args.unfused_adamw)
     train.scheduler = make_constant_scheduler
     train.dense_fsdp = DenseFSDPCfg()
+    train.dense_fsdp.tensor_parallel_size = args.tp
+    train.dense_fsdp.async_tensor_parallel = args.async_tp
     train.dense_fsdp.blocks_per_group = args.blocks_per_group
     train.dense_fsdp.group_by_attention_type = args.group_by_attention_type
     train.dense_fsdp.edge_sharding = args.edge_sharding

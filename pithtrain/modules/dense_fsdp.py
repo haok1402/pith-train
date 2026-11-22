@@ -30,6 +30,11 @@ __all__ = ["DenseFSDPCfg", "shard_dense_model"]
 
 @dataclass(init=False, slots=True)
 class DenseFSDPCfg(SlottedDefault):
+    tensor_parallel_size: int = 1
+
+    async_tensor_parallel: bool = False
+    """Overlap sequence collectives and BF16 GEMMs via CUDA symmetric memory."""
+
     blocks_per_group: int = 1
     """Number of consecutive decoder blocks per communication bucket."""
 

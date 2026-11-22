@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from ._streaming import generic_plan_param
+from ._streaming import CopyOp, generic_plan_param
 
 
 class Qwen35Converter:
@@ -40,7 +40,48 @@ class Qwen35Converter:
             nested = self._renest(canon)
             return nested if nested in weight_map else canon
 
-        return generic_plan_param(local_fqn, param, weight_map, named_modules, remap=remap)
+        tp = getattr(named_modules[""], "tensor_parallel", None)
+        if tp is None or local_fqn not in tp.shards:
+            return generic_plan_param(local_fqn, param, weight_map, named_modules, remap=remap)
+
+        spec = tp.shards[local_fqn]
+        key = remap(local_fqn)
+        local = param.detach().to_local()
+        chunk = -(-param.size(0) // tp.dp_group.size())
+        start = min(tp.dp_group.rank() * chunk, param.size(0))
+        if spec.dim == 1:
+            (col,) = spec.spans
+            return [
+                CopyOp(
+                    local_fqn,
+                    local,
+                    (key,),
+                    (weight_map[key],),
+                    (slice(start, start + local.size(0)), slice(col.start, col.stop)),
+                    None,
+                )
+            ]
+
+        # A DP shard may straddle the Q/K or K/V boundary of a packed TP shard.
+        copies, segment_start = [], 0
+        end = start + local.size(0)
+        for source in spec.spans:
+            lo = max(start, segment_start)
+            hi = min(end, segment_start + len(source))
+            if lo < hi:
+                shift = source.start - segment_start
+                copies.append(
+                    CopyOp(
+                        local_fqn,
+                        local[lo - start : hi - start],
+                        (key,),
+                        (weight_map[key],),
+                        slice(lo + shift, hi + shift),
+                        None,
+                    )
+                )
+            segment_start += len(source)
+        return copies
 
     def expected_unmapped(self, hf_keys: set) -> set:
         return {key for key in hf_keys if key.startswith(("visual.", "mtp."))}

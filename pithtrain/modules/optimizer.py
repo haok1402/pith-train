@@ -210,7 +210,12 @@ def scale_grads_(grads: list[torch.Tensor], scale: torch.Tensor) -> None:
 
 @torch.no_grad()
 def clip_grad_norm(
-    model: torch.nn.Module, max_norm: float, norm_type: float = 2.0, hsdp_replica: int = 1
+    model: torch.nn.Module,
+    max_norm: float,
+    norm_type: float = 2.0,
+    hsdp_replica: int = 1,
+    *,
+    norm_grads: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """
     Clip the gradients in place to a global norm of max_norm over all ranks and return the total
@@ -225,7 +230,9 @@ def clip_grad_norm(
         first_param = next(model.parameters(), None)
         device = first_param.device if first_param is not None else torch.device("cpu")
         return torch.tensor(0.0, device=device)
-    local_norm = torch.nn.utils.get_total_norm(grads, norm_type=norm_type)
+    local_norm = torch.nn.utils.get_total_norm(
+        grads if norm_grads is None else norm_grads, norm_type=norm_type
+    )
     local_norm_sq = local_norm**norm_type
     torch.distributed.all_reduce(local_norm_sq, op=torch.distributed.ReduceOp.SUM)
     local_norm_sq = local_norm_sq / hsdp_replica

@@ -23,7 +23,7 @@ class CopyOp(NamedTuple):
     dst: torch.Tensor
     hf_keys: Tuple[str, ...]
     shard_files: Tuple[str, ...]
-    row_slice: slice
+    row_slice: slice | Tuple[slice, slice]
     transform: Optional[Callable[..., torch.Tensor]]
 
 
