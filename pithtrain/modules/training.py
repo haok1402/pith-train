@@ -262,6 +262,9 @@ class TrainingCfg(SlottedDefault):
     pipeline_preallocate_grad_buffers: Literal["input", "output", "both"] | None = None
     """Reserve FP32 reduce-scatter storage at startup for scheduled dense DP2."""
 
+    pipeline_preallocate_grad_output_layers: tuple[int, ...] = ()
+    """Limit preallocated reduce-scatter outputs to these decoder layers when given."""
+
     pipeline_compact_embedding_grad: bool = False
     """Use a microbatch-sized temporary for embedding backward."""
 
@@ -455,6 +458,7 @@ def setup_model(
 
     schedule = cfg.pipeline_schedule
     grad_buffers = cfg.pipeline_preallocate_grad_buffers
+    output_layers = cfg.pipeline_preallocate_grad_output_layers
     if grad_buffers is not None and (
         grad_buffers not in ("input", "output", "both")
         or schedule not in ("zb-h1", "zbv")
@@ -466,6 +470,13 @@ def setup_model(
     ):
         raise ValueError(
             "Preallocated gradient buffers require dense ZB-H1 or ZB-V with DP2 and end-of-step FP32 reductions"
+        )
+    if output_layers and (
+        grad_buffers not in ("output", "both")
+        or any(not 0 <= index < module_config.num_hidden_layers for index in output_layers)
+    ):
+        raise ValueError(
+            "Preallocated gradient output layers require valid decoder indices and output buffers"
         )
     weight_delays = cfg.pipeline_zb_h1_weight_delays
     if weight_delays is not None and (
@@ -560,7 +571,17 @@ def setup_model(
         compute_stream_grad_buffers=cfg.pipeline_compute_stream_grad_buffers,
     )
     if grad_buffers is not None:
-        preallocate_reduce_scatter(modules, distributed.device, grad_buffers)
+        output_modules = (
+            {
+                layer
+                for stage in modules
+                for layer in stage.layers.values()
+                if layer.idx in output_layers
+            }
+            if output_layers
+            else None
+        )
+        preallocate_reduce_scatter(modules, distributed.device, grad_buffers, output_modules)
     install_wgrad_accumulation(modules)
     install_raw_main_grad(modules)  # gpt-oss raw expert weights; no-op elsewhere
     install_side_grads(modules)  # after the main_grad installs: its post_backward runs first

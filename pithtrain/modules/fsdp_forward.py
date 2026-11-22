@@ -118,7 +118,12 @@ class PreallocatedReduceScatter(ComputeStreamReduceScatter):
         return work
 
 
-def preallocate_reduce_scatter(model: nn.Module, device: torch.device, mode: str) -> None:
+def preallocate_reduce_scatter(
+    model: nn.Module,
+    device: torch.device,
+    mode: str,
+    output_modules: set[nn.Module] | None = None,
+) -> None:
     groups = []
     for module in model.modules():
         if isinstance(module, FSDPModule):
@@ -132,10 +137,14 @@ def preallocate_reduce_scatter(model: nn.Module, device: torch.device, mode: str
                     groups.append((module, group, output_size))
 
     # Align starts of the FP32 output views to 256 bytes while reserving one CUDA block.
-    aligned_sizes = [(size + 63) // 64 * 64 for _, _, size in groups]
-    arena = None
-    if mode in ("output", "both"):
-        arena = torch.empty(sum(aligned_sizes), dtype=torch.float32, device=device)
+    aligned_sizes = [
+        (size + 63) // 64 * 64
+        if mode in ("output", "both") and (output_modules is None or module in output_modules)
+        else 0
+        for module, _, size in groups
+    ]
+    arena_size = sum(aligned_sizes)
+    arena = torch.empty(arena_size, dtype=torch.float32, device=device) if arena_size else None
     scratch = None
     if mode in ("input", "both"):
         capacity = max(size for _, _, size in groups) * 2
@@ -143,8 +152,11 @@ def preallocate_reduce_scatter(model: nn.Module, device: torch.device, mode: str
 
     offset = 0
     for (module, group, size), aligned in zip(groups, aligned_sizes, strict=True):
-        output = None if arena is None else arena.narrow(0, offset, size)
-        module.set_custom_reduce_scatter(PreallocatedReduceScatter(device, group, scratch, output))
+        output = arena.narrow(0, offset, size) if arena is not None and aligned else None
+        if scratch is not None or output is not None:
+            module.set_custom_reduce_scatter(
+                PreallocatedReduceScatter(device, group, scratch, output)
+            )
         offset += aligned
 
 
