@@ -386,14 +386,19 @@ def _local_loss_stats(logits, maximum, local_label, owned):
     return torch.stack((sumexp, torch.where(owned, selected, 0)))
 
 
-@torch.compile(fullgraph=True, dynamic=False)
-def _local_loss_gradient(logits, lse, local_label, owned, valid, grad):
-    probs = (logits.float() - lse[:, None]).exp()
+@torch.compile(
+    fullgraph=True,
+    dynamic=False,
+    options={"emulate_precision_casts": True, "triton.enable_fp_fusion": False},
+)
+def _local_loss_gradient(logits, maximum, sumexp, local_label, owned, valid, rcp_count, scale):
+    probs = (logits.float() - maximum[:, None]).exp() * sumexp.reciprocal()[:, None]
     columns = torch.arange(logits.size(1), device=logits.device)
     target = owned[:, None] & (columns == local_label[:, None])
-    result = (probs - target.float()) * valid[:, None] * grad
-    # The loss consumes the logits. Reuse their buffer for the gradient, as stock CE does.
-    return logits.copy_(result)
+    mean_gradient = (probs * rcp_count - target.float() * rcp_count) * valid[:, None]
+    # Stock CE stores its mean-loss gradient in the logits dtype before applying
+    # the upstream scale. Keep the same rounding point while reusing the logits.
+    return logits.copy_(mean_gradient.to(logits.dtype) * scale)
 
 
 def _local_targets(labels, offset, vocab_size):
@@ -409,21 +414,34 @@ def _vocab_loss_stats(logits, local_label, owned, valid, group):
     stats = _local_loss_stats(logits, maximum, local_label, owned)
     dist.all_reduce(stats, group=group)
     sumexp, selected = stats.unbind()
-    lse = maximum + sumexp.log()
-    return lse, torch.where(valid, lse - selected, 0)
+    return maximum, sumexp, torch.where(valid, (maximum - selected) + sumexp.log(), 0)
+
+
+def _vocab_gradient_scale(valid, grad, dtype):
+    count = valid.sum().clamp_min(1).float()
+    return count.reciprocal(), (grad * count).to(dtype)
 
 
 class _VocabCrossEntropy(torch.autograd.Function):
     @staticmethod
     def forward(ctx, logits, labels, offset, group):
         local_label, owned, valid = _local_targets(labels, offset, logits.size(1))
-        lse, loss = _vocab_loss_stats(logits, local_label, owned, valid, group)
-        ctx.save_for_backward(logits, lse, local_label, owned, valid)
+        maximum, sumexp, loss = _vocab_loss_stats(logits, local_label, owned, valid, group)
+        ctx.save_for_backward(logits, maximum, sumexp, local_label, owned, valid)
         return loss.sum()
 
     @staticmethod
     def backward(ctx, grad):
-        return _local_loss_gradient(*ctx.saved_tensors, grad), None, None, None
+        logits, maximum, sumexp, local_label, owned, valid = ctx.saved_tensors
+        rcp_count, scale = _vocab_gradient_scale(valid, grad, logits.dtype)
+        return (
+            _local_loss_gradient(
+                logits, maximum, sumexp, local_label, owned, valid, rcp_count, scale
+            ),
+            None,
+            None,
+            None,
+        )
 
 
 class _ChunkedVocabHead(torch.autograd.Function):
@@ -432,34 +450,37 @@ class _ChunkedVocabHead(torch.autograd.Function):
         size, vocab_size = group.size(), weight.size(0)
         targets = _local_targets(labels, group.rank() * vocab_size, vocab_size)
         gathered = _gather(x, size, name)
-        lse_parts, loss_parts = [], []
+        maxima, sums, losses = [], [], []
         for xs, *ys in zip(
             gathered.split(chunk_tokens),
             *(target.split(chunk_tokens) for target in targets),
             strict=True,
         ):
-            lse, loss = _vocab_loss_stats(F.linear(xs, weight), *ys, group)
-            lse_parts.append(lse)
-            loss_parts.append(loss)
-        ctx.save_for_backward(gathered, weight, torch.cat(lse_parts), *targets)
+            maximum, sumexp, loss = _vocab_loss_stats(F.linear(xs, weight), *ys, group)
+            maxima.append(maximum)
+            sums.append(sumexp)
+            losses.append(loss)
+        ctx.save_for_backward(gathered, weight, torch.cat(maxima), torch.cat(sums), *targets)
         ctx.main_grad, ctx.size, ctx.name, ctx.chunk_tokens = main_grad, size, name, chunk_tokens
-        return torch.cat(loss_parts).sum()
+        return torch.cat(losses).sum()
 
     @staticmethod
     def backward(ctx, grad):
-        x, weight, lse, *targets = ctx.saved_tensors
+        x, weight, maximum, sumexp, *targets = ctx.saved_tensors
+        rcp_count, scale = _vocab_gradient_scale(targets[-1], grad, x.dtype)
         dx = torch.empty_like(x, dtype=torch.float32)
         dw = ctx.main_grad
         if dw is None:
             dw = torch.zeros_like(weight, dtype=torch.float32)
-        for dxs, xs, ls, *ys in zip(
+        for dxs, xs, ms, es, *ys in zip(
             dx.split(ctx.chunk_tokens),
             x.split(ctx.chunk_tokens),
-            lse.split(ctx.chunk_tokens),
+            maximum.split(ctx.chunk_tokens),
+            sumexp.split(ctx.chunk_tokens),
             *(target.split(ctx.chunk_tokens) for target in targets),
             strict=True,
         ):
-            logits_grad = _local_loss_gradient(F.linear(xs, weight), ls, *ys, grad)
+            logits_grad = _local_loss_gradient(F.linear(xs, weight), ms, es, *ys, rcp_count, scale)
             if x.dtype == torch.float32:
                 torch.mm(logits_grad, weight, out=dxs)
                 dw.addmm_(logits_grad.t(), xs)
