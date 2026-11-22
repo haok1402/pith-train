@@ -32,6 +32,7 @@ from pithtrain.modules.fp8_param_gather import (
 from pithtrain.modules.fsdp_forward import (
     ComputeStreamReduceScatter,
     install_lean_hooks,
+    preallocate_reduce_scatter,
     register_fsdp_forward_method,
 )
 from pithtrain.modules.load_balance import make_load_balance_loss_fn
@@ -258,6 +259,9 @@ class TrainingCfg(SlottedDefault):
     pipeline_compute_stream_grad_buffers: bool = False
     """Allocate FSDP reduction buffers on the model compute stream."""
 
+    pipeline_preallocate_grad_buffers: Literal["input", "output", "both"] | None = None
+    """Reserve FP32 reduce-scatter storage at startup for scheduled dense DP2."""
+
     pipeline_compact_embedding_grad: bool = False
     """Use a microbatch-sized temporary for embedding backward."""
 
@@ -450,6 +454,19 @@ def setup_model(
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")
 
     schedule = cfg.pipeline_schedule
+    grad_buffers = cfg.pipeline_preallocate_grad_buffers
+    if grad_buffers is not None and (
+        grad_buffers not in ("input", "output", "both")
+        or schedule not in ("zb-h1", "zbv")
+        or not cfg.pipeline_compute_stream_grad_buffers
+        or cfg.pipeline_grad_sync_layers
+        or distributed.dp_size != 2
+        or distributed.cp_size != 1
+        or distributed_cfg.hsdp_replica != 1
+    ):
+        raise ValueError(
+            "Preallocated gradient buffers require dense ZB-H1 or ZB-V with DP2 and end-of-step FP32 reductions"
+        )
     weight_delays = cfg.pipeline_zb_h1_weight_delays
     if weight_delays is not None and (
         schedule != "zb-h1"
@@ -464,7 +481,9 @@ def setup_model(
         or forward_warmups[-1] != 0
         or any(left < right for left, right in zip(forward_warmups, forward_warmups[1:]))
     ):
-        raise ValueError("ZB-H1 forward warmups require a nonincreasing value per rank ending at zero")
+        raise ValueError(
+            "ZB-H1 forward warmups require a nonincreasing value per rank ending at zero"
+        )
     if schedule in ("1f1b", "interleaved", "zb-h1", "zbv"):
         if ModelClass is not Qwen35Model or distributed.ep_size != 1:
             raise ValueError("Dense pipeline schedules require Qwen3.5 with expert_parallel_size=1")
@@ -540,6 +559,8 @@ def setup_model(
         distributed_cfg.hsdp_replica,
         compute_stream_grad_buffers=cfg.pipeline_compute_stream_grad_buffers,
     )
+    if grad_buffers is not None:
+        preallocate_reduce_scatter(modules, distributed.device, grad_buffers)
     install_wgrad_accumulation(modules)
     install_raw_main_grad(modules)  # gpt-oss raw expert weights; no-op elsewhere
     install_side_grads(modules)  # after the main_grad installs: its post_backward runs first

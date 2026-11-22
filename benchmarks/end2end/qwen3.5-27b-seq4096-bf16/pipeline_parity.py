@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
@@ -31,6 +32,7 @@ def main():
     parser.add_argument("--arms", nargs="+", default=["1f1b-attention", "interleaved-attention"])
     parser.add_argument("--repeat-stock", action="store_true")
     parser.add_argument("--compute-stream-grad-buffers", action="store_true")
+    parser.add_argument("--preallocate-grad-buffers", choices=("input", "output", "both"))
     parser.add_argument("--compact-embedding-grad", action="store_true")
     parser.add_argument("--virtual-layer-counts", type=int, nargs=4)
     parser.add_argument("--microbatch-size", type=int, choices=(1, 2), default=2)
@@ -43,6 +45,7 @@ def main():
     from pithtrain.models.qwen35 import Qwen35Model
     from pithtrain.modules import training as train
     from pithtrain.modules.distributed import setup_distributed
+    from pithtrain.modules.fsdp_forward import PreallocatedReduceScatter
     from pithtrain.modules.optimizer import clip_grad_norm, local_grads, scale_grads_
     from pithtrain.operators.linear import BF16Linear
     from pithtrain.pipeline import Microbatch
@@ -151,6 +154,9 @@ def main():
         cfg.training.pipeline_compute_stream_grad_buffers = (
             args.compute_stream_grad_buffers and arm not in controls
         )
+        cfg.training.pipeline_preallocate_grad_buffers = (
+            args.preallocate_grad_buffers if schedule in ("zb-h1", "zbv") else None
+        )
         cfg.training.pipeline_compact_embedding_grad = (
             args.compact_embedding_grad and arm not in controls
         )
@@ -173,7 +179,30 @@ def main():
                 ]
                 local(param).copy_(shard)
         print(f"rank={rank} starting {arm}", flush=True)
-        losses = model.step(batches, objective)
+        buffers = [
+            group._reduce_scatter_comm
+            for module in model.modules()
+            if isinstance(module, FSDPModule)
+            for group in module._get_fsdp_state()._fsdp_param_groups
+            if isinstance(group._reduce_scatter_comm, PreallocatedReduceScatter)
+        ]
+        for attempt in range(2 if buffers else 1):
+            if attempt:
+                model.zero_grad(set_to_none=True)
+            losses = model.step(batches, objective)
+            for comm in buffers:
+                if comm.output is not None:
+                    start = comm.output.data_ptr()
+                    end = start + comm.output.nbytes
+                    for param in comm.params:
+                        grad = param.sharded_param.grad
+                        assert grad is not None and start <= local(grad).data_ptr() < end, (
+                            arm,
+                            attempt,
+                            param.sharded_param.shape,
+                        )
+                if comm.input_buffer is not None:
+                    assert comm.input_buffer.done is not None, (arm, attempt)
         loss = torch.stack(losses).sum() if losses else torch.zeros((), device=device)
         dist.all_reduce(loss)
         torch.testing.assert_close(loss / num_tokens, reference_loss, rtol=0.002, atol=0.002)

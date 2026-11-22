@@ -39,7 +39,13 @@ from torch.distributed.fsdp._fully_shard._fsdp_param_group import (
 )
 from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
 
-__all__ = ["ComputeStreamReduceScatter", "install_lean_hooks", "register_fsdp_forward_method"]
+__all__ = [
+    "ComputeStreamReduceScatter",
+    "PreallocatedReduceScatter",
+    "install_lean_hooks",
+    "preallocate_reduce_scatter",
+    "register_fsdp_forward_method",
+]
 
 
 class ComputeStreamReduceScatter(DefaultReduceScatter):
@@ -56,6 +62,90 @@ class ComputeStreamReduceScatter(DefaultReduceScatter):
             caller.wait_stream(self.compute_stream)
             buffer.record_stream(caller)
         return buffer
+
+
+class ReduceScatterInput:
+    """A rank-local packing buffer shared by FSDP groups after each NCCL read."""
+
+    def __init__(self, buffer: torch.Tensor) -> None:
+        self.buffer = buffer
+        self.done: torch.cuda.Event | None = None
+
+
+class PreallocatedReduceScatter(ComputeStreamReduceScatter):
+    """Use startup allocations for scheduled dense DP2 reductions."""
+
+    def __init__(
+        self,
+        device: torch.device,
+        group: FSDPParamGroup,
+        input_buffer: ReduceScatterInput | None,
+        output: torch.Tensor | None,
+    ) -> None:
+        super().__init__(device)
+        self.params = group.fsdp_params
+        self.input_buffer = input_buffer
+        self.output = output
+
+    def allocate(self, size, *, dtype, device):
+        if dtype == torch.float32 and len(size) == 1:
+            caller = torch.cuda.current_stream(device)
+            if caller == self.compute_stream:
+                scratch = self.input_buffer
+                if scratch is not None and size[0] <= scratch.buffer.numel():
+                    if scratch.done is not None:
+                        caller.wait_event(scratch.done)
+                    return scratch.buffer.narrow(0, 0, size[0])
+            elif (
+                self.output is not None
+                and self.output.shape == size
+                and all(param.sharded_param.grad is None for param in self.params)
+            ):
+                # The preceding step consumed these gradient views on the compute stream.
+                caller.wait_stream(self.compute_stream)
+                return self.output
+        return super().allocate(size, dtype=dtype, device=device)
+
+    def __call__(self, output_tensor, input_tensor, group, op, async_op=False):
+        work = super().__call__(output_tensor, input_tensor, group, op, async_op=async_op)
+        scratch = self.input_buffer
+        if scratch is not None and input_tensor.data_ptr() == scratch.buffer.data_ptr():
+            if work is not None:
+                work.wait()
+            if scratch.done is None:
+                scratch.done = torch.cuda.Event()
+            scratch.done.record(torch.cuda.current_stream(input_tensor.device))
+        return work
+
+
+def preallocate_reduce_scatter(model: nn.Module, device: torch.device, mode: str) -> None:
+    groups = []
+    for module in model.modules():
+        if isinstance(module, FSDPModule):
+            for group in module._get_fsdp_state()._fsdp_param_groups:
+                output_size = sum(
+                    param.padded_sharded_param_size.numel()
+                    for param in group.fsdp_params
+                    if param.sharded_param.requires_grad
+                )
+                if output_size:
+                    groups.append((module, group, output_size))
+
+    # Align starts of the FP32 output views to 256 bytes while reserving one CUDA block.
+    aligned_sizes = [(size + 63) // 64 * 64 for _, _, size in groups]
+    arena = None
+    if mode in ("output", "both"):
+        arena = torch.empty(sum(aligned_sizes), dtype=torch.float32, device=device)
+    scratch = None
+    if mode in ("input", "both"):
+        capacity = max(size for _, _, size in groups) * 2
+        scratch = ReduceScatterInput(torch.empty(capacity, dtype=torch.float32, device=device))
+
+    offset = 0
+    for (module, group, size), aligned in zip(groups, aligned_sizes, strict=True):
+        output = None if arena is None else arena.narrow(0, offset, size)
+        module.set_custom_reduce_scatter(PreallocatedReduceScatter(device, group, scratch, output))
+        offset += aligned
 
 
 def is_sequence(x: Any) -> bool:
