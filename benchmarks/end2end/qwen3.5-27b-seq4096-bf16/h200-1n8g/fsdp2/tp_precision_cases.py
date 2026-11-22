@@ -57,7 +57,8 @@ class PrecisionTP(dense_tp.DenseTP):
         return self.names[id(module)].endswith(self.case)
 
     def rows(self, x, module):
-        if self.selects(module) or self.case == "stock-row":
+        stock_row = self.case in ("stock-row", "stock-linear-loss")
+        if self.selects(module) or stock_row:
             return ProbeRow.apply(
                 x,
                 module.weight,
@@ -65,11 +66,28 @@ class PrecisionTP(dense_tp.DenseTP):
                 self.size,
                 self.name,
                 self.rank,
-                self.case == "stock-row",
+                stock_row,
             )
         return super().rows(x, module)
 
     def columns(self, x, *modules):
+        if self.case in ("stock-column-forward", "stock-column-backward", "stock-linear-loss"):
+            return tuple(
+                ReferenceColumn.apply(
+                    x,
+                    module.weight,
+                    getattr(module, "main_grad", None),
+                    self.size,
+                    self.name,
+                    self.rank,
+                    tuple(
+                        len(span) for span in self.shards[self.names[id(module)] + ".weight"].spans
+                    ),
+                    self.case != "stock-column-backward",
+                    self.case != "stock-column-forward",
+                )
+                for module in modules
+            )
         fp32_decay = self.case == "fp32-decay-projection"
         selected = tuple(
             self.selects(module)
@@ -92,7 +110,7 @@ class PrecisionTP(dense_tp.DenseTP):
         )
 
     def loss(self, logits, labels):
-        if self.case == "stock-loss":
+        if self.case in ("stock-loss", "stock-linear-loss"):
             return StockLoss.apply(logits, labels.flatten(), self.size, self.name, self.rank)
         return super().loss(logits, labels)
 
@@ -182,6 +200,46 @@ class ProbeColumns(torch.autograd.Function):
             for mg, grad in zip(ctx.main_grads, grads, strict=True)
         )
         return dx, None, None, None, None, None, None, *dw
+
+
+def gather_column_rows(x, spans, size, name):
+    pieces = dense_tp._gather(x.contiguous(), size, name).unflatten(0, (size, x.size(0)))
+    return torch.cat([part.flatten(0, 1) for part in pieces.split(spans, dim=1)])
+
+
+class ReferenceColumn(torch.autograd.Function):
+    """Diagnostic only. Each projection uses the canonical full GEMM as a control."""
+
+    @staticmethod
+    def forward(ctx, x, weight, main_grad, size, name, rank, spans, stock_fwd, stock_bwd):
+        gathered = dense_tp._gather(x, size, name)
+        ctx.save_for_backward(gathered, weight)
+        ctx.main_grad, ctx.size, ctx.name, ctx.rank = main_grad, size, name, rank
+        ctx.spans, ctx.stock_bwd = spans, stock_bwd
+        if stock_fwd:
+            full_weight = gather_column_rows(weight, spans, size, name)
+            full = F.linear(gathered, full_weight)
+            return torch.cat(
+                [
+                    segment.chunk(size, dim=1)[rank]
+                    for segment in full.split(tuple(span * size for span in spans), dim=1)
+                ],
+                dim=1,
+            )
+        return F.linear(gathered, weight)
+
+    @staticmethod
+    def backward(ctx, grad):
+        x, weight = ctx.saved_tensors
+        grad = grad.contiguous()
+        dw = dense_tp._weight_grad(ctx.main_grad, grad, x)
+        if ctx.stock_bwd:
+            full_grad = gather_column_rows(grad.t(), ctx.spans, ctx.size, ctx.name).t()
+            full_weight = gather_column_rows(weight, ctx.spans, ctx.size, ctx.name)
+            dx = (full_grad @ full_weight).chunk(ctx.size)[ctx.rank].clone()
+        else:
+            dx = dense_tp._mm_scatter(grad, weight, ctx.size, ctx.name, False)
+        return dx, dw, None, None, None, None, None, None, None
 
 
 class StockLoss(torch.autograd.Function):
