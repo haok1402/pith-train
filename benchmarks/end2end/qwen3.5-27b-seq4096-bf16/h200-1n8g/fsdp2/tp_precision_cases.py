@@ -669,7 +669,7 @@ def check_column_partials(layout, device):
     for overlap in (False, True):
         x = torch.zeros_like(grad[:2], requires_grad=True)
         outputs = dense_tp._ColumnParallel.apply(
-            x, size, layout.name, overlap, False, (None, None), False, first, second
+            x, size, layout.name, overlap, False, (None, None), False, False, first, second
         )
         torch.autograd.backward(outputs, (grad, grad))
         assert torch.equal(x.grad, torch.full_like(x, 2**-8)), (rank, overlap, x.grad)

@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed import DeviceMesh
 
+from pithtrain.kernels import silu_mul_bwd, silu_mul_fwd
 from pithtrain.operators.flash_attn_v4 import flash_attn_func
 from pithtrain.operators.gated_delta_rule import gated_delta_rule
 from pithtrain.operators.linear import BF16Linear
@@ -50,6 +51,8 @@ class DenseTP:
         self.size = self.group.size()
         self.name = self.group.group_name
         self.async_tp = async_tp
+        self.bulk_row_reduce = False
+        self.recompute_mlp_once = False
         self.regather_inputs = regather_inputs
         self.head_chunk_tokens = head_chunk_tokens
         self.bf16_activations = False
@@ -174,6 +177,7 @@ class DenseTP:
             self.regather_inputs,
             main_grads,
             self.overwrite_wgrad,
+            self.bulk_row_reduce,
             *(m.weight for m in modules),
         )
         return tuple(_add_bias(output, module.bias) for output, module in zip(outputs, modules))
@@ -204,6 +208,7 @@ class DenseTP:
             self.name,
             self.async_tp,
             self.overwrite_wgrad,
+            self.bulk_row_reduce,
         )
         return _add_bias(output, module.bias)
 
@@ -266,6 +271,17 @@ class DenseTP:
 
     def mlp(self, layer: Qwen35DecoderLayer, x: torch.Tensor) -> torch.Tensor:
         mlp = layer.mlp
+        if self.recompute_mlp_once:
+            columns = (mlp.gate_proj, mlp.up_proj)
+            product = _RecomputedSwiGLU.apply(
+                x,
+                self.size,
+                self.name,
+                self.overwrite_wgrad,
+                tuple(module.main_grad for module in columns),
+                *(module.weight for module in columns),
+            )
+            return self.rows(product, mlp.down_proj)
         gate, up = self.columns(x, mlp.gate_proj, mlp.up_proj)
         return self.rows(silu_mul(gate, up), mlp.down_proj)
 
@@ -382,9 +398,19 @@ def _weight_grad(main_grad, grad, x, overwrite=False):
     return None
 
 
+def _column_dgrad(grads, weights, size, name):
+    contributions = (_mm_fp32(grad, weight) for grad, weight in zip(grads, weights, strict=True))
+    total = next(contributions)
+    for contribution in contributions:
+        total = total + contribution
+    return torch.ops._c10d_functional.reduce_scatter_tensor(total.contiguous(), "sum", size, name)
+
+
 class _ColumnParallel(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, size, name, overlap, regather, main_grads, overwrite, *weights):
+    def forward(
+        ctx, x, size, name, overlap, regather, main_grads, overwrite, bulk_reduce, *weights
+    ):
         if overlap and all(weight.dtype == x.dtype for weight in weights):
             gathered, outputs = torch.ops.symm_mem.fused_all_gather_matmul(
                 x, [w.t() for w in weights], 0, name, return_A=not regather
@@ -396,6 +422,7 @@ class _ColumnParallel(torch.autograd.Function):
         ctx.size, ctx.name, ctx.overlap, ctx.regather = size, name, overlap, regather
         ctx.main_grads = main_grads
         ctx.overwrite = overwrite
+        ctx.bulk_reduce = bulk_reduce
         return tuple(outputs)
 
     @staticmethod
@@ -406,19 +433,13 @@ class _ColumnParallel(torch.autograd.Function):
             x = torch.ops._c10d_functional.all_gather_into_tensor(
                 x.contiguous(), ctx.size, ctx.name
             )
-        scatter_pending = len(weights) != 1 or not ctx.overlap
+        scatter_pending = len(weights) != 1 or not ctx.overlap or ctx.bulk_reduce
         if not scatter_pending:
             dx = _mm_scatter(grads[0], weights[0], ctx.size, ctx.name, ctx.overlap)
         else:
-            contributions = (_mm_fp32(grad, weight) for grad, weight in zip(grads, weights))
-            total = next(contributions)
-            for contribution in contributions:
-                total = total + contribution
             # The weight-gradient GEMMs only need the gathered input, so they can run
             # while NCCL is reducing the input-gradient partials.
-            dx = torch.ops._c10d_functional.reduce_scatter_tensor(
-                total.contiguous(), "sum", ctx.size, ctx.name
-            )
+            dx = _column_dgrad(grads, weights, ctx.size, ctx.name)
         if ctx.regather:
             x = torch.ops._c10d_functional.wait_tensor(x)
         dweights = tuple(
@@ -426,17 +447,45 @@ class _ColumnParallel(torch.autograd.Function):
         )
         if scatter_pending:
             dx = torch.ops._c10d_functional.wait_tensor(dx).to(x.dtype)
-        return dx, None, None, None, None, None, None, *dweights
+        return dx, None, None, None, None, None, None, None, *dweights
+
+
+class _RecomputedSwiGLU(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, size, name, overwrite, main_grads, gate_weight, up_weight):
+        _, (gate, up) = torch.ops.symm_mem.fused_all_gather_matmul(
+            x, [gate_weight.t(), up_weight.t()], 0, name, return_A=False
+        )
+        ctx.save_for_backward(x, gate_weight, up_weight)
+        ctx.size, ctx.name, ctx.overwrite = size, name, overwrite
+        ctx.main_grads = main_grads
+        return silu_mul_fwd(gate, up)
+
+    @staticmethod
+    def backward(ctx, grad):
+        x, *weights = ctx.saved_tensors
+        # The replay gather also provides the input for both weight gradients.
+        gathered, (gate, up) = torch.ops.symm_mem.fused_all_gather_matmul(
+            x, [weight.t() for weight in weights], 0, ctx.name
+        )
+        grads = silu_mul_bwd(grad, gate, up)
+        dx = _column_dgrad(grads, weights, ctx.size, ctx.name)
+        dweights = tuple(
+            _weight_grad(main_grad, derivative, gathered, ctx.overwrite)
+            for main_grad, derivative in zip(ctx.main_grads, grads, strict=True)
+        )
+        dx = torch.ops._c10d_functional.wait_tensor(dx).to(x.dtype)
+        return dx, None, None, None, None, *dweights
 
 
 class _RowParallel(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, main_grad, size, name, overlap, overwrite):
+    def forward(ctx, x, weight, main_grad, size, name, overlap, overwrite, bulk_reduce):
         ctx.save_for_backward(x, weight)
         ctx.size, ctx.name, ctx.overlap = size, name, overlap
         ctx.main_grad = main_grad
         ctx.overwrite = overwrite
-        return _mm_scatter(x, weight.t(), size, name, overlap)
+        return _mm_scatter(x, weight.t(), size, name, overlap and not bulk_reduce)
 
     @staticmethod
     def backward(ctx, dout):
@@ -447,7 +496,7 @@ class _RowParallel(torch.autograd.Function):
             grad = _gather(dout, ctx.size, ctx.name)
             dx = grad @ weight
         dw = _weight_grad(ctx.main_grad, grad, x, ctx.overwrite)
-        return dx, dw, None, None, None, None, None
+        return dx, dw, None, None, None, None, None, None
 
 
 class _ScatterSum(torch.autograd.Function):

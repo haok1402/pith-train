@@ -234,6 +234,8 @@ def main():
     parser.add_argument("--tp-fp32-gates", action="store_true")
     parser.add_argument("--tp-overwrite-wgrad", action="store_true")
     parser.add_argument("--tp-recompute-mlp-columns", action="store_true")
+    parser.add_argument("--tp-recompute-mlp-once", action="store_true")
+    parser.add_argument("--tp-bulk-row-reduce", action="store_true")
     parser.add_argument("--compile-blocks", action="store_true")
     parser.add_argument("--blocks-per-group", type=int, default=2)
     parser.add_argument("--reuse-single-weight-gather-buffers", action="store_true")
@@ -530,6 +532,8 @@ def run_trial(args, device, mesh, seed, batch_index):
         )
         config_fsdp.tp_overwrite_wgrad = args.tp_overwrite_wgrad
         config_fsdp.tp_recompute_mlp_columns = args.tp_recompute_mlp_columns
+        config_fsdp.tp_recompute_mlp_once = args.tp_recompute_mlp_once
+        config_fsdp.tp_bulk_row_reduce = args.tp_bulk_row_reduce
         config_fsdp.activation_checkpoint = checkpoint
         config_fsdp.full_checkpoint_blocks = args.full_checkpoint_blocks
         config_fsdp.blocks_per_group = args.blocks_per_group

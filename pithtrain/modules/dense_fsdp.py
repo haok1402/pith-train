@@ -53,6 +53,12 @@ class DenseFSDPCfg(SlottedDefault):
     tp_recompute_mlp_columns: bool = False
     """Replay the two wide MLP column projections during selective checkpointing."""
 
+    tp_recompute_mlp_once: bool = False
+    """Use the MLP projection replay gather for the weight gradients too."""
+
+    tp_bulk_row_reduce: bool = False
+    """Keep async input gathers and use full FP32 GEMMs followed by NCCL reduce-scatter."""
+
     blocks_per_group: int = 1
     """Number of consecutive decoder blocks per communication bucket."""
 
@@ -213,6 +219,16 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError("dense_fsdp.reduce_dtype must be fp32 or bf16")
     if cfg.activation_checkpoint not in ("none", "selective", "full"):
         raise ValueError("dense_fsdp.activation_checkpoint must be none, selective or full")
+    tp = model.tensor_parallel
+    if cfg.tp_recompute_mlp_once and (
+        tp is None or not tp.async_tp or cfg.tp_recompute_mlp_columns
+    ):
+        raise ValueError("Single-gather MLP replay requires async TP and its own replay policy")
+    if cfg.tp_bulk_row_reduce and (tp is None or not tp.async_tp):
+        raise ValueError("The bulk row reduction override requires async TP")
+    if tp is not None:
+        tp.recompute_mlp_once = cfg.tp_recompute_mlp_once
+        tp.bulk_row_reduce = cfg.tp_bulk_row_reduce
     if cfg.tp_recompute_mlp_columns and (
         cfg.activation_checkpoint != "selective"
         or model.tensor_parallel is None
