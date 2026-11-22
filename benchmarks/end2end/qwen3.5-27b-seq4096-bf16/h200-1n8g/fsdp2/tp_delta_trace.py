@@ -5,7 +5,14 @@ from collections import defaultdict
 import torch
 import torch.distributed as dist
 
-TRACE_CASES = ("trace-gdn-compiled", "restore-gdn-adjoint-compiled", "restore-gdn-core-compiled")
+TRACE_CASES = (
+    "trace-gdn-compiled",
+    "restore-gdn-adjoint-compiled",
+    "restore-gdn-core-compiled",
+    "qk-round-silu-compiled",
+    "qk-fp32-silu-compiled",
+    "qk-fp32-silu-rounded-loss-compiled",
+)
 PROJECTIONS = ("q", "k", "v", "decay", "beta")
 TENSORS = defaultdict(dict)
 MICROBATCH = 0

@@ -309,10 +309,10 @@ def main():
                 *fp32_master_cases,
             ):
                 layout = dense_tp.DenseTP(mesh, async_tp=overlap)
-            elif case in TRACE_CASES:
-                layout = dense_tp.DenseTP(mesh, async_tp=False)
             elif case in COMPILED_DECAY_CASES:
                 layout = DecayProbeTP(mesh, case)
+            elif case in TRACE_CASES:
+                layout = dense_tp.DenseTP(mesh, async_tp=False)
             else:
                 layout = PrecisionTP(mesh, case, async_tp=overlap)
         layout.shard_model(parallel)
