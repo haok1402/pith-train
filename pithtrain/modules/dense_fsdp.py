@@ -73,6 +73,12 @@ class DenseFSDPCfg(SlottedDefault):
 
 
 def checkpoint_policy(ctx, op, *args, **kwargs):
+    # The combined TP operators contain GEMMs just like aten.mm.
+    if op.name() in {
+        "symm_mem::fused_all_gather_matmul",
+        "symm_mem::fused_matmul_reduce_scatter",
+    }:
+        return CheckpointPolicy.MUST_SAVE
     if op in {
         torch.ops.aten.mm.default,
         torch.ops.aten.addmm.default,
