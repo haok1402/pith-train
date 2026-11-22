@@ -14,7 +14,7 @@ PATTERN = re.compile(
 
 
 def training_flops_per_token(config, seq_len):
-    """Megatron-style forward FLOPs, multiplied by 3 for training."""
+    """Count useful training FLOPs, using the recurrent estimate for Gated DeltaNet."""
     hidden = config["hidden_size"]
     counts = Counter(config["layer_types"])
     if sum(counts.values()) != config["num_hidden_layers"] or counts.keys() - {
@@ -36,18 +36,21 @@ def training_flops_per_token(config, seq_len):
     conv_width = 2 * key_width + value_width
     gdn_proj = 2 * hidden * (2 * key_width + 3 * value_width + 2 * value_heads)
     gdn_conv = 2 * config["linear_conv_kernel_dim"] * conv_width
-    gdn_core = 8 * value_heads * key_head_dim * value_head_dim
-
     forward = {
         "SwiGLU projections": counts.total() * 6 * hidden * config["intermediate_size"],
         "full-attention projections": counts["full_attention"] * full_proj,
         "causal full-attention core": counts["full_attention"] * full_core,
         "GDN projections": counts["linear_attention"] * gdn_proj,
         "GDN depthwise convolution": counts["linear_attention"] * gdn_conv,
-        "GDN recurrent core": counts["linear_attention"] * gdn_core,
         "LM head": 2 * hidden * config["vocab_size"],
     }
-    return {name: 3 * flops for name, flops in forward.items()}
+    training = {name: 3 * flops for name, flops in forward.items()}
+    # State decay, reads and rank-one update cost about 7 forward and 15 backward
+    # FLOPs per state element. The chunked implementation performs extra work.
+    training["GDN recurrent core"] = (
+        counts["linear_attention"] * 22 * value_heads * key_head_dim * value_head_dim
+    )
+    return training
 
 
 def main():
@@ -67,7 +70,7 @@ def main():
     flops = sum(breakdown.values())
     peak = args.gpus * 989e12
     print(f"Total {flops / 1e9:.4f} GFLOP/token")
-    print(f"40% target {0.4 * peak / flops:,.0f} aggregate tokens/s")
+    print(f"50% target {0.5 * peak / flops:,.0f} aggregate tokens/s")
     if args.log is None:
         return
     rows = [

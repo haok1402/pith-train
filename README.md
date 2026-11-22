@@ -15,3 +15,5 @@ srun -A nvr_elm_llm -p cpu -q cpu-short -N1 -n1 -c4 --mem=8G \
 [STATUS.md](notes/STATUS.md) has the GPU launcher, detached benchmark command, and measured state. [survey.md](notes/survey.md) describes the dense execution path and ablations. The BF16 driver adapts the fork's PP8 recipe at `088b32d` to a short 4K synthetic-data benchmark using the released weights.
 
 `/usr/bin/python3 bench/summarize.py logs/bf16-JOB_ID.log` summarizes the steady-state step time, throughput, allocated memory, and MFU.
+
+The integration tests use the pinned WikiText-103 train fixture and fused AdamW. Prepare the fixture in a CPU Slurm job with `bash bench/prepare-integration-text.sh`. The command accepts `E2EFP8_TEXT_PYTHON` for an environment with NumPy, PyArrow and tokenizers. [RESULTS.md](notes/RESULTS.md) records the full-node ablations and the held-out WikiText loss reference.
