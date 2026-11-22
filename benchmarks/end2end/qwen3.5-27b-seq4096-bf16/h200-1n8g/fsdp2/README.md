@@ -1,40 +1,47 @@
 # Dense Qwen3.5 tensor parallelism
 
-The dense FSDP2 benchmark enables tensor parallelism with `--tp 2` or `--tp 4`.
-FSDP shards across the remaining ranks. `--async-tp` enables PyTorch
-SymmetricMemory GEMM and collective overlap. The defaults use dense FSDP2
-with TP disabled.
+The dense BF16 trainer accepts `--tp 2` or `--tp 4` with FSDP2 on the
+remaining ranks. TP shards the residual stream across sequence tokens,
+attention across complete query/KV head groups, DeltaNet across matching
+key/value head groups, and the embedding and LM head across vocabulary.
+TP groups must fit on one node. Qwen3.5-27B has four KV heads, which limits
+this layout to TP4. The trainer supports HF checkpoint import.
 
-TP shards the residual stream across tokens, attention across complete
-query and KV groups, DeltaNet across matching key and value heads, and
-the embedding and LM head across vocabulary. TP groups must fit on one
-node. The Qwen3.5-27B config has four KV heads, which limits this sharding
-to TP4. The standalone BF16 path supports HF checkpoint import. DCP,
-HSDP, and combinations with PP, CP or EP are currently unsupported.
+The row projection writes FP32 GEMM partials and reduce-scatters them
+in FP32. The column projection backward follows the same rule for input
+gradients. These sequence collectives cast their results at the BF16
+activation boundary. Linear weight GEMMs write FP32 gradients, and
+FSDP2 reduces and accumulates FP32 shards. Master weights and both
+AdamW moments remain FP32.
 
-Run the benchmark from the repository root with the PithTrain environment
-active, using the scheduler to provide eight GPUs. For example:
+On the project cluster, launch from the project workspace with the GPU pool:
 
 ```bash
-torchrun --standalone --nproc-per-node=8 \
-  benchmarks/end2end/qwen3.5-27b-seq4096-bf16/h200-1n8g/fsdp2/script.py \
-  --model "$MODEL_DIR" --weights "$MODEL_DIR" --dataset "$DATASET_DIR" \
-  --tp 2 --async-tp --compile-blocks --seq 4096 --batch 64 --micro-batch 2 \
-  --reduce-dtype bf16 --bf16-sharded-gradients --blocks-per-group 2 \
+model="$PWD/inputs/Qwen3.5-27B"
+bench/gpu-run.sh --gpus 8 --time 00:10:00 --timing -- \
+  bash bench/run-tp.sh exact 8 benchmark --model "$model" --weights "$model" \
+  --tp 2 --async-tp --compile-blocks --checkpoint selective \
+  --seq 4096 --batch 64 --micro-batch 2 --blocks-per-group 2 \
   --skip-embedding-backward-gather --steps 6
 ```
 
-The benchmark uses fused AdamW by default. SymmetricMemory's CUDA backend
-creates Unix sockets under `TMPDIR`. Use a sufficiently short path reachable
-by every rank on the node.
+`--async-tp` overlaps sequence collectives with GEMMs through PyTorch
+SymmetricMemory, whose Unix sockets require a short `TMPDIR`. Use
+`--tp-regather-inputs` to save only a rank's own sequence shard of
+column projections and overlap the backward all-gather with input-gradient
+compute. The benchmark uses fused AdamW at 1e-5, the default CUDA
+allocator, and WikiText-103. It reports maximum per-rank allocation retries
+each step and stops if a retry occurs after step 2.
 
-On one eight-H200 node with 4K WikiText-103, async TP2 at microbatch 2
-reached 47.54% MFU and 117.24 GiB peak allocated per GPU with zero
-allocator retries over six steps. TP2 at microbatch 4 ran out of memory.
-Async TP4 at microbatch 4 reached 42.59% MFU. The tuned FSDP2 control
-reached 50.65% MFU, so the benchmark keeps TP optional.
+Run the reduced parity audit with TP2 and an FSDP degree of two:
 
-On two GPUs, run `tp_parity.py --hf-roundtrip` with `torchrun` for the reduced
-loss and gradient check. Use `--precision-reference` to add BF16 FSDP2 and
-FP32 recurrence controls, or `--check-tp-partials` to also check the head-local
-BF16 kernels and FP32 GEMM partials.
+```bash
+bench/gpu-run.sh --gpus 4 --time 00:12:00 --non-timing -- \
+  bash bench/run-tp.sh exact 4 parity --async-tp --compile-blocks --checkpoint selective
+```
+
+The audit reports relative L2 error for every parameter against the
+unsharded FP32 model, alongside the stock BF16 gradient error and an
+FP32 TP layout check. It includes both attention types and masked tokens,
+accumulates two microbatches, and verifies FP32 master weights, gradients,
+and fused AdamW state.
