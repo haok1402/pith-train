@@ -5,9 +5,14 @@ from functools import partial
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from pithtrain.kernels import cross_entropy_fwd_bwd, stage_compile_options
-from pithtrain.models.qwen35_moe import Qwen35MoeRMSNorm, Qwen35MoeRMSNormGated
+from pithtrain.models.qwen35_moe import (
+    Qwen35MoeRMSNorm,
+    Qwen35MoeRMSNormGated,
+    selective_recompute_contexts,
+)
 from pithtrain.modules import dense_tp
 from pithtrain.operators.causal_conv1d import causal_conv1d
 
@@ -53,6 +58,7 @@ COMPILED_DECAY_CASES = (
     "qk-round-silu-compiled",
     "qk-fp32-silu-compiled",
     "qk-fp32-silu-rounded-loss-compiled",
+    "delta-stock-checkpoint-compiled",
 )
 
 
@@ -84,6 +90,19 @@ class DecayProbeTP(dense_tp.DenseTP):
         else:
             return super().delta_decay(delta, a)
         return -decay.exp() * F.softplus(a.float() + bias)
+
+    def delta_attention(self, delta, x, batch, seq):
+        forward = super().delta_attention
+        if self.case == "delta-stock-checkpoint-compiled":
+            return checkpoint(
+                partial(forward, delta),
+                x,
+                batch,
+                seq,
+                use_reentrant=False,
+                context_fn=selective_recompute_contexts,
+            )
+        return forward(delta, x, batch, seq)
 
     def delta_project(self, delta, x):
         if self.case not in ("fp32-gate-compiled", "fp32-decay-combined-compiled"):

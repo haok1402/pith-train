@@ -12,6 +12,7 @@ TRACE_CASES = (
     "qk-round-silu-compiled",
     "qk-fp32-silu-compiled",
     "qk-fp32-silu-rounded-loss-compiled",
+    "delta-stock-checkpoint-compiled",
 )
 PROJECTIONS = ("q", "k", "v", "decay", "beta")
 TENSORS = defaultdict(dict)

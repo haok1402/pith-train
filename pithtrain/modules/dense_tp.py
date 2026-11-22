@@ -188,6 +188,15 @@ class DenseTP:
     def delta_project(self, delta, x):
         return self.columns(x, delta.in_proj_qkv, delta.in_proj_z, delta.in_proj_b, delta.in_proj_a)
 
+    def delta_attention(self, delta, x, batch, seq):
+        qkv, z, b, a = self.delta_project(delta, x)
+        q, k, v = delta.conv_qkv(qkv.view(batch, seq, -1), 0)
+        beta = b.view(batch, seq, -1).sigmoid().to(qkv.dtype)
+        decay = self.delta_decay(delta, a)
+        x = gated_delta_rule(q, k, v, decay.view(batch, seq, -1), beta)
+        x = delta.norm(x.reshape(-1, delta.head_v_dim), z.reshape(-1, delta.head_v_dim))
+        return self.rows(x.view(batch * seq, -1), delta.out_proj)
+
     def attention(
         self,
         layer: Qwen35DecoderLayer,
@@ -198,14 +207,7 @@ class DenseTP:
         batch = hidden.size(0) * self.size // seq
         x = layer.input_layernorm(hidden)
         if layer.is_linear:
-            delta = layer.linear_attn
-            qkv, z, b, a = self.delta_project(delta, x)
-            q, k, v = delta.conv_qkv(qkv.view(batch, seq, -1), 0)
-            beta = b.view(batch, seq, -1).sigmoid().to(qkv.dtype)
-            decay = self.delta_decay(delta, a)
-            x = gated_delta_rule(q, k, v, decay.view(batch, seq, -1), beta)
-            x = delta.norm(x.reshape(-1, delta.head_v_dim), z.reshape(-1, delta.head_v_dim))
-            x = self.rows(x.view(batch * seq, -1), delta.out_proj)
+            x = self.delta_attention(layer.linear_attn, x, batch, seq)
         else:
             attn = layer.self_attn
             q, k, v = self.columns(x, attn.q_proj, attn.k_proj, attn.v_proj)
