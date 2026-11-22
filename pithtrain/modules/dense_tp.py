@@ -205,7 +205,7 @@ class DenseTP:
     ) -> torch.Tensor:
         seq = rotary[0].size(1)
         batch = hidden.size(0) * self.size // seq
-        x = layer.input_layernorm(hidden)
+        x = self.attention_input(layer, hidden)
         if layer.is_linear:
             delta = layer.linear_attn
             if x.dtype == torch.bfloat16 and torch.is_grad_enabled():
@@ -224,6 +224,9 @@ class DenseTP:
             x = x.reshape(batch * seq, -1) * gate.reshape(batch * seq, -1).sigmoid()
             x = self.rows(x, attn.o_proj)
         return x
+
+    def attention_input(self, layer: Qwen35DecoderLayer, hidden: torch.Tensor) -> torch.Tensor:
+        return layer.input_layernorm(hidden)
 
     def attention(
         self,

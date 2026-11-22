@@ -65,6 +65,7 @@ COMPILED_DECAY_CASES = (
     "trace-decoder-compiled",
     "residual-round-trace-compiled",
     "residual-fp32-norm-compiled",
+    "fp32-residual-stream-compiled",
 )
 
 
@@ -73,6 +74,18 @@ class DecayProbeTP(dense_tp.DenseTP):
         super().__init__(mesh, async_tp=False)
         self.case = case
         self.master = case in ("fp32-decay-master-compiled", "fp32-decay-combined-compiled")
+        self.fp32_residual = case == "fp32-residual-stream-compiled"
+
+    def embed(self, module, tokens):
+        hidden = super().embed(module, tokens)
+        return hidden.float() if self.fp32_residual else hidden
+
+    def attention_input(self, layer, hidden):
+        x = super().attention_input(layer, hidden)
+        return x.to(torch.bfloat16) if self.fp32_residual else x
+
+    def head(self, module, x, labels=None):
+        return super().head(module, x.to(torch.bfloat16) if self.fp32_residual else x, labels)
 
     def shard_model(self, model):
         super().shard_model(model)
@@ -104,6 +117,10 @@ class DecayProbeTP(dense_tp.DenseTP):
         return residual
 
     def decoder(self, layer, hidden, rotary):
+        if self.fp32_residual:
+            residual = self.attention(layer, hidden, rotary)
+            mlp_input = layer.post_attention_layernorm(residual).to(torch.bfloat16)
+            return residual + self.mlp(layer, mlp_input)
         if self.case != "residual-fp32-norm-compiled":
             return super().decoder(layer, hidden, rotary)
         contribution = self.token_mixing(layer, hidden, rotary)
