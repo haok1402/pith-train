@@ -10,7 +10,7 @@ install_wgrad_accumulation connects these layers to FSDP2 after fully_shard by e
 of each parameter group:
 - pre_backward allocates and zeroes main_grad at the first backward of the step.
 - post_backward, when the group reduces, hands main_grad to FSDP2 as the gradient of the parameter
-  and releases its memory once FSDP2 has copied it into the reduce-scatter input.
+  and releases its memory or zeroes the retained storage once FSDP2 has packed the input.
 
 main_grad keeps the same tensor object across steps, so compiled graphs that take it as an input
 stay valid. Without install, main_grad is None and the layer behaves like its torch.nn version.
@@ -48,7 +48,9 @@ from pithtrain.operators.main_grad import MAIN_GRADS
 __all__ = ["install_raw_main_grad", "install_side_grads", "install_wgrad_accumulation"]
 
 
-def install_wgrad_accumulation(model: nn.Module) -> None:
+def install_wgrad_accumulation(
+    model: nn.Module, *, keep_buffers_for: tuple[nn.Module, ...] = ()
+) -> None:
     """
     Give the supported linears and compact embeddings a main_grad after fully_shard.
     """
@@ -58,6 +60,7 @@ def install_wgrad_accumulation(model: nn.Module) -> None:
         for group in fully_shard.state(module)._fsdp_param_groups:
             assert isinstance(group, FSDPParamGroup)
             pairs = []
+            resident = set()
             for fsdp_param in group.fsdp_params:
                 assert isinstance(fsdp_param, FSDPParam)
                 owner = fsdp_param._module_info.module
@@ -74,31 +77,45 @@ def install_wgrad_accumulation(model: nn.Module) -> None:
                     owner.main_grad = fp8_grouped_wgrad_empty(size, device)
                 else:
                     owner.main_grad = torch.empty(size, dtype=torch.float32, device=device)
-                owner.main_grad.untyped_storage().resize_(0)
+                if owner in keep_buffers_for:
+                    owner.main_grad.zero_()
+                    resident.add(owner.main_grad)
+                else:
+                    owner.main_grad.untyped_storage().resize_(0)
                 pairs.append((fsdp_param, owner.main_grad))
             if pairs:
-                _attach_main_grads(group, pairs)
+                _attach_main_grads(group, pairs, resident)
 
 
-def _attach_main_grads(group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch.Tensor]]) -> None:
+def _attach_main_grads(
+    group: FSDPParamGroup,
+    pairs: List[Tuple[FSDPParam, torch.Tensor]],
+    resident: set[torch.Tensor] | None = None,
+) -> None:
     """
-    Make the group allocate main_grad at the start of backward and reduce it in place of a .grad.
+    Give FSDP main_grad as .grad and reset the retained buffers after packing.
     """
     orig_pre_backward, orig_post_backward = group.pre_backward, group.post_backward
+    started = False
 
     def pre_backward(*args: Any) -> None:
+        nonlocal started
         for _, main_grad in pairs:
             if main_grad.untyped_storage().size() == 0:
                 main_grad.untyped_storage().resize_(main_grad.numel() * main_grad.element_size())
                 main_grad.zero_()
         orig_pre_backward(*args)
+        started = True
 
     def post_backward(*args: Any) -> None:
+        nonlocal started
         if not group.reduce_grads:
             orig_post_backward(*args)
             return
         # Keep any gradient the weight got outside its layer, e.g. kv_b_proj in MLA ring attention.
         for fsdp_param, main_grad in pairs:
+            if resident and main_grad in resident and not started:
+                continue
             if main_grad.untyped_storage().size() > 0:
                 param = fsdp_param.unsharded_param
                 if param.grad is not None:
@@ -109,7 +126,11 @@ def _attach_main_grads(group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch
         orig_post_backward(*args)
         # FSDP2 has copied main_grad into the reduce-scatter input on this stream.
         for _, main_grad in pairs:
-            main_grad.untyped_storage().resize_(0)
+            if resident and main_grad in resident:
+                main_grad.zero_()
+            else:
+                main_grad.untyped_storage().resize_(0)
+        started = False
 
     group.pre_backward = pre_backward
     group.post_backward = post_backward

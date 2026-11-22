@@ -35,6 +35,7 @@ def main():
     parser.add_argument("--preallocate-grad-buffers", choices=("input", "output", "both"))
     parser.add_argument("--preallocate-grad-output-layers", type=int, nargs="+", default=())
     parser.add_argument("--split-mlp-shard-layers", type=int, nargs="+", default=())
+    parser.add_argument("--preallocate-edge-wgrads", action="store_true")
     parser.add_argument("--compact-embedding-grad", action="store_true")
     parser.add_argument("--virtual-layer-counts", type=int, nargs=4)
     parser.add_argument("--microbatch-size", type=int, choices=(1, 2), default=2)
@@ -167,6 +168,9 @@ def main():
         cfg.training.pipeline_split_mlp_shard_layers = (
             tuple(args.split_mlp_shard_layers) if schedule in ("zb-h1", "zbv") else ()
         )
+        cfg.training.pipeline_preallocate_edge_wgrads = (
+            args.preallocate_edge_wgrads and schedule in ("zb-h1", "zbv")
+        )
         cfg.training.pipeline_compact_embedding_grad = (
             args.compact_embedding_grad and arm not in controls
         )
@@ -196,7 +200,7 @@ def main():
             for group in module._get_fsdp_state()._fsdp_param_groups
             if isinstance(group._reduce_scatter_comm, PreallocatedReduceScatter)
         ]
-        for attempt in range(2 if buffers else 1):
+        for attempt in range(2 if buffers or cfg.training.pipeline_preallocate_edge_wgrads else 1):
             if attempt:
                 model.zero_grad(set_to_none=True)
             losses = model.step(batches, objective)

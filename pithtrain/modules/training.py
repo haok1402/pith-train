@@ -268,6 +268,9 @@ class TrainingCfg(SlottedDefault):
     pipeline_split_mlp_shard_layers: tuple[int, ...] = ()
     """Use separate FSDP groups for MLP projections in these dense decoder layers."""
 
+    pipeline_preallocate_edge_wgrads: bool = False
+    """Keep the dense embedding and LM-head FP32 accumulation buffers resident."""
+
     pipeline_compact_embedding_grad: bool = False
     """Use a microbatch-sized temporary for embedding backward."""
 
@@ -501,6 +504,10 @@ def setup_model(
         or any(not 0 <= index < module_config.num_hidden_layers for index in split_mlp_shard_layers)
     ):
         raise ValueError("MLP sharding requires valid dense ZB-H1 or ZB-V decoder indices")
+    if cfg.pipeline_preallocate_edge_wgrads and (
+        schedule not in ("zb-h1", "zbv") or not cfg.pipeline_compact_embedding_grad
+    ):
+        raise ValueError("Preallocated edge gradients require ZB-H1 or ZB-V and compact embedding")
     weight_delays = cfg.pipeline_zb_h1_weight_delays
     if weight_delays is not None and (
         schedule != "zb-h1"
@@ -605,7 +612,17 @@ def setup_model(
         preallocate_reduce_scatter(
             modules, distributed.device, grad_buffers, decoder_modules, output_modules
         )
-    install_wgrad_accumulation(modules)
+    edge_modules = (
+        tuple(
+            child
+            for stage in modules
+            for child in (stage.embed_tokens, stage.lm_head)
+            if child is not None
+        )
+        if cfg.pipeline_preallocate_edge_wgrads
+        else ()
+    )
+    install_wgrad_accumulation(modules, keep_buffers_for=edge_modules)
     install_raw_main_grad(modules)  # gpt-oss raw expert weights; no-op elsewhere
     install_side_grads(modules)  # after the main_grad installs: its post_backward runs first
 
