@@ -1,6 +1,6 @@
 """Interleaved 1F1B and split-backward schedules for dense Qwen3.5."""
 
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
 from functools import lru_cache
 from typing import Any
@@ -207,11 +207,26 @@ class ScheduledDensePipeline(nn.Module):
         results = {}
         deferred_wgrads = {}
         reductions = []
+        wire_buffers: dict[tuple[torch.Size, torch.dtype], list[torch.Tensor]] = defaultdict(list)
+
+        def wire_buffer(shape: torch.Size, dtype: torch.dtype) -> torch.Tensor:
+            available = wire_buffers[shape, dtype]
+            return (
+                available.pop()
+                if available
+                else torch.empty(shape, dtype=dtype, device=distributed.device)
+            )
+
+        def recycle_wire_buffer(tensor: torch.Tensor) -> None:
+            wire_buffers[tensor.shape, tensor.dtype].append(tensor)
 
         def receive(operation, stage, index):
             tensor, work = receives.pop((operation, stage, index))
             work.wait()
-            return tensor
+            # Keep NCCL's buffers separate from autograd and deferred GEMM operands.
+            value = tensor.clone()
+            recycle_wire_buffer(tensor)
+            return value
 
         def take_input(receive_op, send_op, stage, index, source):
             if source in self.stages:
@@ -226,7 +241,10 @@ class ScheduledDensePipeline(nn.Module):
                     neighbor = stage_index + (1 if operation == SEND_F else -1)
                     peer = stage_to_rank(neighbor, self.pp_size, self.schedule)
                     group = self.edge_groups.get((self.pp_rank, peer), self.pp_group)
-                    tensor = outgoing.pop((operation, *key)).detach().contiguous()
+                    value = outgoing.pop((operation, *key)).detach()
+                    tensor = wire_buffer(value.shape, value.dtype)
+                    tensor.copy_(value)
+                    del value
                     work = dist.isend(tensor, group=group, dst=self.peers[peer])
                     sends[operation, *key] = (tensor, work)
                 elif operation in (RECV_F, RECV_B):
@@ -234,11 +252,8 @@ class ScheduledDensePipeline(nn.Module):
                     peer = stage_to_rank(neighbor, self.pp_size, self.schedule)
                     group = self.edge_groups.get((peer, self.pp_rank), self.pp_group)
                     (tokens,) = microbatch.model_inputs
-                    tensor = torch.empty(
-                        (*tokens.shape[:2], self.hidden_size),
-                        dtype=training.PARAM_DTYPE,
-                        device=distributed.device,
-                    )
+                    shape = torch.Size((*tokens.shape[:2], self.hidden_size))
+                    tensor = wire_buffer(shape, training.PARAM_DTYPE)
                     receives[operation, *key] = (
                         tensor,
                         dist.irecv(tensor, group=group, src=self.peers[peer]),
@@ -247,7 +262,7 @@ class ScheduledDensePipeline(nn.Module):
                     send = SEND_F if operation == WAIT_SEND_F else SEND_B
                     tensor, work = sends.pop((send, *key))
                     work.wait()
-                    del tensor
+                    recycle_wire_buffer(tensor)
                 elif operation == F:
                     training.current_microbatch = index
                     if stage_index == 0:

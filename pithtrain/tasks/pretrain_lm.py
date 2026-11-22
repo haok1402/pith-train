@@ -320,8 +320,6 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
             wandb.log(metrics)
 
     completed = step + 1
-    if retry_warmup is not None and completed > retry_warmup and step_retries:
-        raise RuntimeError(f"Invalid benchmark: CUDA allocator retried at step {completed}")
 
     stop = cfg.training.nsys_stop
     if stop is not None and completed == stop:
@@ -334,6 +332,9 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         path = Path(cfg.training.memory_profile_output, "snapshot-rank%05d.pickle" % rank)
         torch.cuda.memory._dump_snapshot(str(path))
         torch.cuda.memory._record_memory_history(enabled=None)
+
+    if retry_warmup is not None and completed > retry_warmup and step_retries:
+        raise RuntimeError(f"Invalid benchmark: CUDA allocator retried at step {completed}")
 
     if cfg.training.save_interval is not None:
         should_save = False

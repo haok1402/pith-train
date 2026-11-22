@@ -39,7 +39,13 @@ def main() -> None:
     parser.add_argument("--hf-import", type=Path)
     parser.add_argument("--dataset", type=Path, help="Directory of PithTrain token shards.")
     parser.add_argument("--log-first-microbatch-loss", action="store_true")
+    parser.add_argument("--allocator-trace-step", type=int)
+    parser.add_argument("--allocator-trace-dir", type=Path)
     args = parser.parse_args()
+    if args.allocator_trace_step is not None and (
+        args.allocator_trace_dir is None or not 1 <= args.allocator_trace_step <= args.steps
+    ):
+        parser.error("--allocator-trace-step requires a valid step and --allocator-trace-dir")
 
     cfg = PretrainLMCfg()
     cfg.dataset = args.dataset or Path(".")
@@ -72,6 +78,10 @@ def main() -> None:
     )
     training.lr = args.lr
     training.sequence_length = args.seq
+    if args.allocator_trace_step is not None:
+        training.memory_profile_start = args.allocator_trace_step - 1
+        training.memory_profile_stop = args.allocator_trace_step
+        training.memory_profile_output = args.allocator_trace_dir
     training.micro_batch_size = args.micro_batch
     training.global_batch_size = args.batch
     training.max_steps = args.steps
