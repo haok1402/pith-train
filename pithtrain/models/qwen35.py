@@ -168,6 +168,7 @@ class Qwen35DenseStage(Qwen35Model):
         defer_wgrad: bool = False,
         recompute_mlp_up_only: bool = False,
         recompute_mlp_product_only: bool = False,
+        recompute_mlp_up_layers: tuple[int, ...] = (),
         compact_embedding_grad: bool = False,
     ):
         nn.Module.__init__(self)
@@ -184,11 +185,13 @@ class Qwen35DenseStage(Qwen35Model):
                 f"pipeline_layer_counts must assign {config.num_hidden_layers} layers "
                 f"to {count} nonempty stages, got {layer_counts}"
             )
-        if isinstance(recompute_mlp, tuple) and any(
-            not 0 <= layer < config.num_hidden_layers for layer in recompute_mlp
+        selected_replay_layers = recompute_mlp if isinstance(recompute_mlp, tuple) else ()
+        if any(
+            not 0 <= layer < config.num_hidden_layers
+            for layer in (*selected_replay_layers, *recompute_mlp_up_layers)
         ):
             raise ValueError(
-                f"Invalid decoder layer indices for MLP recomputation: {recompute_mlp}"
+                "MLP recomputation layers must be valid global decoder indices"
             )
         start = sum(layer_counts[:index])
         self._build_stage(config, index, count, range(start, start + layer_counts[index]))
@@ -198,6 +201,10 @@ class Qwen35DenseStage(Qwen35Model):
             )
         for layer in self.layers.values():
             layer.compile_mode = compile_mode
+            if layer.idx in recompute_mlp_up_layers:
+                layer.recompute_mlp = True
+                layer.recompute_mlp_up_only = True
+                continue
             layer.recompute_mlp = (
                 layer.idx in recompute_mlp if isinstance(recompute_mlp, tuple) else recompute_mlp
             )

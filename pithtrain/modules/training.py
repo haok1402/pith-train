@@ -243,6 +243,9 @@ class TrainingCfg(SlottedDefault):
     pipeline_recompute_mlp_product_only: bool = False
     """Replay only the SwiGLU product saved by the down projection."""
 
+    pipeline_recompute_mlp_up_layers: tuple[int, ...] = ()
+    """Replay the up projection on these global layers, overriding their other MLP replay mode."""
+
     pipeline_grad_sync_layers: tuple[int, ...] = ()
     """Reduce gradients for these 1F1B decoder layers after each microbatch."""
 
@@ -481,6 +484,8 @@ def setup_model(
             raise ValueError(f"Unknown pipeline_compile: {cfg.pipeline_compile!r}")
         if cfg.pipeline_recompute_mlp_up_only and (cfg.fp8 or not cfg.pipeline_recompute_mlp):
             raise ValueError("Selective up-projection replay requires BF16 and MLP checkpointing")
+        if cfg.pipeline_recompute_mlp_up_layers and cfg.fp8:
+            raise ValueError("Selective up-projection replay requires BF16")
         if cfg.pipeline_recompute_mlp_product_only and (
             cfg.fp8 or not cfg.pipeline_recompute_mlp or cfg.pipeline_recompute_mlp_up_only
         ):
@@ -502,6 +507,7 @@ def setup_model(
                 defer_wgrad=split_backward,
                 recompute_mlp_up_only=cfg.pipeline_recompute_mlp_up_only,
                 recompute_mlp_product_only=cfg.pipeline_recompute_mlp_product_only,
+                recompute_mlp_up_layers=cfg.pipeline_recompute_mlp_up_layers,
                 compact_embedding_grad=cfg.pipeline_compact_embedding_grad,
             )
             for stage_index in range(stage_count)
@@ -516,6 +522,7 @@ def setup_model(
             or cfg.pipeline_recompute_mlp
             or cfg.pipeline_recompute_mlp_up_only
             or cfg.pipeline_recompute_mlp_product_only
+            or cfg.pipeline_recompute_mlp_up_layers
             or cfg.pipeline_grad_sync_layers
             or cfg.pipeline_compute_stream_grad_buffers
             or cfg.pipeline_compact_embedding_grad
