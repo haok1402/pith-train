@@ -142,7 +142,7 @@ class Qwen35TextModel(nn.Module):
         self.norm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = BF16Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, labels: torch.Tensor | None = None) -> torch.Tensor:
         tp = self.tensor_parallel
         if tp is None:
             hidden_states = self.embed_tokens(tokens)
@@ -151,4 +151,9 @@ class Qwen35TextModel(nn.Module):
         rotary_posemb = tuple(t.unsqueeze(0) for t in self.rotary_emb(tokens.size(1)))
         for layer in self.layers:
             hidden_states = layer(hidden_states, rotary_posemb)
-        return self.lm_head(self.norm(hidden_states))
+        hidden_states = self.norm(hidden_states)
+        if labels is not None:
+            if tp is None:
+                raise ValueError("Passing labels to the model requires tensor parallelism")
+            return self.lm_head(hidden_states, labels)
+        return self.lm_head(hidden_states)

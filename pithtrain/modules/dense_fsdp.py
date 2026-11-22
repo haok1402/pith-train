@@ -38,6 +38,9 @@ class DenseFSDPCfg(SlottedDefault):
     tp_regather_inputs: bool = False
     """Save only local column inputs and gather them again before the weight gradient."""
 
+    tp_head_chunk_tokens: int = 0
+    """Bound vocab-logit storage by rematerializing token chunks of this size in backward."""
+
     blocks_per_group: int = 1
     """Number of consecutive decoder blocks per communication bucket."""
 
@@ -80,6 +83,9 @@ class DenseFSDPCfg(SlottedDefault):
 
     checkpoint_blocks: int | None = None
     """Checkpoint this many leading decoder blocks, or all by default."""
+
+    full_checkpoint_blocks: int = 0
+    """Override selective checkpointing with full recompute for this decoder prefix."""
 
     compile_blocks: bool = False
 
@@ -145,6 +151,8 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError("dense_fsdp.activation_checkpoint must be none, selective or full")
     if cfg.tensor_parallel_size > 1 and (cfg.reduce_dtype != "fp32" or cfg.bf16_sharded_gradients):
         raise ValueError("Dense TP requires FP32 reduction and gradient shards")
+    if cfg.tp_head_chunk_tokens < 0:
+        raise ValueError("TP head chunk size must be nonnegative")
     if cfg.keep_gathered_across_microbatches and not cfg.keep_last_groups:
         raise ValueError("Keeping weights across microbatches requires --keep-last-groups")
     if cfg.checkpoint_blocks is not None and not (
@@ -164,11 +172,18 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         cast_forward_inputs=False,
     )
     checkpoint_blocks = cfg.checkpoint_blocks or len(model.layers)
+    if cfg.full_checkpoint_blocks and (
+        cfg.activation_checkpoint != "selective"
+        or not 1 <= cfg.full_checkpoint_blocks <= checkpoint_blocks
+    ):
+        raise ValueError(
+            "Full checkpoint prefix requires selective checkpointing and a valid depth"
+        )
     for i, layer in enumerate(model.layers):
         if i < checkpoint_blocks and cfg.activation_checkpoint != "none":
             ctx = (
                 {"context_fn": selective_checkpoint_contexts}
-                if cfg.activation_checkpoint == "selective"
+                if cfg.activation_checkpoint == "selective" and i >= cfg.full_checkpoint_blocks
                 else {}
             )
             layer.forward = partial(

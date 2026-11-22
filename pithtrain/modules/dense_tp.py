@@ -34,7 +34,14 @@ class DenseTPShard:
 
 
 class DenseTP:
-    def __init__(self, mesh: DeviceMesh, *, async_tp: bool, regather_inputs: bool = False):
+    def __init__(
+        self,
+        mesh: DeviceMesh,
+        *,
+        async_tp: bool,
+        regather_inputs: bool = False,
+        head_chunk_tokens: int = 0,
+    ):
         self.mesh = mesh
         self.group = mesh.get_group("tp")
         self.dp_group = mesh.get_group("dp")
@@ -43,6 +50,7 @@ class DenseTP:
         self.name = self.group.group_name
         self.async_tp = async_tp
         self.regather_inputs = regather_inputs
+        self.head_chunk_tokens = head_chunk_tokens
         if async_tp:
             # Import registers the symmetric-memory operators.
             import torch.distributed._symmetric_memory  # noqa: F401
@@ -147,8 +155,21 @@ class DenseTP:
             for output, module in zip(outputs, modules)
         )
 
-    def head(self, module: BF16Linear, x: torch.Tensor) -> torch.Tensor:
-        return self.columns(x, module)[0]
+    def head(
+        self, module: BF16Linear, x: torch.Tensor, labels: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if labels is not None and self.head_chunk_tokens:
+            return _ChunkedVocabHead.apply(
+                x,
+                module.weight,
+                labels.flatten(),
+                module.main_grad,
+                self.group,
+                self.name,
+                self.head_chunk_tokens,
+            )
+        logits = self.columns(x, module)[0]
+        return logits if labels is None else self.loss(logits, labels)
 
     def rows(self, x: torch.Tensor, module: nn.Linear) -> torch.Tensor:
         output = _RowParallel.apply(
@@ -208,12 +229,15 @@ class DenseTP:
         for name, param in model.named_parameters():
             if param.grad is not None:
                 grad = param.grad.to_local()
+                if grad.dtype != torch.float32:
+                    raise RuntimeError(f"Expected FP32 gradient for {name}, got {grad.dtype}")
                 (sharded if name in self.shards else replicated).append(grad)
-        for dtype in {grad.dtype for grad in replicated}:
-            grads = [grad for grad in replicated if grad.dtype == dtype]
-            flat = torch._utils._flatten_dense_tensors(grads)
+        if replicated:
+            flat = torch._utils._flatten_dense_tensors(replicated)
             dist.all_reduce(flat, group=self.group)
-            torch._foreach_copy_(grads, torch._utils._unflatten_dense_tensors(flat, grads))
+            torch._foreach_copy_(
+                replicated, torch._utils._unflatten_dense_tensors(flat, replicated)
+            )
         return sharded if self.rank else sharded + replicated
 
 
@@ -351,22 +375,75 @@ def _local_loss_gradient(logits, lse, local_label, owned, valid, grad):
     return logits.copy_(result)
 
 
+def _local_targets(labels, offset, vocab_size):
+    valid = labels != -100
+    local_label = labels - offset
+    owned = valid & (local_label >= 0) & (local_label < vocab_size)
+    return local_label.clamp(0, vocab_size - 1), owned, valid
+
+
+def _vocab_loss_stats(logits, local_label, owned, valid, group):
+    maximum = logits.amax(1).float()
+    dist.all_reduce(maximum, op=dist.ReduceOp.MAX, group=group)
+    stats = _local_loss_stats(logits, maximum, local_label, owned)
+    dist.all_reduce(stats, group=group)
+    sumexp, selected = stats.unbind()
+    lse = maximum + sumexp.log()
+    return lse, torch.where(valid, lse - selected, 0)
+
+
 class _VocabCrossEntropy(torch.autograd.Function):
     @staticmethod
     def forward(ctx, logits, labels, offset, group):
-        valid = labels != -100
-        local_label = labels - offset
-        owned = valid & (local_label >= 0) & (local_label < logits.size(1))
-        local_label = local_label.clamp(0, logits.size(1) - 1)
-        maximum = logits.amax(1).float()
-        dist.all_reduce(maximum, op=dist.ReduceOp.MAX, group=group)
-        stats = _local_loss_stats(logits, maximum, local_label, owned)
-        dist.all_reduce(stats, group=group)
-        sumexp, selected = stats.unbind()
-        lse = maximum + sumexp.log()
+        local_label, owned, valid = _local_targets(labels, offset, logits.size(1))
+        lse, loss = _vocab_loss_stats(logits, local_label, owned, valid, group)
         ctx.save_for_backward(logits, lse, local_label, owned, valid)
-        return torch.where(valid, lse - selected, 0).sum()
+        return loss.sum()
 
     @staticmethod
     def backward(ctx, grad):
         return _local_loss_gradient(*ctx.saved_tensors, grad), None, None, None
+
+
+class _ChunkedVocabHead(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, labels, main_grad, group, name, chunk_tokens):
+        size, vocab_size = group.size(), weight.size(0)
+        targets = _local_targets(labels, group.rank() * vocab_size, vocab_size)
+        gathered = _gather(x, size, name)
+        lse_parts, loss_parts = [], []
+        for xs, *ys in zip(
+            gathered.split(chunk_tokens),
+            *(target.split(chunk_tokens) for target in targets),
+            strict=True,
+        ):
+            lse, loss = _vocab_loss_stats(F.linear(xs, weight), *ys, group)
+            lse_parts.append(lse)
+            loss_parts.append(loss)
+        ctx.save_for_backward(gathered, weight, torch.cat(lse_parts), *targets)
+        ctx.main_grad, ctx.size, ctx.name, ctx.chunk_tokens = main_grad, size, name, chunk_tokens
+        return torch.cat(loss_parts).sum()
+
+    @staticmethod
+    def backward(ctx, grad):
+        x, weight, lse, *targets = ctx.saved_tensors
+        dx = torch.empty_like(x, dtype=torch.float32)
+        dw = ctx.main_grad
+        if dw is None:
+            dw = torch.zeros_like(weight, dtype=torch.float32)
+        for dxs, xs, ls, *ys in zip(
+            dx.split(ctx.chunk_tokens),
+            x.split(ctx.chunk_tokens),
+            lse.split(ctx.chunk_tokens),
+            *(target.split(ctx.chunk_tokens) for target in targets),
+            strict=True,
+        ):
+            logits_grad = _local_loss_gradient(F.linear(xs, weight), ls, *ys, grad)
+            if x.dtype == torch.float32:
+                torch.mm(logits_grad, weight, out=dxs)
+                dw.addmm_(logits_grad.t(), xs)
+            else:
+                torch.mm(logits_grad, weight, out_dtype=torch.float32, out=dxs)
+                torch.ops.pithtrain.wgrad_accumulate_(dw, logits_grad.t(), xs)
+        dx = _scatter_sum(dx, ctx.size, ctx.name).to(x.dtype)
+        return dx, dw if ctx.main_grad is None else None, None, None, None, None, None

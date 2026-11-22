@@ -90,11 +90,10 @@ def backward(model, tokens, labels, dp, tp=None):
 
     losses = []
     for x, y in zip(tokens[:, dp.rank()], labels[:, dp.rank()], strict=True):
-        logits = model(x)
         if tp is None:
-            loss, _ = objective((logits,), (y,))
+            loss, _ = objective((model(x),), (y,))
         else:
-            loss = tp.loss(logits, y)
+            loss = model(x, y)
         loss.backward()
         losses.append(loss.detach())
     if tp is not None:
@@ -109,9 +108,11 @@ def main():
     parser.add_argument("--tp", type=int, default=2)
     parser.add_argument("--async-tp", action="store_true")
     parser.add_argument("--tp-regather-inputs", action="store_true")
+    parser.add_argument("--tp-head-chunk-tokens", type=int, default=0)
     parser.add_argument("--compile-blocks", action="store_true")
     parser.add_argument("--blocks-per-group", type=int, default=2)
     parser.add_argument("--checkpoint", choices=("none", "selective", "full"), default="none")
+    parser.add_argument("--full-checkpoint-blocks", type=int, default=0)
     args = parser.parse_args()
 
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
@@ -163,12 +164,18 @@ def main():
     )
     dp_mesh = mesh["dp"]
     dp = dp_mesh.get_group()
-    layout = dense_tp.DenseTP(mesh, async_tp=args.async_tp, regather_inputs=args.tp_regather_inputs)
+    layout = dense_tp.DenseTP(
+        mesh,
+        async_tp=args.async_tp,
+        regather_inputs=args.tp_regather_inputs,
+        head_chunk_tokens=args.tp_head_chunk_tokens,
+    )
     layout.shard_model(parallel)
     config_fsdp = DenseFSDPCfg()
     config_fsdp.tensor_parallel_size = args.tp
     config_fsdp.compile_blocks = args.compile_blocks
     config_fsdp.activation_checkpoint = args.checkpoint
+    config_fsdp.full_checkpoint_blocks = args.full_checkpoint_blocks
     config_fsdp.blocks_per_group = args.blocks_per_group
     config_fsdp.skip_embedding_backward_gather = True
     shard_dense_model(parallel, dp_mesh, config_fsdp)

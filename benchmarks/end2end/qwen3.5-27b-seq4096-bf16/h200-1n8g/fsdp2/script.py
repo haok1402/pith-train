@@ -41,11 +41,13 @@ if __name__ == "__main__":
     parser.add_argument("--separate-reduce-scatter", action="store_true")
     parser.add_argument("--checkpoint", choices=("none", "selective", "full"), default="none")
     parser.add_argument("--checkpoint-blocks", type=int)
+    parser.add_argument("--full-checkpoint-blocks", type=int, default=0)
     parser.add_argument("--compile-blocks", action="store_true")
     parser.add_argument("--unfused-adamw", action="store_true")
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--async-tp", action="store_true")
     parser.add_argument("--tp-regather-inputs", action="store_true")
+    parser.add_argument("--tp-head-chunk-tokens", type=int, default=0)
     args = parser.parse_args()
     if args.tp > 1 and any(
         name in os.environ for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
@@ -75,6 +77,7 @@ if __name__ == "__main__":
     train.dense_fsdp.tensor_parallel_size = args.tp
     train.dense_fsdp.async_tensor_parallel = args.async_tp
     train.dense_fsdp.tp_regather_inputs = args.tp_regather_inputs
+    train.dense_fsdp.tp_head_chunk_tokens = args.tp_head_chunk_tokens
     train.dense_fsdp.blocks_per_group = args.blocks_per_group
     train.dense_fsdp.group_by_attention_type = args.group_by_attention_type
     train.dense_fsdp.edge_sharding = args.edge_sharding
@@ -90,5 +93,6 @@ if __name__ == "__main__":
     train.dense_fsdp.separate_reduce_scatter = args.separate_reduce_scatter
     train.dense_fsdp.activation_checkpoint = args.checkpoint
     train.dense_fsdp.checkpoint_blocks = args.checkpoint_blocks
+    train.dense_fsdp.full_checkpoint_blocks = args.full_checkpoint_blocks
     train.dense_fsdp.compile_blocks = args.compile_blocks
     launch(cfg)

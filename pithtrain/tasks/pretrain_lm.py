@@ -193,7 +193,7 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
             if tp is None:
                 loss, detached = objective((model(tokens),), (labels,))
             else:
-                loss = tp.loss(model(tokens), labels)
+                loss = model(tokens, labels)
                 detached = loss.detach()
             loss.backward()
             losses.append(detached)

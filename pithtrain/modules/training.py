@@ -433,6 +433,7 @@ def setup_model(
                 tp_mesh,
                 async_tp=dense.async_tensor_parallel,
                 regather_inputs=dense.tp_regather_inputs,
+                head_chunk_tokens=dense.tp_head_chunk_tokens,
             )
             mesh = tp_mesh["dp"]
             distributed.dp_size, distributed.dp_rank = mesh.size(), mesh.get_local_rank()
