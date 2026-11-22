@@ -127,7 +127,8 @@ def main():
         )
         replay_up = schedule.endswith("-up")
         replay_product = schedule.endswith("-product")
-        schedule = schedule.removesuffix("-up").removesuffix("-product")
+        replay_full = schedule.endswith("-full")
+        schedule = schedule.removesuffix("-up").removesuffix("-product").removesuffix("-full")
         cfg.training.pipeline_schedule = schedule
         cfg.training.pipeline_zb_h1_weight_delays = (
             tuple(args.zb_h1_weight_delays)
@@ -152,7 +153,7 @@ def main():
         cfg.training.pipeline_compact_embedding_grad = (
             args.compact_embedding_grad and arm not in controls
         )
-        cfg.training.pipeline_recompute_mlp = replay_up or replay_product
+        cfg.training.pipeline_recompute_mlp = replay_up or replay_product or replay_full
         cfg.training.pipeline_recompute_mlp_up_only = replay_up
         cfg.training.pipeline_recompute_mlp_product_only = replay_product
         with torch.device(device):
