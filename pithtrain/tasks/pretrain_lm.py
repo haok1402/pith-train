@@ -25,7 +25,7 @@ from pithtrain.modules.hf_loader import load_hf_into_model
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
 from pithtrain.modules.optimizer import clip_grad_norm, local_grads, scale_grads_
-from pithtrain.modules.training import TrainingCfg, setup_training
+from pithtrain.modules.training import TrainingCfg, initialize_fused_adamw_state, setup_training
 from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.cross_entropy import cross_entropy
 from pithtrain.pipeline import Microbatch
@@ -58,6 +58,9 @@ class PretrainLMCfg(SlottedDefault):
 
     allocator_retry_warmup_steps: int | None = None
     """Log allocator statistics every step and fail on retries after this many warmup steps."""
+
+    initialize_adamw_state: bool = False
+    """Allocate fused AdamW state after loading weights and before the first forward."""
 
 
 def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset:
@@ -365,6 +368,12 @@ def launch(cfg: PretrainLMCfg) -> None:
         load_hf_into_model(cfg.training.hf_import_path, training.model)
         if training.fp8:
             precompute_fp8_param_scales()
+    if cfg.initialize_adamw_state:
+        if len(training.optimizers) != 1 or not isinstance(
+            training.optimizers[0], torch.optim.AdamW
+        ):
+            raise ValueError("Early optimizer state initialization requires AdamW")
+        initialize_fused_adamw_state(training.optimizers[0])
     step = step or 0
     # Freeze the startup heap (model, datasets, compiled graphs) out of the collector, so the
     # per-step gc.collect() in train_step scans only what the step allocated.
