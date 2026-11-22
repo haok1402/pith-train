@@ -1031,20 +1031,6 @@ def fp8_pack_transpose_sm90(x: torch.Tensor, out: torch.Tensor) -> None:
 DESC_WORDS = 8  # int64 words per descriptor row
 
 
-@cute.jit
-def find_table_row(table_base: Int64, num_rows: Int32, cta_idx: Int32, row_words: cutlass.Constexpr[int]) -> Int32:
-    """
-    Index of the last descriptor row (row_words int64 words apart) whose first CTA, word 7, is at
-    or below cta_idx.
-    """
-    row_idx = Int32(0)
-    for i in cutlass.range(1, num_rows, unroll=1):
-        first_cta = Int32(ld_u64(table_base + (Int64(i) * row_words + 7) * 8))
-        if first_cta <= cta_idx:
-            row_idx = i
-    return row_idx
-
-
 class ShardAmaxMulti:
     """
     Shard amax over n shards. The table holds two rows per shard: (shard, amax, local_rows, K,
@@ -1126,14 +1112,14 @@ class ScalesMulti:
     """
 
     @cute.jit
-    def __call__(self, mTable: cute.Tensor, num_grids: Int32, num_ctas: Int32, stream: cuda.CUstream):
-        self.kernel(mTable.iterator.toint(), num_grids).launch(grid=[num_ctas, 1, 1], block=[NUM_THREADS, 1, 1], stream=stream)
+    def __call__(self, mTable: cute.Tensor, mGridForCta: cute.Tensor, num_ctas: Int32, stream: cuda.CUstream):
+        self.kernel(mTable.iterator.toint(), mGridForCta.iterator.toint()).launch(grid=[num_ctas, 1, 1], block=[NUM_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(self, table_base: Int64, num_grids: Int32):
+    def kernel(self, table_base: Int64, grid_for_cta_base: Int64):
         bx, _, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
-        grid_idx = find_table_row(table_base, num_grids, bx, DESC_WORDS)
+        grid_idx = Int32(ld_scalar_ordered(grid_for_cta_base + Int64(bx) * 4, Int32(1), 4))
         desc_addr = table_base + Int64(grid_idx) * DESC_WORDS * 8
         amax_base, scale_base, scale_t_base = ld_u64(desc_addr), ld_u64(desc_addr + 8), ld_u64(desc_addr + 16)
         amax_rows = Int32(ld_u64(desc_addr + 24))
@@ -1152,24 +1138,27 @@ class FP8ScalesGroup:
 
     def __init__(self, amaxes: Sequence[torch.Tensor], scales: Sequence[torch.Tensor], scales_t: Sequence[torch.Tensor]) -> None:
         desc_rows = []
-        first_cta = 0
+        grid_for_cta = []
         for amax, scale, scale_t in zip(amaxes, scales, scales_t):
             G, amax_rows, amax_cols = amax.shape
             ctas_per_group = (amax_rows * amax_cols + NUM_THREADS - 1) // NUM_THREADS
+            grid_idx = len(desc_rows)
+            first_cta = len(grid_for_cta)
             desc_rows.append([amax.data_ptr(), scale.data_ptr(), scale_t.data_ptr(), amax_rows, amax_cols, ctas_per_group, 0, first_cta])
-            first_cta += G * ctas_per_group
-        self.num_ctas = first_cta
-        self.num_grids = len(desc_rows)
-        self.table = torch.tensor(desc_rows, dtype=torch.int64, device=amaxes[0].device)
+            grid_for_cta.extend([grid_idx] * (G * ctas_per_group))
+        self.num_ctas = len(grid_for_cta)
+        device = amaxes[0].device
+        self.table = torch.tensor(desc_rows, dtype=torch.int64, device=device)
+        self.grid_for_cta = torch.tensor(grid_for_cta, dtype=torch.int32, device=device)
         fn = COMPILED.get("scales_multi")
         if fn is None:
-            fn = cute.compile(ScalesMulti(), fake_row_major(cutlass.Int64, 2, 8), Int32(0), Int32(0), fake_stream(), options="--enable-tvm-ffi")
+            fn = cute.compile(ScalesMulti(), fake_row_major(cutlass.Int64, 2, 8), fake_row_major(Int32, 1, 4), Int32(0), fake_stream(), options="--enable-tvm-ffi")
             COMPILED["scales_multi"] = fn
         self.fn = fn
 
     def __call__(self) -> None:
         if self.num_ctas:
-            self.fn(self.table, self.num_grids, self.num_ctas)
+            self.fn(self.table, self.grid_for_cta, self.num_ctas)
 
 
 def fp8_shard_amax_multi_sm90(shards: Sequence[torch.Tensor], amaxes: Sequence[torch.Tensor], row_offsets: Sequence[int], group_offsets: Sequence[int]) -> FP8ShardAmaxGroup:
