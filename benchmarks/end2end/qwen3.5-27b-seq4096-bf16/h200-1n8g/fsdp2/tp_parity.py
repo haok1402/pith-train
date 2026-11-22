@@ -232,8 +232,10 @@ def main():
     parser.add_argument("--tp-head-chunk-tokens", type=int, default=0)
     parser.add_argument("--tp-fp32-affine", action="store_true")
     parser.add_argument("--tp-fp32-gates", action="store_true")
+    parser.add_argument("--tp-overwrite-wgrad", action="store_true")
     parser.add_argument("--compile-blocks", action="store_true")
     parser.add_argument("--blocks-per-group", type=int, default=2)
+    parser.add_argument("--reuse-single-weight-gather-buffers", action="store_true")
     parser.add_argument("--checkpoint", choices=("none", "selective", "full"), default="none")
     parser.add_argument("--full-checkpoint-blocks", type=int, default=0)
     parser.add_argument("--token-sums-audit", action="store_true")
@@ -242,6 +244,8 @@ def main():
     parser.add_argument("--seeds", nargs="+", type=int, default=[17, 18, 19, 20, 21])
     parser.add_argument("--batches", type=int, default=2)
     args = parser.parse_args()
+    if args.tp_overwrite_wgrad and args.bisect:
+        parser.error("TP weight-gradient overwrite requires the production TP forwards")
     if args.statistical and (
         args.bisect
         or args.cases
@@ -523,12 +527,14 @@ def run_trial(args, device, mesh, seed, batch_index):
             "fp32-gates-compiled",
             "fp32-affine-gates-compiled",
         )
+        config_fsdp.tp_overwrite_wgrad = args.tp_overwrite_wgrad
         config_fsdp.activation_checkpoint = checkpoint
         config_fsdp.full_checkpoint_blocks = args.full_checkpoint_blocks
         config_fsdp.blocks_per_group = args.blocks_per_group
         config_fsdp.skip_embedding_backward_gather = True
+        config_fsdp.reuse_single_weight_gather_buffers = args.reuse_single_weight_gather_buffers
         shard_dense_model(parallel, dp_mesh, config_fsdp)
-        install_wgrad_accumulation(parallel)
+        install_wgrad_accumulation(parallel, tp_overwrite=config_fsdp.tp_overwrite_wgrad)
         if args.token_sums_audit:
             partials, groups = capture_parameter_partials(parallel)
         if case == "stock-adjoint-compiled":

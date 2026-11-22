@@ -463,7 +463,7 @@ def setup_model(
             model.to_empty(device=distributed.device)
             model.rotary_emb = Qwen35MoeRotaryEmbedding(module_config).to(distributed.device)
         if tp is not None:
-            install_wgrad_accumulation(model)
+            install_wgrad_accumulation(model, tp_overwrite=dense.tp_overwrite_wgrad)
         training.model = model
         return
 

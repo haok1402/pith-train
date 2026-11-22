@@ -47,6 +47,9 @@ class DenseFSDPCfg(SlottedDefault):
     tp_fp32_gates: bool = False
     """Gather the small DeltaNet a and b projection weights in their master dtype."""
 
+    tp_overwrite_wgrad: bool = False
+    """Write each TP weight's first microbatch contribution directly into the FP32 buffer."""
+
     blocks_per_group: int = 1
     """Number of consecutive decoder blocks per communication bucket."""
 
@@ -67,6 +70,9 @@ class DenseFSDPCfg(SlottedDefault):
 
     skip_embedding_backward_gather: bool = False
     """Skip gathering the embedding weight in backward when it is its own bucket."""
+
+    reuse_single_weight_gather_buffers: bool = False
+    """Use the all-gather destination directly for separately sharded edge weights."""
 
     prefetch: int = 0
     """Explicit lookahead in buckets in both directions. Zero uses FSDP's implicit prefetch."""
@@ -118,6 +124,41 @@ def selective_checkpoint_contexts():
     return create_selective_checkpoint_contexts(checkpoint_policy)
 
 
+def reuse_single_weight_gather_buffer(unit: nn.Module) -> None:
+    from torch.distributed.fsdp._fully_shard._fsdp_collectives import DefaultAllGather
+    from torch.distributed.fsdp._fully_shard._fsdp_param import alloc_storage
+
+    (group,) = unit._get_fsdp_state()._fsdp_param_groups
+    (param,) = group.fsdp_params
+
+    class AllGatherIntoWeight(DefaultAllGather):
+        def allocate(self, size, *, dtype, device):
+            if not param.all_gather_outputs:
+                param.all_gather_outputs = [super().allocate(size, dtype=dtype, device=device)]
+            (output,) = param.all_gather_outputs
+            if output.shape != size or output.dtype != dtype or output.device != device:
+                raise ValueError("All-gather buffer metadata changed")
+            alloc_storage(output)
+            return output
+
+    def reuse_output(_params, result, _world_size):
+        result.all_gather_output.record_stream(torch.cuda.current_stream())
+
+    unshard = group.unshard
+
+    def unshard_into_weight(async_op: bool = False):
+        # A backward gather restores a saved weight. Preserve its version just
+        # as FSDP does when copying the all-gather output into that weight.
+        if param.all_gather_outputs and not param.all_gather_outputs[0].is_inference():
+            with torch.autograd._unsafe_preserve_version_counter(tuple(param.all_gather_outputs)):
+                return unshard(async_op=async_op)
+        return unshard(async_op=async_op)
+
+    group.unshard = unshard_into_weight
+    group._all_gather_output_fn = reuse_output
+    unit.set_custom_all_gather(AllGatherIntoWeight())
+
+
 def log_bucket_sizes(
     buckets: list[tuple[str, list[nn.Module]]],
     shard_size: int,
@@ -154,6 +195,8 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError("dense_fsdp.edge_sharding must be separate or root")
     if cfg.edge_sharding == "root" and cfg.skip_embedding_backward_gather:
         raise ValueError("Skipping the embedding backward gather requires a separate embedding")
+    if cfg.edge_sharding == "root" and cfg.reuse_single_weight_gather_buffers:
+        raise ValueError("Reusing gathered weights requires separate edge buckets")
     if cfg.prefetch < 0:
         raise ValueError("dense_fsdp.prefetch must be nonnegative")
     if cfg.reduce_dtype not in ("fp32", "bf16"):
@@ -162,6 +205,8 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError("dense_fsdp.activation_checkpoint must be none, selective or full")
     if cfg.tensor_parallel_size > 1 and (cfg.reduce_dtype != "fp32" or cfg.bf16_sharded_gradients):
         raise ValueError("Dense TP requires FP32 reduction and gradient shards")
+    if cfg.tp_overwrite_wgrad and (model.tensor_parallel is None or cfg.reduce_at_step_end):
+        raise ValueError("Overwriting TP weight gradients requires reduction on each microbatch")
     if cfg.tp_head_chunk_tokens < 0:
         raise ValueError("TP head chunk size must be nonnegative")
     if cfg.keep_gathered_across_microbatches and not cfg.keep_last_groups:
@@ -266,6 +311,9 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
     if cfg.edge_sharding == "separate":
         fully_shard(model.embed_tokens, mesh=mesh, reshard_after_forward=True, mp_policy=mp)
         fully_shard(model.lm_head, mesh=mesh, reshard_after_forward=True, mp_policy=mp)
+        if cfg.reuse_single_weight_gather_buffers:
+            reuse_single_weight_gather_buffer(model.embed_tokens)
+            reuse_single_weight_gather_buffer(model.lm_head)
         if cfg.skip_embedding_backward_gather:
             model.embed_tokens.set_unshard_in_backward(False)
         order = [model.embed_tokens, *order, model.lm_head]

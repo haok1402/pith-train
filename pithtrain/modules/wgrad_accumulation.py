@@ -47,12 +47,14 @@ from pithtrain.operators.main_grad import MAIN_GRADS
 __all__ = ["install_raw_main_grad", "install_side_grads", "install_wgrad_accumulation"]
 
 
-def install_wgrad_accumulation(model: nn.Module) -> None:
+def install_wgrad_accumulation(model: nn.Module, *, tp_overwrite: bool = False) -> None:
     """
     Give every BF16Linear, GroupedLinear and FP8GroupedLinear weight in the model a main_grad,
     after fully_shard.
     """
     dense_tp = getattr(model, "tensor_parallel", None)
+    if dense_tp is not None:
+        dense_tp.overwrite_wgrad = tp_overwrite
     tp_linear = (nn.Linear,) if dense_tp is not None else ()
     seen_groups = set()
     for module in model.modules():
@@ -81,10 +83,12 @@ def install_wgrad_accumulation(model: nn.Module) -> None:
                 owner.main_grad.untyped_storage().resize_(0)
                 pairs.append((fsdp_param, owner.main_grad))
             if pairs:
-                _attach_main_grads(group, pairs)
+                _attach_main_grads(group, pairs, overwrite=tp_overwrite)
 
 
-def _attach_main_grads(group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch.Tensor]]) -> None:
+def _attach_main_grads(
+    group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch.Tensor]], *, overwrite: bool = False
+) -> None:
     """
     Make the group allocate main_grad at the start of backward and reduce it in place of a .grad.
     """
@@ -94,7 +98,8 @@ def _attach_main_grads(group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch
         for _, main_grad in pairs:
             if main_grad.untyped_storage().size() == 0:
                 main_grad.untyped_storage().resize_(main_grad.numel() * main_grad.element_size())
-                main_grad.zero_()
+                if not overwrite:
+                    main_grad.zero_()
         orig_pre_backward(*args)
 
     def post_backward(*args: Any) -> None:

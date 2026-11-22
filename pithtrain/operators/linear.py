@@ -228,14 +228,20 @@ class FP8Linear(nn.Linear):
 
 # Inductor has no single-GEMM lowering for addmm with out_dtype, so the fused GEMM is its own op.
 wgrad_accumulate_library = torch.library.Library("pithtrain", "FRAGMENT")
-wgrad_accumulate_library.define("wgrad_accumulate_(Tensor(a!) main_grad, Tensor a, Tensor b) -> ()")
+wgrad_accumulate_library.define(
+    "wgrad_accumulate_(Tensor(a!) main_grad, Tensor a, Tensor b, bool overwrite=False) -> ()"
+)
 
 
-def wgrad_accumulate_cuda(main_grad: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> None:
-    torch.addmm(main_grad, a, b, out_dtype=torch.float32, out=main_grad)
+def wgrad_accumulate_cuda(
+    main_grad: torch.Tensor, a: torch.Tensor, b: torch.Tensor, overwrite: bool = False
+) -> None:
+    torch.addmm(main_grad, a, b, beta=0 if overwrite else 1, out_dtype=torch.float32, out=main_grad)
 
 
-def wgrad_accumulate_meta(main_grad: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> None:
+def wgrad_accumulate_meta(
+    main_grad: torch.Tensor, a: torch.Tensor, b: torch.Tensor, overwrite: bool = False
+) -> None:
     return None
 
 
@@ -245,8 +251,10 @@ addmm_dtype_out_fallback = fallback_handler(torch.ops.aten.addmm.dtype_out, add_
 
 
 @register_lowering(torch.ops.pithtrain.wgrad_accumulate_.default, type_promotion_kind=None)
-def lower_wgrad_accumulate(main_grad: Any, a: Any, b: Any) -> None:
-    addmm_dtype_out_fallback(main_grad, a, b, torch.float32, beta=1, alpha=1, out=main_grad)
+def lower_wgrad_accumulate(main_grad: Any, a: Any, b: Any, overwrite: bool = False) -> None:
+    addmm_dtype_out_fallback(
+        main_grad, a, b, torch.float32, beta=0 if overwrite else 1, alpha=1, out=main_grad
+    )
 
 
 class BF16LinearFunc(torch.autograd.Function):

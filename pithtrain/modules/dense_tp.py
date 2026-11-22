@@ -53,6 +53,7 @@ class DenseTP:
         self.regather_inputs = regather_inputs
         self.head_chunk_tokens = head_chunk_tokens
         self.bf16_activations = False
+        self.overwrite_wgrad = False
         if async_tp:
             # Import registers the symmetric-memory operators.
             import torch.distributed._symmetric_memory  # noqa: F401
@@ -172,6 +173,7 @@ class DenseTP:
             self.async_tp,
             self.regather_inputs,
             main_grads,
+            self.overwrite_wgrad,
             *(m.weight for m in modules),
         )
         return tuple(_add_bias(output, module.bias) for output, module in zip(outputs, modules))
@@ -188,6 +190,7 @@ class DenseTP:
                 self.group,
                 self.name,
                 self.head_chunk_tokens,
+                self.overwrite_wgrad,
             )
         logits = self.columns(x, module)[0]
         return logits if labels is None else self.loss(logits, labels)
@@ -200,6 +203,7 @@ class DenseTP:
             self.size,
             self.name,
             self.async_tp,
+            self.overwrite_wgrad,
         )
         return _add_bias(output, module.bias)
 
@@ -368,19 +372,19 @@ def _mm_scatter_fake(a, b, size, name, overlap):
     return a.new_empty((a.size(0) // size, b.size(1)))
 
 
-def _weight_grad(main_grad, grad, x):
+def _weight_grad(main_grad, grad, x, overwrite=False):
     if main_grad is None:
         return _mm_fp32(grad.t(), x)
     if grad.dtype == x.dtype == torch.bfloat16:
-        torch.ops.pithtrain.wgrad_accumulate_(main_grad, grad.t(), x)
+        torch.ops.pithtrain.wgrad_accumulate_(main_grad, grad.t(), x, overwrite)
     else:
-        main_grad.addmm_(grad.float().t(), x.float())
+        main_grad.addmm_(grad.float().t(), x.float(), beta=0 if overwrite else 1)
     return None
 
 
 class _ColumnParallel(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, size, name, overlap, regather, main_grads, *weights):
+    def forward(ctx, x, size, name, overlap, regather, main_grads, overwrite, *weights):
         if overlap and all(weight.dtype == x.dtype for weight in weights):
             gathered, outputs = torch.ops.symm_mem.fused_all_gather_matmul(
                 x, [w.t() for w in weights], 0, name, return_A=not regather
@@ -391,6 +395,7 @@ class _ColumnParallel(torch.autograd.Function):
         ctx.save_for_backward(x if regather else gathered, *weights)
         ctx.size, ctx.name, ctx.overlap, ctx.regather = size, name, overlap, regather
         ctx.main_grads = main_grads
+        ctx.overwrite = overwrite
         return tuple(outputs)
 
     @staticmethod
@@ -416,18 +421,21 @@ class _ColumnParallel(torch.autograd.Function):
             )
         if ctx.regather:
             x = torch.ops._c10d_functional.wait_tensor(x)
-        dweights = tuple(_weight_grad(mg, grad, x) for mg, grad in zip(ctx.main_grads, grads))
+        dweights = tuple(
+            _weight_grad(mg, grad, x, ctx.overwrite) for mg, grad in zip(ctx.main_grads, grads)
+        )
         if scatter_pending:
             dx = torch.ops._c10d_functional.wait_tensor(dx).to(x.dtype)
-        return dx, None, None, None, None, None, *dweights
+        return dx, None, None, None, None, None, None, *dweights
 
 
 class _RowParallel(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, main_grad, size, name, overlap):
+    def forward(ctx, x, weight, main_grad, size, name, overlap, overwrite):
         ctx.save_for_backward(x, weight)
         ctx.size, ctx.name, ctx.overlap = size, name, overlap
         ctx.main_grad = main_grad
+        ctx.overwrite = overwrite
         return _mm_scatter(x, weight.t(), size, name, overlap)
 
     @staticmethod
@@ -438,7 +446,8 @@ class _RowParallel(torch.autograd.Function):
         else:
             grad = _gather(dout, ctx.size, ctx.name)
             dx = grad @ weight
-        return dx, _weight_grad(ctx.main_grad, grad, x), None, None, None, None
+        dw = _weight_grad(ctx.main_grad, grad, x, ctx.overwrite)
+        return dx, dw, None, None, None, None, None
 
 
 class _ScatterSum(torch.autograd.Function):
@@ -519,7 +528,7 @@ class _VocabCrossEntropy(torch.autograd.Function):
 
 class _ChunkedVocabHead(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, labels, main_grad, group, name, chunk_tokens):
+    def forward(ctx, x, weight, labels, main_grad, group, name, chunk_tokens, overwrite):
         size, vocab_size = group.size(), weight.size(0)
         targets = _local_targets(labels, group.rank() * vocab_size, vocab_size)
         gathered = _gather(x, size, name)
@@ -535,6 +544,7 @@ class _ChunkedVocabHead(torch.autograd.Function):
             losses.append(loss)
         ctx.save_for_backward(gathered, weight, torch.cat(maxima), torch.cat(sums), *targets)
         ctx.main_grad, ctx.size, ctx.name, ctx.chunk_tokens = main_grad, size, name, chunk_tokens
+        ctx.overwrite = overwrite
         return torch.cat(losses).sum()
 
     @staticmethod
@@ -545,6 +555,7 @@ class _ChunkedVocabHead(torch.autograd.Function):
         dw = ctx.main_grad
         if dw is None:
             dw = torch.zeros_like(weight, dtype=torch.float32)
+        overwrite = ctx.overwrite
         for dxs, xs, ms, es, *ys in zip(
             dx.split(ctx.chunk_tokens),
             x.split(ctx.chunk_tokens),
@@ -556,9 +567,9 @@ class _ChunkedVocabHead(torch.autograd.Function):
             logits_grad = _local_loss_gradient(F.linear(xs, weight), ms, es, *ys, rcp_count, scale)
             if x.dtype == torch.float32:
                 torch.mm(logits_grad, weight, out=dxs)
-                dw.addmm_(logits_grad.t(), xs)
             else:
                 torch.mm(logits_grad, weight, out_dtype=torch.float32, out=dxs)
-                torch.ops.pithtrain.wgrad_accumulate_(dw, logits_grad.t(), xs)
+            _weight_grad(dw, logits_grad, xs, overwrite)
+            overwrite = False
         dx = _scatter_sum(dx, ctx.size, ctx.name).to(x.dtype)
-        return dx, dw if ctx.main_grad is None else None, None, None, None, None, None
+        return dx, dw if ctx.main_grad is None else None, None, None, None, None, None, None
