@@ -71,6 +71,8 @@ COMPILED_DECAY_CASES = (
     "fp32-residual-stream-row-dgrad-compiled",
     "fp32-residual-stream-row-out32-compiled",
     "fp32-residual-stream-all-row-out32-compiled",
+    "fp32-residual-stream-delta-adjoint-compiled",
+    "fp32-residual-stream-row-adjoints-compiled",
 )
 
 MODULE_TP_CASES = ("module-tp-compiled", "module-tp-staged")
@@ -278,6 +280,11 @@ class DecayProbeTP(dense_tp.DenseTP):
         )
 
     def rows(self, x, module):
+        if self.case == "fp32-residual-stream-row-adjoints-compiled" or (
+            self.case == "fp32-residual-stream-delta-adjoint-compiled"
+            and getattr(module, "audit_delta_row", False)
+        ):
+            return FP32RowAdjoint.apply(x, module.weight, module.main_grad, self.size, self.name)
         use_fp32_dgrad = (
             self.case == "fp32-residual-stream-all-row-out32-compiled"
             or self.case
@@ -491,6 +498,24 @@ class ProbeRow(torch.autograd.Function):
         else:
             dx = gathered @ weight
         return dx, dw, None, None, None, None, None, None, None
+
+
+class FP32RowAdjoint(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, main_grad, size, name):
+        ctx.save_for_backward(x, weight)
+        ctx.main_grad, ctx.size, ctx.name = main_grad, size, name
+        # The sequence reduction still produces the stock BF16 activation.
+        # Carry its adjoint in FP32 through the residual stream.
+        return dense_tp._mm_scatter(x, weight.t(), size, name, False).float()
+
+    @staticmethod
+    def backward(ctx, dout):
+        x, weight = ctx.saved_tensors
+        grad = dense_tp._gather(dout, ctx.size, ctx.name)
+        dx = (grad @ weight.float()).to(x.dtype)
+        ctx.main_grad.addmm_(grad.t(), x.float())
+        return dx, None, None, None, None
 
 
 class ProbeColumns(torch.autograd.Function):
