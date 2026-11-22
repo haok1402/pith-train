@@ -609,9 +609,7 @@ class Qwen35MoeModel(nn.Module):
         if stage_index == stage_count - 1:
             self.norm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.lm_head = BF16Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.layers = nn.ModuleDict(
-            {str(i): self.decoder_layer_class(config, i) for i in indices}
-        )
+        self.layers = nn.ModuleDict({str(i): self.decoder_layer_class(config, i) for i in indices})
 
     def forward_posemb(
         self, S: int, cu_seqlens: torch.Tensor | None = None

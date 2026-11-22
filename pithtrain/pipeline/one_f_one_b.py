@@ -118,6 +118,10 @@ class OneForwardOneBackward(nn.Module):
                 for index, microbatch in enumerate(microbatches):
                     activation = self._exchange(self.prev, receive_for=microbatch)
                     self._exchange(self.next, forward(index, activation))
+                if fsdp is not None:
+                    for module in stage.modules():
+                        if isinstance(module, FSDPModule):
+                            module.reshard()
                 return outputs
 
             # Fill the pipeline, alternating F/B once full, then finish the outstanding backwards.

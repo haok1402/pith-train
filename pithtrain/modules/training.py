@@ -426,7 +426,11 @@ def setup_model(
     install_side_grads(modules)  # after the main_grad installs: its post_backward runs first
 
     # The two V-chunks build identical read-only rotary caches; share one to save memory.
-    if len(modules) == 2 and hasattr(modules[0], "rotary_emb") and hasattr(modules[1], "rotary_emb"):
+    if (
+        len(modules) == 2
+        and hasattr(modules[0], "rotary_emb")
+        and hasattr(modules[1], "rotary_emb")
+    ):
         modules[1].rotary_emb = modules[0].rotary_emb
 
     local_seq_len = cfg.sequence_length // cp_size
