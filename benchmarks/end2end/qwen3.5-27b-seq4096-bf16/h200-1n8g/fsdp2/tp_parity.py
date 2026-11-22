@@ -210,12 +210,17 @@ def main():
     stock_adjoints = []
     if args.cases and "stock-adjoint-compiled" in args.cases:
         capture = record_block_adjoints(stock.layers[0], stock_adjoints)
-    from tp_delta_trace import TRACE_CASES, begin_microbatch, report, trace_core
+    from tp_delta_trace import (
+        GQA_TRACE_CASES,
+        TRACE_CASES,
+        begin_microbatch,
+        report,
+        trace_attention,
+    )
 
     if args.cases and any(case in TRACE_CASES for case in args.cases):
-        with patch.object(
-            qwen35_moe, "gated_delta_rule", trace_core(qwen35_moe.gated_delta_rule, "stock")
-        ):
+        trace_gqa = any(case in GQA_TRACE_CASES for case in args.cases)
+        with trace_attention(qwen35_moe, "stock", include_gqa=trace_gqa):
             stock_loss = backward(stock, tokens, labels, dp, begin_microbatch=begin_microbatch)
     else:
         stock_loss = backward(stock, tokens, labels, dp)
@@ -339,10 +344,12 @@ def main():
         if case == "stock-adjoint-compiled":
             override = use_stock_block_adjoints(parallel.layers[0], stock_adjoints, layout)
         if case in TRACE_CASES:
-            with patch.object(
+            with trace_attention(
                 dense_tp,
-                "gated_delta_rule",
-                trace_core(dense_tp.gated_delta_rule, case, layout.rank, layout.size),
+                case,
+                layout.rank,
+                layout.size,
+                include_gqa=case in GQA_TRACE_CASES,
             ):
                 tp_loss = backward(parallel, tokens, labels, dp, layout, begin_microbatch)
             report(case, layout.rank, layout.size, rel_l2)
