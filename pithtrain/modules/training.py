@@ -246,9 +246,6 @@ class TrainingCfg(SlottedDefault):
     pipeline_compute_stream_grad_buffers: bool = False
     """Allocate FSDP reduction buffers on the model compute stream."""
 
-    pipeline_fuse_delta_gates: bool = False
-    """Fuse the two BF16 DeltaNet gate projections in dense 1F1B."""
-
     fp8: bool = False
     """
     Train the linear layers in FP8 through DeepGEMM with 128-element block scaling; False is BF16.
@@ -469,7 +466,6 @@ def setup_model(
                 cfg.pipeline_layer_counts,
                 cfg.pipeline_compile,
                 cfg.pipeline_recompute_mlp,
-                fuse_delta_gates=cfg.pipeline_fuse_delta_gates,
                 stage_index=stage_index,
                 stage_count=stage_count,
                 defer_wgrad=split_backward,
@@ -488,7 +484,6 @@ def setup_model(
             or cfg.pipeline_recompute_mlp_up_only
             or cfg.pipeline_grad_sync_layers
             or cfg.pipeline_compute_stream_grad_buffers
-            or cfg.pipeline_fuse_delta_gates
         ):
             raise ValueError("Dense pipeline tuning options require a dense schedule")
         modules = nn.Sequential(
