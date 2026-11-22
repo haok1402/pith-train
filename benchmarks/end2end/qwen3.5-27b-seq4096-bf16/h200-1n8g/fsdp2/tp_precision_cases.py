@@ -46,6 +46,9 @@ COMPILED_DECAY_CASES = (
     "fp32-decay-master-compiled",
     "fp32-gate-compiled",
     "fp32-decay-combined-compiled",
+    "separate-dgrad-compiled",
+    "mlp-dgrad-compiled",
+    "gqa-dgrad-compiled",
 )
 
 
@@ -89,6 +92,29 @@ class DecayProbeTP(dense_tp.DenseTP):
             delta.in_proj_z.weight,
             delta.in_proj_b.weight,
             delta.in_proj_a.weight,
+        )
+
+    def columns(self, x, *modules):
+        count = len(modules)
+        split = (
+            self.case == "separate-dgrad-compiled"
+            and count > 1
+            or self.case == "mlp-dgrad-compiled"
+            and count == 2
+            or self.case == "gqa-dgrad-compiled"
+            and count == 3
+        )
+        if not split:
+            return super().columns(x, *modules)
+        return ProbeColumns.apply(
+            x,
+            self.size,
+            self.name,
+            (False,) * count,
+            True,
+            False,
+            tuple(getattr(module, "main_grad", None) for module in modules),
+            *(module.weight for module in modules),
         )
 
     def loss(self, logits, labels):
