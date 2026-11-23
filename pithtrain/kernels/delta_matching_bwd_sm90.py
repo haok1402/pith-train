@@ -47,9 +47,8 @@ def compute_backward_products(mma, mma_thread, probabilities, probability_grad, 
 
 
 @cute.jit
-def accumulate_matched_delta(scores, probability_grad, coords, acc_delta, log2_lse, mKeyScale, mValueScale,
-                             key_head_idx, key_start, query_start, query_scale, grad_out_scale,
-                             GROUP_KEYS: cutlass.Constexpr, MASKED: cutlass.Constexpr):
+def accumulate_matched_delta(scores, probability_grad, coords, acc_delta, log2_lse, key_scales, product_scales,
+                             key_start, query_start, MASKED: cutlass.Constexpr):
     score_rows = reshape_acc_to_mn(scores)
     grad_rows = reshape_acc_to_mn(probability_grad)
     positions = reshape_acc_to_mn(coords)
@@ -58,10 +57,8 @@ def accumulate_matched_delta(scores, probability_grad, coords, acc_delta, log2_l
         query_pos = query_start + positions[row, 0][0]
         for group in cutlass.range_constexpr(cute.size(score_rows, mode=[1]) // COLS_PER_GROUP):
             group_start = group * COLS_PER_GROUP
-            group_key_pos = key_start + positions[row, group_start][1]
-            scale_idx = group_key_pos // GROUP_KEYS
-            log2_scale = (query_scale * mKeyScale[key_head_idx, scale_idx]) * LOG2_E
-            product_scale = grad_out_scale * mValueScale[key_head_idx, scale_idx]
+            log2_scale = key_scales[group]
+            product_scale = product_scales[group]
             partial = Float32(0.0)
             for col in cutlass.range_constexpr(COLS_PER_GROUP):
                 index = group_start + col
@@ -160,19 +157,25 @@ class MatchedCorrection:
         for key_block_idx in range(last_tile + 1):
             stage_idx, phase = key_block_idx % self.stages, (key_block_idx // self.stages) % 2
             cute.arch.mbarrier_wait(tile_ready + stage_idx, phase)
-            products = (s_query, s_keys[None, None, stage_idx], s_grad, s_values[None, None, stage_idx])
-            compute_backward_products(mma, mma_thread, probabilities, probability_grad, products)
+            issue_multiply_tile(mma, mma_thread, probabilities, s_query, s_keys[None, None, stage_idx], False)
+            issue_multiply_tile(mma, mma_thread, probability_grad, s_grad, s_values[None, None, stage_idx], False)
+            key_start = key_block_idx * self.tile_keys
+            groups = self.tile_keys // 32
+            key_scales = cute.make_rmem_tensor(groups, Float32)
+            product_scales = cute.make_rmem_tensor(groups, Float32)
+            for group in cutlass.range_constexpr(groups):
+                scale_idx = key_start // self.group_keys + group * 32 // self.group_keys
+                key_scales[group] = (query_scale * mKeyScale[key_head_idx, scale_idx]) * LOG2_E
+                product_scales[group] = grad_out_scale * mValueScale[key_head_idx, scale_idx]
+            warpgroup.wait_group(0)
             if tidx == 0:
                 cute.arch.mbarrier_arrive(tile_released + stage_idx)
-            key_start = key_block_idx * self.tile_keys
             if key_block_idx == last_tile:
-                accumulate_matched_delta(probabilities, probability_grad, coords, acc_delta, log2_lse, mKeyScale, mValueScale,
-                                         key_head_idx, key_start, query_start, query_scale, grad_out_scale,
-                                         self.group_keys, True)
+                accumulate_matched_delta(probabilities, probability_grad, coords, acc_delta, log2_lse,
+                                         key_scales, product_scales, key_start, query_start, True)
             else:
-                accumulate_matched_delta(probabilities, probability_grad, coords, acc_delta, log2_lse, mKeyScale, mValueScale,
-                                         key_head_idx, key_start, query_start, query_scale, grad_out_scale,
-                                         self.group_keys, False)
+                accumulate_matched_delta(probabilities, probability_grad, coords, acc_delta, log2_lse,
+                                         key_scales, product_scales, key_start, query_start, False)
 
         if tidx % 4 == 0:
             positions = reshape_acc_to_mn(coords)
