@@ -1141,8 +1141,8 @@ def quantize_grad_block(mGradOut, mCodes, mScale, mTwin):
     s_amax = allocator.allocate_tensor(Float32, cute.make_layout(BACKWARD_THREADS // 32), 16)
     D = cute.size(mGradOut, mode=[3])
     s_codes = allocator.allocate_tensor(Float8E4M3FN, cute.make_ordered_layout((BLOCK_QUERY, D), order=(1, 0)), 128)
-    values = load_quant_block(mGradOut, mScale, block_idx, head_idx, tidx, BLOCK_QUERY, False, 1.0)
-    scale = reduce_quant_block(values, s_amax, tidx, True)
+    values = load_quant_block(mGradOut, mScale, block_idx, head_idx, tidx, BLOCK_QUERY, BACKWARD_THREADS, False, 1.0)
+    scale = reduce_quant_block(values, s_amax, tidx, BACKWARD_THREADS, True)
     if tidx == 0:
         mScale[head_idx, block_idx] = scale
     store_grad_codes(mCodes, values, s_codes, block_idx, head_idx, tidx, scale)
