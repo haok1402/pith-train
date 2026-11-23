@@ -497,8 +497,8 @@ class PipelinedKeyValueGradients:
         key_copy, value_copy = make_operand_tma(mKey, self.tile_keys, D), make_operand_tma(mValue, self.tile_keys, D)
         query_copies = (make_operand_tma(mQuery, BLOCK_QUERY, D), make_operand_tma(mQueryT, D, BLOCK_QUERY), make_backward_row_tma(mLse))
         grad_copies = (make_operand_tma(mGrad, BLOCK_QUERY, D), make_operand_tma(mGradT, D, BLOCK_QUERY), make_backward_row_tma(mDelta))
-        score_layout = cute.make_layout((BLOCK_QUERY, N, mScoreGrad.shape[0]), stride=(N, 1, BLOCK_QUERY * N))
-        score_tensor = cute.make_tensor(mScoreGrad.iterator, score_layout)  # (query row, key, score head)
+        score_layout = cute.make_ordered_layout((BLOCK_QUERY, self.tile_keys, mScoreGrad.shape[0]), order=(1, 0, 2))
+        score_tensor = cute.make_tensor(mScoreGrad.iterator, score_layout)  # (query row, key row, score tile)
         score_store = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileS2GOp(), score_tensor, make_operand_layout(BLOCK_QUERY, self.tile_keys),
             (BLOCK_QUERY, self.tile_keys),
@@ -666,7 +666,8 @@ class PipelinedKeyValueGradients:
                 mScoreScale[score_head_idx, key_block_idx] = score_scale
             stage_pipelined_score_operands(probabilities, probability_grad, score_coords, s_prob_group, s_grad_group, s_output_group, score_scale)
             if tidx == 0:
-                target = cute.local_tile(store_coords[None, None, score_head_idx], (BLOCK_QUERY, self.tile_keys), (0, key_block_idx))
+                score_tile_idx = score_head_idx * NUM_QUERIES + key_block_idx
+                target = store_coords[None, None, score_tile_idx]
                 source_part, target_part = cpasync.tma_partition(
                     store_atom, 0, cute.make_layout(1), cute.group_modes(s_score_output, 0, 2), cute.group_modes(target, 0, 2)
                 )
@@ -757,13 +758,13 @@ class QueryGradients:
         if warp_group == self.load_group:
             cute.arch.setmaxregister_decrease(self.load_registers)
             if tidx == 0:
-                self.load_loop(copies, buffers, barriers, score_head_idx, key_head_idx, last_tile)
+                self.load_loop(copies, buffers, barriers, score_head_idx, key_head_idx, last_tile, num_query_blocks)
         else:
             cute.arch.setmaxregister_increase(self.consumer_registers)
             self.compute_loop(mScoreScale, mGradQuery, buffers, barriers, bx, by, score_head_idx, last_tile, warp_group - 1, tidx % 128, softmax_scale)
 
     @cute.jit
-    def load_loop(self, copies, buffers, barriers, score_head_idx, key_head_idx, last_tile):
+    def load_loop(self, copies, buffers, barriers, score_head_idx, key_head_idx, last_tile, num_query_blocks):
         score_copy, key_copy = copies
         s_score_grad, s_key_t = buffers
         tile_ready, tile_released = barriers
@@ -773,7 +774,11 @@ class QueryGradients:
                 cute.arch.mbarrier_wait(tile_released + stage_idx, phase ^ 1)
             ready = tile_ready + stage_idx
             cute.arch.mbarrier_arrive_and_expect_tx(ready, (BLOCK_QUERY + self.head_dim) * self.tile_keys)
-            copy_tma_operand(score_copy, s_score_grad[None, None, stage_idx], 0, key_block_idx, score_head_idx, ready)
+            if cutlass.const_expr(self.head_dim == 256):
+                score_tile_idx = score_head_idx * num_query_blocks + key_block_idx
+                copy_tma_operand(score_copy, s_score_grad[None, None, stage_idx], 0, 0, score_tile_idx, ready)
+            else:
+                copy_tma_operand(score_copy, s_score_grad[None, None, stage_idx], 0, key_block_idx, score_head_idx, ready)
             copy_tma_operand(key_copy, s_key_t[None, None, stage_idx], 0, key_block_idx, key_head_idx, ready)
 
     @cute.jit
@@ -830,8 +835,15 @@ def delta_matching_bwd_sm90(grad_out, state, backward_state, softmax_scale):
     B, N, H, D = grad_out.shape
     num_key_heads = key.shape[0] // B
     query_blocks = N // BLOCK_QUERY
-    score_grad = torch.empty((B * H * query_blocks, BLOCK_QUERY, N), dtype=query.dtype, device=query.device)
-    score_scale = torch.empty((B * H * query_blocks, N // (16384 // D)), dtype=torch.float32, device=query.device)
+    key_tile_rows = 16384 // D
+    num_key_tiles = N // key_tile_rows
+    if D == 256:
+        # Each bulk dS store and its matching dQ load see a contiguous FP8 tile.
+        score_shape = (B * H * query_blocks * num_key_tiles, BLOCK_QUERY, key_tile_rows)
+    else:
+        score_shape = (B * H * query_blocks, BLOCK_QUERY, N)
+    score_grad = torch.empty(score_shape, dtype=query.dtype, device=query.device)
+    score_scale = torch.empty((B * H * query_blocks, num_key_tiles), dtype=torch.float32, device=query.device)
     grad_query = torch.empty_like(grad, dtype=torch.bfloat16)
     grad_key, grad_value = (torch.empty_like(grad, dtype=torch.float32) for _ in range(2))
 
