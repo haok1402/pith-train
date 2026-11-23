@@ -24,7 +24,8 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T
 
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import lds_v4, max2, prmt, st_b32, st_v2, st_v4
+from pithtrain.kernels.cute_ptx_sm90 import lds_v4, max2, prmt, st_b32, st_b8, st_v2, st_v4, sts_b32_raw, sts_v2
+from pithtrain.kernels.fp8_e8m0_scale_sm90 import compute_scale_rcp_bits, quantize_four_from_bits
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale
 
 __all__ = ["fp8_quant_grad_sm90"]
@@ -135,17 +136,6 @@ cvt.rn.satfinite.e4m3x2.f32 l1, a3, a2;
 mov.b32 $0, {l0, l1};
 }"""
 
-QUANT_COL_F32_PTX = """{
-.reg .f32 a0, a1, a2, a3, r;
-.reg .b16 q0, q1;
-mov.b32 r, $5;
-mov.b32 a0, $1; mov.b32 a1, $2; mov.b32 a2, $3; mov.b32 a3, $4;
-mul.rn.f32 a0, a0, r; mul.rn.f32 a1, a1, r; mul.rn.f32 a2, a2, r; mul.rn.f32 a3, a3, r;
-cvt.rn.satfinite.e4m3x2.f32 q0, a1, a0;
-cvt.rn.satfinite.e4m3x2.f32 q1, a3, a2;
-mov.b32 $0, {q0, q1};
-}"""
-
 # One fp16 half of a word (HALF = l or h), widened exactly to fp32 bits.
 F16_TO_F32_PTX = """{
 .reg .b16 l, h;
@@ -176,12 +166,6 @@ setp.ne.b32 p, $2, 0;
 mov.b16 h, 0;
 @p ld.global.nc.b16 h, [$1];
 cvt.u32.u16 $0, h;
-}"""
-
-ST_B8_PTX = """{
-.reg .pred p;
-setp.ne.b32 p, $2, 0;
-@p st.global.b8 [$0], $1;
 }"""
 
 # 8 fp8 bytes (w0 = bytes 0-3, w1 = bytes 4-7) to an address of any alignment: the widest store
@@ -249,7 +233,7 @@ def quantize_column(words: list, rcp: Uint32, half: int, kind: str) -> Uint32:
     (half = 0 low, 1 high) of each 16-bit word pair, or the fp32 values themselves.
     """
     if kind == "f32":
-        return asm_u32(QUANT_COL_F32_PTX, "=r,r,r,r,r,r", [ir_value(word) for word in words] + [ir_value(rcp)])
+        return quantize_four_from_bits(words[0], words[1], words[2], words[3], rcp)
     if kind == "f16":
         ptx = QUANT_COL_F16_PTX
         for j in range(4):
@@ -291,10 +275,6 @@ def widen(word: Uint32, half: int, kind: str) -> Uint32:
     if kind == "f16":
         return asm_u32(F16_TO_F32_PTX.replace("HALF", "lh"[half]), "=r,r", [ir_value(word)])
     return word << 16 if half == 0 else word & Uint32(0xFFFF0000)
-
-
-def st_b8(addr: Int64, word: Uint32, pred: Int32) -> None:
-    asm_store(ST_B8_PTX, "l,r,r", [ir_value(addr), ir_value(word), ir_value(pred)])
 
 
 def st8_any(addr: Int64, word0: Uint32, word1: Uint32, pred: Int32) -> None:
@@ -375,9 +355,9 @@ def gather_rows(x_base: Int64, row_stride: Int64, col_stride: Int64, sub_block: 
                 pair.append(asm_u32(LD_B32_PTX if kind == "f32" else LD_U16_PTX, "=r,l,r", [ir_value(x_base + byte_offset), ir_value(load_ok)]))
             s_addr = s_raw + (tile_row * TILE + 64 * pass_idx + 2 * lane) * elem_bytes
             if kind == "f32":
-                asm_store("st.shared.v2.b32 [$0], {$1, $2};", "r,r,r", [ir_value(s_addr), ir_value(pair[0]), ir_value(pair[1])])
+                sts_v2(s_addr, pair[0], pair[1])
             else:
-                asm_store("st.shared.b32 [$0], $1;", "r,r", [ir_value(s_addr), ir_value(pair[0] | (pair[1] << 16))])
+                sts_b32_raw(s_addr, pair[0] | (pair[1] << 16))
     cute.arch.barrier()
     rows = []
     for i in range(8):
@@ -446,7 +426,7 @@ def store_tok_rows(rows: list, row_scale_bits: list, sub_block: SubBlock, out_to
     row0, col0, rows_ok, cols_ok, full_cols_ok = sub_block.row0, sub_block.col0, sub_block.rows_ok, sub_block.cols_ok, sub_block.full_cols_ok
     for i in range(8):
         # 0x7F000000 - bits is the exact reciprocal of a power-of-2 scale
-        quant_lo, quant_hi = quantize_row(rows[i], Uint32(0x7F000000) - row_scale_bits[i], kind)
+        quant_lo, quant_hi = quantize_row(rows[i], compute_scale_rcp_bits(row_scale_bits[i]), kind)
         elem_idx = Int64(row0 + i) * N64 + Int64(col0)
         if const_expr(is_tok_aligned):
             st_v2(out_tok_base + elem_idx, quant_lo, quant_hi, rows_ok[i] & cols_ok[0])
@@ -492,9 +472,9 @@ def stage_transposed(rows: list, col_scale_bits: list, sub_block: SubBlock, s_ti
     col_group_idx, row_group_idx = sub_block.col_group_idx, sub_block.row_group_idx
     for col in range(8):
         word_idx, half = (col, 0) if kind == "f32" else (col // 2, col % 2)
-        rcp = Uint32(0x7F000000) - col_scale_bits[col]
+        rcp = compute_scale_rcp_bits(col_scale_bits[col])
         quant_lo, quant_hi = quantize_column([rows[i][word_idx] for i in range(4)], rcp, half, kind), quantize_column([rows[i][word_idx] for i in range(4, 8)], rcp, half, kind)
-        asm_store("st.shared.v2.b32 [$0], {$1, $2};", "r,r,r", [ir_value(s_tile + (col_group_idx * 8 + col) * TILE + (row_group_idx ^ col_group_idx) * 8), ir_value(quant_lo), ir_value(quant_hi)])
+        sts_v2(s_tile + (col_group_idx * 8 + col) * TILE + (row_group_idx ^ col_group_idx) * 8, quant_lo, quant_hi)
 
 
 def store_transposed(sub_block: SubBlock, s_tile: Int32, out_t_base: Int64, M64: Int64, N64: Int64, m_align: int) -> None:

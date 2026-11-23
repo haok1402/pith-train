@@ -17,7 +17,7 @@ from cutlass import Float32, Int32, Int64, Uint32
 from pithtrain.kernels.arch import SM_COUNT
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
 from pithtrain.kernels.cute_ptx_sm90 import abs2, bf16_hi, bf16_lo, bf16_sel, cp_async16, f32_as_u32, ld_b32_coherent, lds_b32_pred, lds_v4, max2, pack_bf16, prmt_args_last, selp_args_last, st_f32, st_v2_args_last, st_v4_args_last, sts_b32_nopred, sts_v4, u32_as_f32
-from pithtrain.kernels.fp8_e8m0_scale_sm90 import e8m0_scale_f32, quant4_e4m3
+from pithtrain.kernels.fp8_e8m0_scale_sm90 import e8m0_scale_f32, quant4_e4m3, reduce_bf16x2_amax4
 from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import fp8cast_rowwise_kmajor_sm90
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale, mn_pad
 from pithtrain.kernels.silu_mul_sm90 import silu_mul_bwd_sm90, silu_mul_fwd_sm90, swiglu_bwd, swiglu_fwd
@@ -250,7 +250,7 @@ class SiluMulQuant:
         lane, warp, col_vec_idx = thread.lane, thread.warp, thread.col_vec_idx
         col_amax = [None] * 4
         for j in cutlass.range_constexpr(4):
-            acc_amax = max2(max2(abs_words[0][j], abs_words[1][j]), max2(abs_words[2][j], abs_words[3][j]))
+            acc_amax = reduce_bf16x2_amax4(abs_words[0][j], abs_words[1][j], abs_words[2][j], abs_words[3][j])
             peer_amax = Uint32(cute.arch.shuffle_sync_bfly(Int32(acc_amax), offset=16))
             col_amax[j] = max2(acc_amax, peer_amax)
         if lane < 16:
@@ -263,7 +263,7 @@ class SiluMulQuant:
         butterfly over the 16 lanes of the row group: row_amax[pair] packs rows 2 * pair and
         2 * pair + 1.
         """
-        row_amax_halves = [max2(max2(abs_words[k][0], abs_words[k][1]), max2(abs_words[k][2], abs_words[k][3])) for k in range(4)]
+        row_amax_halves = [reduce_bf16x2_amax4(abs_words[k][0], abs_words[k][1], abs_words[k][2], abs_words[k][3]) for k in range(4)]
         row_amax = [None] * 2
         for pair in cutlass.range_constexpr(2):
             amax_even, amax_odd = row_amax_halves[2 * pair], row_amax_halves[2 * pair + 1]
