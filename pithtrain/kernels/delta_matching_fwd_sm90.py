@@ -112,9 +112,8 @@ def prepare_value_scales(maxima, value_scales, row_max, final_weights, ratios,
         previous = cute.arch.shuffle_sync(weight, offset=(lane + 3) % 4, mask_and_clamp=quad_mask)
         ratio = previous * cute.arch.rcp_approx(weight)
         bounded = cute.arch.fmin(cute.arch.fmax(ratio, 1e-30), 1e30)
-        final_weights[row] = cute.arch.shuffle_sync(weight, offset=GROUPS - 1, mask_and_clamp=quad_mask)
-        for group in cutlass.range_constexpr(1, GROUPS):
-            ratios[row, group - 1] = cute.arch.shuffle_sync(bounded, offset=group, mask_and_clamp=quad_mask)
+        final_weights[row] = weight
+        ratios[row] = bounded
 
 
 @cute.jit
@@ -171,10 +170,10 @@ def value_basis_ratios(weights, GROUPS: cutlass.Constexpr):
 
 
 @cute.jit
-def rebase_value_accumulator(accumulator, ratios, group_idx: cutlass.Constexpr):
+def rebase_value_accumulator(accumulator, ratio):
     rows = reshape_acc_to_mn(accumulator)
     for row_idx in cutlass.range_constexpr(cute.size(rows, mode=[0])):
-        rows[row_idx, None].store(rows[row_idx, None].load() * ratios[row_idx, group_idx - 1])
+        rows[row_idx, None].store(rows[row_idx, None].load() * ratio[row_idx])
 
 
 @dsl_user_op
@@ -218,20 +217,43 @@ def output_slab(acc_output, cached_output, slab: cutlass.Constexpr, SLABS: cutla
 def accumulate_value_tile(acc_output, cached_output, mma, mma_thread, s_values, weights, ratios, operands,
                           rescale, stage_idx, GROUP_KEYS: cutlass.Constexpr, GROUPS: cutlass.Constexpr,
                           VALUE_COLUMNS: cutlass.Constexpr, SLABS: cutlass.Constexpr, GROUP_QUERY_HEADS: cutlass.Constexpr):
-    if cutlass.const_expr(not GROUP_QUERY_HEADS):
-        ratios = value_basis_ratios(weights, GROUPS)
+    if cutlass.const_expr(GROUP_QUERY_HEADS):
+        quad_mask = (28 << 8) | 31
+        lane_weights = weights[None, GROUPS - 1]
+        current_ratio = cute.make_rmem_tensor(2, Float32)
+        last_weights = cute.make_rmem_tensor(2, Float32)
+    else:
+        tile_ratios = value_basis_ratios(weights, GROUPS)
+        last_weights = weights[None, GROUPS - 1]
     for slab in cutlass.range_constexpr(SLABS):
         acc_tile = cute.make_rmem_tensor(mma_thread.partition_shape_C((BLOCK_QUERY, VALUE_COLUMNS)), Float32)
         for group in cutlass.range_constexpr(GROUPS):
             if cutlass.const_expr(group > 0):
-                rebase_value_accumulator(acc_tile, ratios, group)
+                if cutlass.const_expr(GROUP_QUERY_HEADS):
+                    rebase_value_accumulator(acc_tile, current_ratio)
+                else:
+                    rebase_value_accumulator(acc_tile, tile_ratios[None, group - 1])
             if cutlass.const_expr(GROUP_QUERY_HEADS):
                 source = s_values[None, None, stage_idx]
                 value_tile = cute.local_tile(source, (VALUE_COLUMNS, GROUP_KEYS), (slab, group))
             else:
                 source = s_values[None, None, stage_idx * GROUPS + group]
                 value_tile = cute.local_tile(source, (VALUE_COLUMNS, GROUP_KEYS), (slab, 0))
-            multiply_tile(mma, mma_thread, acc_tile, operands[None, None, None, group], value_tile, group > 0)
+            probability = operands[None, None, None, group]
+            if cutlass.const_expr(GROUP_QUERY_HEADS):
+                issue_multiply_tile(mma, mma_thread, acc_tile, probability, value_tile, group > 0)
+                if cutlass.const_expr(group < GROUPS - 1):
+                    # Read the next FP32 ratio while the current PV group executes.
+                    for row in cutlass.range_constexpr(2):
+                        current_ratio[row] = cute.arch.shuffle_sync(ratios[row], offset=group + 1,
+                                                                   mask_and_clamp=quad_mask)
+                elif cutlass.const_expr(slab == 0):
+                    for row in cutlass.range_constexpr(2):
+                        last_weights[row] = cute.arch.shuffle_sync(lane_weights[row], offset=GROUPS - 1,
+                                                                   mask_and_clamp=quad_mask)
+                warpgroup.wait_group(0)
+            else:
+                multiply_tile(mma, mma_thread, acc_tile, probability, value_tile, group > 0)
         output = reshape_acc_to_mn(output_slab(acc_output, cached_output, slab, SLABS))
         partial = reshape_acc_to_mn(acc_tile)
         for row in cutlass.range_constexpr(2):
@@ -239,12 +261,12 @@ def accumulate_value_tile(acc_output, cached_output, mma, mma_thread, s_values, 
                 fuse_previous = slab != 0 or row != 1
                 if cutlass.const_expr(slab == 1):
                     promote_cached_output_row(output[row, None], partial[row, None], rescale[row],
-                                              weights[row, GROUPS - 1], fuse_previous)
+                                              last_weights[row], fuse_previous)
                 else:
                     promote_output_row(output[row, None], partial[row, None], rescale[row],
-                                       weights[row, GROUPS - 1], fuse_previous)
+                                       last_weights[row], fuse_previous)
             else:
-                promoted = partial[row, None].load() * weights[row, GROUPS - 1]
+                promoted = partial[row, None].load() * last_weights[row]
                 output[row, None].store(output[row, None].load() * rescale[row] + promoted)
 
 
@@ -543,7 +565,7 @@ class CausalAttention:
         prob_shape = value_thread.partition_shape_A((BLOCK_QUERY, self.group_keys))
         probabilities = cute.make_rmem_tensor((*prob_shape, self.groups), Float8E4M3FN)
         weights = cute.make_rmem_tensor((2, self.groups), Float32)
-        ratios = cute.make_rmem_tensor((2, self.groups - 1), Float32) if cutlass.const_expr(self.group_query_heads) else None
+        ratios = cute.make_rmem_tensor(2, Float32) if cutlass.const_expr(self.group_query_heads) else None
         query_start = query_block * BLOCK_QUERY
         scale = mQueryScale[head_idx, query_start // (2 * self.group_keys)]
         own_barrier, peer_barrier = 1 + consumer_group, 2 - consumer_group
