@@ -95,5 +95,5 @@ if __name__ == "__main__":
     train.scheduler = make_constant_scheduler
     mlp_tail = args.checkpoint_mlp_tail
     if mlp_tail is None:
-        mlp_tail = 28 if args.fp8 else 12
+        mlp_tail = 29 if args.fp8 else 12
     launch(cfg, shard_dense_model=partial(shard_model, mlp_tail=mlp_tail))
