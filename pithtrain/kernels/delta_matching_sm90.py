@@ -348,7 +348,7 @@ def launch_quant_block(mInput, mCenter, mCodes, mScale, mTwin, BLOCK: cutlass.Co
 
 
 @cute.kernel
-def fold_key_partials(mPartial, mCenter):
+def fold_key_partials(mPartial, mCenter, mTicket, RESET_TICKET: cutlass.Constexpr):
     tidx, _, _ = cute.arch.thread_idx()
     channel_block, head_idx, _ = cute.arch.block_idx()
     channel = channel_block * 128 + tidx
@@ -356,17 +356,20 @@ def fold_key_partials(mPartial, mCenter):
     for partial_idx in range(cute.size(mPartial, mode=[1])):
         center += mPartial[head_idx, partial_idx, channel]
     mCenter[head_idx, 0, channel] = center
+    if const_expr(RESET_TICKET):
+        if channel == 0 and head_idx == 0:
+            mTicket[0] = 0
 
 
 @cute.jit
-def launch_key_fold(mPartial, mCenter, stream):
+def launch_key_fold(mPartial, mCenter, mTicket, RESET_TICKET: cutlass.Constexpr, stream):
     heads, _, channels = mPartial.shape
-    fold_key_partials(mPartial, mCenter).launch(
+    fold_key_partials(mPartial, mCenter, mTicket, RESET_TICKET).launch(
         grid=(channels // 128, heads, 1), block=(128, 1, 1), stream=stream,
     )
 
 
-def quantize_delta_matching(x, block_rows, *, center_key=False, input_scale=1.0, is_gradient=False, is_forward=False):
+def quantize_delta_matching(x, block_rows, *, center_key=False, input_scale=1.0, is_gradient=False, is_forward=False, scheduler_ticket=None):
     """
     Quantize dense BSHD BF16 to E4M3 head-major and channel-major codes and per-head FP32 scales.
     """
@@ -382,7 +385,9 @@ def quantize_delta_matching(x, block_rows, *, center_key=False, input_scale=1.0,
         launch_delta_matching_kernel("delta_matching_key_sum", launch_key_sum, (x, center))
         if is_forward:
             mean = torch.empty((B * H, 1, D), dtype=torch.float32, device=x.device)
-            launch_delta_matching_kernel("delta_matching_key_mean", launch_key_fold, (center, mean))
+            ticket = scheduler_ticket if scheduler_ticket is not None else mean
+            launch_delta_matching_kernel("delta_matching_key_mean", launch_key_fold,
+                                         (center, mean, ticket), (scheduler_ticket is not None,))
             center = mean
     launch_delta_matching_kernel(
         "delta_matching_quantize", launch_quant_block, (x, center, codes, scales, twin),

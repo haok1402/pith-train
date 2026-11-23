@@ -482,11 +482,13 @@ def delta_matching_fwd_sm90(query, key, value, softmax_scale):
     B, N, H, D = query.shape
     group_keys = 8192 // D
     query_codes, query_scales, query_t = quantize_delta_matching(query, group_keys * 2, input_scale=softmax_scale, is_forward=True)
-    key_codes, key_scales, key_t = quantize_delta_matching(key, group_keys, center_key=True, is_forward=True)
+    ticket = torch.empty(1, dtype=torch.int32, device=query.device)
+    key_codes, key_scales, key_t = quantize_delta_matching(
+        key, group_keys, center_key=True, is_forward=True, scheduler_ticket=ticket,
+    )
     value_codes, value_scales, value_t = quantize_delta_matching(value, group_keys, is_forward=True)
     out = torch.empty((B, N, H, D), dtype=query.dtype, device=query.device)
     lse = torch.empty((B * H, N), dtype=torch.float32, device=query.device)
-    ticket = torch.zeros(1, dtype=torch.int32, device=query.device)
     launch_delta_matching_kernel("delta_matching_forward", launch_forward_attention,
                                  (query_codes, query_scales, key_codes, key_scales, value_t, value_scales, out, lse, ticket))
     return (out, lse, query_codes, query_scales, query_t, key_codes, key_scales, key_t, value_codes, value_scales)
