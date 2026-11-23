@@ -909,6 +909,8 @@ class PipelinedQueryGradients:
             if scale > 0.0 and scale >= max_scale * 1e-8:
                 apply_query_tile(mma, mma_thread, acc_window, s_score_grad[None, None, stage_idx], s_key_t[None, None, stage_idx], scale, window_scale)
                 max_scale, window_scale = cute.arch.fmax(max_scale, scale), scale
+            # A skipped tile still needs all four warps to finish waiting on its phase.
+            cute.arch.barrier()
             next_key = key_block_idx + self.stages
             if tidx == 0 and next_key <= last_tile:
                 self.load_tile(copies, buffers, ready, coords, next_key, stage_idx, NUM_QUERIES)
