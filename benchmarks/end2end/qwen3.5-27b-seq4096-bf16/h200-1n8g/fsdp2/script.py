@@ -23,8 +23,6 @@ def checkpoint_layers(model: Qwen35TextModel, *, mlp_tail: int) -> None:
     saved_ops = [
         torch.ops.aten.mm.default,
         torch.ops.aten.addmm.default,
-        torch.ops.pithtrain.fp8_linear_fwd.default,
-        torch.ops.pithtrain.fp8_linear_fwd_prequantized.default,
         torch.ops.pithtrain.gated_delta_rule_dense_fwd.default,
         torch.ops.pithtrain.flash_attn4_mha_fwd.default,
     ]
