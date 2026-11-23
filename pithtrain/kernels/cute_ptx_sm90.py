@@ -15,7 +15,7 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-__all__ = ["abs2", "asm", "asm_args_last", "atom_add_u64", "barrier_expect_tx", "barrier_wait", "bf16_hi", "bf16_lo", "bf16_sel", "bf16x2_to_f32", "byte_sum", "cp_async16", "cvta_shared", "f32_as_u32", "f32_hex", "f32x2_to_bf16x2", "fence_gpu", "lanemask_lt", "ld_b32", "ld_b32_coherent", "ld_generic_b32", "ld_generic_v4", "ld_relaxed", "ld_u16", "ld_u8", "ld_v2", "ld_v4", "lds_b32", "lds_b32_pred", "lds_v4", "match_any", "max2", "max_u16x2", "pack_bf16", "packed_op", "prmt", "prmt_args_last", "red_add_generic", "red_add_shared", "red_or_shared", "selp", "selp_args_last", "st_b32", "st_b64", "st_f32", "st_generic_b32", "st_generic_u8", "st_generic_v4", "st_u16", "st_u8", "st_v2", "st_v2_args_last", "st_v4", "st_v4_args_last", "sts_b32", "sts_b32_nopred", "sts_v4", "to_ir", "u32_as_f32", "unpack"]
+__all__ = ["abs2", "asm", "asm_args_last", "atom_add_u64", "barrier_expect_tx", "barrier_wait", "bf16_hi", "bf16_lo", "bf16_sel", "bf16x2_to_f32", "byte_sum", "cp_async16", "cvta_shared", "f32_as_u32", "f32_hex", "f32x2_to_bf16x2", "fence_gpu", "lanemask_lt", "ld_b32", "ld_b32_coherent", "ld_generic_b32", "ld_generic_v4", "ld_relaxed", "ld_u16", "ld_u8", "ld_v2", "ld_v4", "lds_b32", "lds_b32_pred", "lds_v4", "match_any", "max2", "max_u16x2", "pack_bf16", "packed_op", "prmt", "prmt_args_last", "red_add_generic", "red_add_shared", "red_or_shared", "selp", "selp_args_last", "st_b32", "st_b64", "st_f32", "st_generic_b32", "st_generic_u8", "st_generic_v4", "st_u16", "st_u8", "st_v2", "st_v2_args_last", "st_v4", "st_v4_args_last", "sts_b32", "sts_b32_nopred", "sts_v2", "sts_v4", "to_ir", "u32_as_f32", "unpack"]
 
 
 def f32_hex(value: float) -> str:
@@ -215,6 +215,11 @@ def st_f32(addr: Int64, value: Float32, pred: Int32, *, loc=None, ip=None) -> No
 @dsl_user_op
 def sts_b32_nopred(addr: Int32, value: Uint32, *, loc=None, ip=None) -> None:
     asm_args_last(T.i32(), "st.shared.b32 [$1], $2;\nmov.b32 $0, 0;", "=r,r,r", [to_ir(addr, Int32, loc, ip), to_ir(value, Uint32, loc, ip)], side_effects=True)
+
+
+@dsl_user_op
+def sts_v2(s_addr: Int32, word_lo: Uint32, word_hi: Uint32, *, loc=None, ip=None) -> None:
+    asm(None, [Int32(s_addr).ir_value(loc=loc, ip=ip), Uint32(word_lo).ir_value(loc=loc, ip=ip), Uint32(word_hi).ir_value(loc=loc, ip=ip)], "st.shared.v2.b32 [$0], {$1, $2};", "r,r,r", side_effects=True)
 
 
 @dsl_user_op

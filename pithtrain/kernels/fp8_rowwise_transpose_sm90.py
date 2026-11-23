@@ -1,17 +1,5 @@
 """
-CuTe-DSL (SM90) rowwise FP8 quantization of x and of x.T from one read of x, for every input
-fp8_quant_grad accepts: bf16, fp16 or fp32, any shape (empty included) and any strides.
-
-One CTA (256 threads) per 128x128 tile. Large, aligned BF16 grids stage input in a swizzled shared
-tile and use separate row and column warps. Other inputs use 8x8 per-thread blocks and a swizzled
-output tile so each warp writes whole 128-byte rows of x.T. A view
-with unit row stride runs as its transpose with the outputs swapped; rows with unit column stride
-whose 16-byte column groups are all aligned and in or out of their row as a whole are read in place
-with 16-byte loads and a runtime row stride; every other view (a non-unit column stride, misaligned
-or odd-strided rows, N not a multiple of 16 bytes) is gathered into smem by the CTA first, each
-warp reading 64 consecutive columns of a row per instruction pair (coalesced when the column stride
-is 1). fp16 and fp32 are Constexpr branches of the same kernel (the amax in the input dtype, the
-scale math in fp32).
+Rowwise FP8 quantization of an input and its transpose on SM90.
 """
 
 from typing import Callable
@@ -21,18 +9,19 @@ import cutlass.cute as cute
 import torch
 from cutlass import Int32, Int64, Uint32, const_expr
 from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import T
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import cp_async16, lds_b32, lds_v4, max2, prmt, st_b32, st_v2, st_v4
+from pithtrain.kernels.cute_ptx_sm90 import asm_args_last, cp_async16, lds_b32, lds_v4, max2, prmt, st_b32, st_v2, st_v4, sts_v2, unpack
+from pithtrain.kernels.fp8_e8m0_scale_sm90 import reduce_bf16x2_amax4
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale
 
 __all__ = ["fp8_quant_grad_sm90"]
 
-TILE, THREADS = 128, 256
+TILE = 128
+THREADS = 256
 
-# The SM90 E8M0 scale of the recipe, 2^ceil(log2(max(amax, 1e-4) * fp32(1 / 448))) at least 2^-126,
-# from the fp32 amax bits: 1e-4 -> 0x38D1B717, 1/448 -> 0x3B124925.
+# A nonzero mantissa rounds the exponent up to the next power of two.
 SCALE_PTX = """{
 .reg .f32 a, s;
 .reg .b32 b, m;
@@ -49,9 +38,7 @@ max.s32 b, b, 0x00800000;
 mov.b32 $0, b;
 }"""
 
-# Rowwise quantize: 4 bf16x2 words (8 consecutive columns) times one reciprocal scale -> 8 fp8
-# bytes in two words. bf16 -> f32 is a 16-bit shift; the multiply by a power of 2 is exact and
-# cvt.rn.satfinite rounds to nearest even with saturation, as the recipe.
+# Shifting each BF16 half into FP32 is exact, as is multiplication by a power of two.
 QUANT_ROW_PTX = """{
 .reg .f32 a0, a1, a2, a3, a4, a5, a6, a7, r;
 .reg .b16 h0, h1, h2, h3;
@@ -70,8 +57,7 @@ mov.b32 $0, {h0, h1};
 mov.b32 $1, {h2, h3};
 }"""
 
-# Column quantize: one half (EXTRACT = low or high bf16) of 4 words (4 consecutive rows of one
-# column) -> 4 fp8 bytes in one word.
+# EXTRACT selects the BF16 half belonging to this column from each of four rows.
 QUANT_COL_PTX = """{
 .reg .f32 a0, a1, a2, a3, r;
 .reg .b16 h0, h1;
@@ -87,8 +73,6 @@ mov.b32 $0, {h0, h1};
 }"""
 QUANT_COL_EXTRACT = ("shl.b32 {}, {}, 16;", "and.b32 {}, {}, 0xFFFF0000;")
 
-# The same two quantizations for fp16 words (cvt.f32.f16 widens each half exactly) and for fp32
-# input (8 words per row, one per column; no widening).
 QUANT_ROW_F16_PTX = """{
 .reg .f32 a0, a1, a2, a3, a4, a5, a6, a7, r;
 .reg .b16 l0, h0, l1, h1, l2, h2, l3, h3;
@@ -146,7 +130,6 @@ cvt.rn.satfinite.e4m3x2.f32 q1, a3, a2;
 mov.b32 $0, {q0, q1};
 }"""
 
-# One fp16 half of a word (HALF = l or h), widened exactly to fp32 bits.
 F16_TO_F32_PTX = """{
 .reg .b16 l, h;
 .reg .f32 f;
@@ -186,8 +169,7 @@ setp.ne.b32 p, $2, 0;
 @p st.global.b8 [$0], $1;
 }"""
 
-# 8 fp8 bytes (w0 = bytes 0-3, w1 = bytes 4-7) to an address of any alignment: the widest store
-# the runtime alignment allows (8/4/2/1 bytes), mutually exclusive predicates.
+# Select the widest legal store at runtime so unaligned rows can avoid byte stores when possible.
 ST8_ANY_PTX = """{
 .reg .pred p, p8, p4, p2, p1;
 .reg .b32 al, t;
@@ -224,512 +206,531 @@ shr.b32 t, $2, 24;
 }"""
 
 
-def ir_value(value):
-    return value.ir_value()
+def emit_u32(ptx: str, constraints: str, operands: list) -> Uint32:
+    return Uint32(asm_args_last(T.i32(), ptx, constraints, operands))
 
 
-def asm_u32(ptx: str, constraints: str, args: list) -> Uint32:
-    return Uint32(llvm.inline_asm(T.i32(), args, ptx, constraints, has_side_effects=False, is_align_stack=False))
+def emit_words(ptx: str, constraints: str, operands: list, num_words: int) -> list:
+    packed_type = llvm.StructType.get_literal([T.i32()] * num_words)
+    return list(unpack(asm_args_last(packed_type, ptx, constraints, operands), num_words, Uint32))
 
 
-def asm_words(ptx: str, constraints: str, args: list, num_words: int) -> list:
-    packed = llvm.inline_asm(llvm.StructType.get_literal([T.i32()] * num_words), args, ptx, constraints, has_side_effects=False, is_align_stack=False)
-    return [Uint32(llvm.extractvalue(T.i32(), packed, [i])) for i in range(num_words)]
+@dsl_user_op
+def e8m0_scale_bits(amax_bits: Uint32, *, loc=None, ip=None) -> Uint32:
+    return emit_u32(SCALE_PTX, "=r,r", [amax_bits.ir_value(loc=loc, ip=ip)])
 
 
-def asm_store(ptx: str, constraints: str, args: list) -> None:
-    llvm.inline_asm(None, args, ptx, constraints, has_side_effects=True, is_align_stack=False)
+@dsl_user_op
+def load_v4_nc_pred(x_addr: Int64, load_ok: Int32, *, loc=None, ip=None) -> list:
+    return emit_words(LD_V4_NC_PTX, "=r,=r,=r,=r,l,r", [x_addr.ir_value(loc=loc, ip=ip), load_ok.ir_value(loc=loc, ip=ip)], 4)
 
 
-def e8m0_scale_bits(amax_bits: Uint32) -> Uint32:
-    return asm_u32(SCALE_PTX, "=r,r", [ir_value(amax_bits)])
-
-
-def quantize_column(words: list, rcp: Uint32, half: int, kind: str) -> Uint32:
+def quantize_column(words: list, rcp_bits: Uint32, half_idx: int, input_format: str) -> Uint32:
     """
-    4 consecutive rows of one column -> 4 fp8 bytes. words hold the column's values: one half
-    (half = 0 low, 1 high) of each 16-bit word pair, or the fp32 values themselves.
+    Pack four FP8 bytes from one column, selecting a half of each packed 16-bit input.
     """
-    if kind == "f32":
-        return asm_u32(QUANT_COL_F32_PTX, "=r,r,r,r,r,r", [ir_value(word) for word in words] + [ir_value(rcp)])
-    if kind == "f16":
+    if input_format == "f32":
+        return emit_u32(QUANT_COL_F32_PTX, "=r,r,r,r,r,r", [word.ir_value() for word in words] + [rcp_bits.ir_value()])
+    if input_format == "f16":
         ptx = QUANT_COL_F16_PTX
         for j in range(4):
-            ptx = ptx.replace(f"HALF{j}", f"{'lh'[half]}{j}")
-        return asm_u32(ptx, "=r,r,r,r,r,r", [ir_value(word) for word in words] + [ir_value(rcp)])
-    extract = QUANT_COL_EXTRACT[half].format("$0", "{}")
+            ptx = ptx.replace(f"HALF{j}", f"{'lh'[half_idx]}{j}")
+        return emit_u32(ptx, "=r,r,r,r,r,r", [word.ir_value() for word in words] + [rcp_bits.ir_value()])
+    extract = QUANT_COL_EXTRACT[half_idx].format("$0", "{}")
     ptx = QUANT_COL_PTX
     for j in range(4):
         ptx = ptx.replace(f"EXTRACT $0, ${j + 1};", extract.format(f"${j + 1}"))
-    return asm_u32(ptx, "=&r,r,r,r,r,r", [ir_value(word) for word in words] + [ir_value(rcp)])
+    return emit_u32(ptx, "=&r,r,r,r,r,r", [word.ir_value() for word in words] + [rcp_bits.ir_value()])
 
 
-def quantize_row(words: list, rcp: Uint32, kind: str) -> list:
+def quantize_row(words: list, rcp_bits: Uint32, input_format: str) -> list:
     """
-    8 consecutive columns of one row (4 16-bit pair words or 8 fp32 words) -> 8 fp8 bytes (2 words).
+    Pack eight FP8 bytes from consecutive columns of one row.
     """
-    if kind == "f32":
-        return asm_words(QUANT_ROW_F32_PTX, "=r,=r,r,r,r,r,r,r,r,r,r", [ir_value(word) for word in words] + [ir_value(rcp)], 2)
-    if kind == "f16":
-        return asm_words(QUANT_ROW_F16_PTX, "=r,=r,r,r,r,r,r", [ir_value(word) for word in words] + [ir_value(rcp)], 2)
-    return asm_words(QUANT_ROW_PTX, "=&r,=&r,r,r,r,r,r", [ir_value(word) for word in words] + [ir_value(rcp)], 2)
+    if input_format == "f32":
+        return emit_words(QUANT_ROW_F32_PTX, "=r,=r,r,r,r,r,r,r,r,r,r", [word.ir_value() for word in words] + [rcp_bits.ir_value()], 2)
+    if input_format == "f16":
+        return emit_words(QUANT_ROW_F16_PTX, "=r,=r,r,r,r,r,r", [word.ir_value() for word in words] + [rcp_bits.ir_value()], 2)
+    return emit_words(QUANT_ROW_PTX, "=&r,=&r,r,r,r,r,r", [word.ir_value() for word in words] + [rcp_bits.ir_value()], 2)
 
 
-def max_words(first: Uint32, second: Uint32, kind: str) -> Uint32:
+def max_magnitude_words(first: Uint32, second: Uint32, input_format: str) -> Uint32:
     """
-    NaN-ignoring max of |x| words in the input dtype: two bf16 / fp16 lanes or one fp32.
+    Take the NaN-ignoring maximum of packed magnitudes in the input format.
     """
-    if kind == "bf16":
+    if input_format == "bf16":
         return max2(first, second)
-    return asm_u32("max.f16x2 $0, $1, $2;" if kind == "f16" else "max.f32 $0, $1, $2;", "=r,r,r", [ir_value(first), ir_value(second)])
+    return emit_u32("max.f16x2 $0, $1, $2;" if input_format == "f16" else "max.f32 $0, $1, $2;", "=r,r,r", [first.ir_value(), second.ir_value()])
 
 
-def widen(word: Uint32, half: int, kind: str) -> Uint32:
+def widen_word_bits(word: Uint32, half_idx: int, input_format: str) -> Uint32:
     """
-    fp32 bits of one element of a word: half (0 low, 1 high) of a bf16 / fp16 pair, or an fp32 word.
+    Return the FP32 bits of one element selected from a packed word.
     """
-    if kind == "f32":
+    if input_format == "f32":
         return word
-    if kind == "f16":
-        return asm_u32(F16_TO_F32_PTX.replace("HALF", "lh"[half]), "=r,r", [ir_value(word)])
-    return word << 16 if half == 0 else word & Uint32(0xFFFF0000)
+    if input_format == "f16":
+        return emit_u32(F16_TO_F32_PTX.replace("HALF", "lh"[half_idx]), "=r,r", [word.ir_value()])
+    return word << 16 if half_idx == 0 else word & Uint32(0xFFFF0000)
 
 
-def st_b8(addr: Int64, word: Uint32, pred: Int32) -> None:
-    asm_store(ST_B8_PTX, "l,r,r", [ir_value(addr), ir_value(word), ir_value(pred)])
+@dsl_user_op
+def store_byte(out_addr: Int64, word: Uint32, store_ok: Int32, *, loc=None, ip=None) -> None:
+    asm_args_last(None, ST_B8_PTX, "l,r,r", [out_addr.ir_value(loc=loc, ip=ip), word.ir_value(loc=loc, ip=ip), store_ok.ir_value(loc=loc, ip=ip)], side_effects=True)
 
 
-def st8_any(addr: Int64, word0: Uint32, word1: Uint32, pred: Int32) -> None:
-    asm_store(ST8_ANY_PTX, "l,r,r,r", [ir_value(addr), ir_value(word0), ir_value(word1), ir_value(pred)])
+@dsl_user_op
+def store_eight_bytes(out_addr: Int64, word_lo: Uint32, word_hi: Uint32, store_ok: Int32, *, loc=None, ip=None) -> None:
+    asm_args_last(None, ST8_ANY_PTX, "l,r,r,r", [out_addr.ir_value(loc=loc, ip=ip), word_lo.ir_value(loc=loc, ip=ip), word_hi.ir_value(loc=loc, ip=ip), store_ok.ir_value(loc=loc, ip=ip)], side_effects=True)
 
 
-def pred_i32(condition) -> Int32:
+def make_predicate(condition) -> Int32:
     return Int32(cutlass.select_(condition, Int32(1), Int32(0)))
 
 
 class SubBlock:
     """
-    Where one thread's 8 x 8 sub-block sits in the CTA's 128 x 128 tile and in x, with the bounds
-    predicates of its rows and columns.
+    Coordinates and bounds masks for one thread's 8 by 8 block.
     """
 
-    def __init__(self, tidx: Int32, pid_row: Int32, pid_col: Int32, M: Int32, N: Int32, full_tiles: bool) -> None:
+    def __init__(self, tidx: Int32, by: Int32, bx: Int32, M: Int32, N: Int32, use_full_tiles: bool) -> None:
         self.warp, self.lane = tidx // 32, tidx % 32
         self.col_group_idx = self.lane % 16
         self.row_group_idx = self.warp * 2 + self.lane // 16
-        self.pid_row, self.pid_col = pid_row, pid_col
-        self.row0 = pid_row * TILE + self.row_group_idx * 8
-        self.col0 = pid_col * TILE + self.col_group_idx * 8
-        self.full_tiles = full_tiles
-        if full_tiles:
+        self.by, self.bx = by, bx
+        self.row_start, self.col_start = by * TILE + self.row_group_idx * 8, bx * TILE + self.col_group_idx * 8
+        self.use_full_tiles = use_full_tiles
+        if use_full_tiles:
             self.rows_ok = self.cols_ok = [Int32(1)] * 8
             self.full_cols_ok = Int32(1)
         else:
-            self.rows_ok = [pred_i32(self.row0 + i < M) for i in range(8)]
-            self.cols_ok = [pred_i32(self.col0 + j < N) for j in range(8)]
-            self.full_cols_ok = pred_i32(self.col0 + 8 <= N)
+            self.rows_ok = [make_predicate(self.row_start + i < M) for i in range(8)]
+            self.cols_ok = [make_predicate(self.col_start + j < N) for j in range(8)]
+            self.full_cols_ok = make_predicate(self.col_start + 8 <= N)
 
 
-def load_rows(x_base: Int64, row_stride: Int64, sub_block: SubBlock, kind: str) -> list:
+def load_rows(x_base: Int64, row_stride: Int64, sub_block: SubBlock, input_format: str) -> list:
     """
-    The sub-block as 32-bit words, zero out of bounds: rows[i][k] = columns (2k, 2k+1) of row i for
-    bf16 / fp16, column k of row i for fp32. Rows of x are row_stride elements apart; x, row_stride
-    and N are such that every 16-byte column group is 16-byte aligned and in or out of its row as a
-    whole.
+    Load aligned 16-byte groups into 32-bit words, zeroing groups outside the input.
     """
-    row0, col0, rows_ok, cols_ok = sub_block.row0, sub_block.col0, sub_block.rows_ok, sub_block.cols_ok
+    row_start, col_start, rows_ok, cols_ok = sub_block.row_start, sub_block.col_start, sub_block.rows_ok, sub_block.cols_ok
+    use_full_tiles = sub_block.use_full_tiles
     rows = []
     for i in range(8):
-        elem_idx = Int64(row0 + i) * row_stride + Int64(col0)
-        if sub_block.full_tiles:
-            rows.append(asm_words(LD_V4_NC_FULL_PTX, "=r,=r,=r,=r,l", [ir_value(x_base + elem_idx * 2)], 4))
-        elif kind == "f32":
+        elem_idx = Int64(row_start + i) * row_stride + Int64(col_start)
+        if use_full_tiles:
+            rows.append(emit_words(LD_V4_NC_FULL_PTX, "=r,=r,=r,=r,l", [(x_base + elem_idx * 2).ir_value()], 4))
+        elif input_format == "f32":
             words = []
-            for half in range(2):
-                load_ok = rows_ok[i] & cols_ok[4 * half]
-                byte_offset = cutlass.select_(load_ok != 0, elem_idx * 4 + 16 * half, Int64(0))
-                words += asm_words(LD_V4_NC_PTX, "=r,=r,=r,=r,l,r", [ir_value(x_base + byte_offset), ir_value(load_ok)], 4)
+            for half_idx in range(2):
+                load_ok = rows_ok[i] & cols_ok[4 * half_idx]
+                byte_offset = cutlass.select_(load_ok != 0, elem_idx * 4 + 16 * half_idx, Int64(0))
+                words += load_v4_nc_pred(x_base + byte_offset, load_ok)
             rows.append(words)
         else:
             load_ok = rows_ok[i] & cols_ok[0]
             byte_offset = cutlass.select_(load_ok != 0, elem_idx * 2, Int64(0))
-            rows.append(asm_words(LD_V4_NC_PTX, "=r,=r,=r,=r,l,r", [ir_value(x_base + byte_offset), ir_value(load_ok)], 4))
+            rows.append(load_v4_nc_pred(x_base + byte_offset, load_ok))
     return rows
 
 
-def gather_rows(x_base: Int64, row_stride: Int64, col_stride: Int64, sub_block: SubBlock, kind: str, s_raw: Int32, M: Int32, N: Int32) -> list:
-    """
-    load_rows for any other x (a non-unit column stride, or rows that are not 16-byte aligned): the
-    CTA first copies its tile into s_raw (row-major, 128 elements per row), each warp instruction
-    reading 64 consecutive columns of one row (two per lane), then each thread reads its sub-block
-    back with 16-byte shared loads.
-    """
-    elem_bytes = 4 if kind == "f32" else 2
-    lane, warp = sub_block.lane, sub_block.warp
-    tile_row0, tile_col0 = sub_block.pid_row * TILE, sub_block.pid_col * TILE
+def stage_input_tile(x_base: Int64, row_stride: Int64, col_stride: Int64, sub_block: SubBlock, input_format: str, s_raw: Int32, M: Int32, N: Int32) -> None:
+    lane, warp, by, bx = sub_block.lane, sub_block.warp, sub_block.by, sub_block.bx
+    elem_bytes = 4 if input_format == "f32" else 2
+    tile_row_start, tile_col_start = by * TILE, bx * TILE
     col_offsets, cols_ok = [], []
-    for col in range(4):
-        tile_col = tile_col0 + 64 * (col // 2) + 2 * lane + col % 2
-        col_offsets.append(Int64(tile_col) * col_stride)
-        cols_ok.append(pred_i32(tile_col < N))
-    for warp_row in range(16):
-        tile_row = warp * 16 + warp_row
-        row_offset = Int64(tile_row0 + tile_row) * row_stride
-        row_ok = pred_i32(tile_row0 + tile_row < M)
+    # Each warp gathers 64 neighboring columns per pass for coalescing when columns are contiguous.
+    for col_idx in range(4):
+        x_col_idx = tile_col_start + 64 * (col_idx // 2) + 2 * lane + col_idx % 2
+        col_offsets.append(Int64(x_col_idx) * col_stride)
+        cols_ok.append(make_predicate(x_col_idx < N))
+
+    for warp_row_idx in range(16):
+        tile_row_idx = warp * 16 + warp_row_idx
+        row_offset = Int64(tile_row_start + tile_row_idx) * row_stride
+        row_ok = make_predicate(tile_row_start + tile_row_idx < M)
         for pass_idx in range(2):
-            pair = []
-            for half in range(2):
-                load_ok = row_ok & cols_ok[2 * pass_idx + half]
-                byte_offset = cutlass.select_(load_ok != 0, (row_offset + col_offsets[2 * pass_idx + half]) * elem_bytes, Int64(0))
-                pair.append(asm_u32(LD_B32_PTX if kind == "f32" else LD_U16_PTX, "=r,l,r", [ir_value(x_base + byte_offset), ir_value(load_ok)]))
-            s_addr = s_raw + (tile_row * TILE + 64 * pass_idx + 2 * lane) * elem_bytes
-            if kind == "f32":
-                asm_store("st.shared.v2.b32 [$0], {$1, $2};", "r,r,r", [ir_value(s_addr), ir_value(pair[0]), ir_value(pair[1])])
+            words = []
+            for half_idx in range(2):
+                load_ok = row_ok & cols_ok[2 * pass_idx + half_idx]
+                byte_offset = cutlass.select_(load_ok != 0, (row_offset + col_offsets[2 * pass_idx + half_idx]) * elem_bytes, Int64(0))
+                words.append(emit_u32(LD_B32_PTX if input_format == "f32" else LD_U16_PTX, "=r,l,r", [(x_base + byte_offset).ir_value(), load_ok.ir_value()]))
+            s_addr = s_raw + (tile_row_idx * TILE + 64 * pass_idx + 2 * lane) * elem_bytes
+            if input_format == "f32":
+                sts_v2(s_addr, words[0], words[1])
             else:
-                asm_store("st.shared.b32 [$0], $1;", "r,r", [ir_value(s_addr), ir_value(pair[0] | (pair[1] << 16))])
+                asm_args_last(None, "st.shared.b32 [$0], $1;", "r,r", [s_addr.ir_value(), (words[0] | (words[1] << 16)).ir_value()], side_effects=True)
     cute.arch.barrier()
+
+
+def load_staged_rows(s_raw: Int32, sub_block: SubBlock, input_format: str) -> list:
+    row_group_idx, col_group_idx = sub_block.row_group_idx, sub_block.col_group_idx
+    elem_bytes = 4 if input_format == "f32" else 2
     rows = []
     for i in range(8):
-        s_addr = s_raw + ((sub_block.row_group_idx * 8 + i) * TILE + sub_block.col_group_idx * 8) * elem_bytes
-        rows.append(list(lds_v4(s_addr)) + (list(lds_v4(s_addr + 16)) if kind == "f32" else []))
+        s_addr = s_raw + ((row_group_idx * 8 + i) * TILE + col_group_idx * 8) * elem_bytes
+        rows.append(list(lds_v4(s_addr)) + (list(lds_v4(s_addr + 16)) if input_format == "f32" else []))
     return rows
 
 
-def share_col_amax(abs_rows: list, sub_block: SubBlock, s_red: Int32, kind: str) -> None:
+def get_magnitude_bits(rows: list, num_words: int, input_format: str) -> list:
+    abs_mask = Uint32(0x7FFFFFFF) if input_format == "f32" else Uint32(0x7FFF7FFF)
+    return [[rows[i][k] & abs_mask for k in range(num_words)] for i in range(8)]
+
+
+def share_col_amax(row_magnitude_bits: list, sub_block: SubBlock, s_col_amax: Int32, input_format: str) -> None:
     """
-    Amax of the thread's 8 columns over its warp's 16 rows (4 or 8 words), stored to s_red for the
-    cross-warp reduction.
+    Share each warp's partial column maxima for the cross-warp reduction.
     """
-    num_words = len(abs_rows[0])
+    warp, lane, col_group_idx = sub_block.warp, sub_block.lane, sub_block.col_group_idx
+    num_words = len(row_magnitude_bits[0])
     col_amax = []
-    for k in range(num_words):
-        acc_amax = abs_rows[0][k]
-        for i in range(1, 8):
-            acc_amax = max_words(acc_amax, abs_rows[i][k], kind)
-        other = Uint32(cute.arch.shuffle_sync_bfly(Int32(acc_amax), offset=16))
-        col_amax.append(max_words(acc_amax, other, kind))
-    for quad in range(num_words // 4):
-        asm_store("{\n.reg .pred p;\nsetp.ne.b32 p, $5, 0;\n@p st.shared.v4.b32 [$0], {$1, $2, $3, $4};\n}", "r,r,r,r,r,r", [ir_value(s_red + (sub_block.warp * 16 * num_words + sub_block.col_group_idx * num_words + 4 * quad) * 4)] + [ir_value(amax) for amax in col_amax[4 * quad : 4 * quad + 4]] + [ir_value(pred_i32(sub_block.lane < 16))])
+    for word_idx in range(num_words):
+        acc_amax = row_magnitude_bits[0][word_idx]
+        for row_idx in range(1, 8):
+            acc_amax = max_magnitude_words(acc_amax, row_magnitude_bits[row_idx][word_idx], input_format)
+        peer_amax = Uint32(cute.arch.shuffle_sync_bfly(Int32(acc_amax), offset=16))
+        col_amax.append(max_magnitude_words(acc_amax, peer_amax, input_format))
+
+    for quad_idx in range(num_words // 4):
+        s_addr = s_col_amax + (warp * 16 * num_words + col_group_idx * num_words + 4 * quad_idx) * 4
+        operands = [s_addr.ir_value()] + [amax.ir_value() for amax in col_amax[4 * quad_idx : 4 * quad_idx + 4]]
+        operands += [make_predicate(lane < 16).ir_value()]
+        asm_args_last(None, "{\n.reg .pred p;\nsetp.ne.b32 p, $5, 0;\n@p st.shared.v4.b32 [$0], {$1, $2, $3, $4};\n}", "r,r,r,r,r,r", operands, side_effects=True)
 
 
-def reduce_row_amax(abs_rows: list, kind: str) -> list:
+def reduce_row_amax(row_magnitude_bits: list, input_format: str) -> list:
     """
-    fp32 bits of the amax of each of the sub-block's 8 rows over the 16 lanes sharing them; 16-bit
-    inputs reduce two rows packed per word.
+    Reduce over 16 lanes per row and return the FP32 bits of each row maximum.
     """
-    if kind == "f32":
+    if input_format == "f32":
         row_amax = []
         for i in range(8):
-            acc_amax = abs_rows[i][0]
+            acc_amax = row_magnitude_bits[i][0]
             for k in range(1, 8):
-                acc_amax = max_words(acc_amax, abs_rows[i][k], kind)
+                acc_amax = max_magnitude_words(acc_amax, row_magnitude_bits[i][k], input_format)
             row_amax.append(acc_amax)
         for step in range(4):
             for i in range(8):
-                other = Uint32(cute.arch.shuffle_sync_bfly(Int32(row_amax[i]), offset=1 << step))
-                row_amax[i] = max_words(row_amax[i], other, kind)
+                peer_amax = Uint32(cute.arch.shuffle_sync_bfly(Int32(row_amax[i]), offset=1 << step))
+                row_amax[i] = max_magnitude_words(row_amax[i], peer_amax, input_format)
         return row_amax
-    row_amax = [max_words(max_words(abs_rows[i][0], abs_rows[i][1], kind), max_words(abs_rows[i][2], abs_rows[i][3], kind), kind) for i in range(8)]
+    row_amax = [max_magnitude_words(max_magnitude_words(row_magnitude_bits[i][0], row_magnitude_bits[i][1], input_format), max_magnitude_words(row_magnitude_bits[i][2], row_magnitude_bits[i][3], input_format), input_format) for i in range(8)]
     row_pair_amax = []
     for pair_idx in range(4):
         amax_lo, amax_hi = prmt(row_amax[2 * pair_idx], row_amax[2 * pair_idx + 1], 0x5410), prmt(row_amax[2 * pair_idx], row_amax[2 * pair_idx + 1], 0x7632)
-        row_pair_amax.append(max_words(amax_lo, amax_hi, kind))
+        row_pair_amax.append(max_magnitude_words(amax_lo, amax_hi, input_format))
     for step in range(4):
         for pair_idx in range(4):
-            other = Uint32(cute.arch.shuffle_sync_bfly(Int32(row_pair_amax[pair_idx]), offset=1 << step))
-            row_pair_amax[pair_idx] = max_words(row_pair_amax[pair_idx], other, kind)
-    return [widen(row_pair_amax[i // 2], i % 2, kind) for i in range(8)]
+            peer_amax = Uint32(cute.arch.shuffle_sync_bfly(Int32(row_pair_amax[pair_idx]), offset=1 << step))
+            row_pair_amax[pair_idx] = max_magnitude_words(row_pair_amax[pair_idx], peer_amax, input_format)
+    return [widen_word_bits(row_pair_amax[i // 2], i % 2, input_format) for i in range(8)]
 
 
-def store_row_scales(row_amax: list, sub_block: SubBlock, scale_tok_base: Int64, M64: Int64) -> list:
+def store_row_scales(row_amax: list, sub_block: SubBlock, scale_base: Int64, num_rows: Int64) -> list:
+    rows_ok, col_group_idx, bx, row_start = sub_block.rows_ok, sub_block.col_group_idx, sub_block.bx, sub_block.row_start
     row_scale_bits = [e8m0_scale_bits(amax) for amax in row_amax]
-    # MN-major scales: scale[r, j] at j * align(rows, 4) + r.
-    m_pad = (M64 + 3) // 4 * 4
+    num_padded_rows = (num_rows + 3) // 4 * 4
     for i in range(8):
-        store_ok = sub_block.rows_ok[i] & pred_i32(sub_block.col_group_idx == i)
-        st_b32(scale_tok_base + (Int64(sub_block.pid_col) * m_pad + Int64(sub_block.row0 + i)) * 4, row_scale_bits[i], store_ok)
+        store_ok = rows_ok[i] & make_predicate(col_group_idx == i)
+        st_b32(scale_base + (Int64(bx) * num_padded_rows + Int64(row_start + i)) * 4, row_scale_bits[i], store_ok)
     return row_scale_bits
 
 
-def store_tok_rows(rows: list, row_scale_bits: list, sub_block: SubBlock, out_tok_base: Int64, N64: Int64, kind: str, is_tok_aligned: bool) -> None:
-    row0, col0, rows_ok, cols_ok, full_cols_ok = sub_block.row0, sub_block.col0, sub_block.rows_ok, sub_block.cols_ok, sub_block.full_cols_ok
+def quantize_store_rows(rows: list, row_scale_bits: list, sub_block: SubBlock, out_base: Int64, num_cols: Int64, input_format: str, is_out_aligned: bool) -> None:
+    row_start, col_start = sub_block.row_start, sub_block.col_start
+    rows_ok, cols_ok, full_cols_ok = sub_block.rows_ok, sub_block.cols_ok, sub_block.full_cols_ok
+    # Subtract the scale bits from 0x7F000000 for an exact power-of-two reciprocal.
     for i in range(8):
-        # 0x7F000000 - bits is the exact reciprocal of a power-of-2 scale
-        quant_lo, quant_hi = quantize_row(rows[i], Uint32(0x7F000000) - row_scale_bits[i], kind)
-        elem_idx = Int64(row0 + i) * N64 + Int64(col0)
-        if const_expr(is_tok_aligned):
-            st_v2(out_tok_base + elem_idx, quant_lo, quant_hi, rows_ok[i] & cols_ok[0])
+        quant_lo, quant_hi = quantize_row(rows[i], Uint32(0x7F000000) - row_scale_bits[i], input_format)
+        elem_idx = Int64(row_start + i) * num_cols + Int64(col_start)
+        if const_expr(is_out_aligned):
+            st_v2(out_base + elem_idx, quant_lo, quant_hi, rows_ok[i] & cols_ok[0])
         else:
-            st8_any(out_tok_base + elem_idx, quant_lo, quant_hi, rows_ok[i] & full_cols_ok)
-            part_ok = rows_ok[i] & (full_cols_ok ^ 1)
+            store_eight_bytes(out_base + elem_idx, quant_lo, quant_hi, rows_ok[i] & full_cols_ok)
+            partial_ok = rows_ok[i] & (full_cols_ok ^ 1)
             for byte_idx in range(7):
                 word = quant_lo if byte_idx < 4 else quant_hi
-                st_b8(out_tok_base + elem_idx + byte_idx, word >> (8 * (byte_idx % 4)), part_ok & cols_ok[byte_idx])
+                store_byte(out_base + elem_idx + byte_idx, word >> (8 * (byte_idx % 4)), partial_ok & cols_ok[byte_idx])
 
 
-def reduce_col_amax(sub_block: SubBlock, s_red: Int32, kind: str) -> list:
+def reduce_col_amax(sub_block: SubBlock, s_col_amax: Int32, input_format: str) -> list:
     """
-    fp32 bits of the amax of each of the thread's 8 columns over the whole tile, from the 8 warps'
-    partial amaxes in s_red.
+    Return the FP32 bits of the column maxima across all warps.
     """
-    num_words = 8 if kind == "f32" else 4
-    warp_amax = [sum((list(lds_v4(s_red + (warp * 16 * num_words + sub_block.col_group_idx * num_words + 4 * quad) * 4)) for quad in range(num_words // 4)), []) for warp in range(8)]
+    col_group_idx = sub_block.col_group_idx
+    num_words = 8 if input_format == "f32" else 4
+    warp_amax = [sum((list(lds_v4(s_col_amax + (warp * 16 * num_words + col_group_idx * num_words + 4 * quad) * 4)) for quad in range(num_words // 4)), []) for warp in range(8)]
     col_amax = []
-    for k in range(num_words):
-        acc_amax = warp_amax[0][k]
+    for word_idx in range(num_words):
+        acc_amax = warp_amax[0][word_idx]
         for warp in range(1, 8):
-            acc_amax = max_words(acc_amax, warp_amax[warp][k], kind)
+            acc_amax = max_magnitude_words(acc_amax, warp_amax[warp][word_idx], input_format)
         col_amax.append(acc_amax)
-    return col_amax if kind == "f32" else [widen(col_amax[j // 2], j % 2, kind) for j in range(8)]
+    return col_amax if input_format == "f32" else [widen_word_bits(col_amax[j // 2], j % 2, input_format) for j in range(8)]
 
 
-def store_col_scales(col_amax: list, sub_block: SubBlock, scale_t_base: Int64, N64: Int64) -> list:
+def store_col_scales(col_amax: list, sub_block: SubBlock, scale_t_base: Int64, num_cols: Int64) -> list:
+    cols_ok, row_group_idx, by, col_start = sub_block.cols_ok, sub_block.row_group_idx, sub_block.by, sub_block.col_start
     col_scale_bits = [e8m0_scale_bits(amax) for amax in col_amax]
-    n_pad = (N64 + 3) // 4 * 4
+    num_padded_cols = (num_cols + 3) // 4 * 4
     for j in range(8):
-        store_ok = sub_block.cols_ok[j] & pred_i32(sub_block.row_group_idx == j)
-        st_b32(scale_t_base + (Int64(sub_block.pid_row) * n_pad + Int64(sub_block.col0 + j)) * 4, col_scale_bits[j], store_ok)
+        store_ok = cols_ok[j] & make_predicate(row_group_idx == j)
+        st_b32(scale_t_base + (Int64(by) * num_padded_cols + Int64(col_start + j)) * 4, col_scale_bits[j], store_ok)
     return col_scale_bits
 
 
-def stage_transposed(rows: list, col_scale_bits: list, sub_block: SubBlock, s_tile: Int32, kind: str) -> None:
+def quantize_stage_transpose(rows: list, col_scale_bits: list, sub_block: SubBlock, s_tile: Int32, input_format: str) -> None:
     """
-    Quantize the sub-block's columns and write them into the tile of x.T in s_tile (row = one column
-    of x, 128 B). The 8-byte chunk index is swizzled by the column group so the 32 lanes of a warp
-    hit distinct banks.
+    Quantize the sub-block's columns into the shared transposed tile.
     """
     col_group_idx, row_group_idx = sub_block.col_group_idx, sub_block.row_group_idx
-    for col in range(8):
-        word_idx, half = (col, 0) if kind == "f32" else (col // 2, col % 2)
-        rcp = Uint32(0x7F000000) - col_scale_bits[col]
-        quant_lo, quant_hi = quantize_column([rows[i][word_idx] for i in range(4)], rcp, half, kind), quantize_column([rows[i][word_idx] for i in range(4, 8)], rcp, half, kind)
-        asm_store("st.shared.v2.b32 [$0], {$1, $2};", "r,r,r", [ir_value(s_tile + (col_group_idx * 8 + col) * TILE + (row_group_idx ^ col_group_idx) * 8), ir_value(quant_lo), ir_value(quant_hi)])
+    # XOR the chunk index with the column group so the warp's lanes hit distinct banks.
+    for col_idx in range(8):
+        word_idx, half_idx = (col_idx, 0) if input_format == "f32" else (col_idx // 2, col_idx % 2)
+        rcp_bits = Uint32(0x7F000000) - col_scale_bits[col_idx]
+        quant_lo = quantize_column([rows[i][word_idx] for i in range(4)], rcp_bits, half_idx, input_format)
+        quant_hi = quantize_column([rows[i][word_idx] for i in range(4, 8)], rcp_bits, half_idx, input_format)
+        sts_v2(s_tile + (col_group_idx * 8 + col_idx) * TILE + (row_group_idx ^ col_group_idx) * 8, quant_lo, quant_hi)
 
 
-def store_transposed(sub_block: SubBlock, s_tile: Int32, out_t_base: Int64, M64: Int64, N64: Int64, m_align: int) -> None:
+def store_transpose(sub_block: SubBlock, s_tile: Int32, out_t_base: Int64, num_rows: Int64, num_cols: Int64, transpose_alignment: int) -> None:
     """
-    Store the staged tile of x.T into out_t; each warp writes 4 contiguous 128-byte rows per pass
-    (16 B per lane).
+    Write four 128-byte transposed rows per warp and pass.
     """
-    lane, warp = sub_block.lane, sub_block.warp
+    lane, warp, by, bx = sub_block.lane, sub_block.warp, sub_block.by, sub_block.bx
+    use_full_tiles = sub_block.use_full_tiles
     chunk_idx = lane % 8
-    x_row_start = Int64(sub_block.pid_row * TILE + chunk_idx * 16)
-    for k in range(4):
-        tile_row_idx = k * 32 + warp * 4 + lane // 8
+    x_row_start = Int64(by * TILE + chunk_idx * 16)
+    for pass_idx in range(4):
+        tile_row_idx = pass_idx * 32 + warp * 4 + lane // 8
         swizzle = (tile_row_idx // 8) % 16
         words = lds_v4(s_tile + tile_row_idx * TILE + (((2 * chunk_idx) ^ swizzle) & 14) * 8)
+        # An odd swizzle exchanges the two halves of the aligned 16-byte load.
         is_odd_swizzle = (swizzle % 2) != 0
-        words_lo, words_hi = [cutlass.select_(is_odd_swizzle, words[2], words[0]), cutlass.select_(is_odd_swizzle, words[3], words[1])], [cutlass.select_(is_odd_swizzle, words[0], words[2]), cutlass.select_(is_odd_swizzle, words[1], words[3])]
-        x_col = sub_block.pid_col * TILE + tile_row_idx
-        col_ok = Int32(1) if sub_block.full_tiles else pred_i32(x_col < N64)
-        out_addr = out_t_base + Int64(x_col) * M64 + x_row_start
-        if const_expr(m_align == 16):
-            store_ok = col_ok if sub_block.full_tiles else col_ok & pred_i32(x_row_start < M64)
+        words_lo = [cutlass.select_(is_odd_swizzle, words[2], words[0]), cutlass.select_(is_odd_swizzle, words[3], words[1])]
+        words_hi = [cutlass.select_(is_odd_swizzle, words[0], words[2]), cutlass.select_(is_odd_swizzle, words[1], words[3])]
+        x_col_idx = bx * TILE + tile_row_idx
+        col_ok = Int32(1) if use_full_tiles else make_predicate(x_col_idx < num_cols)
+        out_addr = out_t_base + Int64(x_col_idx) * num_rows + x_row_start
+        if const_expr(transpose_alignment == 16):
+            store_ok = col_ok if use_full_tiles else col_ok & make_predicate(x_row_start < num_rows)
             st_v4(out_addr, words_lo + words_hi, store_ok)
         else:
-            for half, (word0, word1) in enumerate((words_lo, words_hi)):
-                half_row_start = x_row_start + 8 * half
-                full_ok = col_ok & pred_i32(half_row_start + 8 <= M64)
-                if const_expr(m_align == 8):
-                    st_v2(out_addr + 8 * half, word0, word1, full_ok)
+            for half_idx, (word_lo, word_hi) in enumerate((words_lo, words_hi)):
+                half_row_start = x_row_start + 8 * half_idx
+                full_store_ok = col_ok & make_predicate(half_row_start + 8 <= num_rows)
+                if const_expr(transpose_alignment == 8):
+                    st_v2(out_addr + 8 * half_idx, word_lo, word_hi, full_store_ok)
                 else:
-                    st8_any(out_addr + 8 * half, word0, word1, full_ok)
-                    part_ok = col_ok & pred_i32(half_row_start < M64) & (full_ok ^ 1)
+                    store_eight_bytes(out_addr + 8 * half_idx, word_lo, word_hi, full_store_ok)
+                    partial_ok = col_ok & make_predicate(half_row_start < num_rows) & (full_store_ok ^ 1)
                     for byte_idx in range(7):
-                        word = word0 if byte_idx < 4 else word1
-                        st_b8(out_addr + 8 * half + byte_idx, word >> (8 * (byte_idx % 4)), part_ok & pred_i32(half_row_start + byte_idx < M64))
+                        word = word_lo if byte_idx < 4 else word_hi
+                        store_byte(out_addr + 8 * half_idx + byte_idx, word >> (8 * (byte_idx % 4)), partial_ok & make_predicate(half_row_start + byte_idx < num_rows))
 
 
 @cute.kernel
-def rowwise_transpose_kernel(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, kind: cutlass.Constexpr[str], is_tok_aligned: cutlass.Constexpr[bool], m_align: cutlass.Constexpr[int], is_gather: cutlass.Constexpr[bool], full_tiles: cutlass.Constexpr[bool]) -> None:
+def rowwise_transpose_kernel(mX: cute.Tensor, mOut: cute.Tensor, mScale: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor,
+    input_format: cutlass.Constexpr[str], is_out_aligned: cutlass.Constexpr[bool], transpose_alignment: cutlass.Constexpr[int], use_gather: cutlass.Constexpr[bool], use_full_tiles: cutlass.Constexpr[bool]) -> None:
     M, N = mX.shape[0], mX.shape[1]
     tidx, _, _ = cute.arch.thread_idx()
-    pid_col, pid_row, _ = cute.arch.block_idx()
-    sub_block = SubBlock(tidx, pid_row, pid_col, M, N, full_tiles)
+    bx, by, _ = cute.arch.block_idx()
+    sub_block = SubBlock(tidx, by, bx, M, N, use_full_tiles)
     smem = cutlass.memory.SmemAllocator()
-    num_words = 8 if const_expr(kind == "f32") else 4
-    # 2 KB (4 KB for fp32) for the cross-warp column amax, 16 KB for the transposed tile
-    s_red = smem.allocate_array(Uint32, 8 * 16 * num_words, byte_alignment=16).toint()
-    M64, N64 = Int64(M), Int64(N)
+    num_words = 8 if const_expr(input_format == "f32") else 4
+    s_col_amax = smem.allocate_array(Uint32, 8 * 16 * num_words, byte_alignment=16).toint()
+    num_rows, num_cols = Int64(M), Int64(N)
 
-    if const_expr(is_gather):
-        # the raw tile is dead once every thread holds its sub-block (before the barrier after
-        # share_col_amax), so the transposed tile reuses it
-        s_tile = smem.allocate_array(cutlass.Uint8, TILE * TILE * (4 if const_expr(kind == "f32") else 2), byte_alignment=128).toint()
-        rows = gather_rows(mX.iterator.toint(), Int64(mX.stride[0]), Int64(mX.stride[1]), sub_block, kind, s_tile, M, N)
+    if const_expr(use_gather):
+        # The column-maxima barrier lets the transpose reuse the input tile safely.
+        s_tile = smem.allocate_array(cutlass.Uint8, TILE * TILE * (4 if const_expr(input_format == "f32") else 2), byte_alignment=128).toint()
+        stage_input_tile(mX.iterator.toint(), Int64(mX.stride[0]), Int64(mX.stride[1]), sub_block, input_format, s_tile, M, N)
+        rows = load_staged_rows(s_tile, sub_block, input_format)
     else:
         s_tile = smem.allocate_array(cutlass.Uint8, TILE * TILE, byte_alignment=128).toint()
-        rows = load_rows(mX.iterator.toint(), Int64(mX.stride[0]), sub_block, kind)
+        rows = load_rows(mX.iterator.toint(), Int64(mX.stride[0]), sub_block, input_format)
 
-    out_tok_base, scale_tok_base, out_t_base, scale_t_base = mOutTok.iterator.toint(), mScaleTok.iterator.toint(), mOutT.iterator.toint(), mScaleT.iterator.toint()
-    abs_mask = Uint32(0x7FFFFFFF) if const_expr(kind == "f32") else Uint32(0x7FFF7FFF)
-    abs_rows = [[rows[i][k] & abs_mask for k in range(num_words)] for i in range(8)]
-    share_col_amax(abs_rows, sub_block, s_red, kind)
+    out_base, scale_base, out_t_base, scale_t_base = mOut.iterator.toint(), mScale.iterator.toint(), mOutT.iterator.toint(), mScaleT.iterator.toint()
+    row_magnitude_bits = get_magnitude_bits(rows, num_words, input_format)
+    share_col_amax(row_magnitude_bits, sub_block, s_col_amax, input_format)
+    # Column reductions read the partial maxima from every warp.
     cute.arch.barrier()
 
-    # needs only registers and warp shuffles; the barrier above is for reduce_col_amax's s_red reads
-    row_amax = reduce_row_amax(abs_rows, kind)
-    row_scale_bits = store_row_scales(row_amax, sub_block, scale_tok_base, M64)
-    store_tok_rows(rows, row_scale_bits, sub_block, out_tok_base, N64, kind, is_tok_aligned)
+    row_amax = reduce_row_amax(row_magnitude_bits, input_format)
+    row_scale_bits = store_row_scales(row_amax, sub_block, scale_base, num_rows)
+    quantize_store_rows(rows, row_scale_bits, sub_block, out_base, num_cols, input_format, is_out_aligned)
 
-    col_amax = reduce_col_amax(sub_block, s_red, kind)
-    col_scale_bits = store_col_scales(col_amax, sub_block, scale_t_base, N64)
-    stage_transposed(rows, col_scale_bits, sub_block, s_tile, kind)
+    col_amax = reduce_col_amax(sub_block, s_col_amax, input_format)
+    col_scale_bits = store_col_scales(col_amax, sub_block, scale_t_base, num_cols)
+    quantize_stage_transpose(rows, col_scale_bits, sub_block, s_tile, input_format)
     cute.arch.barrier()
-    store_transposed(sub_block, s_tile, out_t_base, M64, N64, m_align)
+    store_transpose(sub_block, s_tile, out_t_base, num_rows, num_cols, transpose_alignment)
 
 
-def staged_chunk_addr(tile: Int32, row: Int32, chunk: Int32) -> Int32:
-    """An input row has sixteen 16-byte chunks, swizzled by four-row groups."""
-    return tile + row * (TILE * 2) + (chunk ^ ((row // 4) % 8)) * 16
+def get_staged_chunk_addr(s_input: Int32, row_idx: Int32, chunk_idx: Int32) -> Int32:
+    """
+    Address one of the sixteen 16-byte chunks swizzled across four-row groups.
+    """
+    return s_input + row_idx * (TILE * 2) + (chunk_idx ^ ((row_idx // 4) % 8)) * 16
 
 
-@cute.jit
-def quantize_staged_rows(tile: Int32, lane: Int32, warp: Int32, row0: Int32, col0: Int32, M: Int64, N: Int64, out: Int64, scales: Int64) -> None:
-    lane_in_row = lane % 16
-    for step in cutlass.range(16, unroll=2):
-        row = warp * 2 + lane // 16 + step * 8
-        words = list(lds_v4(staged_chunk_addr(tile, row, lane_in_row)))
+class StagedBf16Transpose:
+    def __init__(self) -> None:
+        # Row warps occupy the first four slots. The remaining warps handle columns.
+        self.num_row_warps = 4
+
+    def load_input_tile(self, x_base: Int64, row_stride: Int64, s_input: Int32, tidx: Int32, origin: tuple) -> None:
+        row_start, col_start = origin
+        for segment_idx in range(8):
+            row_idx, chunk_idx = tidx // 16 + segment_idx * 16, tidx % 16
+            x_addr = x_base + (Int64(row_start + row_idx) * row_stride + Int64(col_start + chunk_idx * 8)) * 2
+            cp_async16(get_staged_chunk_addr(s_input, row_idx, chunk_idx), x_addr, Int32(16))
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.barrier()
+
+    @cute.jit
+    def row_quantize_loop(self, s_input: Int32, lane: Int32, warp: Int32, origin: tuple, shape: tuple, out_base: Int64, scale_base: Int64) -> None:
+        lane_in_row = lane % 16
+        for step in cutlass.range(16, unroll=2):
+            tile_row_idx = warp * 2 + lane // 16 + step * 8
+            self.quantize_row_step(s_input, tile_row_idx, lane_in_row, origin, shape, out_base, scale_base)
+
+    @cute.jit
+    def quantize_row_step(self, s_input: Int32, tile_row_idx: Int32, lane_in_row: Int32, origin: tuple, shape: tuple, out_base: Int64, scale_base: Int64) -> None:
+        row_start, col_start = origin
+        M, N = shape
+        words = list(lds_v4(get_staged_chunk_addr(s_input, tile_row_idx, lane_in_row)))
         magnitudes = [word & Uint32(0x7FFF7FFF) for word in words]
-        amax = max2(max2(magnitudes[0], magnitudes[1]), max2(magnitudes[2], magnitudes[3]))
+        amax = reduce_bf16x2_amax4(magnitudes[0], magnitudes[1], magnitudes[2], magnitudes[3])
         amax = max2(amax, (amax << 16) | (amax >> 16))
         for stage in cutlass.range_constexpr(4):
-            other = Uint32(cute.arch.shuffle_sync_bfly(Int32(amax), offset=1 << stage))
-            amax = max2(amax, other)
-        scale = e8m0_scale_bits(widen(amax, 0, "bf16"))
-        out_row = Int64(row0 + row)
-        scale_idx = Int64(col0 // TILE) * M + out_row
-        st_b32(scales + scale_idx * 4, scale, pred_i32(lane_in_row == 0))
-        rcp = Uint32(0x7F000000) - scale
-        lo, hi = quantize_row(words, rcp, "bf16")
-        st_v2(out + out_row * N + Int64(col0 + lane_in_row * 8), lo, hi, Int32(1))
+            peer_amax = Uint32(cute.arch.shuffle_sync_bfly(Int32(amax), offset=1 << stage))
+            amax = max2(amax, peer_amax)
+        scale_bits = e8m0_scale_bits(widen_word_bits(amax, 0, "bf16"))
+        row_idx = Int64(row_start + tile_row_idx)
+        scale_idx = Int64(col_start // TILE) * M + row_idx
+        st_b32(scale_base + scale_idx * 4, scale_bits, make_predicate(lane_in_row == 0))
+        rcp_bits = Uint32(0x7F000000) - scale_bits
+        quant_lo, quant_hi = quantize_row(words, rcp_bits, "bf16")
+        st_v2(out_base + row_idx * N + Int64(col_start + lane_in_row * 8), quant_lo, quant_hi, Int32(1))
 
+    @cute.jit
+    def column_quantize_loop(self, s_input: Int32, lane: Int32, warp: Int32, origin: tuple, shape: tuple, out_t_base: Int64, scale_t_base: Int64) -> None:
+        tile_row_start = (lane % 8) * 4
+        pair_in_chunk = lane // 8
+        for step in cutlass.range(4, unroll=1):
+            chunk_idx = warp + step * 4
+            self.quantize_column_step(s_input, (lane, tile_row_start, chunk_idx, pair_in_chunk), origin, shape, out_t_base, scale_t_base)
 
-@cute.jit
-def quantize_staged_cols(tile: Int32, lane: Int32, warp: Int32, row0: Int32, col0: Int32, M: Int64, N: Int64, out: Int64, scales: Int64) -> None:
-    row = (lane % 8) * 4
-    pair_in_chunk = lane // 8
-    for step in cutlass.range(4, unroll=1):
-        chunk = warp + step * 4
-        # The eight lanes for a column pair each own four adjacent rows in
-        # each 32-row slab. The swizzle gives those eight lanes different
-        # four-bank groups. The four pairs in a chunk use all four banks.
-        words = [
-            lds_b32(staged_chunk_addr(tile, row + i % 4 + (i // 4) * 32, chunk) + pair_in_chunk * 4)
-            for i in range(16)
-        ]
+    @cute.jit
+    def quantize_column_step(self, s_input: Int32, coords: tuple, origin: tuple, shape: tuple, out_t_base: Int64, scale_t_base: Int64) -> None:
+        row_start, col_start = origin
+        M, N = shape
+        lane, tile_row_start, chunk_idx, pair_in_chunk = coords
+        # The swizzle gives the eight lanes of a column pair distinct four-bank groups.
+        # The four pairs in a chunk use all four banks in each group.
+        words = [lds_b32(get_staged_chunk_addr(s_input, tile_row_start + i % 4 + (i // 4) * 32, chunk_idx) + pair_in_chunk * 4) for i in range(16)]
         amax = words[0] & Uint32(0x7FFF7FFF)
         for i in cutlass.range_constexpr(1, 16):
             amax = max2(amax, words[i] & Uint32(0x7FFF7FFF))
         for stage in cutlass.range_constexpr(3):
-            other = Uint32(cute.arch.shuffle_sync_bfly(Int32(amax), offset=1 << stage))
-            amax = max2(amax, other)
-        for half in cutlass.range_constexpr(2):
-            col = Int64(col0 + chunk * 8 + pair_in_chunk * 2 + half)
-            scale = e8m0_scale_bits(widen(amax, half, "bf16"))
-            scale_idx = Int64(row0 // TILE) * N + col
-            st_b32(scales + scale_idx * 4, scale, pred_i32(lane % 8 == 0))
-            rcp = Uint32(0x7F000000) - scale
-            out_addr = out + col * M + Int64(row0 + row)
-            for slab in cutlass.range_constexpr(4):
-                quant = quantize_column(words[4 * slab : 4 * slab + 4], rcp, half, "bf16")
-                st_b32(out_addr + slab * 32, quant, Int32(1))
+            peer_amax = Uint32(cute.arch.shuffle_sync_bfly(Int32(amax), offset=1 << stage))
+            amax = max2(amax, peer_amax)
+        for half_idx in cutlass.range_constexpr(2):
+            col_idx = Int64(col_start + chunk_idx * 8 + pair_in_chunk * 2 + half_idx)
+            scale_bits = e8m0_scale_bits(widen_word_bits(amax, half_idx, "bf16"))
+            scale_idx = Int64(row_start // TILE) * N + col_idx
+            st_b32(scale_t_base + scale_idx * 4, scale_bits, make_predicate(lane % 8 == 0))
+            rcp_bits = Uint32(0x7F000000) - scale_bits
+            out_addr = out_t_base + col_idx * M + Int64(row_start + tile_row_start)
+            for slab_idx in cutlass.range_constexpr(4):
+                quant = quantize_column(words[4 * slab_idx : 4 * slab_idx + 4], rcp_bits, half_idx, "bf16")
+                st_b32(out_addr + slab_idx * 32, quant, Int32(1))
 
+    @cute.kernel
+    def staged_bf16_kernel(self, mX: cute.Tensor, mOut: cute.Tensor, mScale: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+        bx, by, _ = cute.arch.block_idx()
+        M, N = Int64(mX.shape[0]), Int64(mX.shape[1])
+        row_start, col_start = by * TILE, bx * TILE
+        smem = cutlass.memory.SmemAllocator()
+        s_input = smem.allocate_array(cutlass.Uint8, TILE * TILE * 2, byte_alignment=128).toint()
 
-@cute.kernel
-def staged_bf16_kernel(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor) -> None:
-    tidx, _, _ = cute.arch.thread_idx()
-    pid_col, pid_row, _ = cute.arch.block_idx()
-    M, N = Int64(mX.shape[0]), Int64(mX.shape[1])
-    row0, col0 = pid_row * TILE, pid_col * TILE
-    smem = cutlass.memory.SmemAllocator()
-    tile = smem.allocate_array(cutlass.Uint8, TILE * TILE * 2, byte_alignment=128).toint()
-    base = mX.iterator.toint()
-    stride = Int64(mX.stride[0])
-    for segment in cutlass.range_constexpr(8):
-        row, chunk = tidx // 16 + segment * 16, tidx % 16
-        addr = base + (Int64(row0 + row) * stride + Int64(col0 + chunk * 8)) * 2
-        cp_async16(staged_chunk_addr(tile, row, chunk), addr, Int32(16))
-    cute.arch.cp_async_commit_group()
-    cute.arch.cp_async_wait_group(0)
-    cute.arch.barrier()
-    warp, lane = tidx // 32, tidx % 32
-    if warp < 4:
-        quantize_staged_rows(tile, lane, warp, row0, col0, M, N, mOutTok.iterator.toint(), mScaleTok.iterator.toint())
-    else:
-        quantize_staged_cols(tile, lane, warp - 4, row0, col0, M, N, mOutT.iterator.toint(), mScaleT.iterator.toint())
+        origin = (row_start, col_start)
+        self.load_input_tile(mX.iterator.toint(), Int64(mX.stride[0]), s_input, tidx, origin)
+
+        warp, lane = tidx // 32, tidx % 32
+        if warp < self.num_row_warps:
+            self.row_quantize_loop(s_input, lane, warp, origin, (M, N), mOut.iterator.toint(), mScale.iterator.toint())
+        else:
+            self.column_quantize_loop(s_input, lane, warp - self.num_row_warps, origin, (M, N), mOutT.iterator.toint(), mScaleT.iterator.toint())
 
 
 @cute.jit
-def launch(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, stream, kind: cutlass.Constexpr[str], is_tok_aligned: cutlass.Constexpr[bool], m_align: cutlass.Constexpr[int], is_gather: cutlass.Constexpr[bool], full_tiles: cutlass.Constexpr[bool], staged: cutlass.Constexpr[bool]) -> None:
+def launch_fp8_quant_grad(mX: cute.Tensor, mOut: cute.Tensor, mScale: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, stream,
+    input_format: cutlass.Constexpr[str], is_out_aligned: cutlass.Constexpr[bool], transpose_alignment: cutlass.Constexpr[int], use_gather: cutlass.Constexpr[bool], use_full_tiles: cutlass.Constexpr[bool], use_staging: cutlass.Constexpr[bool]) -> None:
     M, N = mX.shape[0], mX.shape[1]
     grid = [(N + (TILE - 1)) // TILE, (M + (TILE - 1)) // TILE, 1]
-    if const_expr(staged):
-        staged_bf16_kernel(mX, mOutTok, mScaleTok, mOutT, mScaleT).launch(grid=grid, block=[THREADS, 1, 1], stream=stream)
+    if const_expr(use_staging):
+        StagedBf16Transpose().staged_bf16_kernel(mX, mOut, mScale, mOutT, mScaleT).launch(grid=grid, block=[THREADS, 1, 1], stream=stream)
     else:
-        rowwise_transpose_kernel(mX, mOutTok, mScaleTok, mOutT, mScaleT, kind, is_tok_aligned, m_align, is_gather, full_tiles).launch(grid=grid, block=[THREADS, 1, 1], stream=stream)
+        rowwise_transpose_kernel(mX, mOut, mScale, mOutT, mScaleT, input_format, is_out_aligned, transpose_alignment, use_gather, use_full_tiles).launch(grid=grid, block=[THREADS, 1, 1], stream=stream)
 
 
-INPUT_KINDS = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}
-COMPILED: dict[tuple[str, bool, int, bool, bool, bool], Callable] = {}
+INPUT_FORMATS = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}
+COMPILED_KERNELS: dict[tuple[str, str, bool, int, bool, bool, bool], Callable] = {}
 
 
-def compile_kernel(kind: str, is_tok_aligned: bool, m_align: int, is_gather: bool, full_tiles: bool, staged: bool = False) -> Callable:
-    M, N, num_scale_tok_cols, num_scale_t_cols = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
-    dtype = {"bf16": cutlass.BFloat16, "f16": cutlass.Float16, "f32": cutlass.Float32}[kind]
-    x = fake(dtype, (M, N), (cute.sym_int64(), cute.sym_int64() if is_gather else 1), dtype.width // 8 if is_gather else 16)
-    out_tok, scale_tok = fake(cutlass.Float8E4M3FN, (M, N), (cute.sym_int64(), 1)), fake(cutlass.Float32, (M, num_scale_tok_cols), (1, cute.sym_int64()))
+def compile_kernel(input_format: str, is_out_aligned: bool, transpose_alignment: int, use_gather: bool, use_full_tiles: bool, use_staging: bool = False) -> Callable:
+    M, N, num_scale_cols, num_scale_t_cols = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
+    dtype = {"bf16": cutlass.BFloat16, "f16": cutlass.Float16, "f32": cutlass.Float32}[input_format]
+    x = fake(dtype, (M, N), (cute.sym_int64(), cute.sym_int64() if use_gather else 1), dtype.width // 8 if use_gather else 16)
+    out, scale = fake(cutlass.Float8E4M3FN, (M, N), (cute.sym_int64(), 1)), fake(cutlass.Float32, (M, num_scale_cols), (1, cute.sym_int64()))
     out_t, scale_t = fake(cutlass.Float8E4M3FN, (N, M), (cute.sym_int64(), 1)), fake(cutlass.Float32, (N, num_scale_t_cols), (1, cute.sym_int64()))
-    return cute.compile(launch, x, out_tok, scale_tok, out_t, scale_t, fake_stream(), kind, is_tok_aligned, m_align, is_gather, full_tiles, staged, options="--enable-tvm-ffi")
+    return cute.compile(launch_fp8_quant_grad, x, out, scale, out_t, scale_t, fake_stream(), input_format, is_out_aligned, transpose_alignment, use_gather, use_full_tiles, use_staging, options="--enable-tvm-ffi")
 
 
-def quantize(x: torch.Tensor, kind: str, M: int, N: int, row_stride: int, col_stride: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    The kernel on x, an (M, N) view with strides (row_stride, col_stride): 16-byte loads in place
-    when col_stride == 1 and every 16-byte column group of every row is aligned and in or out of the
-    row as a whole, else the gather.
-    """
-    device = x.device
-    out_tok, out_t = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=device), torch.empty((N, M), dtype=torch.float8_e4m3fn, device=device)
-    scale_tok, scale_t = mn_major_scale(M, (N + 127) >> 7, device), mn_major_scale(N, (M + 127) >> 7, device)
-    elems_per_16_bytes = 4 if kind == "f32" else 8
-    is_gather = col_stride != 1 or x.data_ptr() % 16 != 0 or row_stride % elems_per_16_bytes != 0 or N % elems_per_16_bytes != 0
+def launch_fp8_quant_grad_view(x: torch.Tensor, input_format: str, M: int, N: int, row_stride: int, col_stride: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    elems_per_16_bytes = 4 if input_format == "f32" else 8
+    use_gather = col_stride != 1 or x.data_ptr() % 16 != 0 or row_stride % elems_per_16_bytes != 0 or N % elems_per_16_bytes != 0
     # The aligned BF16 load path and complete tiles make every vector access in-bounds.
-    full_tiles = kind == "bf16" and not is_gather and M % TILE == 0 and N % TILE == 0
+    use_full_tiles = input_format == "bf16" and not use_gather and M % TILE == 0 and N % TILE == 0
     # Staging has enough work to amortize its CTA rendezvous on large grids.
-    staged = full_tiles and M >= 4096 and N >= 10240 and (M // TILE) * (N // TILE) >= 4352
-    # 8-byte fp8 stores of out_tok need N % 8 == 0
-    key = (kind, N % 8 == 0, 16 if M % 16 == 0 else 8 if M % 8 == 0 else 1, is_gather, full_tiles, staged)
-    fn = COMPILED.get(key)
+    use_staging = use_full_tiles and M >= 4096 and N >= 10240 and (M // TILE) * (N // TILE) >= 4352
+
+    device = x.device
+    out, out_t = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=device), torch.empty((N, M), dtype=torch.float8_e4m3fn, device=device)
+    scale, scale_t = mn_major_scale(M, (N + 127) >> 7, device), mn_major_scale(N, (M + 127) >> 7, device)
+
+    # A row width divisible by eight keeps the FP8 vector stores aligned.
+    key = ("staged_bf16" if use_staging else "rowwise_transpose", input_format, N % 8 == 0, 16 if M % 16 == 0 else 8 if M % 8 == 0 else 1, use_gather, use_full_tiles, use_staging)
+    fn = COMPILED_KERNELS.get(key)
     if fn is None:
-        fn = COMPILED[key] = compile_kernel(*key)
-    fn(x, out_tok, scale_tok, out_t, scale_t)
-    return out_tok, scale_tok, out_t, scale_t
+        fn = COMPILED_KERNELS[key] = compile_kernel(*key[1:])
+    fn(x, out, scale, out_t, scale_t)
+    return out, scale, out_t, scale_t
 
 
 def fp8_quant_grad_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    fp8_quant_grad on SM90: x is 2-D (M, N) bf16, fp16 or fp32 (else TypeError), any M and N (an
-    empty x returns empty outputs without a launch), any strides (row-strided, transposed, both
-    strides non-unit, misaligned base pointers, size-1 and stride-0 dims); not modified. Returns
-    (x_fp8 e4m3 (M, N) contiguous, x_scale fp32 (M, ceil(N / 128)), xt_fp8 e4m3 (N, M) contiguous,
-    xt_scale fp32 (N, ceil(M / 128))), both scales MN-major (strides (1, align(rows, 4))), with the
-    bytes and scale values of the recipe in the picker's docstring.
+    Run fp8_quant_grad on SM90 with MN-major scales padded to a multiple of four rows.
     """
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
-    kind = INPUT_KINDS.get(x.dtype)
-    if kind is None:
+    input_format = INPUT_FORMATS.get(x.dtype)
+    if input_format is None:
         raise TypeError(f"fp8_quant_grad takes bfloat16, float16 or float32 input, got {x.dtype}")
     (M, N), (row_stride, col_stride) = x.shape, x.stride()
     if M == 0 or N == 0:
         device = x.device
         return torch.empty((M, N), dtype=torch.float8_e4m3fn, device=device), mn_major_scale(M, (N + 127) >> 7, device), torch.empty((N, M), dtype=torch.float8_e4m3fn, device=device), mn_major_scale(N, (M + 127) >> 7, device)
     if M == 1 or N == 1:
-        # the stride of a size-1 dim addresses no element: read it as the dense one
+        # A size-one dimension uses one address, so its stride can be normalized for dispatch.
         row_stride, col_stride = row_stride if M > 1 else N, col_stride if N > 1 else 1
         x = x.as_strided((M, N), (row_stride, col_stride))
     if col_stride == 1 or row_stride != 1:
-        return quantize(x, kind, M, N, row_stride, col_stride)
-    # unit row stride (a transposed view): x.T has unit column stride, and its outputs are x's swapped
-    out_t, scale_t, out_tok, scale_tok = quantize(x.T, kind, N, M, col_stride, 1)
-    return out_tok, scale_tok, out_t, scale_t
+        return launch_fp8_quant_grad_view(x, input_format, M, N, row_stride, col_stride)
+    # Swap outputs so a unit row stride can use the contiguous-column path.
+    out_t, scale_t, out, scale = launch_fp8_quant_grad_view(x.T, input_format, N, M, col_stride, 1)
+    return out, scale, out_t, scale_t

@@ -11,9 +11,9 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from pithtrain.kernels.cute_ptx_sm90 import asm, asm_args_last, f32_hex, to_ir, unpack
+from pithtrain.kernels.cute_ptx_sm90 import asm, asm_args_last, f32_hex, max2, to_ir, unpack
 
-__all__ = ["AMAX_MIN", "FP8_MAX_RCP", "e8m0_scale", "e8m0_scale_bf16x2", "e8m0_scale_f32", "exact_rcp", "ptx_f32", "quant4_e4m3"]
+__all__ = ["AMAX_MIN", "FP8_MAX_RCP", "e8m0_scale", "e8m0_scale_bf16x2", "e8m0_scale_f32", "exact_rcp", "ptx_f32", "quant4_e4m3", "reduce_bf16x2_amax4"]
 
 
 def ptx_f32(x: float) -> str:
@@ -155,3 +155,10 @@ def exact_rcp(scale: Float32, *, loc=None, ip=None) -> Float32:
         "=f,f", has_side_effects=False, is_align_stack=False, loc=loc, ip=ip,
     )
     return Float32(rcp)
+
+
+def reduce_bf16x2_amax4(first: Uint32, second: Uint32, third: Uint32, fourth: Uint32) -> Uint32:
+    """
+    Reduce four packed BF16 magnitude words lane by lane.
+    """
+    return max2(max2(first, second), max2(third, fourth))
