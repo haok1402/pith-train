@@ -26,7 +26,9 @@ class WeightGradient:
         self.num_activation_blocks = cute.ceil_div(N, BLOCK_K)
         self.cluster_m = 2 if self.num_m % 2 == 0 and self.num_m * self.num_n >= SM_COUNT else 1
         self.grid = min(SM_COUNT // self.cluster_m, self.num_m * self.num_n // self.cluster_m) * self.cluster_m
-        self.stages = 3 if self.block_n == 192 else 5
+        # The 128x128 FP32 epilogue leaves room for four input stages in shared memory.
+        max_stages = 3 if self.block_n == 192 else (4 if self.block_m == self.block_n == 128 else 5)
+        self.stages = min(self.num_k, max_stages)
         self.threads_math = 2 * self.block_m
         self.load_warp = self.threads_math // 32
         self.load_regs, self.math_regs = 40, 232 if self.threads_math == 256 else 248
