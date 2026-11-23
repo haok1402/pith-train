@@ -50,6 +50,9 @@ KERNELS = PKG / "kernels"
 
 # SM90 kernels with no SM100 kernel to pair with: SM100 runs a non-kernel path.
 SM90_ONLY = {
+    "delta_matching_bwd_sm90",
+    "delta_matching_fwd_sm90",
+    "delta_matching_sm90",
     "group_indices_sm90",
     "fp8_rowwise_kmajor_sm90",
 }
