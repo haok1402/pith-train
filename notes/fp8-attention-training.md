@@ -34,13 +34,29 @@ With tail 24, job `1290572` on `pool1-00971` completed eight Delta-Matching upda
 
 The same job also ran the full model with FP8 linears and BF16 attention at tail 29 on the feature and starting revisions. Both microbatch loss scalars matched bit for bit on all eight ranks. All arms completed before a launcher edit caused a shell syntax error at exit. The metric and bit checks use the completed arm logs.
 
-The 300-step pair uses tail 24 for both FP8 arms to isolate the attention implementation. Slurm job `1290664` on `pool1-00350` runs the native Delta-Matching arm, the FA4 control, then the optional BF16 compute arm. The separate steady-state sweep in job `1290659` on `pool1-00909` runs 12 steps per setting with FA4 at its stock tail 29 and Delta-Matching at tails 24–27. Steps 3–12 are timed and any post-warmup retry disqualifies a setting.
+## 300-step matched-tail convergence
 
-Delta-Matching completed all 300 steps with zero allocator retries on every rank, including warmup. The median over steps 3–300 was 8.757 seconds, 29,935 tokens/s, or 59.40% MFU. Peak allocated and reserved memory were 121.56 and 134.63 GiB per GPU. Loss moved from 1.9772 to 1.6886 and averaged 1.678783 nats. The pre-clip gradient norm was 30.0696 at step 1 and 0.4960 at step 300, with clipping on 10 steps. The paired FA4 run started on the same node.
+Job `1290664` ran both FP8 arms at tail 24 on `pool1-00350`, with code pinned to `121c6cb`. Both completed 300 optimizer steps and had zero allocator retries across all eight ranks, including warmup. Their batch-order hash was `cda16eda5eddd269c6849ff94189c50d058c6eb0880eaba0ebc0714dc311492c`.
+
+| FP8 recipe attention | Loss step 1 → 300 | Mean loss (nats) | Pre-clip norm step 1 → 300 | Median seconds | Tokens/s | MFU | Peak allocated / reserved GiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| FA4 BF16 | 1.9778 → 1.6890 | 1.678641 | 25.4463 → 0.4768 | 8.830 | 29,688 | 58.91% | 119.12 / 132.99 |
+| Delta-Matching | 1.9772 → 1.6886 | 1.678783 | 30.0696 → 0.4960 | 8.757 | 29,935 | 59.40% | 121.56 / 134.63 |
+
+Mean Delta-Matching minus FA4 loss was **+0.000142 nats**, with a mean absolute gap of **0.000396 nats**. Paired differences ranged from −0.0011 to +0.0022 nats, and the final gap was −0.0004 nats. Delta-Matching finished the measured run with similar training loss and 0.83% more tokens per second at the common tail.
+
+| Steps | Mean loss gap (nats) | Median Delta-Matching / FA4 pre-clip norm |
+| --- | ---: | ---: |
+| 1–10 | −0.000370 | 0.986× |
+| 11–50 | −0.000050 | 0.967× |
+| 51–150 | +0.000085 | 0.996× |
+| 151–300 | +0.000266 | 1.000× |
+
+The first-step norm ratio was 1.182×. The persistent gap faded, with isolated higher norms later. Steps 119 and 293 were 3.2209 versus 0.5191 and 3.4872 versus 0.5768, respectively. Delta-Matching exceeded 2× the FA4 norm at five later steps and fell below 0.5× at two. Gradient clipping applied at 10 steps with Delta-Matching and 6 with FA4. The BF16 compute arm started after the FP8 pair finished.
 
 ## Throughput at each backend's best measured tail
 
-The tail sweep held the node, checkpoint, shuffled WikiText batches, microbatch 4 and revision `121c6cb` fixed. All five settings ran 12 steps with zero post-warmup retries.
+Job `1290659` on `pool1-00909` held the node, checkpoint, shuffled WikiText batches, microbatch 4 and revision `121c6cb` fixed. All five settings ran 12 steps with zero post-warmup retries. Steps 3–12 are timed.
 
 | FP8 recipe attention | MLP-only tail | Median seconds | Tokens/s | MFU | Peak allocated / reserved GiB |
 | --- | ---: | ---: | ---: | ---: | ---: |
