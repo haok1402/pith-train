@@ -282,16 +282,17 @@ def quantize_register_twins(mInput, mCenter, mCodes, mScale, mTwin, BLOCK: cutla
     if tidx == 0:
         mScale[by, bx] = scale
 
+    PERMUTE_TWIN = const_expr(not center_key and BLOCK == 32 and dim == 256)
     # Preserve direct division for tiny and nonfinite scales.
     if (scale >= Float32(2.0 ** -88)) and (scale < Float32(float("inf"))):
-        store_register_twins(mCodes, mTwin, values, scale, by, row_start, col_start, ROWS, COLUMNS, True)
+        store_register_twins(mCodes, mTwin, values, scale, by, row_start, col_start, ROWS, COLUMNS, True, PERMUTE_TWIN)
     else:
-        store_register_twins(mCodes, mTwin, values, scale, by, row_start, col_start, ROWS, COLUMNS, False)
+        store_register_twins(mCodes, mTwin, values, scale, by, row_start, col_start, ROWS, COLUMNS, False, PERMUTE_TWIN)
 
 
 @cute.jit
 def store_register_twins(mCodes, mTwin, values, scale, by, row_start, col_start,
-                         ROWS: cutlass.Constexpr, COLUMNS: cutlass.Constexpr, FAST: cutlass.Constexpr):
+                         ROWS: cutlass.Constexpr, COLUMNS: cutlass.Constexpr, FAST: cutlass.Constexpr, PERMUTE_TWIN: cutlass.Constexpr):
     codes = cute.make_rmem_tensor(cute.make_ordered_layout((ROWS, COLUMNS), order=(0, 1)), Float8E4M3FN)
     reciprocal = reciprocal_rn(scale) if const_expr(FAST) else Float32(0.0)
     for row_offset in cutlass.range_constexpr(ROWS):
@@ -305,8 +306,12 @@ def store_register_twins(mCodes, mTwin, values, scale, by, row_start, col_start,
         quantized = quotient.load().to(Float8E4M3FN)
         destination = cute.local_tile(mCodes[by, row_start + row_offset, None], (COLUMNS,), (col_start // COLUMNS,))
         destination.store(quantized)
+        twin_row = row_offset
+        if const_expr(PERMUTE_TWIN):
+            # Convert each half of a 32-key group from pairs spaced by eight to consecutive A-register keys.
+            twin_row = row_offset // 16 * 16 + row_offset % 8 // 2 * 4 + row_offset // 8 % 2 * 2 + row_offset % 2
         for col_offset in cutlass.range_constexpr(COLUMNS):
-            codes[row_offset, col_offset] = quantized[col_offset]
+            codes[twin_row, col_offset] = quantized[col_offset]
     for col_offset in cutlass.range_constexpr(COLUMNS):
         twin = cute.local_tile(mTwin[by, col_start + col_offset, None], (ROWS,), (row_start // ROWS,))
         twin.store(codes[None, col_offset].load())

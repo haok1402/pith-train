@@ -68,12 +68,17 @@ def pack_probability_operand(rows, basis, fragment, group_idx: cutlass.Constexpr
         codes = cute.make_rmem_tensor(8, Float8E4M3FN)
         codes.store(values.load().to(Float8E4M3FN))
         packed = cute.recast_tensor(codes, Int32)
-        low = packed[0] if choose_first else packed[1]
-        high = packed[1] if choose_first else packed[0]
-        low = cute.arch.shuffle_sync(low, offset=lane_first, mask_and_clamp=quad_mask)
-        high = cute.arch.shuffle_sync(high, offset=lane_first ^ 1, mask_and_clamp=quad_mask)
-        words[2 * half_idx] = Int32(cute.arch.prmt(low, high, selector_low))
-        words[2 * half_idx + 1] = Int32(cute.arch.prmt(low, high, selector_high))
+        if cutlass.const_expr(GROUP_KEYS == 32):
+            # The value-twin producer already arranges these keys in register-A order.
+            words[2 * half_idx] = Int32(cute.arch.prmt(packed[0], packed[1], 0x5410))
+            words[2 * half_idx + 1] = Int32(cute.arch.prmt(packed[0], packed[1], 0x7632))
+        else:
+            low = packed[0] if choose_first else packed[1]
+            high = packed[1] if choose_first else packed[0]
+            low = cute.arch.shuffle_sync(low, offset=lane_first, mask_and_clamp=quad_mask)
+            high = cute.arch.shuffle_sync(high, offset=lane_first ^ 1, mask_and_clamp=quad_mask)
+            words[2 * half_idx] = Int32(cute.arch.prmt(low, high, selector_low))
+            words[2 * half_idx + 1] = Int32(cute.arch.prmt(low, high, selector_high))
 
 
 @cute.jit
