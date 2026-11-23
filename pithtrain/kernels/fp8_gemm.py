@@ -25,7 +25,10 @@ def fp8_gemm_nt(a_fp8: torch.Tensor, a_scale: torch.Tensor, b_fp8: torch.Tensor,
       row-major, as fp8_quant_weight returns it.
     """
     out = torch.empty((m, n), device=device, dtype=dtype)
-    deep_gemm.fp8_fp4_gemm_nt((a_fp8, a_scale), (b_fp8, b_scale), out)
+    # Specialize the fixed token dimension of the Hopper dense MLP projections.
+    specialize_rows = ARCH_MAJOR == 9 and m == 16384 and (n, a_fp8.shape[-1]) in ((17408, 5120), (5120, 17408))
+    compiled_dims = "mnk" if specialize_rows else "nk"
+    deep_gemm.fp8_fp4_gemm_nt((a_fp8, a_scale), (b_fp8, b_scale), out, compiled_dims=compiled_dims)
     return out
 
 
