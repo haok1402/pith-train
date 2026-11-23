@@ -626,16 +626,16 @@ class PipelinedKeyValueGradients:
         store_atom, store_coords = score_store
 
         cute.arch.mbarrier_wait(resident_ready, 0)
+        probabilities = cute.make_rmem_tensor(thread_score.partition_shape_C(score_shape), Float32)
+        cute.arch.mbarrier_wait(ready, 0)
+        issue_multiply_tile(mma_score, thread_score, probabilities, s_queries[None, None, 0], s_key, False)
         for query_block_idx in range(key_block_idx, NUM_QUERIES):
             offset = query_block_idx - key_block_idx
             query_stage, query_phase = offset % self.query_stages, (offset // self.query_stages) % 2
             grad_stage, grad_phase = offset % self.grad_stages, (offset // self.grad_stages) % 2
-            cute.arch.mbarrier_wait(ready + query_stage, query_phase)
-            probabilities = cute.make_rmem_tensor(thread_score.partition_shape_C(score_shape), Float32)
             probability_grad = cute.make_rmem_tensor(thread_score.partition_shape_C(score_shape), Float32)
             prob_rows = reshape_acc_to_mn(probabilities)  # (query rows, key columns)
             grad_rows = reshape_acc_to_mn(probability_grad)  # (query rows, key columns)
-            issue_multiply_tile(mma_score, thread_score, probabilities, s_queries[None, None, query_stage], s_key, False)
             lse_rows = cute.make_rmem_tensor(cute.size(prob_rows, mode=[0]), Float32)
             for row_idx in cutlass.range_constexpr(cute.size(lse_rows)):
                 lse_rows[row_idx] = s_lse[positions[row_idx, 0][0], 0, query_stage] * LOG2_E
@@ -682,10 +682,20 @@ class PipelinedKeyValueGradients:
             cute.arch.mbarrier_wait(ready + self.query_t_slot + query_stage, query_phase)
             acc_key_tile = cute.make_rmem_tensor(grad_shape, Float32)
             issue_gradient_stripes(mma_grad, thread_grad, acc_key_tile, s_queries_t[None, None, query_stage], s_score_grad, consumer_idx, False)
-            warpgroup.wait_group(1)
-            if tidx % 128 == 0:
-                cute.arch.mbarrier_arrive(released + self.grad_t_slot + grad_stage)
-            warpgroup.wait_group(0)
+            if query_block_idx + 1 < NUM_QUERIES:
+                # Leave the next score in flight while retiring this tile's gradients.
+                next_stage, next_phase = (offset + 1) % self.query_stages, ((offset + 1) // self.query_stages) % 2
+                cute.arch.mbarrier_wait(ready + next_stage, next_phase)
+                issue_multiply_tile(mma_score, thread_score, probabilities, s_queries[None, None, next_stage], s_key, False)
+                warpgroup.wait_group(2)
+                if tidx % 128 == 0:
+                    cute.arch.mbarrier_arrive(released + self.grad_t_slot + grad_stage)
+                warpgroup.wait_group(1)
+            else:
+                warpgroup.wait_group(1)
+                if tidx % 128 == 0:
+                    cute.arch.mbarrier_arrive(released + self.grad_t_slot + grad_stage)
+                warpgroup.wait_group(0)
             if tidx % 128 == 0:
                 cute.arch.mbarrier_arrive(released + self.query_t_slot + query_stage)
             acc_key.store(acc_key.load() + acc_key_tile.load() * key_weight)
