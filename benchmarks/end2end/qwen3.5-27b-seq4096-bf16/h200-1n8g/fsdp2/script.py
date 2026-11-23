@@ -19,8 +19,17 @@ if TYPE_CHECKING:
     from pithtrain.models.qwen35 import Qwen35TextModel
 
 
-def checkpoint_layers(model: Qwen35TextModel, *, mlp_tail: int, fp8_attention: bool = False) -> None:
-    """Checkpoint stock decoder stages, replaying only the MLP in the tail."""
+def checkpoint_layers(
+    model: Qwen35TextModel,
+    *,
+    mlp_tail: int | None,
+    fp8: bool = False,
+    fp8_attention: bool = False,
+) -> None:
+    """Replay only the MLP in the tail and retain one earlier FA4 layer in the FP8 preset."""
+    retain_attention = fp8 and mlp_tail is None
+    if mlp_tail is None:
+        mlp_tail = 30 if fp8 else 12
     # Inductor reuses FP8 projection output storage inside compiled stages.
     # Recompute those projections so this eager checkpoint never retains their aliases.
     saved_ops = [
@@ -37,9 +46,15 @@ def checkpoint_layers(model: Qwen35TextModel, *, mlp_tail: int, fp8_attention: b
         preserve_rng_state=False,
         context_fn=partial(create_selective_checkpoint_contexts, saved_ops),
     )
+    tail_start = len(model.layers) - mlp_tail
+    extra_attention = (
+        next((i for i in reversed(range(tail_start)) if not model.layers[i].is_linear), -1)
+        if retain_attention
+        else -1
+    )
     for i, layer in enumerate(model.layers):
         layer.forward = layer.forward_stock_stages
-        if i < len(model.layers) - mlp_tail:
+        if i < tail_start and i != extra_attention:
             layer.forward = partial(selective_checkpoint, layer.forward)
         else:
             layer.forward_stage3 = partial(selective_checkpoint, layer.forward_stage3)
@@ -49,11 +64,11 @@ def shard_model(
     model: Qwen35TextModel,
     mesh: DeviceMesh,
     *,
-    mlp_tail: int = 12,
+    mlp_tail: int | None = 12,
     fp8: bool = False,
     fp8_attention: bool = False,
 ) -> None:
-    checkpoint_layers(model, mlp_tail=mlp_tail, fp8_attention=fp8_attention)
+    checkpoint_layers(model, mlp_tail=mlp_tail, fp8=fp8, fp8_attention=fp8_attention)
 
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
     for blocks in batched(model.layers, 2):
@@ -132,14 +147,14 @@ if __name__ == "__main__":
     train.lr = 1e-5
     train.fp8 = args.fp8
     train.fp8_attention = args.fp8_attention
-    train.optimizer = partial(make_adamw_optimizer, fused=True)
-    train.scheduler = make_constant_scheduler
     mlp_tail = args.checkpoint_mlp_tail
-    if mlp_tail is None:
-        mlp_tail = 29 if args.fp8 else 12
-        if args.fp8 and args.fp8_attention:
+    if args.fp8 and mlp_tail is None:
+        train.fp8_shard_cache_bytes = 1 << 30
+        if args.fp8_attention:
             # Free space for Delta-Matching's backward workspace at microbatch four.
             mlp_tail = 24
+    train.optimizer = partial(make_adamw_optimizer, fused=True)
+    train.scheduler = make_constant_scheduler
     shard = partial(shard_model, mlp_tail=mlp_tail, fp8=args.fp8, fp8_attention=args.fp8_attention)
     with bulk_reduce_scatter_packing(args.fp8):
         launch(cfg, shard_dense_model=shard)

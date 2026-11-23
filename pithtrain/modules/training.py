@@ -232,6 +232,11 @@ class TrainingCfg(SlottedDefault):
     parallelism. Independent of the precision for linear layers.
     """
 
+    fp8_shard_cache_bytes: int = 0
+    """
+    Byte budget for retaining local FP8 gather shards in dense Hopper FSDP2 training.
+    """
+
     init_std: float = 0.02
 
     nsys_start: Optional[int] = None
@@ -438,7 +443,12 @@ def setup_model(
             model.to_empty(device=distributed.device)
             model.rotary_emb = Qwen35MoeRotaryEmbedding(module_config).to(distributed.device)
         if cfg.fp8:
-            install_fp8_param_gather(model, (FP8Linear,), precompute=not from_hf)
+            install_fp8_param_gather(
+                model,
+                (FP8Linear,),
+                precompute=not from_hf,
+                retain_shard_bytes=cfg.fp8_shard_cache_bytes,
+            )
         install_wgrad_accumulation(model, overwrite=True)
         training.model = model
         return

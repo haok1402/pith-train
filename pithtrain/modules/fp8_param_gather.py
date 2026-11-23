@@ -83,6 +83,7 @@ class FP8ParamState:
     """
 
     gathered_shards: Optional[torch.Tensor] = None
+    retain_shard: bool = False
 
     def local_shard(self) -> torch.Tensor:
         """
@@ -160,9 +161,8 @@ class FP8ParamState:
         # Both run on the current stream, so the free is ordered.
         for output in self.fsdp_param.all_gather_outputs:
             free_storage(output)
-        # FSDP copied the FP8 shard into its all-gather buffer, so it is dead until the next
-        # pre_all_gather recasts it.
-        free_storage(self.fp8_shard)
+        if not self.retain_shard:
+            free_storage(self.fp8_shard)
         if out is not None:
             return None
         return self.packed.view(torch.bfloat16).view(self.shape), (self.packed,)
@@ -207,7 +207,11 @@ fp8_groups: list[tuple[dist.ProcessGroup, torch.Tensor, list[FP8ParamState]]] = 
 
 
 def install_fp8_param_gather(
-    model: nn.Module, fp8_classes: tuple[type, ...], *, precompute: bool = True
+    model: nn.Module,
+    fp8_classes: tuple[type, ...],
+    *,
+    precompute: bool = True,
+    retain_shard_bytes: int = 0,
 ) -> None:
     """
     Make FSDP2 all-gather the weight of every module of fp8_classes in FP8, registering the
@@ -264,6 +268,10 @@ def install_fp8_param_gather(
             local.fsdp_post_all_gather = state.post_all_gather
             fsdp_param._init_extensions()
             fp8_states.append(state)
+            shard_bytes = fsdp_param.padded_sharded_param_size.numel()
+            if gather_pack and len(shape) == 2 and shard_bytes <= retain_shard_bytes:
+                state.retain_shard = True
+                retain_shard_bytes -= shard_bytes
             if gather_pack and len(shape) == 2 and N % (size * BLOCK) == K % 16 == 0:
                 dense_states[fsdp_param] = state
         if dense_states and param_group._all_gather_output_fn is _default_all_gather_output_fn:
