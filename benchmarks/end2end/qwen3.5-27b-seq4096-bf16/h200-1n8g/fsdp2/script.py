@@ -152,7 +152,7 @@ if __name__ == "__main__":
         train.fp8_shard_cache_bytes = 1 << 30
         if args.fp8_attention:
             # Free space for Delta-Matching's backward workspace at microbatch four.
-            mlp_tail = 24
+            mlp_tail = 29
     train.optimizer = partial(make_adamw_optimizer, fused=True)
     train.scheduler = make_constant_scheduler
     shard = partial(shard_model, mlp_tail=mlp_tail, fp8=args.fp8, fp8_attention=args.fp8_attention)

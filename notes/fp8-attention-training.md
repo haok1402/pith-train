@@ -115,3 +115,21 @@ The follow-up same-node run `1291031` on `pool1-00397` measured another 12 steps
 The latest Delta-Matching arm at tail 27 delivered 0.73% more tokens/s and 0.43 more MFU points than FA4 at tail 29. Both had one warmup retry per GPU. Tail 26 had zero retries including warmup, and the two backward revisions differed by 4 ms in median step time at tail 26. For those two full-model runs, the first microbatch losses matched bit for bit on six of eight ranks, and the largest logged loss gap over 12 steps was 0.0020 nats. The operating default stays at tail 24, which completed the 300-step allocator check.
 
 Per-step logs, Slurm and GPU gate output, input preparation, and the analysis script are in `.cache/fp8-attention-training/`. Slurm accepted submissions and warned that the account is approaching its stale-data submission threshold.
+
+## Refresh to the `e199499` FP8 fusion recipe
+
+Merge `e4c275e` brings in `e199499` with the wider DeltaNet forward tiles, fixed-row FP8 MLP GEMMs, and the upstream FP8 retention preset. The previous SwiGLU and loss-scaling fusions remain in the shared recipe. The promoted Delta-Matching forward and backward pins are `755d2ac` and `116959f`. Both default FP8 attention backends use the preset's 1 GiB per-GPU FP8 gather-shard cache. FA4 retains 30 tail layers plus the closest earlier full-attention layer. Delta-Matching uses a contiguous MLP-only checkpoint tail.
+
+All 49 kernel, operator and import-layer tests passed in job `1295232`, including dense DeltaNet and FP8 GEMM tests. In job `1295868` on `pool1-00725`, both step-1 FP32 microbatch loss scalars matched on all eight ranks between the upstream revision and the merged FA4 path.
+
+The same job screened Delta-Matching tails 24–30 with the 1 GiB cache, using eight H200s, microbatch 4, global batch 64, sequence length 4096, and the 32-batch WikiText smoke corpus. Delta-Matching ran 12 steps per setting and FA4 ran 16, with steps 1 and 2 excluded from timing. Both arms loaded the same checkpoint and sample permutation. Tails 26, 27 and 30 hit allocator retries at step 3 and were rejected.
+
+| FP8 recipe attention | MLP-only tail | Tokens/s per node | Median step time | Peak allocated / reserved GiB |
+| --- | ---: | ---: | ---: | ---: |
+| FA4 BF16 | 30 + 1 earlier mixer | 29,752 | 8.8110 s | 127.15 / 136.49 |
+| Delta-Matching | 24 | 29,869 | 8.7765 s | 122.56 / 135.50 |
+| Delta-Matching | 25 | 29,874 | 8.7750 s | 123.13 / 135.78 |
+| Delta-Matching | 28 | 29,959 | 8.7500 s | 126.64 / 135.73 |
+| Delta-Matching | 29 | 29,980 | 8.7440 s | 127.20 / 136.08 |
+
+All settings in the table had zero post-warmup retries. The fastest tested Delta-Matching tail was 29, which gave 1.303× the 23,017 tok/s same-run BF16 control and 1.300× the best confirmed 23,058 tok/s BF16 result.
