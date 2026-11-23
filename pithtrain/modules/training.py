@@ -399,8 +399,8 @@ def setup_model(
         )
 
     if shard_dense_model is not None:
-        if module_config.model_type != "qwen3_5_text" or cfg.fp8 or cfg.moe_load_balance_coef:
-            raise ValueError("Direct FSDP2 training requires BF16 dense Qwen3.5")
+        if module_config.model_type != "qwen3_5_text" or cfg.moe_load_balance_coef:
+            raise ValueError("Direct FSDP2 training requires dense Qwen3.5")
         if (distributed.pp_size, distributed.cp_size, distributed.ep_size) != (1, 1, 1):
             raise ValueError("Direct FSDP2 training requires PP, CP and EP all 1")
         mesh = distributed.attn_mesh["dp"]
@@ -411,7 +411,7 @@ def setup_model(
         with torch.device("meta") if from_hf else nullcontext():
             model = Qwen35TextModel(module_config)
         if any(param.dtype != torch.float32 for param in model.parameters()):
-            raise ValueError("Dense BF16 training requires FP32 master parameters")
+            raise ValueError("Dense training requires FP32 master parameters")
         if not from_hf:
             init_weights(
                 model,
@@ -424,6 +424,8 @@ def setup_model(
         if from_hf:
             model.to_empty(device=distributed.device)
             model.rotary_emb = Qwen35MoeRotaryEmbedding(module_config).to(distributed.device)
+        if cfg.fp8:
+            install_fp8_param_gather(model, (FP8Linear,), precompute=not from_hf)
         install_wgrad_accumulation(model, overwrite=True)
         training.model = model
         return

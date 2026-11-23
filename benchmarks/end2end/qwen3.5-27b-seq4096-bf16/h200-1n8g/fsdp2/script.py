@@ -23,6 +23,8 @@ def checkpoint_layers(model: Qwen35TextModel, *, mlp_tail: int) -> None:
     saved_ops = [
         torch.ops.aten.mm.default,
         torch.ops.aten.addmm.default,
+        torch.ops.pithtrain.fp8_linear_fwd.default,
+        torch.ops.pithtrain.fp8_linear_fwd_prequantized.default,
         torch.ops.pithtrain.gated_delta_rule_dense_fwd.default,
         torch.ops.pithtrain.flash_attn4_mha_fwd.default,
     ]
@@ -40,8 +42,8 @@ def checkpoint_layers(model: Qwen35TextModel, *, mlp_tail: int) -> None:
             layer.forward_stage3 = partial(selective_checkpoint, layer.forward_stage3)
 
 
-def shard_model(model: Qwen35TextModel, mesh: DeviceMesh) -> None:
-    checkpoint_layers(model, mlp_tail=12)
+def shard_model(model: Qwen35TextModel, mesh: DeviceMesh, *, mlp_tail: int = 12) -> None:
+    checkpoint_layers(model, mlp_tail=mlp_tail)
 
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
     for blocks in batched(model.layers, 2):
@@ -67,6 +69,9 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--seq", type=int, default=4096)
     parser.add_argument("--batch", type=int, default=64)
+    parser.add_argument("--micro-batch", type=int, default=2)
+    parser.add_argument("--checkpoint-mlp-tail", type=int, default=12)
+    parser.add_argument("--fp8", action="store_true")
     args = parser.parse_args()
 
     # PithTrain's kernel imports query the current GPU.
@@ -82,9 +87,10 @@ if __name__ == "__main__":
     train.benchmark = args.dataset is None
     train.sequence_length = args.seq
     train.global_batch_size = args.batch
-    train.micro_batch_size = 2
+    train.micro_batch_size = args.micro_batch
     train.max_steps = args.steps
     train.lr = 1e-5
+    train.fp8 = args.fp8
     train.optimizer = partial(make_adamw_optimizer, fused=True)
     train.scheduler = make_constant_scheduler
-    launch(cfg, shard_dense_model=shard_model)
+    launch(cfg, shard_dense_model=partial(shard_model, mlp_tail=args.checkpoint_mlp_tail))

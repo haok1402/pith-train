@@ -41,7 +41,7 @@ from pithtrain.kernels import (
     fp8_grouped_wgrad_empty,
 )
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
-from pithtrain.operators.linear import BF16Linear
+from pithtrain.operators.linear import BF16Linear, FP8Linear
 from pithtrain.operators.main_grad import MAIN_GRADS
 
 __all__ = ["install_raw_main_grad", "install_side_grads", "install_wgrad_accumulation"]
@@ -50,7 +50,7 @@ __all__ = ["install_raw_main_grad", "install_side_grads", "install_wgrad_accumul
 def install_wgrad_accumulation(model: nn.Module, *, overwrite: bool = False) -> None:
     """
     Give every BF16Linear, GroupedLinear and FP8GroupedLinear weight in the model a main_grad,
-    after fully_shard.
+    after fully_shard. The dense overwrite path also installs FP8Linear buffers.
     """
     seen_groups = set()
     for module in model.modules():
@@ -67,12 +67,14 @@ def install_wgrad_accumulation(model: nn.Module, *, overwrite: bool = False) -> 
                 owner = fsdp_param._module_info.module
                 if fsdp_param._module_info.param_name != "weight":
                     continue
-                if not isinstance(owner, (BF16Linear, GroupedLinear, FP8GroupedLinear)):
+                if not isinstance(owner, (BF16Linear, GroupedLinear, FP8GroupedLinear)) and not (
+                    overwrite and isinstance(owner, FP8Linear)
+                ):
                     continue
                 if overwrite:
-                    if not isinstance(owner, BF16Linear):
-                        raise ValueError("Overwriting wgrad requires single-use BF16 linears")
-                    owner.overwrite_main_grad = True
+                    if not isinstance(owner, (BF16Linear, FP8Linear)):
+                        raise ValueError("Overwriting wgrad requires single-use dense linears")
+                    owner.overwrite_main_grad = isinstance(owner, BF16Linear)
                 size, device = fsdp_param._orig_size, fsdp_param.device
                 if isinstance(owner, FP8GroupedLinear):
                     # Laid out as the k-grouped FP8 wgrad accumulates in place (transposed where
@@ -95,11 +97,13 @@ def _attach_main_grads(
     orig_pre_backward, orig_post_backward = group.pre_backward, group.post_backward
 
     def pre_backward(*args: Any) -> None:
-        for _, main_grad in pairs:
+        for fsdp_param, main_grad in pairs:
             if main_grad.untyped_storage().size() == 0:
                 main_grad.untyped_storage().resize_(main_grad.numel() * main_grad.element_size())
-                if not overwrite:
-                    main_grad.zero_()
+                if not overwrite or not fsdp_param._module_info.module.overwrite_main_grad:
+                    # The compiled FP8 backward holds this work buffer as a graph input.
+                    # Initialize its storage without changing the saved input's version.
+                    main_grad.data.zero_()
         orig_pre_backward(*args)
 
     def post_backward(*args: Any) -> None:

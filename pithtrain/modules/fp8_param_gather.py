@@ -159,22 +159,31 @@ fp8_states: list[FP8ParamState] = []
 fp8_groups: list[tuple[dist.ProcessGroup, torch.Tensor, list[FP8ParamState]]] = []
 
 
-def install_fp8_param_gather(model: nn.Module, fp8_classes: tuple[type, ...]) -> None:
+def install_fp8_param_gather(
+    model: nn.Module, fp8_classes: tuple[type, ...], *, precompute: bool = True
+) -> None:
     """
     Make FSDP2 all-gather the weight of every module of fp8_classes in FP8, registering the
     weight_scale and weight_scale_t buffers on each module and computing the scales once.
 
-    Call after fully_shard and before the first forward. Collective over each shard group.
+    Call after fully_shard and before the first forward. With deferred precompute, call
+    precompute_fp8_param_scales after loading the weights. Collective over each shard group.
     """
     fp8_states.clear()
     fp8_groups.clear()
+    multi_launch_cache.clear()
+    seen_groups = set()
     by_group: dict[int, tuple[dist.ProcessGroup, list[tuple[FP8ParamState, int]]]] = {}
-    for fsdp_module in model.modules():
-        if not isinstance(fsdp_module, FSDPModule):
+    param_groups = (
+        group
+        for module in model.modules()
+        if isinstance(module, FSDPModule)
+        for group in module._get_fsdp_state()._fsdp_param_groups
+    )
+    for param_group in param_groups:
+        if param_group in seen_groups:
             continue
-        param_group = fsdp_module._get_fsdp_state()._fsdp_param_group
-        if param_group is None:
-            continue
+        seen_groups.add(param_group)
         for fsdp_param in param_group.fsdp_params:
             module = fsdp_param._module_info.module
             if not isinstance(module, fp8_classes) or fsdp_param._module_info.param_name != "weight":  # fmt: skip
@@ -218,7 +227,8 @@ def install_fp8_param_gather(model: nn.Module, fp8_classes: tuple[type, ...]) ->
             start += num_tiles
         fp8_groups.append((group, buffer, [state for state, _ in entries]))
 
-    precompute_fp8_param_scales()
+    if precompute:
+        precompute_fp8_param_scales()
 
 
 @torch.no_grad()
