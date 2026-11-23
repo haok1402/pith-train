@@ -123,6 +123,15 @@ def apply_key_scale(value, scale, *, loc=None, ip=None):
 
 
 @cute.jit
+def dense_group_max(rows, row: cutlass.Constexpr, begin: cutlass.Constexpr):
+    left = cute.arch.fmax(cute.arch.fmax(rows[row, begin], rows[row, begin + 1]),
+                          cute.arch.fmax(rows[row, begin + 2], rows[row, begin + 3]))
+    right = cute.arch.fmax(cute.arch.fmax(rows[row, begin + 4], rows[row, begin + 5]),
+                           cute.arch.fmax(rows[row, begin + 6], rows[row, begin + 7]))
+    return cute.arch.fmax(left, right)
+
+
+@cute.jit
 def update_probability_tile(scores, weights, ratios, operands, key_scales, value_scales, row_max, row_sum,
                             rescale, tidx, GROUP_KEYS: cutlass.Constexpr, GROUPS: cutlass.Constexpr,
                             GROUP_QUERY_HEADS: cutlass.Constexpr, DELAY_SCALE: cutlass.Constexpr):
@@ -134,9 +143,12 @@ def update_probability_tile(scores, weights, ratios, operands, key_scales, value
     for row in cutlass.range_constexpr(2):
         tile_max = Float32(float("-inf"))
         for group in cutlass.range_constexpr(GROUPS):
-            group_max = Float32(float("-inf"))
-            for col in cutlass.range_constexpr(GROUP_COLUMNS):
-                group_max = cute.arch.fmax(group_max, rows[row, group * GROUP_COLUMNS + col])
+            if cutlass.const_expr(GROUP_QUERY_HEADS):
+                group_max = dense_group_max(rows, row, group * GROUP_COLUMNS)
+            else:
+                group_max = Float32(float("-inf"))
+                for col in cutlass.range_constexpr(GROUP_COLUMNS):
+                    group_max = cute.arch.fmax(group_max, rows[row, group * GROUP_COLUMNS + col])
             maximum = warp_reduce(group_max, cute.arch.fmax, threads_in_group=4)
             if cutlass.const_expr(DELAY_SCALE):
                 maximum = apply_key_scale(maximum, key_scales[group])
