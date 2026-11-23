@@ -533,7 +533,7 @@ class PipelinedKeyValueGradients:
     def __init__(self):
         self.head_dim = 256
         self.group_keys, self.tile_keys = 32, 64
-        self.query_stages, self.grad_stages = 2, 1
+        self.query_stages, self.grad_stages = 2, 2
         self.query_t_stages, self.grad_t_stages = 1, 2
         self.grad_slot = self.query_stages
         self.query_t_slot = self.grad_slot + self.grad_stages
@@ -543,7 +543,8 @@ class PipelinedKeyValueGradients:
         self.load_group, self.score_group, self.gradient_group = 0, 1, 2
         self.num_threads, self.score_stages = 512, 3
         self.store_stages = 2
-        self.load_registers, self.score_registers, self.gradient_registers = 24, 120, 184
+        self.load_registers, self.score_registers, self.gradient_registers = 24, 104, 192
+        self.value_register_values = 16
 
     @cute.jit
     def __call__(self, mQuery, mQueryScale, mKey, mKeyScale, mValue, mValueScale, mQueryT, mGrad, mGradScale, mGradT, mLse, mDelta, mScoreGrad, mScoreScale, mGradKey, mGradValue, stream):
@@ -602,7 +603,7 @@ class PipelinedKeyValueGradients:
             allocator.allocate_tensor(Float32, cute.make_layout(self.score_stages), 16),
         )
         # Keep four adjacent FP32 promotion values contiguous for each lane.
-        value_vectors = self.tile_keys * self.head_dim // (256 * 4)
+        value_vectors = (self.tile_keys * self.head_dim // 256 - self.value_register_values) // 4
         value_layout = cute.make_ordered_layout((4, 256, value_vectors), order=(0, 1, 2))
         s_grad_value = allocator.allocate_tensor(Float32, value_layout, 128)
         resident_ready = allocator.allocate_array(Int64, 1)
@@ -796,10 +797,15 @@ class PipelinedKeyValueGradients:
         grad_shape = (*stripe_shape, 2)
         acc_key = cute.make_rmem_tensor(grad_shape, Float32)
         acc_window = cute.make_rmem_tensor(grad_shape, Float32)
+        value_registers = cute.make_rmem_tensor(self.value_register_values, Float32)
         lane_values = s_grad_value[None, tidx, None]
-        s_value = cute.make_tensor(lane_values.iterator, cute.composition(lane_values.layout, cute.make_layout(grad_shape)))
+        shared_shape = cute.make_layout(cute.size(acc_window) - self.value_register_values)
+        s_value = cute.make_tensor(lane_values.iterator, cute.composition(lane_values.layout, shared_shape))
+        register_window = cute.make_tensor(acc_window.iterator, value_registers.layout)
+        shared_window = cute.make_tensor(acc_window.iterator + self.value_register_values, shared_shape)
         acc_key.fill(0.0)
         acc_window.fill(0.0)
+        value_registers.fill(0.0)
         s_value.fill(0.0)
         previous_weight = Float32(1.0)
         next_value_weight = mGradScale[query_head_idx, key_block_idx] * PROBABILITY_SCALE
@@ -835,10 +841,12 @@ class PipelinedKeyValueGradients:
                         cute.arch.mbarrier_arrive(released + self.query_t_slot + query_stage)
                         cute.arch.mbarrier_arrive(score_released + score_stage)
                     if (query_start + BLOCK_QUERY) % PROMOTION_ROWS == 0 or query_block_idx + 1 == NUM_QUERIES:
-                        s_value.store(s_value.load() + acc_window.load() * value_weight)
+                        value_registers.store(value_registers.load() + register_window.load() * value_weight)
+                        s_value.store(s_value.load() + shared_window.load() * value_weight)
                         acc_window.fill(0.0)
                     previous_weight = value_weight
-        acc_window.store(s_value.load())
+        register_window.store(value_registers.load())
+        shared_window.store(s_value.load())
         write_key_value_gradients(
             mGradKey, mGradValue, mKeyScale, (acc_key, acc_window, acc_window), mma_thread,
             key_block_idx, query_head_idx, key_head_idx, consumer_idx, self.group_keys, self.tile_keys, 2,
