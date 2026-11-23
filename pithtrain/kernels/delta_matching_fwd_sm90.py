@@ -116,10 +116,16 @@ def prepare_value_scales(maxima, value_scales, row_max, final_weights, ratios,
         ratios[row] = bounded
 
 
+@dsl_user_op
+def apply_key_scale(value, scale, *, loc=None, ip=None):
+    operands = [to_ir(item, Float32, loc, ip) for item in (value, scale)]
+    return Float32(asm(T.f32(), operands, "mul.rn.f32 $0, $1, $2;", "=f,f,f"))
+
+
 @cute.jit
-def update_probability_tile(scores, weights, ratios, operands, value_scales, row_max, row_sum, rescale,
-                            tidx, GROUP_KEYS: cutlass.Constexpr, GROUPS: cutlass.Constexpr,
-                            GROUP_QUERY_HEADS: cutlass.Constexpr):
+def update_probability_tile(scores, weights, ratios, operands, key_scales, value_scales, row_max, row_sum,
+                            rescale, tidx, GROUP_KEYS: cutlass.Constexpr, GROUPS: cutlass.Constexpr,
+                            GROUP_QUERY_HEADS: cutlass.Constexpr, DELAY_SCALE: cutlass.Constexpr):
     rows = reshape_acc_to_mn(scores)
     GROUP_COLUMNS = GROUP_KEYS // 4
     maxima = cute.make_rmem_tensor((2, GROUPS), Float32)
@@ -132,6 +138,8 @@ def update_probability_tile(scores, weights, ratios, operands, value_scales, row
             for col in cutlass.range_constexpr(GROUP_COLUMNS):
                 group_max = cute.arch.fmax(group_max, rows[row, group * GROUP_COLUMNS + col])
             maximum = warp_reduce(group_max, cute.arch.fmax, threads_in_group=4)
+            if cutlass.const_expr(DELAY_SCALE):
+                maximum = apply_key_scale(maximum, key_scales[group])
             maxima[row, group] = maximum
             tile_max = cute.arch.fmax(tile_max, maximum)
         next_max = cute.arch.fmax(row_max[row], tile_max)
@@ -144,7 +152,11 @@ def update_probability_tile(scores, weights, ratios, operands, value_scales, row
         basis = cute.make_rmem_tensor(2, Float32)
         for row in cutlass.range_constexpr(2):
             for col in cutlass.range_constexpr(GROUP_COLUMNS):
-                value = rows[row, group * GROUP_COLUMNS + col]
+                index = group * GROUP_COLUMNS + col
+                value = rows[row, index]
+                if cutlass.const_expr(DELAY_SCALE):
+                    value = apply_key_scale(value, key_scales[group])
+                    rows[row, index] = value
                 tile_sums[row] += cute.math.exp2(value - row_max[row], fastmath=True)
             if cutlass.const_expr(GROUP_QUERY_HEADS):
                 basis[row] = cute.arch.fmax(maxima[row, group], row_max[row] - 12.0)
@@ -542,9 +554,11 @@ class CausalAttention:
         if tidx == 0:
             cute.arch.mbarrier_arrive(key_empty)
         coords = thread.partition_C(cute.make_identity_tensor(shape))
-        scale_causal_scores(scores, coords, key_scales, query_start, tile_idx * self.tile_keys, MASKED, self.group_keys)
-        update_probability_tile(scores, weights, ratios, probabilities, value_scales, row_max, row_sum, rescale,
-                                tidx, self.group_keys, self.groups, self.group_query_heads)
+        DELAY_SCALE = self.group_query_heads and not MASKED
+        if cutlass.const_expr(not DELAY_SCALE):
+            scale_causal_scores(scores, coords, key_scales, query_start, tile_idx * self.tile_keys, MASKED, self.group_keys)
+        update_probability_tile(scores, weights, ratios, probabilities, key_scales, value_scales, row_max, row_sum,
+                                rescale, tidx, self.group_keys, self.groups, self.group_query_heads, DELAY_SCALE)
 
     @cute.jit
     def compute_loop(self, inputs, output_copy, buffers, s_output_cache, barriers, query_block, head_idx, key_head, last_tile,

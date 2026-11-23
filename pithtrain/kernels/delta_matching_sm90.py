@@ -137,28 +137,39 @@ def reduce_mma_row(fragment, row_idx: cutlass.Constexpr, initial, op: cutlass.Co
 
 
 @cute.kernel
-def sum_key_channels(mKey, mPartial, H: cutlass.Constexpr, N: cutlass.Constexpr):
+def sum_key_channels(mKey, mPartial, H: cutlass.Constexpr, N: cutlass.Constexpr, WIDTH: cutlass.Constexpr):
     tidx, _, _ = cute.arch.thread_idx()
     bx, by, bz = cute.arch.block_idx()
     batch_idx, head_idx = bz // H, bz % H
-    col_idx, row_idx = bx * 32 + tidx % 32, tidx // 32
-    acc_sum = Float32(0.0)
+    col_group, row_idx = bx * 32 + tidx % 32, tidx // 32
+    acc_sum = cute.make_rmem_tensor(WIDTH, Float32)
+    acc_sum.fill(0.0)
     for row_offset in cutlass.range_constexpr(16):
-        acc_sum += mKey[batch_idx, by * 128 + row_idx + row_offset * 8, head_idx, col_idx].to(Float32)
+        token = by * 128 + row_idx + row_offset * 8
+        part = cute.local_tile(mKey[batch_idx, token, head_idx, None], (WIDTH,), (col_group,))
+        acc_sum.store(acc_sum.load() + part.load().to(Float32))
     allocator = SmemAllocator()
-    s_partial = allocator.allocate_tensor(Float32, cute.make_layout((8, 32), stride=(32, 1)), 16)
-    s_partial[row_idx, tidx % 32] = acc_sum
+    layout = cute.make_layout((8, 32 * WIDTH), stride=(32 * WIDTH, 1))
+    s_partial = allocator.allocate_tensor(Float32, layout, 16)
+    local_group = tidx % 32
+    store = cute.local_tile(s_partial[row_idx, None], (WIDTH,), (local_group,))
+    store.store(acc_sum.load())
     cute.arch.barrier()
     if row_idx == 0:
         for row_offset in cutlass.range_constexpr(1, 8):
-            acc_sum += s_partial[row_offset, tidx]
-        mPartial[bz, by, col_idx] = acc_sum / N
+            shared_part = cute.local_tile(s_partial[row_offset, None], (WIDTH,), (local_group,))
+            acc_sum.store(acc_sum.load() + shared_part.load())
+        output = cute.local_tile(mPartial[bz, by, None], (WIDTH,), (col_group,))
+        output.store(acc_sum.load() / N)
 
 
 @cute.jit
 def launch_key_sum(mKey, mPartial, stream):
     B, N, H, D = mKey.shape
-    sum_key_channels(mKey, mPartial, H, N).launch(grid=(D // 32, N // 128, B * H), block=(256, 1, 1), stream=stream)
+    WIDTH = 4
+    sum_key_channels(mKey, mPartial, H, N, WIDTH).launch(
+        grid=(D // (32 * WIDTH), N // 128, B * H), block=(256, 1, 1), stream=stream,
+    )
 
 
 @cute.jit
