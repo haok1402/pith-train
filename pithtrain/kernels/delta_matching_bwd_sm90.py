@@ -840,6 +840,40 @@ def delta_matching_bwd_prepare_sm90(grad_out, state):
     return grad, grad_scale, grad_t, delta
 
 
+@cute.jit
+def fold_six_heads(mInput, mOutput, output_head, vector_idx):
+    first_head = output_head * 6
+    head0 = cute.local_tile(mInput[first_head, None], (4,), (vector_idx,)).load()
+    head1 = cute.local_tile(mInput[first_head + 1, None], (4,), (vector_idx,)).load()
+    head2 = cute.local_tile(mInput[first_head + 2, None], (4,), (vector_idx,)).load()
+    head3 = cute.local_tile(mInput[first_head + 3, None], (4,), (vector_idx,)).load()
+    head4 = cute.local_tile(mInput[first_head + 4, None], (4,), (vector_idx,)).load()
+    head5 = cute.local_tile(mInput[first_head + 5, None], (4,), (vector_idx,)).load()
+    # CUDA sum groups six inputs in four zero-initialized FP32 lanes.
+    partial0, partial1 = (head0 + 0.0) + head4, (head1 + 0.0) + head5
+    partial2, partial3 = head2 + 0.0, head3 + 0.0
+    folded = ((partial0 + partial1) + partial2) + partial3
+    output = cute.local_tile(mOutput[output_head, None], (4,), (vector_idx,))  # (channel vector,)
+    output.store(folded.to(BFloat16))
+
+
+@cute.kernel
+def fold_attention_gradients(mGradKey, mGradValue, mKey, mValue):
+    tidx, _, _ = cute.arch.thread_idx()
+    bx, by, bz = cute.arch.block_idx()
+    vector_idx = bx * 128 + tidx
+    if bz == 0:
+        fold_six_heads(mGradKey, mKey, by, vector_idx)
+    else:
+        fold_six_heads(mGradValue, mValue, by, vector_idx)
+
+
+@cute.jit
+def launch_fold_attention_gradients(mGradKey, mGradValue, mKey, mValue, stream):
+    output_heads, elements = mKey.shape
+    fold_attention_gradients(mGradKey, mGradValue, mKey, mValue).launch(grid=(elements // 512, output_heads, 2), block=(128, 1, 1), stream=stream)
+
+
 def delta_matching_bwd_sm90(grad_out, state, backward_state, softmax_scale):
     """
     Compute the three BF16 gradients with E4M3 operands and deterministic GQA reduction.
@@ -864,5 +898,10 @@ def delta_matching_bwd_sm90(grad_out, state, backward_state, softmax_scale):
     launch_delta_matching_kernel("delta_matching_kv_gradients", launch_key_value_gradients, (query, query_scale, key, key_scale, value, value_scale, query_t, grad, grad_scale, grad_t, lse, delta, score_grad, score_scale, grad_key, grad_value))
     launch_delta_matching_kernel("delta_matching_query_gradients", launch_query_gradients, (key_t, score_grad, score_scale, grad_query), (softmax_scale,))
     grad_query = grad_query.reshape(B, H, N, D).transpose(1, 2)
+    if D == 256 and H == 6 * num_key_heads:
+        folded_shape = (B * num_key_heads, N * D)
+        key_out, value_out = (torch.empty(folded_shape, dtype=torch.bfloat16, device=query.device) for _ in range(2))
+        launch_delta_matching_kernel("delta_matching_fold_gradients", launch_fold_attention_gradients, (grad_key.flatten(1), grad_value.flatten(1), key_out, value_out))
+        return grad_query, key_out.reshape(B, num_key_heads, N, D).transpose(1, 2), value_out.reshape(B, num_key_heads, N, D).transpose(1, 2)
     grad_key, grad_value = (tensor.reshape(B, num_key_heads, H // num_key_heads, N, D).sum(dim=2).to(torch.bfloat16).transpose(1, 2) for tensor in (grad_key, grad_value))
     return grad_query, grad_key, grad_value
