@@ -25,7 +25,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import asm, ld_b32, ld_u16, ld_v4, lds_b32, lds_b32_pred, lds_v4, max_u16x2, prmt, selp, st_b32, st_u8, st_v2, sts_b32, sts_b32_nopred, f32_hex, u32_as_f32
+from pithtrain.kernels.cute_ptx_sm90 import asm, ld_b32, ld_u16, ld_v4, lds_b32, lds_b32_pred, lds_v4, max_u16x2, max_u32, prmt, selp, st_b32, st_u8, st_v2, sts_b32, sts_b32_nopred, f32_hex, u32_as_f32
 from pithtrain.kernels.fp8_e8m0_scale_sm90 import FP8_MAX_RCP, e8m0_scale_bf16x2, quant4_e4m3
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale, mn_pad
 
@@ -251,14 +251,6 @@ class RowwiseKmajor:
                 st_v2(tok_base + (sub_block.row0 + i) * N + sub_block.col0, tok_words[i][0], tok_words[i][1], sub_block.col_ok)
         for j in range(8):
             st_v2(kmajor_block_base + Int64(sub_block.col0 + j) * num_group_rows, kmajor_words[j][0], kmajor_words[j][1], sub_block.col_ok)
-
-
-@dsl_user_op
-def max_u32(first: Uint32, second: Uint32, *, loc=None, ip=None) -> Uint32:
-    """
-    Unsigned max: the float max of non-negative fp32 bit patterns, a NaN above every number.
-    """
-    return Uint32(asm(T.i32(), [Uint32(first).ir_value(loc=loc, ip=ip), Uint32(second).ir_value(loc=loc, ip=ip)], "max.u32 $0, $1, $2;", "=r,r,r"))
 
 
 @dsl_user_op

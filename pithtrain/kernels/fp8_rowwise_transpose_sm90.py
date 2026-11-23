@@ -12,8 +12,8 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import asm_args_last, cp_async16, lds_b32, lds_v4, max2, prmt, st_b32, st_v2, st_v4, sts_v2, unpack
-from pithtrain.kernels.fp8_e8m0_scale_sm90 import reduce_bf16x2_amax4
+from pithtrain.kernels.cute_ptx_sm90 import asm_args_last, cp_async16, lds_b32, lds_v4, max2, prmt, st_b32, st_b8, st_v2, st_v4, sts_b32_raw, sts_v2, unpack
+from pithtrain.kernels.fp8_e8m0_scale_sm90 import compute_scale_rcp_bits, quantize_four_from_bits, reduce_bf16x2_amax4
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale
 
 __all__ = ["fp8_quant_grad_sm90"]
@@ -119,17 +119,6 @@ cvt.rn.satfinite.e4m3x2.f32 l1, a3, a2;
 mov.b32 $0, {l0, l1};
 }"""
 
-QUANT_COL_F32_PTX = """{
-.reg .f32 a0, a1, a2, a3, r;
-.reg .b16 q0, q1;
-mov.b32 r, $5;
-mov.b32 a0, $1; mov.b32 a1, $2; mov.b32 a2, $3; mov.b32 a3, $4;
-mul.rn.f32 a0, a0, r; mul.rn.f32 a1, a1, r; mul.rn.f32 a2, a2, r; mul.rn.f32 a3, a3, r;
-cvt.rn.satfinite.e4m3x2.f32 q0, a1, a0;
-cvt.rn.satfinite.e4m3x2.f32 q1, a3, a2;
-mov.b32 $0, {q0, q1};
-}"""
-
 F16_TO_F32_PTX = """{
 .reg .b16 l, h;
 .reg .f32 f;
@@ -161,12 +150,6 @@ setp.ne.b32 p, $2, 0;
 mov.b16 h, 0;
 @p ld.global.nc.b16 h, [$1];
 cvt.u32.u16 $0, h;
-}"""
-
-ST_B8_PTX = """{
-.reg .pred p;
-setp.ne.b32 p, $2, 0;
-@p st.global.b8 [$0], $1;
 }"""
 
 # Select the widest legal store at runtime so unaligned rows can avoid byte stores when possible.
@@ -230,7 +213,7 @@ def quantize_column(words: list, rcp_bits: Uint32, half_idx: int, input_format: 
     Pack four FP8 bytes from one column, selecting a half of each packed 16-bit input.
     """
     if input_format == "f32":
-        return emit_u32(QUANT_COL_F32_PTX, "=r,r,r,r,r,r", [word.ir_value() for word in words] + [rcp_bits.ir_value()])
+        return quantize_four_from_bits(words[0], words[1], words[2], words[3], rcp_bits)
     if input_format == "f16":
         ptx = QUANT_COL_F16_PTX
         for j in range(4):
@@ -272,11 +255,6 @@ def widen_word_bits(word: Uint32, half_idx: int, input_format: str) -> Uint32:
     if input_format == "f16":
         return emit_u32(F16_TO_F32_PTX.replace("HALF", "lh"[half_idx]), "=r,r", [word.ir_value()])
     return word << 16 if half_idx == 0 else word & Uint32(0xFFFF0000)
-
-
-@dsl_user_op
-def store_byte(out_addr: Int64, word: Uint32, store_ok: Int32, *, loc=None, ip=None) -> None:
-    asm_args_last(None, ST_B8_PTX, "l,r,r", [out_addr.ir_value(loc=loc, ip=ip), word.ir_value(loc=loc, ip=ip), store_ok.ir_value(loc=loc, ip=ip)], side_effects=True)
 
 
 @dsl_user_op
@@ -359,7 +337,7 @@ def stage_input_tile(x_base: Int64, row_stride: Int64, col_stride: Int64, sub_bl
             if input_format == "f32":
                 sts_v2(s_addr, words[0], words[1])
             else:
-                asm_args_last(None, "st.shared.b32 [$0], $1;", "r,r", [s_addr.ir_value(), (words[0] | (words[1] << 16)).ir_value()], side_effects=True)
+                sts_b32_raw(s_addr, words[0] | (words[1] << 16))
     cute.arch.barrier()
 
 
@@ -442,7 +420,7 @@ def quantize_store_rows(rows: list, row_scale_bits: list, sub_block: SubBlock, o
     rows_ok, cols_ok, full_cols_ok = sub_block.rows_ok, sub_block.cols_ok, sub_block.full_cols_ok
     # Subtract the scale bits from 0x7F000000 for an exact power-of-two reciprocal.
     for i in range(8):
-        quant_lo, quant_hi = quantize_row(rows[i], Uint32(0x7F000000) - row_scale_bits[i], input_format)
+        quant_lo, quant_hi = quantize_row(rows[i], compute_scale_rcp_bits(row_scale_bits[i]), input_format)
         elem_idx = Int64(row_start + i) * num_cols + Int64(col_start)
         if const_expr(is_out_aligned):
             st_v2(out_base + elem_idx, quant_lo, quant_hi, rows_ok[i] & cols_ok[0])
@@ -451,7 +429,7 @@ def quantize_store_rows(rows: list, row_scale_bits: list, sub_block: SubBlock, o
             partial_ok = rows_ok[i] & (full_cols_ok ^ 1)
             for byte_idx in range(7):
                 word = quant_lo if byte_idx < 4 else quant_hi
-                store_byte(out_base + elem_idx + byte_idx, word >> (8 * (byte_idx % 4)), partial_ok & cols_ok[byte_idx])
+                st_b8(out_base + elem_idx + byte_idx, word >> (8 * (byte_idx % 4)), partial_ok & cols_ok[byte_idx])
 
 
 def reduce_col_amax(sub_block: SubBlock, s_col_amax: Int32, input_format: str) -> list:
@@ -488,7 +466,7 @@ def quantize_stage_transpose(rows: list, col_scale_bits: list, sub_block: SubBlo
     # XOR the chunk index with the column group so the warp's lanes hit distinct banks.
     for col_idx in range(8):
         word_idx, half_idx = (col_idx, 0) if input_format == "f32" else (col_idx // 2, col_idx % 2)
-        rcp_bits = Uint32(0x7F000000) - col_scale_bits[col_idx]
+        rcp_bits = compute_scale_rcp_bits(col_scale_bits[col_idx])
         quant_lo = quantize_column([rows[i][word_idx] for i in range(4)], rcp_bits, half_idx, input_format)
         quant_hi = quantize_column([rows[i][word_idx] for i in range(4, 8)], rcp_bits, half_idx, input_format)
         sts_v2(s_tile + (col_group_idx * 8 + col_idx) * TILE + (row_group_idx ^ col_group_idx) * 8, quant_lo, quant_hi)
@@ -527,7 +505,7 @@ def store_transpose(sub_block: SubBlock, s_tile: Int32, out_t_base: Int64, num_r
                     partial_ok = col_ok & make_predicate(half_row_start < num_rows) & (full_store_ok ^ 1)
                     for byte_idx in range(7):
                         word = word_lo if byte_idx < 4 else word_hi
-                        store_byte(out_addr + 8 * half_idx + byte_idx, word >> (8 * (byte_idx % 4)), partial_ok & make_predicate(half_row_start + byte_idx < num_rows))
+                        st_b8(out_addr + 8 * half_idx + byte_idx, word >> (8 * (byte_idx % 4)), partial_ok & make_predicate(half_row_start + byte_idx < num_rows))
 
 
 @cute.kernel
@@ -612,7 +590,7 @@ class StagedBf16Transpose:
         row_idx = Int64(row_start + tile_row_idx)
         scale_idx = Int64(col_start // TILE) * M + row_idx
         st_b32(scale_base + scale_idx * 4, scale_bits, make_predicate(lane_in_row == 0))
-        rcp_bits = Uint32(0x7F000000) - scale_bits
+        rcp_bits = compute_scale_rcp_bits(scale_bits)
         quant_lo, quant_hi = quantize_row(words, rcp_bits, "bf16")
         st_v2(out_base + row_idx * N + Int64(col_start + lane_in_row * 8), quant_lo, quant_hi, Int32(1))
 
@@ -643,7 +621,7 @@ class StagedBf16Transpose:
             scale_bits = e8m0_scale_bits(widen_word_bits(amax, half_idx, "bf16"))
             scale_idx = Int64(row_start // TILE) * N + col_idx
             st_b32(scale_t_base + scale_idx * 4, scale_bits, make_predicate(lane % 8 == 0))
-            rcp_bits = Uint32(0x7F000000) - scale_bits
+            rcp_bits = compute_scale_rcp_bits(scale_bits)
             out_addr = out_t_base + col_idx * M + Int64(row_start + tile_row_start)
             for slab_idx in cutlass.range_constexpr(4):
                 quant = quantize_column(words[4 * slab_idx : 4 * slab_idx + 4], rcp_bits, half_idx, "bf16")

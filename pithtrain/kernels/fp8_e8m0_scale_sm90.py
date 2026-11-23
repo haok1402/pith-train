@@ -13,7 +13,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from pithtrain.kernels.cute_ptx_sm90 import asm, asm_args_last, f32_hex, max2, to_ir, unpack
 
-__all__ = ["AMAX_MIN", "FP8_MAX_RCP", "e8m0_scale", "e8m0_scale_bf16x2", "e8m0_scale_f32", "exact_rcp", "ptx_f32", "quant4_e4m3", "reduce_bf16x2_amax4"]
+__all__ = ["AMAX_MIN", "FP8_MAX_RCP", "e8m0_scale", "e8m0_scale_bf16x2", "e8m0_scale_f32", "compute_scale_rcp_bits", "exact_rcp", "ptx_f32", "quant4_e4m3", "quantize_four_from_bits", "reduce_bf16x2_amax4"]
 
 
 def ptx_f32(x: float) -> str:
@@ -155,6 +155,30 @@ def exact_rcp(scale: Float32, *, loc=None, ip=None) -> Float32:
         "=f,f", has_side_effects=False, is_align_stack=False, loc=loc, ip=ip,
     )
     return Float32(rcp)
+
+
+@dsl_user_op
+def quantize_four_from_bits(x0_bits: Uint32, x1_bits: Uint32, x2_bits: Uint32, x3_bits: Uint32, rcp_bits: Uint32, *, loc=None, ip=None) -> Uint32:
+    """
+    Scale four fp32 values by one reciprocal and pack the E4M3 bytes in input order.
+    """
+    return Uint32(asm_args_last(T.i32(),
+        "{\n.reg .f32 a, b, c, d, r;\n.reg .b16 lo, hi;\n"
+        "mov.b32 r, $5;\n"
+        "mov.b32 a, $1;\nmov.b32 b, $2;\nmov.b32 c, $3;\nmov.b32 d, $4;\n"
+        "mul.rn.f32 a, a, r;\nmul.rn.f32 b, b, r;\nmul.rn.f32 c, c, r;\nmul.rn.f32 d, d, r;\n"
+        "cvt.rn.satfinite.e4m3x2.f32 lo, b, a;\n"
+        "cvt.rn.satfinite.e4m3x2.f32 hi, d, c;\n"
+        "mov.b32 $0, {lo, hi};\n}",
+        "=r,r,r,r,r,r", [to_ir(x0_bits, Uint32, loc, ip), to_ir(x1_bits, Uint32, loc, ip), to_ir(x2_bits, Uint32, loc, ip), to_ir(x3_bits, Uint32, loc, ip), to_ir(rcp_bits, Uint32, loc, ip)],
+    ))
+
+
+def compute_scale_rcp_bits(scale_bits: Uint32) -> Uint32:
+    """
+    Flip the exponent of a power-of-two scale to get its exact reciprocal.
+    """
+    return Uint32(0x7F000000) - scale_bits
 
 
 def reduce_bf16x2_amax4(first: Uint32, second: Uint32, third: Uint32, fourth: Uint32) -> Uint32:
