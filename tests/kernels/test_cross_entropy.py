@@ -504,3 +504,16 @@ def test_correctly_rounded_scale(vocab):
         assert ulps <= 4, (
             f"vocab {vocab}, n {num_counted}: gradient {ulps} ulps from correctly rounded"
         )
+
+
+@pytest.mark.parametrize("rows,cols", [(21, 1027), (256, 248320), (0, 128)])
+def test_sum_grad_preserves_rounding(rows, cols):
+    torch.manual_seed(4)
+    logits = torch.randn((rows, cols), device="cuda", dtype=torch.bfloat16)
+    target = torch.randint(cols, (rows,), device="cuda", dtype=torch.long)
+    target[::9] = -100
+    loss, grad = cross_entropy_fwd_bwd(logits.clone(), target, -100)
+    grad.mul_((target != -100).sum().clamp_min(1).to(grad.dtype))
+    fused_loss, fused_grad = cross_entropy_fwd_bwd(logits, target, -100, sum_grad=True)
+    assert torch.equal(fused_loss.view(torch.int32), loss.view(torch.int32))
+    assert torch.equal(fused_grad.view(torch.int16), grad.view(torch.int16))

@@ -29,7 +29,7 @@ from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
 from pithtrain.modules.optimizer import clip_grad_norm, local_grads, scale_grads_
 from pithtrain.modules.training import TrainingCfg, setup_training
 from pithtrain.operators.cp_sequence import zigzag_spans
-from pithtrain.operators.cross_entropy import cross_entropy
+from pithtrain.operators.cross_entropy import cross_entropy, prepare_cross_entropy_sum
 from pithtrain.pipeline import Microbatch
 
 __all__ = [
@@ -174,10 +174,16 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     if isinstance(model, Qwen35TextModel):
         losses, counts = [], []
         for tokens, labels in get_batch_tensors(cfg, dataset, step, device):
-            loss, detached = objective((model(tokens),), (labels,))
-            loss.backward()
-            losses.append(detached)
-            counts.append((labels != -100).sum())
+            if training.fp8:
+                backward, loss, count = prepare_cross_entropy_sum(model(tokens), labels)
+                backward()
+                losses.append(loss)
+                counts.append(count)
+            else:
+                loss, detached = objective((model(tokens),), (labels,))
+                loss.backward()
+                losses.append(detached)
+                counts.append((labels != -100).sum())
 
         totals = torch.stack((torch.stack(losses).sum(), torch.stack(counts).sum()))
         torch.distributed.all_reduce(totals)

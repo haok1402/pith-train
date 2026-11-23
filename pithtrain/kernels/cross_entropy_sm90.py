@@ -84,9 +84,10 @@ class CrossEntropy:
     slice, so x[target] is always read before any store.
     """
 
-    def __init__(self, dtype, num_cols: int, cluster_size: int, chunks: int, is_resident: bool, threads: int) -> None:
+    def __init__(self, dtype, num_cols: int, cluster_size: int, chunks: int, is_resident: bool, threads: int, sum_grad: bool) -> None:
         self.dtype, self.num_cols, self.cluster_size = dtype, num_cols, cluster_size
         self.chunks, self.is_resident, self.threads = chunks, is_resident, threads
+        self.sum_grad = sum_grad
         self.warps = threads // 32
         self.element_bytes = dtype.width // 8
         self.unit_elements = 16 // self.element_bytes
@@ -240,6 +241,15 @@ class CrossEntropy:
         return Float32(asm(T.f32(), [to_ir(exp_shifted(value, row_max, use_ftz), Float32), to_ir(rcp_sum, Float32), to_ir(rcp_counted, Float32)], "{\n.reg .f32 t;\nmul.rn.f32 t, $1, $2;\nmul.rn.f32 $0, t, $3;\n}", "=f,f,f,f"))
 
     @cute.jit
+    def scale_grad(self, grad: Float32, num_counted: Float32) -> Float32:
+        """
+        Preserve the two rounding points of scaling the stored gradient by the token count.
+        """
+        if const_expr(self.sum_grad):
+            return Float32(self.dtype(grad)) * Float32(self.dtype(num_counted))
+        return grad
+
+    @cute.jit
     def store_grad(self, row: RowSlice, s_slice: Int32, s_target: Int32, edge_value: Float32, stats: RowStats, num_counted: Float32, tidx: Int32, cta_rank: Int32) -> None:
         """
         (softmax(x) - onehot) / n. The ftz ex2 is used only when no exponent of the slice is below
@@ -248,25 +258,28 @@ class CrossEntropy:
         rcp_sum, rcp_counted = (Float32(asm(T.f32(), [to_ir(divisor, Float32)], "rcp.rn.f32 $0, $1;", "=f,f")) for divisor in (stats.row_sum, num_counted))
         min_exponent = Float32(asm(T.f32(), [to_ir(stats.cta_min, Float32), to_ir(stats.row_max, Float32)], "{\n.reg .f32 t;\nsub.rn.f32 t, $1, $2;\nmul.rn.f32 $0, t, 0f3FB8AA3B;\n}", "=f,f,f"))
         if min_exponent >= Float32(-126.0):
-            self.store_slice_grad(row, s_slice, s_target, stats.row_max, rcp_sum, rcp_counted, tidx, True)
+            self.store_slice_grad(row, s_slice, s_target, stats.row_max, rcp_sum, rcp_counted, num_counted, tidx, True)
         else:
-            self.store_slice_grad(row, s_slice, s_target, stats.row_max, rcp_sum, rcp_counted, tidx, False)
+            self.store_slice_grad(row, s_slice, s_target, stats.row_max, rcp_sum, rcp_counted, num_counted, tidx, False)
         if cta_rank == 0:
             edge_addr, edge_ok = self.access.edge_element(row, tidx)
             edge_grad = self.grad_of(edge_value, stats.row_max, rcp_sum, rcp_counted, False)
-            self.access.store_element(edge_addr, cutlass.select_(edge_addr == row.target_addr, edge_grad - rcp_counted, edge_grad), edge_ok)
+            edge_grad = cutlass.select_(edge_addr == row.target_addr, edge_grad - rcp_counted, edge_grad)
+            self.access.store_element(edge_addr, self.scale_grad(edge_grad, num_counted), edge_ok)
 
     @cute.jit
-    def store_slice_grad(self, row: RowSlice, s_slice: Int32, s_target: Int32, row_max: Float32, rcp_sum: Float32, rcp_counted: Float32, tidx: Int32, use_ftz: cutlass.Constexpr[bool]) -> None:
+    def store_slice_grad(self, row: RowSlice, s_slice: Int32, s_target: Int32, row_max: Float32, rcp_sum: Float32, rcp_counted: Float32, num_counted: Float32, tidx: Int32, use_ftz: cutlass.Constexpr[bool]) -> None:
         """
         The thread that stores the target's unit then rewrites the target element with the -1 / n
         term, from the copy of x[target] taken before any store.
         """
         for unit_idx in cutlass.range(tidx, row.cta_units, self.threads, unroll=1):
             grads = [self.grad_of(value, row_max, rcp_sum, rcp_counted, use_ftz) for value in unpack_unit(self.load_unit(row, s_slice, unit_idx), self.dtype)]
-            st_v4(row.slice_start + Int64(unit_idx) * Int64(16), pack_unit(grads, self.dtype), Int32(1))
+            packed_grad = pack_unit([self.scale_grad(grad, num_counted) for grad in grads], self.dtype)
+            st_v4(row.slice_start + Int64(unit_idx) * Int64(16), packed_grad, Int32(1))
             if unit_idx == row.target_unit:
-                self.access.store_element(row.target_addr, self.grad_of(lds_f32(s_target), row_max, rcp_sum, rcp_counted, False) - rcp_counted, True)
+                target_grad = self.grad_of(lds_f32(s_target), row_max, rcp_sum, rcp_counted, False) - rcp_counted
+                self.access.store_element(row.target_addr, self.scale_grad(target_grad, num_counted), True)
 
     @cute.jit
     def store_row_loss(self, row: RowSlice, s_target: Int32, stats: RowStats, mLoss: cute.Tensor, row_idx: Int32, tidx: Int32) -> None:
@@ -363,15 +376,15 @@ def pick_layout(num_cols: int, element_bytes: int) -> tuple:
     return 8, 2, row_bytes <= 8 * MAX_SLICE_BYTES, 256
 
 
-def compile_kernel(dtype: torch.dtype, target_dtype: torch.dtype, num_cols: int, cluster_size: int, chunks: int, is_resident: bool, threads: int) -> Callable:
+def compile_kernel(dtype: torch.dtype, target_dtype: torch.dtype, num_cols: int, cluster_size: int, chunks: int, is_resident: bool, threads: int, sum_grad: bool) -> Callable:
     # The flat logits hold N * V elements, past 2^31 at long packs (N > 10.6k at V = 201088): a 64-bit length. The kernel reads only their base address and offsets rows in Int64 bytes (RowSlice).
     x = fake(TORCH2CUTE[dtype], (cute.sym_int64(),), (1,), dtype.itemsize)
     target = fake(TARGET_TYPES[target_dtype], (cute.sym_int(),), (1,), target_dtype.itemsize)
     row_loss, count, mean_loss = fake(Float32, (cute.sym_int(),), (1,), 4), fake(Int64, (1,), (1,), 8), fake(Float32, (1,), (1,), 4)
-    return cute.compile(CrossEntropy(TORCH2CUTE[dtype], num_cols, cluster_size, chunks, is_resident, threads), x, target, row_loss, count, mean_loss, Int64(0), fake_stream(), options="--enable-tvm-ffi")
+    return cute.compile(CrossEntropy(TORCH2CUTE[dtype], num_cols, cluster_size, chunks, is_resident, threads, sum_grad), x, target, row_loss, count, mean_loss, Int64(0), fake_stream(), options="--enable-tvm-ffi")
 
 
-def cross_entropy_fwd_bwd_sm90(inp: torch.Tensor, target: torch.Tensor, ignore_index: int) -> tuple[torch.Tensor, torch.Tensor]:
+def cross_entropy_fwd_bwd_sm90(inp: torch.Tensor, target: torch.Tensor, ignore_index: int, sum_grad: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     """
     The picker's contract on SM90, every dtype, shape and stride through the CuTe kernels.
     """
@@ -390,9 +403,9 @@ def cross_entropy_fwd_bwd_sm90(inp: torch.Tensor, target: torch.Tensor, ignore_i
     row_loss = torch.empty(num_rows, dtype=torch.float32, device=inp.device)
     count = torch.empty(1, dtype=torch.int64, device=inp.device)
     layout = pick_layout(num_cols, inp.element_size())
-    key = ("cross_entropy", inp.dtype, target.dtype, num_cols, *layout)
+    key = ("cross_entropy", inp.dtype, target.dtype, num_cols, *layout, sum_grad)
     fn = COMPILED.get(key)
     if fn is None:
-        fn = COMPILED[key] = compile_kernel(inp.dtype, target.dtype, num_cols, *layout)
+        fn = COMPILED[key] = compile_kernel(inp.dtype, target.dtype, num_cols, *layout, sum_grad)
     fn(inp.view(-1), target, row_loss, count, loss.view(1), ignore_index)
     return loss, inp
