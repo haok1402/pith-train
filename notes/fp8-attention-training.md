@@ -54,6 +54,27 @@ Mean Delta-Matching minus FA4 loss was **+0.000142 nats**, with a mean absolute 
 
 The first-step norm ratio was 1.182×. The persistent gap faded, with isolated higher norms later. Steps 119 and 293 were 3.2209 versus 0.5191 and 3.4872 versus 0.5768, respectively. Delta-Matching exceeded 2× the FA4 norm at five later steps and fell below 0.5× at two. Gradient clipping applied at 10 steps with Delta-Matching and 6 with FA4.
 
+### Replay of updates 119 and 293
+
+The original job saved scalar logs and FP32 microbatch loss bits. Its configuration had `save_interval=None` and `save_location=None`, so the original weights, optimizer state and per-parameter gradients at those updates are unavailable. Jobs `1294648` and `1294608` reconstructed the Delta-Matching and FA4 trajectories from the released checkpoint at `121c6cb`. Both matched the original sample permutation byte for byte. The first microbatch loss-bit differences appeared at step 1 for Delta-Matching and step 2 for FA4. Neither of the archived spikes recurred.
+
+| Update | Archived Delta-Matching | Archived FA4 | Replayed Delta-Matching | Replayed FA4 | FA4 on replayed Delta-Matching weights |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 119 | 3.2209 | 0.5191 | 0.5170 | 0.7962 | 0.5162 |
+| 293 | 3.4872 | 0.5768 | 0.5477 | 0.5424 | 0.5988 |
+
+All 851 parameter norms were collected from normalized FP32 shards before clipping and reduced over eight ranks. At replayed step 119, the same-weight squared-norm excess was only +0.000802. Its largest contributors were `lm_head.weight` (+0.000231), `layers.62.linear_attn.conv1d.weight` (+0.000113) and `layers.18.linear_attn.conv1d.weight` (+0.000109). At replayed step 293, Delta-Matching had a lower norm on the same weights. Relative to the separately trained FA4 replay, its small squared-norm excess of +0.005764 was led by `layers.0.linear_attn.out_proj.weight` (+0.001515), `layers.17.linear_attn.conv1d.weight` (+0.000777) and `layers.17.linear_attn.in_proj_qkv.weight` (+0.000673). These parameter measurements describe the replayed gradients.
+
+| Same-weight probe on the Delta-Matching replay | Step 119 pre-clip norm | Step 293 pre-clip norm |
+| --- | ---: | ---: |
+| Native forward and backward | 0.5170 | 0.5477 |
+| Delta-Matching forward, FA4 backward | 0.5176 | 0.5413 |
+| FA4 forward, Delta-Matching backward | 0.5191 | 0.5025 |
+| Rounded-reciprocal encoding with IEEE decode scales | 0.5171 | 0.5062 |
+| Rounded-reciprocal encoding and decode scales | 0.5117 | 0.5061 |
+
+Each probe held the replayed weights, batch, gate and optimizer state fixed. Changing the encoding rule alone flipped 408,613 Q, 78 K and 78,912 V bytes at step 119 and 343,415 Q, 54 K and 85,584 V bytes at step 293 across the eight ranks' first full-attention calls. The decode scales matched bit for bit in that probe. These perturbations and both forward/backward substitutions produced norms between 0.5025 and 0.5988. The native input producers use IEEE division for `amax / 448`, so they lack the published reciprocal-multiplication discrepancy identified by dm-diff. Whether ordinary FP8 midpoint sensitivity or another effect produced the original spikes remains unresolved. The original parameter attribution also remains unresolved. The norm vectors, code counters and logs are under `.cache/fp8-attention-training/spike-audit/`.
+
 ## BF16 compute control
 
 The third arm in job `1290664` completed all 300 steps on the same node and verified the same batch-order hash. It used microbatch 2 and MLP-only tail 12 with FP32 gradients, reduction, master weights and optimizer moments. It had three allocator retries per GPU in warmup and zero afterward. The job released all eight GPUs after 2 h 39 min.
