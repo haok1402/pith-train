@@ -15,13 +15,14 @@ from cutlass.utils import SmemAllocator
 from quack.layout_utils import reshape_acc_to_mn
 from quack.reduce import warp_reduce
 
-from pithtrain.kernels.delta_matching_sm90 import BLOCK_QUERY, LOG2_E, THREADS, allocate_operand, allocate_staged_operand, copy_tma_operand, initialize_attention_barriers, issue_multiply_tile, launch_delta_matching_kernel, load_quant_block, make_mma, make_operand_layout, make_operand_tma, multiply_tile, quantize_delta_matching, reduce_quant_block
+from pithtrain.kernels.delta_matching_sm90 import BLOCK_QUERY, LOG2_E, allocate_operand, allocate_staged_operand, copy_tma_operand, initialize_attention_barriers, issue_multiply_tile, launch_delta_matching_kernel, make_mma, make_operand_layout, make_operand_tma, multiply_tile, quantize_delta_matching
 
 __all__ = ["delta_matching_bwd_prepare_sm90", "delta_matching_bwd_sm90"]
 
 # Pi is scaled by 2**8 until a gradient or correction is promoted.
 PROBABILITY_SCALE = 1.0 / 256.0
 PROMOTION_ROWS = 512
+GRAD_QUANT_THREADS = 256
 
 
 @cute.jit
@@ -1139,13 +1140,37 @@ def launch_query_gradients(mKeyT, mScoreGrad, mScoreScale, mGradQuery, softmax_s
 
 
 @cute.jit
+def load_grad_block(mGradOut, block_idx, head_idx, tidx, s_amax):
+    _, _, H, D = mGradOut.shape
+    VECTOR = 8
+    REPEATS = BLOCK_QUERY * D // (GRAD_QUANT_THREADS * VECTOR)
+    values = cute.make_rmem_tensor((VECTOR, REPEATS), Float32)
+    col, first_row = tidx % (D // VECTOR), tidx // (D // VECTOR)
+    amax = Float32(0.0)
+    for repeat_idx in cutlass.range_constexpr(REPEATS):
+        row = block_idx * BLOCK_QUERY + first_row + repeat_idx * (GRAD_QUANT_THREADS * VECTOR // D)
+        source = cute.local_tile(mGradOut[head_idx // H, row, head_idx % H, None], (VECTOR,), (col,))
+        raw = source.load().to(Float32)
+        values[None, repeat_idx].store(raw)
+        for elem_idx in cutlass.range_constexpr(VECTOR):
+            amax = cute.arch.fmax(amax, abs(values[elem_idx, repeat_idx]))
+    amax = warp_reduce(amax, cute.arch.fmax)
+    if tidx % 32 == 0:
+        s_amax[tidx // 32] = amax
+    cute.arch.barrier()
+    for warp_idx in cutlass.range_constexpr(GRAD_QUANT_THREADS // 32):
+        amax = cute.arch.fmax(amax, s_amax[warp_idx])
+    return values, cute.arch.fmax(amax, 1e-30) * (1.0 / 448.0)
+
+
+@cute.jit
 def store_grad_codes(mCodes, values, s_codes, block_idx, head_idx, tidx, scale):
     D = cute.size(mCodes, mode=[2])
     VECTOR = 8
     channel_idx = tidx % (D // VECTOR) * VECTOR
     first_row = tidx // (D // VECTOR)
     for repeat_idx in cutlass.range_constexpr(cute.size(values, mode=[1])):
-        row_idx = first_row + repeat_idx * (THREADS * VECTOR // D)
+        row_idx = first_row + repeat_idx * (GRAD_QUANT_THREADS * VECTOR // D)
         scaled = cute.make_rmem_tensor(VECTOR, Float32)
         for elem_idx in cutlass.range_constexpr(VECTOR):
             scaled[elem_idx] = values[elem_idx, repeat_idx] / scale
@@ -1162,8 +1187,8 @@ def store_grad_codes(mCodes, values, s_codes, block_idx, head_idx, tidx, scale):
 def store_grad_twin(mTwin, s_codes, block_idx, head_idx, tidx):
     D = cute.size(mTwin, mode=[1])
     VECTOR = 8
-    for repeat_idx in cutlass.range_constexpr(BLOCK_QUERY * D // (THREADS * VECTOR)):
-        vector_idx = tidx + repeat_idx * THREADS
+    for repeat_idx in cutlass.range_constexpr(BLOCK_QUERY * D // (GRAD_QUANT_THREADS * VECTOR)):
+        vector_idx = tidx + repeat_idx * GRAD_QUANT_THREADS
         channel_idx = vector_idx // (BLOCK_QUERY // VECTOR)
         row_group = vector_idx % (BLOCK_QUERY // VECTOR)
         row_idx = row_group * VECTOR
@@ -1180,11 +1205,10 @@ def quantize_grad_block(mGradOut, mCodes, mScale, mTwin):
     tidx, _, _ = cute.arch.thread_idx()
     block_idx, head_idx, _ = cute.arch.block_idx()
     allocator = SmemAllocator()
-    s_amax = allocator.allocate_tensor(Float32, cute.make_layout(THREADS // 32), 16)
+    s_amax = allocator.allocate_tensor(Float32, cute.make_layout(GRAD_QUANT_THREADS // 32), 16)
     D = cute.size(mGradOut, mode=[3])
     s_codes = allocator.allocate_tensor(Float8E4M3FN, cute.make_ordered_layout((BLOCK_QUERY, D), order=(1, 0)), 128)
-    values = load_quant_block(mGradOut, mScale, block_idx, head_idx, tidx, BLOCK_QUERY, False, 1.0)
-    scale = reduce_quant_block(values, s_amax, tidx, True)
+    values, scale = load_grad_block(mGradOut, block_idx, head_idx, tidx, s_amax)
     if tidx == 0:
         mScale[head_idx, block_idx] = scale
     store_grad_codes(mCodes, values, s_codes, block_idx, head_idx, tidx, scale)
@@ -1196,7 +1220,7 @@ def quantize_grad_block(mGradOut, mCodes, mScale, mTwin):
 def launch_grad_quantization(mGradOut, mCodes, mScale, mTwin, stream):
     B, N, H, _ = mGradOut.shape
     quantize_grad_block(mGradOut, mCodes, mScale, mTwin).launch(
-        grid=(N // BLOCK_QUERY, B * H, 1), block=(THREADS, 1, 1), stream=stream,
+        grid=(N // BLOCK_QUERY, B * H, 1), block=(GRAD_QUANT_THREADS, 1, 1), stream=stream,
     )
 
 
