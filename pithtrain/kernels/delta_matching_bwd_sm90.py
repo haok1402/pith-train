@@ -8,7 +8,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import BFloat16, Float8E4M3FN, Float32, Float64, Int32, Int64, Uint8, Uint16, Uint32
-from cutlass._mlir.dialects import llvm
+from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.utils import SmemAllocator
@@ -574,6 +574,17 @@ def store_pipelined_score_tile(score_store, s_score_output, score_tile_idx):
     cute.arch.cp_async_bulk_commit_group()
 
 
+@dsl_user_op
+def wait_score_tile(barrier_id, participants, *, loc=None, ip=None):
+    nvvm.barrier_cta_sync(
+        barrier_id=Int32(barrier_id).ir_value(loc=loc, ip=ip),
+        thread_count=Int32(participants).ir_value(loc=loc, ip=ip),
+        aligned=False,
+        loc=loc,
+        ip=ip,
+    )
+
+
 class PipelinedKeyValueGradients:
     """
     Overlap score reconstruction with dK/dV using independent TMA stream producers.
@@ -591,6 +602,7 @@ class PipelinedKeyValueGradients:
         self.head_section = 4
         self.load_group, self.score_group, self.gradient_group = 0, 1, 2
         self.num_threads, self.score_stages = 512, 3
+        self.score_participants = self.num_threads - 128
         self.store_stages = 2
         self.load_registers, self.score_registers, self.gradient_registers = 24, 104, 192
         self.value_register_values = 16
@@ -658,7 +670,6 @@ class PipelinedKeyValueGradients:
         resident_ready = allocator.allocate_array(Int64, 1)
         ready = allocator.allocate_array(Int64, self.num_stages)
         released = allocator.allocate_array(Int64, self.num_stages)
-        score_ready = allocator.allocate_array(Int64, self.score_stages)
         score_released = allocator.allocate_array(Int64, self.score_stages)
         if tidx == 0:
             cute.arch.mbarrier_init(resident_ready, 1)
@@ -667,7 +678,6 @@ class PipelinedKeyValueGradients:
                 consumers = 4 if stage_idx < self.query_t_slot else 8
                 cute.arch.mbarrier_init(released + stage_idx, consumers)
             for stage_idx in cutlass.range_constexpr(self.score_stages):
-                cute.arch.mbarrier_init(score_ready + stage_idx, 1)
                 cute.arch.mbarrier_init(score_released + stage_idx, 8)
             cute.arch.mbarrier_init_fence()
         cute.arch.barrier()
@@ -680,11 +690,11 @@ class PipelinedKeyValueGradients:
         elif warp_group == self.score_group:
             cute.arch.setmaxregister_decrease(self.score_registers)
             self.score_loop(tensors, resident, query_buffers, grad_buffers, score_buffers,
-                            copies[3], barriers, (score_ready, score_released), coords, NUM_QUERIES, tidx % 128)
+                            copies[3], barriers, score_released, coords, NUM_QUERIES, tidx % 128)
         else:
             cute.arch.setmaxregister_increase(self.gradient_registers)
             self.gradient_loop(tensors, query_buffers, grad_buffers, score_buffers, s_grad_value,
-                               barriers, (score_ready, score_released), coords, NUM_QUERIES,
+                               barriers, score_released, coords, NUM_QUERIES,
                                tidx - 128 * self.gradient_group, warp_group - self.gradient_group)
 
     @cute.jit
@@ -751,7 +761,7 @@ class PipelinedKeyValueGradients:
         return amax
 
     @cute.jit
-    def score_loop(self, tensors, resident, query_buffers, grad_buffers, score_buffers, score_store, barriers, score_barriers, coords, NUM_QUERIES: cutlass.Constexpr, tidx):
+    def score_loop(self, tensors, resident, query_buffers, grad_buffers, score_buffers, score_store, barriers, score_released, coords, NUM_QUERIES: cutlass.Constexpr, tidx):
         mQueryScale, mKeyScale, mValueScale, mGradScale, mScoreScale, _, _ = tensors
         key_block_idx, query_head_idx, key_head_idx = coords
         s_keys, s_values = resident
@@ -759,7 +769,6 @@ class PipelinedKeyValueGradients:
         s_grads, _, s_delta = grad_buffers
         s_prob, s_score_grad, s_score_output, s_amax, s_key_weights = score_buffers
         resident_ready, ready, released = barriers
-        score_ready, score_released = score_barriers
         score_coords = cute.make_identity_tensor((BLOCK_QUERY, self.tile_keys))
         mma = make_mma(self.tile_keys)
         mma_thread = mma.get_slice(tidx)
@@ -823,8 +832,12 @@ class PipelinedKeyValueGradients:
                 probabilities, probability_grad, positions,
                 (s_prob[None, None, score_stage], s_score_grad[None, None, score_stage], s_output), scale,
             )
+            # The two gradient warpgroups join the score warpgroup at one
+            # named barrier per slot. Only the gradient participants wait.
+            cute.arch.barrier_arrive(
+                barrier_id=2 + score_stage, number_of_threads=self.score_participants, aligned=False,
+            )
             if tidx == 0:
-                cute.arch.mbarrier_arrive(score_ready + score_stage)
                 score_tile_idx = score_head_idx * NUM_QUERIES + key_block_idx
                 store_pipelined_score_tile(score_store, s_output, score_tile_idx)
             max_weight = cute.arch.fmax(max_weight, key_weight)
@@ -832,14 +845,13 @@ class PipelinedKeyValueGradients:
             cute.arch.cp_async_bulk_wait_group(0)
 
     @cute.jit
-    def gradient_loop(self, tensors, query_buffers, grad_buffers, score_buffers, s_grad_value, barriers, score_barriers, coords, NUM_QUERIES: cutlass.Constexpr, tidx, consumer_idx):
+    def gradient_loop(self, tensors, query_buffers, grad_buffers, score_buffers, s_grad_value, barriers, score_released, coords, NUM_QUERIES: cutlass.Constexpr, tidx, consumer_idx):
         _, mKeyScale, _, mGradScale, _, mGradKey, mGradValue = tensors
         key_block_idx, query_head_idx, key_head_idx = coords
         _, s_queries_t, _ = query_buffers
         _, s_grads_t, _ = grad_buffers
         s_prob, s_score_grad, _, _, s_key_weights = score_buffers
         _, ready, released = barriers
-        score_ready, score_released = score_barriers
         mma = make_mma(self.tile_keys)
         mma_thread = mma.get_slice(tidx % 128)
         stripe_shape = mma_thread.partition_shape_C((64, self.tile_keys))
@@ -859,7 +871,6 @@ class PipelinedKeyValueGradients:
         next_value_weight = mGradScale[query_head_idx, key_block_idx] * PROBABILITY_SCALE
         num_query_tiles = NUM_QUERIES - key_block_idx
         for ring_idx in range(cute.ceil_div(num_query_tiles, self.score_stages)):
-            score_phase = ring_idx % 2
             # Fixed score slots fix the score operands' WGMMA descriptor offsets.
             for score_stage in cutlass.range_constexpr(self.score_stages):
                 offset = ring_idx * self.score_stages + score_stage
@@ -875,7 +886,7 @@ class PipelinedKeyValueGradients:
                     if not is_first:
                         ratio = cute.arch.fmin(cute.arch.fmax(previous_weight * cute.arch.rcp_approx(value_weight), 1e-8), 1e8)
                         acc_window.store(acc_window.load() * ratio)
-                    cute.arch.mbarrier_wait(score_ready + score_stage, score_phase)
+                    wait_score_tile(2 + score_stage, self.score_participants)
                     key_weight = s_key_weights[score_stage]
                     cute.arch.mbarrier_wait(ready + self.grad_t_slot + grad_stage, grad_phase)
                     issue_gradient_stripes(mma, mma_thread, acc_window, s_grads_t[None, None, grad_stage], s_prob[None, None, score_stage], consumer_idx, not is_first)
