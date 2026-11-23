@@ -5,7 +5,7 @@ E4M3 operands, FP32 block scales and tile primitives for SM90 Delta-Matching.
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float8E4M3FN, Float32, const_expr
+from cutlass import Float8E4M3FN, Float32, Int64, const_expr
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.utils import LayoutEnum, SmemAllocator
 from cutlass.utils.hopper_helpers import get_smem_layout_atom, make_trivial_tiled_mma
@@ -15,9 +15,9 @@ from quack.reduce import warp_reduce
 from pithtrain.kernels.cute_compile_sm90 import TORCH2CUTE, fake, fake_stream
 
 __all__ = [
-    "BLOCK_QUERY", "LOG2_E", "allocate_operand", "copy_operand", "finish_operand_copies",
-    "launch_delta_matching_kernel", "make_mma", "multiply_tile", "quantize_delta_matching",
-    "reduce_mma_row", "share_mma_operand",
+    "BLOCK_QUERY", "LOG2_E", "allocate_operand", "allocate_staged_operand", "copy_tma_operand",
+    "initialize_attention_barriers", "issue_multiply_tile", "launch_delta_matching_kernel", "make_mma",
+    "make_operand_tma", "multiply_tile", "quantize_delta_matching", "reduce_mma_row",
 ]
 
 BLOCK_QUERY = 64
@@ -38,39 +38,66 @@ def launch_delta_matching_kernel(name, launcher, tensors, constants=()):
 
 
 @cute.jit
-def allocate_operand(allocator, rows: cutlass.Constexpr, columns: cutlass.Constexpr):
+def make_operand_layout(rows: cutlass.Constexpr, columns: cutlass.Constexpr):
     kind = get_smem_layout_atom(LayoutEnum.ROW_MAJOR, Float8E4M3FN, columns)
     atom = warpgroup.make_smem_layout_atom(kind, Float8E4M3FN)
-    layout = cute.tile_to_shape(atom, (rows, columns), (0, 1))
+    return cute.tile_to_shape(atom, (rows, columns), (0, 1))
+
+
+@cute.jit
+def allocate_operand(allocator, rows: cutlass.Constexpr, columns: cutlass.Constexpr):
+    layout = make_operand_layout(rows, columns)
     return allocator.allocate_tensor(Float8E4M3FN, layout.outer, 128, swizzle=layout.inner)
 
 
 @cute.jit
-def copy_operand(mCodes, s_codes, head_idx, row_start, col_start, tidx):
-    columns = cute.size(s_codes, mode=[1])
-    vectors_per_row = columns // 16
-    atom = cute.make_copy_atom(cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL), Float8E4M3FN, num_bits_per_copy=128)
-    threads = cute.make_ordered_layout((THREADS // vectors_per_row, vectors_per_row), order=(1, 0))
-    copy = cute.make_tiled_copy_tv(atom, threads, cute.make_layout((1, 16))).get_slice(tidx)
-    tile = cute.local_tile(mCodes[head_idx, None, None], (cute.size(s_codes, mode=[0]), columns), (row_start, col_start))  # (tile row, tile column)
-    cute.copy(copy, copy.partition_S(tile), copy.partition_D(s_codes))
+def allocate_staged_operand(allocator, rows: cutlass.Constexpr, columns: cutlass.Constexpr, stages: cutlass.Constexpr):
+    kind = get_smem_layout_atom(LayoutEnum.ROW_MAJOR, Float8E4M3FN, columns)
+    atom = warpgroup.make_smem_layout_atom(kind, Float8E4M3FN)
+    layout = cute.tile_to_shape(atom, (rows, columns, stages), (0, 1, 2))
+    return allocator.allocate_tensor(Float8E4M3FN, layout.outer, 128, swizzle=layout.inner)
 
 
 @cute.jit
-def finish_operand_copies():
-    cute.arch.cp_async_commit_group()
-    cute.arch.cp_async_wait_group(0)
+def initialize_attention_barriers(allocator, tidx, STAGES: cutlass.Constexpr, CONSUMERS: cutlass.Constexpr):
+    barriers = allocator.allocate_tensor(Int64, cute.make_layout(1 + 2 * STAGES), 8).iterator
+    query_ready, tile_ready, tile_released = barriers, barriers + 1, barriers + 1 + STAGES
+    if tidx == 0:
+        cute.arch.mbarrier_init(query_ready, 1)
+        for stage_idx in cutlass.range_constexpr(STAGES):
+            cute.arch.mbarrier_init(tile_ready + stage_idx, 1)
+            cute.arch.mbarrier_init(tile_released + stage_idx, CONSUMERS)
+        cute.arch.mbarrier_init_fence()
     cute.arch.barrier()
+    return query_ready, tile_ready, tile_released
 
 
 @cute.jit
-def make_mma(columns: cutlass.Constexpr):
-    return make_trivial_tiled_mma(Float8E4M3FN, Float8E4M3FN, warpgroup.OperandMajorMode.K, warpgroup.OperandMajorMode.K, Float32, (1, 1, 1), (64, columns))
+def make_operand_tma(mCodes, rows: cutlass.Constexpr, columns: cutlass.Constexpr):
+    H, N, D = mCodes.shape
+    tensor = cute.make_tensor(mCodes.iterator, cute.make_layout((N, D, H), stride=(D, 1, N * D)))  # (operand row, operand column, head)
+    layout = make_operand_layout(rows, columns)
+    return cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), tensor, layout, (rows, columns))
 
 
 @cute.jit
-def multiply_tile(mma, mma_thread, acc_product, s_left, s_right, accumulate):
-    left = mma_thread.make_fragment_A(mma_thread.partition_A(s_left))  # (MMA, MMA_M, MMA_K)
+def copy_tma_operand(descriptor, s_operand, row_idx, col_idx, head_idx, barrier):
+    atom, tensor = descriptor
+    rows, columns = cute.size(s_operand, mode=[0]), cute.size(s_operand, mode=[1])
+    tile = cute.local_tile(tensor[None, None, head_idx], (rows, columns), (row_idx, col_idx))  # (tile row, tile column)
+    destination, source = cpasync.tma_partition(atom, 0, cute.make_layout(1), cute.group_modes(s_operand, 0, 2), cute.group_modes(tile, 0, 2))
+    cute.copy(atom, source, destination, tma_bar_ptr=barrier)
+
+
+@cute.jit
+def make_mma(columns: cutlass.Constexpr, use_register_operand: cutlass.Constexpr = False):
+    source = warpgroup.OperandSource.RMEM if const_expr(use_register_operand) else warpgroup.OperandSource.SMEM
+    return make_trivial_tiled_mma(Float8E4M3FN, Float8E4M3FN, warpgroup.OperandMajorMode.K, warpgroup.OperandMajorMode.K, Float32, (1, 1, 1), (64, columns), a_source=source)
+
+
+@cute.jit
+def issue_multiply_tile(mma, mma_thread, acc_product, left_operand, s_right, accumulate):
+    left = left_operand if const_expr(left_operand.memspace == cute.AddressSpace.rmem) else mma_thread.make_fragment_A(mma_thread.partition_A(left_operand))  # (MMA, MMA_M, MMA_K)
     right = mma_thread.make_fragment_B(mma_thread.partition_B(s_right))  # (MMA, MMA_N, MMA_K)
     warpgroup.fence()
     atom = cute.make_mma_atom(mma.op)
@@ -79,6 +106,11 @@ def multiply_tile(mma, mma_thread, acc_product, s_left, s_right, accumulate):
         cute.gemm(atom, acc_product, left[None, None, col_idx], right[None, None, col_idx], acc_product)
         atom.set(warpgroup.Field.ACCUMULATE, True)
     warpgroup.commit_group()
+
+
+@cute.jit
+def multiply_tile(mma, mma_thread, acc_product, left_operand, s_right, accumulate):
+    issue_multiply_tile(mma, mma_thread, acc_product, left_operand, s_right, accumulate)
     warpgroup.wait_group(0)
 
 
@@ -89,13 +121,6 @@ def reduce_mma_row(fragment, row_idx: cutlass.Constexpr, initial, op: cutlass.Co
     for col_idx in cutlass.range_constexpr(cute.size(rows, mode=[1])):
         reduction = op(reduction, rows[row_idx, col_idx])
     return warp_reduce(reduction, op, threads_in_group=4)
-
-
-@cute.jit
-def share_mma_operand():
-    # The proxy fence publishes scalar shared stores to the asynchronous WGMMA proxy.
-    cute.arch.fence_proxy("async.shared", space="cta")
-    cute.arch.barrier()
 
 
 @cute.kernel
