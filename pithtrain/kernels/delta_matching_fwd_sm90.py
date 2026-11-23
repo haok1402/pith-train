@@ -62,16 +62,20 @@ def pack_probability_operand(rows, basis, fragment, group_idx: cutlass.Constexpr
     for half_idx in cutlass.range_constexpr(GROUP_KEYS // 16):
         values = cute.make_rmem_tensor(8, Float32)
         for elem_idx in cutlass.range_constexpr(8):
-            row_idx = (elem_idx // 2) % 2
-            col_idx = (GROUP_KEYS // 4) * group_idx + half_idx * 4 + (elem_idx // 4) * 2 + elem_idx % 2
+            if cutlass.const_expr(GROUP_KEYS == 32):
+                row_idx = elem_idx // 4
+                col_idx = (GROUP_KEYS // 4) * group_idx + half_idx * 4 + elem_idx % 4
+            else:
+                row_idx = (elem_idx // 2) % 2
+                col_idx = (GROUP_KEYS // 4) * group_idx + half_idx * 4 + (elem_idx // 4) * 2 + elem_idx % 2
             values[elem_idx] = 448.0 * cute.math.exp2(rows[row_idx, col_idx] - basis[row_idx], fastmath=True)
         codes = cute.make_rmem_tensor(8, Float8E4M3FN)
         codes.store(values.load().to(Float8E4M3FN))
         packed = cute.recast_tensor(codes, Int32)
         if cutlass.const_expr(GROUP_KEYS == 32):
             # The value-twin producer already arranges these keys in register-A order.
-            words[2 * half_idx] = Int32(cute.arch.prmt(packed[0], packed[1], 0x5410))
-            words[2 * half_idx + 1] = Int32(cute.arch.prmt(packed[0], packed[1], 0x7632))
+            words[2 * half_idx] = packed[0]
+            words[2 * half_idx + 1] = packed[1]
         else:
             low = packed[0] if choose_first else packed[1]
             high = packed[1] if choose_first else packed[0]
