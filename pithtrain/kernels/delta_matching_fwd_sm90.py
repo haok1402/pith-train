@@ -49,29 +49,6 @@ def scale_causal_scores(scores, coords, key_scales, query_start, key_start,
 
 
 @cute.jit
-def update_softmax(scores, row_max, row_sum, rescale, maxima, GROUP_KEYS: cutlass.Constexpr, GROUPS: cutlass.Constexpr):
-    rows = reshape_acc_to_mn(scores)  # (query rows, key columns)
-    GROUP_COLUMNS = GROUP_KEYS // 4
-    for row_idx in cutlass.range_constexpr(cute.size(rows, mode=[0])):
-        tile_max = Float32(float("-inf"))
-        for group_idx in cutlass.range_constexpr(GROUPS):
-            group_max = Float32(float("-inf"))
-            for col_idx in cutlass.range_constexpr(GROUP_COLUMNS):
-                column = group_idx * GROUP_COLUMNS + col_idx
-                group_max = cute.arch.fmax(group_max, rows[row_idx, column])
-            maximum = warp_reduce(group_max, cute.arch.fmax, threads_in_group=4)
-            maxima[row_idx, group_idx] = maximum
-            tile_max = cute.arch.fmax(tile_max, maximum)
-        next_max = cute.arch.fmax(row_max[row_idx], tile_max)
-        rescale[row_idx] = cute.math.exp2(row_max[row_idx] - next_max, fastmath=True)
-        row_max[row_idx] = next_max
-        tile_sum = Float32(0.0)
-        for col_idx in cutlass.range_constexpr(cute.size(rows, mode=[1])):
-            tile_sum += cute.math.exp2(rows[row_idx, col_idx] - next_max, fastmath=True)
-        row_sum[row_idx] = row_sum[row_idx] * rescale[row_idx] + warp_reduce(tile_sum, operator.add, threads_in_group=4)
-
-
-@cute.jit
 def pack_probability_operand(rows, basis, fragment, group_idx: cutlass.Constexpr, GROUP_KEYS: cutlass.Constexpr, tidx):
     # WGMMA C assigns two consecutive keys per lane, while register A uses four.
     # Each four-lane group exchanges two packed words per 16-key half.
@@ -110,10 +87,38 @@ def encode_probability_group(scores, fragment, row_max, maxima, weight, value_sc
 
 
 @cute.jit
-def encode_probability_tile(scores, weights, operands, value_scales, row_max, maxima, tidx, GROUP_KEYS: cutlass.Constexpr, GROUPS: cutlass.Constexpr):
-    for group_idx in cutlass.range_constexpr(GROUPS):
-        scale = value_scales[group_idx]
-        encode_probability_group(scores, operands[None, None, None, group_idx], row_max, maxima, weights[None, group_idx], scale, group_idx, GROUP_KEYS, tidx)
+def update_probability_tile(scores, weights, operands, value_scales, row_max, row_sum, rescale,
+                            tidx, GROUP_KEYS: cutlass.Constexpr, GROUPS: cutlass.Constexpr):
+    rows = reshape_acc_to_mn(scores)
+    GROUP_COLUMNS = GROUP_KEYS // 4
+    maxima = cute.make_rmem_tensor((2, GROUPS), Float32)
+    tile_sums = cute.make_rmem_tensor(2, Float32)
+    tile_sums.fill(0.0)
+    for row in cutlass.range_constexpr(2):
+        tile_max = Float32(float("-inf"))
+        for group in cutlass.range_constexpr(GROUPS):
+            group_max = Float32(float("-inf"))
+            for col in cutlass.range_constexpr(GROUP_COLUMNS):
+                group_max = cute.arch.fmax(group_max, rows[row, group * GROUP_COLUMNS + col])
+            maximum = warp_reduce(group_max, cute.arch.fmax, threads_in_group=4)
+            maxima[row, group] = maximum
+            tile_max = cute.arch.fmax(tile_max, maximum)
+        next_max = cute.arch.fmax(row_max[row], tile_max)
+        rescale[row] = cute.math.exp2(row_max[row] - next_max, fastmath=True)
+        row_max[row] = next_max
+
+    for group in cutlass.range_constexpr(GROUPS):
+        # Each row sums the same columns in the same order as the port.
+        # Once a group is summed and packed, its FP32 scores can be retired.
+        for row in cutlass.range_constexpr(2):
+            for col in cutlass.range_constexpr(GROUP_COLUMNS):
+                value = rows[row, group * GROUP_COLUMNS + col]
+                tile_sums[row] += cute.math.exp2(value - row_max[row], fastmath=True)
+        encode_probability_group(scores, operands[None, None, None, group], row_max, maxima,
+                                 weights[None, group], value_scales[group], group, GROUP_KEYS, tidx)
+    for row in cutlass.range_constexpr(2):
+        tile_sum = warp_reduce(tile_sums[row], operator.add, threads_in_group=4)
+        row_sum[row] = row_sum[row] * rescale[row] + tile_sum
 
 
 @cute.jit
@@ -150,6 +155,19 @@ def promote_output_row(output, partial, rescale, weight, FUSE_PREVIOUS: cutlass.
 
 
 @cute.jit
+def promote_cached_output_row(output, partial, rescale, weight, FUSE_PREVIOUS: cutlass.Constexpr):
+    for pair_idx in cutlass.range_constexpr(cute.size(output) // 2):
+        destination = cute.local_tile(output, (2,), (pair_idx,))
+        previous = destination.load()
+        updated = cute.make_rmem_tensor(2, Float32)
+        for elem_idx in cutlass.range_constexpr(2):
+            updated[elem_idx] = promote_output_f32(
+                previous[elem_idx], partial[pair_idx * 2 + elem_idx], rescale, weight, FUSE_PREVIOUS,
+            )
+        destination.store(updated.load())
+
+
+@cute.jit
 def output_slab(acc_output, cached_output, slab: cutlass.Constexpr, SLABS: cutlass.Constexpr):
     if cutlass.const_expr(SLABS == 2 and slab == SLABS - 1):
         return cached_output
@@ -175,8 +193,12 @@ def accumulate_value_tile(acc_output, cached_output, mma, mma_thread, s_values, 
         for row in cutlass.range_constexpr(2):
             if cutlass.const_expr(SLABS == 2):
                 fuse_previous = slab != 0 or row != 1
-                promote_output_row(output[row, None], partial[row, None], rescale[row],
-                                   weights[row, GROUPS - 1], fuse_previous)
+                if cutlass.const_expr(slab == 1):
+                    promote_cached_output_row(output[row, None], partial[row, None], rescale[row],
+                                              weights[row, GROUPS - 1], fuse_previous)
+                else:
+                    promote_output_row(output[row, None], partial[row, None], rescale[row],
+                                       weights[row, GROUPS - 1], fuse_previous)
             else:
                 promoted = partial[row, None].load() * weights[row, GROUPS - 1]
                 output[row, None].store(output[row, None].load() * rescale[row] + promoted)
@@ -240,9 +262,8 @@ class CausalAttention:
         s_values = allocate_staged_operand(allocator, self.head_dim, self.group_keys, self.stages * self.groups)
         s_output_cache = None
         if cutlass.const_expr(self.head_dim == 256):
-            # Each consumer keeps 64 FP32 values per lane in the upper slab.
-            # Adjacent lanes access adjacent words.
-            cache_layout = cute.make_layout((128, 64, self.consumer_groups), stride=(1, 128, 128 * 64))
+            # Each lane accesses pairs of adjacent FP32 values.
+            cache_layout = cute.make_layout((128, (2, 32), self.consumer_groups), stride=(2, (1, 256), 8192))
             s_output_cache = allocator.allocate_tensor(Float32, cache_layout, 16)
         scales_layout = cute.make_layout((self.groups, self.stages), stride=(1, self.groups))
         s_key_scale = allocator.allocate_tensor(Float32, scales_layout, 16)
@@ -364,9 +385,8 @@ class CausalAttention:
             cute.arch.mbarrier_arrive(key_empty)
         coords = thread.partition_C(cute.make_identity_tensor(shape))
         scale_causal_scores(scores, coords, key_scales, query_start, tile_idx * self.tile_keys, MASKED, self.group_keys)
-        maxima = cute.make_rmem_tensor((2, self.groups), Float32)
-        update_softmax(scores, row_max, row_sum, rescale, maxima, self.group_keys, self.groups)
-        encode_probability_tile(scores, weights, probabilities, value_scales, row_max, maxima, tidx, self.group_keys, self.groups)
+        update_probability_tile(scores, weights, probabilities, value_scales, row_max, row_sum, rescale,
+                                tidx, self.group_keys, self.groups)
 
     @cute.jit
     def compute_loop(self, inputs, buffers, s_output_cache, barriers, query_block, head_idx, key_head, last_tile,
