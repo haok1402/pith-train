@@ -30,7 +30,6 @@ def fp8_linear_fwd(
     scale_weight: torch.Tensor,
     weight_t_fp8: torch.Tensor,
     scale_weight_t: torch.Tensor,
-    main_grad: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     output = input_2d @ weight.T for an (M, K) input_2d. Returns output (M, N) in the input dtype
@@ -41,15 +40,7 @@ def fp8_linear_fwd(
 
 
 @fp8_linear_fwd.register_fake
-def _(
-    input_2d,
-    weight,
-    weight_fp8,
-    scale_weight,
-    weight_t_fp8,
-    scale_weight_t,
-    main_grad=None,
-):
+def _(input_2d, weight, weight_fp8, scale_weight, weight_t_fp8, scale_weight_t):
     (M, K), N = input_2d.shape, weight.shape[0]
     output = torch.empty((M, N), dtype=input_2d.dtype, device=input_2d.device)
     input_t_fp8 = torch.empty((K, M), dtype=torch.float8_e4m3fn, device=input_2d.device)
@@ -106,22 +97,18 @@ def _(grad_output, weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t, K, 
 
 
 def fp8_linear_setup_context(ctx, inputs, output):
-    input_2d, _, _, _, weight_t_fp8, scale_weight_t, ctx.main_grad = inputs
+    input_2d, _, _, _, weight_t_fp8, scale_weight_t = inputs
     _, input_t_fp8, scale_input_t = output
     ctx.save_for_backward(weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t)
     ctx.K = input_2d.shape[1]
 
 
-def fp8_linear_gradients(ctx, grad_output):
-    args = (grad_output, *ctx.saved_tensors, ctx.K)
-    if ctx.main_grad is not None:
-        return fp8_linear_bwd_into(*args, ctx.main_grad), None
-    return fp8_linear_bwd(*args)
-
-
 def fp8_linear_backward(ctx, grad_output, grad_input_t_fp8, grad_scale_input_t):
-    grad_input, weight_grad = fp8_linear_gradients(ctx, grad_output)
-    return grad_input, weight_grad, None, None, None, None, None
+    weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t = ctx.saved_tensors
+    grad_input, weight_grad = fp8_linear_bwd(
+        grad_output, weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t, ctx.K
+    )
+    return grad_input, weight_grad, None, None, None, None
 
 
 fp8_linear_fwd.register_autograd(fp8_linear_backward, setup_context=fp8_linear_setup_context)
@@ -162,7 +149,6 @@ def fp8_linear_fwd_prequantized(
     scale_input: torch.Tensor,
     input_t_fp8: torch.Tensor,
     scale_input_t: torch.Tensor,
-    main_grad: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     The output of fp8_linear_fwd for an input already quantized by fp8_quantize_activation.
@@ -181,19 +167,63 @@ def _(input_2d, weight, weight_fp8, scale_weight, weight_t_fp8, scale_weight_t, 
 
 
 def fp8_linear_prequantized_setup_context(ctx, inputs, output):
-    input_2d, _, _, _, weight_t_fp8, scale_weight_t, _, _, input_t_fp8, scale_input_t, ctx.main_grad = inputs  # fmt: skip
+    input_2d, _, _, _, weight_t_fp8, scale_weight_t, _, _, input_t_fp8, scale_input_t = inputs
     ctx.save_for_backward(weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t)
     ctx.K = input_2d.shape[1]
 
 
 def fp8_linear_prequantized_backward(ctx, grad_output):
-    grad_input, weight_grad = fp8_linear_gradients(ctx, grad_output)
-    return grad_input, weight_grad, None, None, None, None, None, None, None, None, None
+    weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t = ctx.saved_tensors
+    grad_input, weight_grad = fp8_linear_bwd(
+        grad_output, weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t, ctx.K
+    )
+    return grad_input, weight_grad, None, None, None, None, None, None, None, None
 
 
 fp8_linear_fwd_prequantized.register_autograd(
     fp8_linear_prequantized_backward, setup_context=fp8_linear_prequantized_setup_context
 )
+
+
+class FP8LinearMainGradFunc(torch.autograd.Function):
+    """Write the weight gradient into the FSDP-owned FP32 accumulation buffer."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        input_2d: torch.Tensor,
+        weight: torch.Tensor,
+        weight_fp8: torch.Tensor,
+        scale_weight: torch.Tensor,
+        weight_t_fp8: torch.Tensor,
+        scale_weight_t: torch.Tensor,
+        main_grad: torch.Tensor,
+        quantized_input: Optional[Tuple[torch.Tensor, ...]],
+    ) -> torch.Tensor:
+        if quantized_input is None:
+            output, input_t_fp8, scale_input_t = fp8_linear_fwd(
+                input_2d, weight, weight_fp8, scale_weight, weight_t_fp8, scale_weight_t
+            )
+        else:
+            output = fp8_linear_fwd_prequantized(
+                input_2d,
+                weight,
+                weight_fp8,
+                scale_weight,
+                weight_t_fp8,
+                scale_weight_t,
+                *quantized_input,
+            )
+            _, _, input_t_fp8, scale_input_t = quantized_input
+        ctx.save_for_backward(weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t)
+        ctx.main_grad = main_grad
+        ctx.K = input_2d.shape[1]
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        grad_input = fp8_linear_bwd_into(grad_output, *ctx.saved_tensors, ctx.K, ctx.main_grad)
+        return grad_input, None, None, None, None, None, None, None
 
 
 class FP8Linear(nn.Linear):
@@ -245,7 +275,11 @@ class FP8Linear(nn.Linear):
         quantized_weight = self.get_quantized_weight()
         weight_fp8, scale_weight, weight_t_fp8, scale_weight_t = quantized_weight
         input_2d = input.flatten(0, -2)
-        if quantized_input is not None:
+        if self.main_grad is not None and torch.is_grad_enabled():
+            output_2d = FP8LinearMainGradFunc.apply(
+                input_2d, self.weight, *quantized_weight, self.main_grad, quantized_input
+            )
+        elif quantized_input is not None:
             output_2d = fp8_linear_fwd_prequantized(
                 input_2d,
                 self.weight,
@@ -254,17 +288,10 @@ class FP8Linear(nn.Linear):
                 weight_t_fp8,
                 scale_weight_t,
                 *quantized_input,
-                self.main_grad,
             )
         else:
             output_2d, _, _ = fp8_linear_fwd(
-                input_2d,
-                self.weight,
-                weight_fp8,
-                scale_weight,
-                weight_t_fp8,
-                scale_weight_t,
-                self.main_grad,
+                input_2d, self.weight, weight_fp8, scale_weight, weight_t_fp8, scale_weight_t
             )
         output = output_2d.view(*input.shape[:-1], self.weight.shape[0])
         if self.bias is not None:
