@@ -509,40 +509,67 @@ def pack_e4m3_pair(low, high, *, loc=None, ip=None):
     return Uint16(bits)
 
 
+@dsl_user_op
+def store_transposed_score_matrices(destination, words, *, loc=None, ip=None):
+    address = destination.toint(loc=loc, ip=ip).to(Uint32)
+    llvm.inline_asm(
+        None, [address.ir_value(loc=loc, ip=ip), *(word.ir_value(loc=loc, ip=ip) for word in words)],
+        "stmatrix.sync.aligned.m8n8.x4.trans.shared::cta.b16 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r,~{memory}", has_side_effects=True, is_align_stack=False, loc=loc, ip=ip,
+    )
+
+
 @cute.jit
-def stage_pipelined_score_operands(probabilities, score_grad, coords, buffers, scale):
+def score_query_pairs(first_row, second_row, even_lane, selector):
+    # Each C lane has one key pair in each of two rows eight queries apart.
+    packed = cute.arch.prmt(first_row.to(Uint32), second_row.to(Uint32), 0x5410)
+    even = cute.arch.shuffle_sync(packed, offset=even_lane, mask_and_clamp=31)
+    odd = cute.arch.shuffle_sync(packed, offset=even_lane + 4, mask_and_clamp=31)
+    return cute.arch.prmt(even, odd, selector)
+
+
+@cute.jit
+def stage_pipelined_score_operands(probabilities, score_grad, coords, buffers, scale, tidx):
     s_probability, s_score_grad, s_score_output = buffers
-    flat_layout = cute.make_layout(BLOCK_QUERY * BLOCK_QUERY)
-    probability_bytes = cute.make_tensor(cute.recast_ptr(s_probability.iterator, dtype=Uint8), flat_layout)
-    score_grad_bytes = cute.make_tensor(cute.recast_ptr(s_score_grad.iterator, dtype=Uint8), flat_layout)
     output_pairs = cute.make_tensor(
         cute.recast_ptr(s_score_output.iterator, dtype=Uint16), cute.make_layout(BLOCK_QUERY * BLOCK_QUERY // 2)
     )
-    transpose_offsets = cute.make_rmem_tensor(4, Int32)
     output_offsets = cute.make_rmem_tensor(2, Int32)
-    # The 512-byte alignment makes a SW64 address depend only on its tile offset.
-    # Each four-value C fragment step advances eight columns at the same two rows.
-    for elem_idx in cutlass.range_constexpr(4):
-        row_idx, col_idx = coords[elem_idx]
-        transpose_offset = col_idx * BLOCK_QUERY + row_idx
-        transpose_offsets[elem_idx] = transpose_offset ^ ((transpose_offset >> 3) & 0x30)
-        if cutlass.const_expr(elem_idx % 2 == 0):
-            output_offset = row_idx * BLOCK_QUERY + col_idx
-            output_offsets[elem_idx // 2] = (output_offset ^ ((output_offset >> 3) & 0x30)) // 2
+    for row in cutlass.range_constexpr(2):
+        query, key = coords[2 * row]
+        offset = query * BLOCK_QUERY + key
+        output_offsets[row] = (offset ^ ((offset >> 3) & 0x30)) // 2
+
+    lane = tidx % 32
+    query_pair = lane // 4
+    even_lane = (query_pair % 4) * 8 + lane % 4
+    selector = Uint32(0x5140 if query_pair < 4 else 0x7362)
+    # Each STSM row starts at the aligned query stripe of this score warp.
+    query_start = (coords[0][0] // 16) * 16
+    matrix_offset = lane * BLOCK_QUERY + query_start
+    matrix_offset = matrix_offset ^ ((matrix_offset >> 3) & 0x30)
+    probability_ptr = cute.recast_ptr(s_probability.iterator, dtype=Uint8)
+    grad_ptr = cute.recast_ptr(s_score_grad.iterator, dtype=Uint8)
     rcp = cute.arch.rcp_approx(scale) if scale > 0.0 else Float32(0.0)
-    for pair_idx in cutlass.range_constexpr(cute.size(probabilities) // 2):
-        elem_idx, quad_idx = 2 * pair_idx, pair_idx // 2
-        within_quad = elem_idx % 4
-        first_offset = transpose_offsets[within_quad] + 512 * quad_idx
-        second_offset = transpose_offsets[within_quad + 1] + 512 * quad_idx
-        # Reconstruction yields finite nonnegative probabilities. The E4M3 conversion clamps them at 448.
-        prob_codes = pack_e4m3_pair(probabilities[elem_idx], probabilities[elem_idx + 1])
-        grad_codes = pack_e4m3_pair(score_grad[elem_idx] * rcp, score_grad[elem_idx + 1] * rcp)
-        probability_bytes[first_offset] = prob_codes.to(Uint8)
-        probability_bytes[second_offset] = (prob_codes >> 8).to(Uint8)
-        score_grad_bytes[first_offset] = grad_codes.to(Uint8)
-        score_grad_bytes[second_offset] = (grad_codes >> 8).to(Uint8)
-        output_pairs[output_offsets[pair_idx % 2] ^ (4 * quad_idx)] = grad_codes
+
+    for section in cutlass.range_constexpr(2):
+        prob_words = cute.make_rmem_tensor(4, Uint32)
+        grad_words = cute.make_rmem_tensor(4, Uint32)
+        for matrix in cutlass.range_constexpr(4):
+            quad = 4 * section + matrix
+            elem = 4 * quad
+            p0 = pack_e4m3_pair(probabilities[elem], probabilities[elem + 1])
+            p1 = pack_e4m3_pair(probabilities[elem + 2], probabilities[elem + 3])
+            ds0 = pack_e4m3_pair(score_grad[elem] * rcp, score_grad[elem + 1] * rcp)
+            ds1 = pack_e4m3_pair(score_grad[elem + 2] * rcp, score_grad[elem + 3] * rcp)
+            output_pairs[output_offsets[0] ^ (4 * quad)] = ds0
+            output_pairs[output_offsets[1] ^ (4 * quad)] = ds1
+            prob_words[matrix] = score_query_pairs(p0, p1, even_lane, selector)
+            grad_words[matrix] = score_query_pairs(ds0, ds1, even_lane, selector)
+        offset = matrix_offset + section * 32 * BLOCK_QUERY
+        store_transposed_score_matrices(probability_ptr + offset, tuple(prob_words[i] for i in range(4)))
+        store_transposed_score_matrices(grad_ptr + offset, tuple(grad_words[i] for i in range(4)))
+
     cute.arch.fence_proxy("async.shared", space="cta")
     cute.arch.barrier(barrier_id=1, number_of_threads=128)
 
@@ -831,7 +858,7 @@ class PipelinedKeyValueGradients:
             s_output = s_score_output[None, None, output_stage]
             stage_pipelined_score_operands(
                 probabilities, probability_grad, positions,
-                (s_prob[None, None, score_stage], s_score_grad[None, None, score_stage], s_output), scale,
+                (s_prob[None, None, score_stage], s_score_grad[None, None, score_stage], s_output), scale, tidx,
             )
             # The two gradient warpgroups join the score warpgroup at one
             # named barrier per slot. Only the gradient participants wait.
