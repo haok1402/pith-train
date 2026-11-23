@@ -15,7 +15,7 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-__all__ = ["abs2", "asm", "asm_args_last", "atom_add_u64", "barrier_expect_tx", "barrier_wait", "bf16_hi", "bf16_lo", "bf16_sel", "bf16x2_to_f32", "byte_sum", "cp_async16", "cvta_shared", "f32_as_u32", "f32_hex", "f32x2_to_bf16x2", "fence_gpu", "lanemask_lt", "ld_b32", "ld_b32_coherent", "ld_generic_b32", "ld_generic_v4", "ld_relaxed", "ld_u16", "ld_u8", "ld_v2", "ld_v4", "lds_b32", "lds_b32_pred", "lds_v4", "match_any", "max2", "max_u16x2", "pack_bf16", "packed_op", "prmt", "prmt_args_last", "red_add_generic", "red_add_shared", "red_or_shared", "selp", "selp_args_last", "st_b32", "st_b64", "st_f32", "st_generic_b32", "st_generic_u8", "st_generic_v4", "st_u16", "st_u8", "st_v2", "st_v2_args_last", "st_v4", "st_v4_args_last", "sts_b32", "sts_b32_nopred", "sts_v4", "to_ir", "u32_as_f32", "unpack"]
+__all__ = ["abs2", "asm", "asm_args_last", "expect_slot_bytes", "fma_f32", "ld_b16", "release_slot", "st_b16", "tma_load_rows", "wait_tma_slot", "atom_add_u64", "barrier_expect_tx", "barrier_wait", "bf16_hi", "bf16_lo", "bf16_sel", "bf16x2_to_f32", "byte_sum", "cp_async16", "cvta_shared", "f32_as_u32", "f32_hex", "f32x2_to_bf16x2", "fence_async_shared", "fence_gpu", "lanemask_lt", "ld_b32", "ld_b32_coherent", "ld_generic_b32", "ld_generic_v4", "ld_relaxed", "ld_u16", "ld_u8", "ld_v2", "ld_v4", "lds_b32", "lds_b32_pred", "lds_v4", "match_any", "max2", "max_u16x2", "pack_bf16", "packed_op", "prmt", "prmt_args_last", "red_add_generic", "red_add_shared", "red_or_shared", "selp", "selp_args_last", "st_b32", "st_b64", "st_f32", "st_generic_b32", "st_generic_u8", "st_generic_v4", "st_u16", "st_u8", "st_v2", "st_v2_args_last", "st_v4", "st_v4_args_last", "sts_b32", "sts_b32_nopred", "sts_v4", "to_ir", "u32_as_f32", "unpack"]
 
 
 def f32_hex(value: float) -> str:
@@ -148,6 +148,11 @@ def ld_relaxed(addr: Int64, pred: Int32, *, loc=None, ip=None) -> Int32:
             "=r,l,r", side_effects=True,
         )
     )
+
+
+@dsl_user_op
+def fence_async_shared(*, loc=None, ip=None) -> None:
+    asm(None, [], "fence.proxy.async.shared::cta;", "", side_effects=True)
 
 
 @dsl_user_op
@@ -417,3 +422,57 @@ def byte_sum(word: Uint32, *, loc=None, ip=None) -> Int32:
     Sum of the four bytes of word, exact while it is below 256.
     """
     return Int32(asm(T.i32(), [Uint32(word).ir_value(loc=loc, ip=ip)], "{\n\t.reg .b32 t;\n\tmul.lo.u32 t, $1, 0x01010101;\n\tshr.u32 $0, t, 24;\n\t}", "=r,r"))
+
+
+@dsl_user_op
+def fma_f32(first: Float32, second: Float32, acc: Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(asm(T.f32(), [to_ir(first, Float32, loc, ip), to_ir(second, Float32, loc, ip), to_ir(acc, Float32, loc, ip)], "fma.rn.f32 $0, $1, $2, $3;", "=f,f,f,f"))
+
+
+@dsl_user_op
+def ld_b16(addr: Int64, access_ok: Int32, *, loc=None, ip=None) -> Uint32:
+    """
+    2-byte global load, zero-extended; 0 where pred == 0.
+    """
+    return Uint32(asm(T.i32(), [to_ir(addr, Int64, loc, ip), to_ir(access_ok, Int32, loc, ip)], "{\n\t.reg .pred p;\n\t.reg .b16 h;\n\tsetp.ne.b32 p, $2, 0;\n\tmov.b16 h, 0;\n\t@p ld.global.b16 h, [$1];\n\tcvt.u32.u16 $0, h;\n\t}", "=r,l,r"))
+
+
+@dsl_user_op
+def st_b16(addr: Int64, value: Uint32, access_ok: Int32, *, loc=None, ip=None) -> None:
+    """
+    Store the low 2 bytes of value.
+    """
+    asm(None, [to_ir(addr, Int64, loc, ip), to_ir(value, Uint32, loc, ip), to_ir(access_ok, Int32, loc, ip)], "{\n\t.reg .pred p;\n\t.reg .b16 l, h;\n\tsetp.ne.b32 p, $2, 0;\n\tmov.b32 {l, h}, $1;\n\t@p st.global.b16 [$0], l;\n\t}", "l,r,r", side_effects=True)
+
+
+@dsl_user_op
+def wait_tma_slot(addr: Int32, parity: Int32, *, loc=None, ip=None) -> None:
+    """
+    Spin until the phase of the mbarrier at addr with the given parity has completed.
+    """
+    asm(None, [to_ir(addr, Int32, loc, ip), to_ir(parity, Int32, loc, ip)], "{\n\t.reg .pred p;\n\tLAB_WAIT:\n\tmbarrier.try_wait.parity.shared::cta.b64 p, [$0], $1;\n\t@!p bra LAB_WAIT;\n\t}", "r,r", side_effects=True)
+
+
+@dsl_user_op
+def expect_slot_bytes(addr: Int32, num_bytes: int, *, loc=None, ip=None) -> None:
+    """
+    The producer's arrival on a slot's full barrier at addr, expecting num_bytes of TMA data.
+    """
+    asm(None, [to_ir(addr, Int32, loc, ip)], f"mbarrier.arrive.expect_tx.shared::cta.b64 _, [$0], {num_bytes};", "r", side_effects=True)
+
+
+@dsl_user_op
+def release_slot(addr: Int32, *, loc=None, ip=None) -> None:
+    """
+    A consumer is done reading a ring slot: fence its generic-proxy reads against the next TMA
+    (async-proxy) write into the slot, then arrive on the slot's empty barrier at addr.
+    """
+    asm(None, [to_ir(addr, Int32, loc, ip)], "fence.proxy.async.shared::cta;\n\tmbarrier.arrive.shared::cta.b64 _, [$0];", "r", side_effects=True)
+
+
+@dsl_user_op
+def tma_load_rows(s_destination: Int32, descriptor_addr: Int64, channel_start: Int32, row_start: Int32, s_full_barrier: Int32, *, loc=None, ip=None) -> None:
+    """
+    Load a channel tile through TMA with zero fill outside the descriptor bounds.
+    """
+    asm(None, [to_ir(s_destination, Int32, loc, ip), to_ir(descriptor_addr, Int64, loc, ip), to_ir(channel_start, Int32, loc, ip), to_ir(row_start, Int32, loc, ip), to_ir(s_full_barrier, Int32, loc, ip)], "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [$0], [$1, {$2, $3}], [$4];", "r,l,r,r,r", side_effects=True)

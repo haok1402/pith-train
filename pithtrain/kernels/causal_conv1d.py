@@ -57,7 +57,7 @@ def causal_conv1d_bwd(g: torch.Tensor, x: torch.Tensor, w: torch.Tensor, offset:
     """
     match ARCH_MAJOR:
         case 9:
-            from pithtrain.kernels.causal_conv1d_sm90 import causal_conv1d_bwd_sm90
+            from pithtrain.kernels.causal_conv1d_bwd_sm90 import causal_conv1d_bwd_sm90
             return causal_conv1d_bwd_sm90(g, x, w, offset)
         case 10:
             from pithtrain.kernels.causal_conv1d_sm100 import causal_conv1d_bwd_sm100

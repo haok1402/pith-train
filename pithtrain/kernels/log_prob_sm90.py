@@ -13,7 +13,7 @@ from cutlass import Float32, Int32, Int64, Uint32, const_expr
 from cutlass.cutlass_dsl import T
 
 from pithtrain.kernels.cute_compile_sm90 import TORCH2CUTE, fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import asm, barrier_expect_tx, barrier_wait, lds_b32, lds_v4, packed_op, st_v4, to_ir
+from pithtrain.kernels.cute_ptx_sm90 import asm, barrier_expect_tx, barrier_wait, fence_async_shared, lds_b32, lds_v4, packed_op, st_v4, to_ir
 from pithtrain.kernels.row_slice_sm90 import RowAccess, RowSlice, lds_f32, pack_unit, sts_f32, unpack_unit
 
 __all__ = ["log_prob_bwd_sm90", "log_prob_fwd_sm90"]
@@ -202,7 +202,7 @@ class LogProbFwd:
         if tidx == 0:
             slot = chunk_idx % self.slots
             num_chunk_units = cutlass.max(cutlass.min(row.cta_units - chunk_idx * self.chunk_units, Int32(self.chunk_units)), Int32(0))
-            asm(None, [], "fence.proxy.async.shared::cta;", "", side_effects=True)
+            fence_async_shared()
             barrier_expect_tx(s_barriers + slot * 8, num_chunk_units * 16)
             if num_chunk_units > 0:
                 asm(None, [to_ir(s_slice + slot * (self.chunk_units * 16), Int32), to_ir(row.slice_start + Int64(chunk_idx) * Int64(self.chunk_units * 16), Int64), to_ir(num_chunk_units * 16, Int32), to_ir(s_barriers + slot * 8, Int32)], "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [$0], [$1], $2, [$3];", "r,l,r,r", side_effects=True)
