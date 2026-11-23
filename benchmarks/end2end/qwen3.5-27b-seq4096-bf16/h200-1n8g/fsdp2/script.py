@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 
 def checkpoint_layers(model: Qwen35TextModel, *, mlp_tail: int) -> None:
     """Checkpoint stock decoder stages, replaying only the MLP in the tail."""
+    # Inductor reuses FP8 projection output storage inside compiled stages.
+    # Recompute those projections so this eager checkpoint never retains their aliases.
     saved_ops = [
         torch.ops.aten.mm.default,
         torch.ops.aten.addmm.default,
