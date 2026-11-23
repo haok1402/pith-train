@@ -337,12 +337,13 @@ def store_quant_tile(descriptor, source, row, column, head):
 
 
 @cute.kernel
-def quantize_tma_twins(mInput, mScale, code_store, twin_store,
-                        input_scale: cutlass.Constexpr, is_gradient: cutlass.Constexpr):
+def quantize_tma_twins(mInput, mCenter, mScale, code_store, twin_store, BLOCK: cutlass.Constexpr,
+                        center_key: cutlass.Constexpr, input_scale: cutlass.Constexpr, is_gradient: cutlass.Constexpr):
     tidx, _, _ = cute.arch.thread_idx()
     bx, by, _ = cute.arch.block_idx()
     heads = cute.size(mInput, mode=[2])
-    BLOCK, DIM, COLUMNS, ROWS = 64, 256, 4, 16
+    DIM, ROWS = 256, 16
+    COLUMNS = 4 if const_expr(BLOCK == 64) else 2
     col_start = tidx % (DIM // COLUMNS) * COLUMNS
     row_start = tidx // (DIM // COLUMNS) * ROWS
     allocator = SmemAllocator()
@@ -350,21 +351,28 @@ def quantize_tma_twins(mInput, mScale, code_store, twin_store,
     s_codes = allocate_operand(allocator, BLOCK, DIM)
     s_twin = allocate_operand(allocator, DIM, BLOCK)
     values = cute.make_rmem_tensor((COLUMNS, ROWS), Float32)
+    center = cute.make_rmem_tensor(COLUMNS, Float32)
+    if const_expr(center_key):
+        for column in cutlass.range_constexpr(COLUMNS):
+            center[column] = Float32(0.0) + mCenter[by, 0, col_start + column]
     for row in cutlass.range_constexpr(ROWS):
         token = bx * BLOCK + row_start + row
         input_row = mInput[by // heads, token, by % heads, None]
         source = cute.local_tile(input_row, (COLUMNS,), (col_start // COLUMNS,))
         raw = source.load().to(Float32)
+        if const_expr(center_key):
+            raw = raw - center.load()
         if const_expr(input_scale != 1.0):
             raw = raw * input_scale
         values[None, row].store(raw)
     scale = reduce_quant_block(values, s_amax, tidx, FORWARD_THREADS, is_gradient)
     if tidx == 0:
         mScale[by, bx] = scale
+    permute_twin = const_expr(BLOCK == 32 and not center_key)
     if (scale >= Float32(2.0 ** -88)) and (scale < Float32(float("inf"))):
-        store_register_twins(s_codes, s_twin, values, scale, row_start, col_start, ROWS, COLUMNS, True, False)
+        store_register_twins(s_codes, s_twin, values, scale, row_start, col_start, ROWS, COLUMNS, True, permute_twin)
     else:
-        store_register_twins(s_codes, s_twin, values, scale, row_start, col_start, ROWS, COLUMNS, False, False)
+        store_register_twins(s_codes, s_twin, values, scale, row_start, col_start, ROWS, COLUMNS, False, permute_twin)
     cute.arch.fence_proxy("async.shared", space="cta")
     cute.arch.barrier()
     if tidx < 32:
@@ -395,13 +403,15 @@ def launch_quant_block(mInput, mCenter, mCodes, mScale, mTwin, BLOCK: cutlass.Co
     B, N, H, _ = mInput.shape
     register_gradient = const_expr(is_gradient and not center_key and BLOCK * cute.size(mInput, mode=[3]) == 16384)
     THREADS = FORWARD_THREADS if const_expr(is_forward or register_gradient) else BACKWARD_THREADS
-    use_tma = const_expr((is_forward or register_gradient) and not center_key
-                         and BLOCK == 64 and cute.size(mInput, mode=[3]) == 256)
+    use_tma = const_expr(
+        cute.size(mInput, mode=[3]) == 256
+        and ((is_forward and BLOCK in (32, 64)) or (register_gradient and BLOCK == 64)),
+    )
     if const_expr(use_tma):
         D = cute.size(mInput, mode=[3])
         code_store = make_quant_store(mCodes, BLOCK, D)
         twin_store = make_quant_store(mTwin, D, BLOCK)
-        quantize_tma_twins(mInput, mScale, code_store, twin_store, input_scale, is_gradient).launch(
+        quantize_tma_twins(mInput, mCenter, mScale, code_store, twin_store, BLOCK, center_key, input_scale, is_gradient).launch(
             grid=(N // BLOCK, B * H, 1), block=(FORWARD_THREADS, 1, 1), stream=stream,
         )
     elif const_expr(is_forward or register_gradient):
