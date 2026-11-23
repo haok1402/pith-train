@@ -573,11 +573,11 @@ class PipelinedKeyValueGradients:
             cute.arch.mbarrier_init(resident_ready, 1)
             for stage_idx in cutlass.range_constexpr(self.num_stages):
                 cute.arch.mbarrier_init(ready + stage_idx, 1)
-                consumers = 4 if stage_idx < self.query_t_slot else 2
+                consumers = 4 if stage_idx < self.query_t_slot else 8
                 cute.arch.mbarrier_init(released + stage_idx, consumers)
             for stage_idx in cutlass.range_constexpr(self.score_stages):
                 cute.arch.mbarrier_init(score_ready + stage_idx, 1)
-                cute.arch.mbarrier_init(score_released + stage_idx, 2)
+                cute.arch.mbarrier_init(score_released + stage_idx, 8)
             cute.arch.mbarrier_init_fence()
         cute.arch.barrier()
         barriers = (resident_ready, ready, released)
@@ -778,7 +778,8 @@ class PipelinedKeyValueGradients:
                 mma, mma_thread, acc_key, s_queries_t[None, None, query_stage], s_score_grad[None, None, score_stage],
                 key_weight, released + self.grad_t_slot + grad_stage, consumer_idx, tidx % 128,
             )
-            if tidx % 128 == 0:
+            cute.arch.sync_warp()
+            if tidx % 32 == 0:
                 cute.arch.mbarrier_arrive(released + self.query_t_slot + query_stage)
                 cute.arch.mbarrier_arrive(score_released + score_stage)
             if (query_start + BLOCK_QUERY) % PROMOTION_ROWS == 0 or query_block_idx + 1 == NUM_QUERIES:
@@ -802,7 +803,8 @@ class PipelinedKeyValueGradients:
             issue_multiply_tile(mma, mma_thread, acc_tile, query_twin, s_score_grad, False)
             if cutlass.const_expr(stripe_idx == 0):
                 warpgroup.wait_group(1)
-                if lane == 0:
+                cute.arch.sync_warp()
+                if lane % 32 == 0:
                     cute.arch.mbarrier_arrive(value_released)
             warpgroup.wait_group(0)
             acc_stripe = acc_key[None, None, None, stripe_idx]
