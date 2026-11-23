@@ -446,15 +446,42 @@ def center_backward_group(probabilities, grad_rows, delta_rows, product_scale, k
 
 
 @cute.jit
-def stage_pipelined_score_operands(probabilities, score_grad, coords, s_probability, s_score_grad, s_score_output, scale):
+def allocate_score_exchange(allocator):
+    layout = make_operand_layout(BLOCK_QUERY, BLOCK_QUERY)
+    return tuple(
+        allocator.allocate_tensor(Float8E4M3FN, layout.outer, 512, swizzle=layout.inner)
+        for _ in range(3)
+    )
+
+
+@cute.jit
+def stage_pipelined_score_operands(probabilities, score_grad, coords, buffers, consumer_idx, scale):
+    s_probability, s_score_grad, s_score_output = buffers
+    flat_layout = cute.make_layout(BLOCK_QUERY * BLOCK_QUERY)
+    probability_bytes = cute.make_tensor(cute.recast_ptr(s_probability.iterator, dtype=Float8E4M3FN), flat_layout)
+    score_grad_bytes = cute.make_tensor(cute.recast_ptr(s_score_grad.iterator, dtype=Float8E4M3FN), flat_layout)
+    score_output_bytes = cute.make_tensor(cute.recast_ptr(s_score_output.iterator, dtype=Float8E4M3FN), flat_layout)
+    transpose_offsets = cute.make_rmem_tensor(4, Int32)
+    output_offsets = cute.make_rmem_tensor(4, Int32)
+    # The 512-byte alignment makes a SW64 address depend only on its tile offset.
+    # Each four-value C fragment step advances eight columns at the same two rows.
+    for elem_idx in cutlass.range_constexpr(4):
+        row_idx, group_col = coords[elem_idx]
+        col_idx = group_col + consumer_idx * (BLOCK_QUERY // 2)
+        transpose_offset = col_idx * BLOCK_QUERY + row_idx
+        output_offset = row_idx * BLOCK_QUERY + col_idx
+        transpose_offsets[elem_idx] = transpose_offset ^ ((transpose_offset >> 3) & 0x30)
+        output_offsets[elem_idx] = output_offset ^ ((output_offset >> 3) & 0x30)
     rcp = cute.arch.rcp_approx(scale) if scale > 0.0 else Float32(0.0)
     for elem_idx in cutlass.range_constexpr(cute.size(probabilities)):
-        row_idx, col_idx = coords[elem_idx]
+        within_quad, quad_idx = elem_idx % 4, elem_idx // 4
+        transpose_offset = transpose_offsets[within_quad] + 512 * quad_idx
+        output_offset = output_offsets[within_quad] ^ (8 * quad_idx)
         prob_code = cute.arch.fmin(probabilities[elem_idx], 448.0).to(Float8E4M3FN)
         grad_code = (score_grad[elem_idx] * rcp).to(Float8E4M3FN)
-        s_probability[col_idx, row_idx] = prob_code
-        s_score_grad[col_idx, row_idx] = grad_code
-        s_score_output[row_idx, col_idx] = grad_code
+        probability_bytes[transpose_offset] = prob_code
+        score_grad_bytes[transpose_offset] = grad_code
+        score_output_bytes[output_offset] = grad_code
     cute.arch.fence_proxy("async.shared", space="cta")
     cute.arch.barrier(barrier_id=1, number_of_threads=256)
 
@@ -556,9 +583,7 @@ class PipelinedKeyValueGradients:
             allocator.allocate_tensor(Float32, cute.make_ordered_layout((BLOCK_QUERY, 1, self.grad_stages), order=(0, 1, 2)), 128),
         )
         score_buffers = (
-            allocate_operand(allocator, self.tile_keys, BLOCK_QUERY),
-            allocate_operand(allocator, self.tile_keys, BLOCK_QUERY),
-            allocate_operand(allocator, BLOCK_QUERY, self.tile_keys),
+            *allocate_score_exchange(allocator),
             allocator.allocate_tensor(Float32, cute.make_layout(8), 16),
         )
         # The thread axis is contiguous. A promotion has one bank per lane.
@@ -619,9 +644,6 @@ class PipelinedKeyValueGradients:
         resident_ready, ready, released = barriers
         s_key = cute.local_tile(s_keys, (self.group_keys, self.head_dim), (consumer_idx, 0))  # (key, channel)
         s_value = cute.local_tile(s_values, (self.group_keys, self.head_dim), (consumer_idx, 0))  # (key, channel)
-        s_prob_group = cute.local_tile(s_prob, (self.group_keys, BLOCK_QUERY), (consumer_idx, 0))  # (key, query)
-        s_grad_group = cute.local_tile(s_score_grad, (self.group_keys, BLOCK_QUERY), (consumer_idx, 0))  # (key, query)
-        s_output_group = cute.local_tile(s_score_output, (BLOCK_QUERY, self.group_keys), (0, consumer_idx))  # (query, key)
         mma_score, mma_grad = make_mma(self.group_keys), make_mma(self.tile_keys)
         thread_score, thread_grad = mma_score.get_slice(tidx % 128), mma_grad.get_slice(tidx % 128)
         score_shape = (BLOCK_QUERY, self.group_keys)
@@ -680,7 +702,9 @@ class PipelinedKeyValueGradients:
             score_head_idx = query_head_idx * NUM_QUERIES + query_block_idx
             if tidx == 0:
                 mScoreScale[score_head_idx, key_block_idx] = score_scale
-            stage_pipelined_score_operands(probabilities, probability_grad, score_coords, s_prob_group, s_grad_group, s_output_group, score_scale)
+            stage_pipelined_score_operands(
+                probabilities, probability_grad, score_coords, (s_prob, s_score_grad, s_score_output), consumer_idx, score_scale,
+            )
             if tidx == 0:
                 score_tile_idx = score_head_idx * NUM_QUERIES + key_block_idx
                 store_pipelined_score_tile(score_store, s_score_output, score_tile_idx)
