@@ -36,4 +36,20 @@ The same job also ran the full model with FP8 linears and BF16 attention at tail
 
 The 300-step pair uses tail 24 for both FP8 arms to isolate the attention implementation. Slurm job `1290664` on `pool1-00350` runs the native Delta-Matching arm, the FA4 control, then the optional BF16 compute arm. The separate steady-state sweep in job `1290659` on `pool1-00909` runs 12 steps per setting with FA4 at its stock tail 29 and Delta-Matching at tails 24–27. Steps 3–12 are timed and any post-warmup retry disqualifies a setting.
 
+## Throughput at each backend's best measured tail
+
+The tail sweep held the node, checkpoint, shuffled WikiText batches, microbatch 4 and revision `121c6cb` fixed. All five settings ran 12 steps with zero post-warmup retries.
+
+| FP8 recipe attention | MLP-only tail | Median seconds | Tokens/s | MFU | Peak allocated / reserved GiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| FA4 BF16 | 29 | 8.912 | 29,416 | 58.37% | 124.20 / 136.42 |
+| Delta-Matching | 24 | 8.873 | 29,542 | 58.62% | 121.56 / 134.63 |
+| Delta-Matching | 25 | 8.861 | 29,582 | 58.70% | 122.13 / 135.52 |
+| Delta-Matching | 26 | 8.849 | 29,622 | 58.78% | 123.30 / 136.37 |
+| Delta-Matching | 27 | 8.852 | 29,614 | 58.76% | 124.47 / 136.39 |
+
+Tail 26 led the short Delta-Matching sweep by 0.70% throughput and 0.41 MFU points versus stock FA4. Tail 26 had zero warmup retries. Tail 27 and stock FA4 each had one warmup retry per GPU. The tail-26 and tail-27 median step times were 3 ms apart.
+
+The backward branch advanced to `116959f` during the 300-step run. Merge `d77de7d` combines its split K/V matched-correction streams, 256-thread dO producer and transposed matrix stores with the forward branch's descending head-major matched-correction dispatch and the training branch's strided input support. All 19 kernel, operator and import tests passed at the new merge. The running convergence pair uses the earlier pinned kernels at `121c6cb`.
+
 Per-step logs, Slurm and GPU gate output, input preparation, and the analysis script are in `.cache/fp8-attention-training/`. Slurm accepted submissions and warned that the account is approaching its stale-data submission threshold.
