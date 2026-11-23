@@ -322,9 +322,14 @@ def store_attention_tma(output_copy, mLse, cache_base, acc_output, cached_output
             token = query_block * BLOCK_QUERY + positions[row, 0][0]
             mLse[head_idx, token] = (row_max[row] + cute.math.log2(row_sum[row], fastmath=True)) * (1.0 / LOG2_E)
 
-    # Preserve the old upper FP32 slab before reusing this warpgroup's cache for BF16 output.
-    upper = cute.make_rmem_tensor(mma_thread.partition_shape_C((BLOCK_QUERY, VALUE_COLUMNS)), Float32)
-    upper.store(cached_output.load())
+    # Normalize the old upper FP32 slab before recycling its storage for TMA.
+    upper = cute.make_rmem_tensor(mma_thread.partition_shape_C((BLOCK_QUERY, VALUE_COLUMNS)), BFloat16)
+    reciprocals = cute.make_rmem_tensor(2, Float32)
+    cached_rows = reshape_acc_to_mn(cached_output)
+    upper_rows = reshape_acc_to_mn(upper)
+    for row in cutlass.range_constexpr(2):
+        reciprocals[row] = cute.arch.rcp_approx(row_sum[row])
+        upper_rows[row, None].store((cached_rows[row, None].load() * reciprocals[row]).to(BFloat16))
     synchronize_output_group(sync_id)
     dim = VALUE_COLUMNS * SLABS
     layout = attention_output_layout(dim)
@@ -332,11 +337,14 @@ def store_attention_tma(output_copy, mLse, cache_base, acc_output, cached_output
     shared = cute.make_tensor(shared_ptr, layout.outer)
     for slab in cutlass.range_constexpr(SLABS):
         out_tile = cute.local_tile(shared, (BLOCK_QUERY, VALUE_COLUMNS), (0, slab))
-        output = reshape_acc_to_mn(mma_thread.partition_C(out_tile))
-        accum = reshape_acc_to_mn(acc_output[None, None, None, 0] if slab == 0 else upper)
-        for row in cutlass.range_constexpr(cute.size(row_sum)):
-            rcp = cute.arch.rcp_approx(row_sum[row])
-            output[row, None].store((accum[row, None].load() * rcp).to(BFloat16))
+        output = mma_thread.partition_C(out_tile)
+        if cutlass.const_expr(slab == 1):
+            output.store(upper.load())
+        else:
+            out_rows = reshape_acc_to_mn(output)
+            accum = reshape_acc_to_mn(acc_output[None, None, None, 0])
+            for row in cutlass.range_constexpr(2):
+                out_rows[row, None].store((accum[row, None].load() * reciprocals[row]).to(BFloat16))
 
     cute.arch.fence_proxy("async.shared", space="cta")
     synchronize_output_group(sync_id)
@@ -579,7 +587,7 @@ class CausalAttention:
         sync_id = consumer_group + 1
         if cutlass.const_expr(self.group_query_heads):
             if tidx < 32:
-                cute.arch.cp_async_bulk_wait_group(0)
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
             synchronize_output_group(sync_id)
             cached_output.fill(0.0)
         else:
