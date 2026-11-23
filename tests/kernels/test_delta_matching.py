@@ -81,7 +81,10 @@ def test_delta_matching_fp32_and_determinism(dim, num_key_heads):
 
 @pytest.mark.parametrize("dim", [128, 256])
 def test_delta_matching_rowsum(dim):
-    query, key, value, grad_output = attention_inputs(dim, 4, 2, 256)
+    query, key, value, grad_output = (tensor.sign() for tensor in attention_inputs(dim, 4, 2, 256))
+    # Centering leaves these key codes unchanged. The resulting FP8 code products and their
+    # sums are exact even in Hopper's narrower tensor-core accumulator.
+    key = torch.cat((key[:, :128], -key[:, :128]), dim=1)
     require_delta_matching(query, key, value)
     out, *state = delta_matching_fwd(query, key, value, dim**-0.5)
     lse, query_codes, query_scale, _, key_codes, key_scale, _, value_codes, value_scale = state
@@ -105,13 +108,17 @@ def test_delta_matching_rowsum(dim):
         value_scale, group_keys, 2
     ).unsqueeze(-2)
     score_gradient = probability * (grad_probability - delta.unsqueeze(-1))
-    magnitude = (probability * grad_probability.abs()).sum(-1).clamp_min(1e-6)
-    residual = (score_gradient.sum(-1).abs() / magnitude).max().item()
-    assert residual < 2e-6, f"pre-cast score-gradient row residual: {residual:.3g}"
+    # Normalize by the terms before subtraction so rows with one available key have
+    # a round-off bound even when their exact gradient is zero.
+    magnitude = (probability * (grad_probability.abs() + delta.abs().unsqueeze(-1))).sum(-1)
+    residual = score_gradient.sum(-1).abs()
+    roundoff_bound = (16 * torch.finfo(torch.float32).eps) * magnitude
+    excess = (residual - roundoff_bound).max().item()
+    assert excess <= 0, f"a pre-cast row sum exceeded its FP32 round-off bound by {excess:.3g}"
 
     stale = (out.float() * grad_output.float()).transpose(1, 2).sum(-1).reshape_as(delta)
     stale_residual = (probability * (grad_probability - stale.unsqueeze(-1))).sum(-1)
-    assert (stale_residual.abs() / magnitude).median() > 1e-3
+    assert (stale_residual.abs() / magnitude.clamp_min(1e-6)).median() > 1e-3
 
 
 @pytest.mark.parametrize("dim", [128, 256])
