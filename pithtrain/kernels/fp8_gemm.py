@@ -11,6 +11,7 @@ from pithtrain.kernels.arch import ARCH_MAJOR
 from pithtrain.kernels.fp8_rowwise_blockwise_transpose import fp8_quant_act
 from pithtrain.kernels.fp8_rowwise_kmajor import fp8cast_rowwise_kmajor
 from pithtrain.kernels.fp8_rowwise_transpose import fp8_quant_grad
+from pithtrain.kernels.fp8_wgrad import fp8_wgrad
 
 __all__ = ["fp8_channels_as_rows", "fp8_gemm_fwd", "fp8_gemm_bwd", "fp8_fused_experts_supported", "fp8_gemm_nt", "fp8_grouped_wgrad_empty", "fp8_grouped_gemm", "k_grouped_fp8_gemm", "k_grouped_safe_size", "fp8_group_indices", "fp8_quant_grouped"]
 
@@ -73,8 +74,8 @@ def fp8_gemm_bwd(grad_2d: torch.Tensor, weight_t_fp8: torch.Tensor, scale_weight
     - input_t_fp8, scale_input_t: x.T (k, m) blockwise, as fp8_gemm_fwd returns them.
     - k: the input features.
     - grad_input = grad @ W, fresh (m, k); weight_grad = grad.T @ x, fresh (n, k) (not accumulated);
-      both in grad_2d's dtype by default. With main_grad, accumulate the FP32 wgrad there and return
-      None for it.
+      both in grad_2d's dtype by default. With a dedicated FP32 main_grad, write the weight
+      gradient there and return None for it.
     - quantized_grad: optional prequantized fp8_quant_grad operands with identical scales.
     """
     M, N = grad_2d.shape
@@ -83,10 +84,12 @@ def fp8_gemm_bwd(grad_2d: torch.Tensor, weight_t_fp8: torch.Tensor, scale_weight
     grad_fp8, scale_grad, grad_t_fp8, scale_grad_t = quantized_grad
     grad_input = fp8_gemm_nt(grad_fp8, scale_grad, weight_t_fp8, scale_weight_t, M, k, grad_2d.device, grad_2d.dtype)
     if main_grad is not None:
-        # Hopper's block-scaled (1D x 2D) GEMM only emits BF16. Repeat each activation block's
-        # scale over its channels to run the same product with the FP32 1D x 1D GEMM.
-        input_channel_scales = scale_input_t.repeat_interleave(128, dim=0)[:k]
-        deep_gemm.fp8_fp4_gemm_nt((grad_t_fp8, scale_grad_t), (input_t_fp8, input_channel_scales), main_grad, c=main_grad, recipe=(1, 1, 128))
+        if ARCH_MAJOR == 9:
+            fp8_wgrad(grad_t_fp8, scale_grad_t, input_t_fp8, scale_input_t, main_grad)
+        else:
+            main_grad.zero_()
+            input_channel_scales = scale_input_t.repeat_interleave(128, dim=0)[:k]
+            deep_gemm.fp8_fp4_gemm_nt((grad_t_fp8, scale_grad_t), (input_t_fp8, input_channel_scales), main_grad, c=main_grad, recipe=(1, 1, 128))
         return grad_input, None
     weight_grad = fp8_gemm_nt(grad_t_fp8, scale_grad_t, input_t_fp8, scale_input_t, N, k, grad_2d.device, grad_2d.dtype)
     return grad_input, weight_grad
