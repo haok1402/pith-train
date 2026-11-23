@@ -19,7 +19,7 @@ from pithtrain.kernels.cute_ptx_sm90 import asm, to_ir
 __all__ = [
     "BLOCK_QUERY", "LOG2_E", "allocate_operand", "allocate_staged_operand", "copy_tma_operand",
     "initialize_attention_barriers", "issue_multiply_tile", "launch_delta_matching_kernel", "make_mma",
-    "make_operand_tma", "multiply_tile", "quantize_delta_matching", "reduce_mma_row",
+    "make_operand_tma", "multiply_tile", "quantize_centered_kv", "quantize_delta_matching", "reduce_mma_row",
 ]
 
 BLOCK_QUERY = 64
@@ -390,7 +390,6 @@ def quantize_tma_twins_block(mInput, mCenter, mScale, code_store, twin_store, ti
         store_quant_tile(twin_store, s_twin, 0, bx, by)
         cute.arch.cp_async_bulk_commit_group()
         cute.arch.cp_async_bulk_wait_group(0)
-
 
 
 @cute.kernel
