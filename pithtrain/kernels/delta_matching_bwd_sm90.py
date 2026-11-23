@@ -87,16 +87,19 @@ class MatchedCorrection:
         query_copy, grad_copy = make_operand_tma(mQuery, BLOCK_QUERY, D), make_operand_tma(mGrad, BLOCK_QUERY, D)
         key_copy, value_copy = make_operand_tma(mKey, self.tile_keys, D), make_operand_tma(mValue, self.tile_keys, D)
         tensors = (mQueryScale, mKeyScale, mValueScale, mGradScale, mLse, mDelta)
-        self.kernel(tensors, (query_copy, grad_copy, key_copy, value_copy)).launch(grid=(N // (BLOCK_QUERY * self.consumer_groups), H, 1), block=(384, 1, 1), stream=stream)
+        query_tiles = N // (BLOCK_QUERY * self.consumer_groups)
+        self.kernel(tensors, (query_copy, grad_copy, key_copy, value_copy), query_tiles).launch(
+            grid=(H, query_tiles, 1), block=(384, 1, 1), stream=stream,
+        )
 
     @cute.kernel
-    def kernel(self, tensors, copies):
+    def kernel(self, tensors, copies, QUERY_TILES: cutlass.Constexpr):
         tidx, _, _ = cute.arch.thread_idx()
-        bx, by, _ = cute.arch.block_idx()
+        head, tile, _ = cute.arch.block_idx()
         warp_group = cute.arch.make_warp_uniform(cute.arch.warp_idx()) // 4
-        query_block = bx * self.consumer_groups
+        query_block = (QUERY_TILES - 1 - tile) * self.consumer_groups
         last_tile = query_block * BLOCK_QUERY // self.tile_keys
-        key_head = by // (cute.size(tensors[0], mode=[0]) // cute.size(tensors[1], mode=[0]))
+        key_head = head // (cute.size(tensors[0], mode=[0]) // cute.size(tensors[1], mode=[0]))
         allocator = SmemAllocator()
         s_query = allocate_staged_operand(allocator, BLOCK_QUERY, self.head_dim, self.consumer_groups)
         s_grad = allocate_staged_operand(allocator, BLOCK_QUERY, self.head_dim, self.consumer_groups)
@@ -108,11 +111,11 @@ class MatchedCorrection:
         if warp_group == self.load_group:
             cute.arch.setmaxregister_decrease(self.load_registers)
             if tidx == 0:
-                self.load_loop(copies, buffers, barriers, query_block, by, key_head, last_tile)
+                self.load_loop(copies, buffers, barriers, query_block, head, key_head, last_tile)
         else:
             cute.arch.setmaxregister_increase(self.consumer_registers)
             consumer_idx = warp_group - 1
-            self.compute_loop(tensors, buffers, barriers, query_block + consumer_idx, by, key_head, last_tile, consumer_idx, tidx % 128)
+            self.compute_loop(tensors, buffers, barriers, query_block + consumer_idx, head, key_head, last_tile, consumer_idx, tidx % 128)
 
     @cute.jit
     def load_loop(self, copies, buffers, barriers, query_block_idx, query_head_idx, key_head_idx, last_tile):
