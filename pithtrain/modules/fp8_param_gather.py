@@ -15,15 +15,22 @@ hooks are plain functions set on the sharded local tensor, so no tensor subclass
 """
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import FSDPModule
+from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
+    AllGatherResult,
+    _default_all_gather_output_fn,
+)
 from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam, free_storage
 
 from pithtrain.kernels import (
+    fp8_gather_pack_supported,
+    fp8_pack_gathered_transpose,
     fp8_pack_transpose,
     fp8_scales,
     fp8_scales_multi,
@@ -74,6 +81,8 @@ class FP8ParamState:
     """
     This rank's shard cast to FP8 at FSDP's padded shard size: the all-gather input.
     """
+
+    gathered_shards: Optional[torch.Tensor] = None
 
     def local_shard(self) -> torch.Tensor:
         """
@@ -131,18 +140,22 @@ class FP8ParamState:
         place and return None.
         """
         assert param_dtype == torch.bfloat16, param_dtype
-        (gathered,) = all_gather_outputs
-        gathered = gathered[: self.shape[0]].view(torch.float8_e4m3fn).view(self.shape)
-        gathered = gathered.view(-1, *self.shape[-2:])
-        numel = gathered.numel()
+        numel = self.shape.numel()
+        device = self.fsdp_param.device
         if out is None:
-            self.packed = torch.empty(2 * numel, dtype=torch.uint8, device=gathered.device)
+            self.packed = torch.empty(2 * numel, dtype=torch.uint8, device=device)
             data = self.packed.view(torch.float8_e4m3fn)
             *lead, N, K = self.shape
             fp8, fp8_t = data[:numel].view(*lead, N, K), data[numel:].view(*lead, K, N)
             self.module.register_buffer("weight_fp8", fp8, persistent=False)
             self.module.register_buffer("weight_t_fp8", fp8_t, persistent=False)
-        fp8_pack_transpose(gathered, self.packed)
+        shards, self.gathered_shards = self.gathered_shards, None
+        if shards is not None:
+            fp8_pack_gathered_transpose(shards, self.packed)
+        else:
+            (gathered,) = all_gather_outputs
+            gathered = gathered[: self.shape[0]].view(torch.float8_e4m3fn)
+            fp8_pack_transpose(gathered.view(-1, *self.shape[-2:]), self.packed)
         # The bytes now live in the packed buffer; the next unshard reallocates the gather output.
         # Both run on the current stream, so the free is ordered.
         for output in self.fsdp_param.all_gather_outputs:
@@ -153,6 +166,40 @@ class FP8ParamState:
         if out is not None:
             return None
         return self.packed.view(torch.bfloat16).view(self.shape), (self.packed,)
+
+
+def copy_out_fp8_gather(
+    fsdp_params: list[FSDPParam],
+    result: AllGatherResult,
+    world_size: int,
+    states: dict[FSDPParam, FP8ParamState],
+) -> None:
+    """Route aligned FP8 slices from the gathered bucket directly to the pack/transpose."""
+    gathered, _, _, dtypes, numels, split_sizes = result
+    if (
+        gathered.dtype != torch.uint8
+        or any(size % 4 for size in split_sizes)
+        or any(p.fsdp_placement.dim != 0 for p in fsdp_params)
+        or any(len(sizes) != 1 for sizes in numels)
+    ):
+        return _default_all_gather_output_fn(fsdp_params, result, world_size)
+    sources = gathered.view(world_size, -1).split(split_sizes, dim=1)
+    destinations, other_sources = [], []
+    for param, source, sizes, types in zip(fsdp_params, sources, numels, dtypes, strict=True):
+        state = states.get(param)
+        if state is not None and source.numel() == state.shape.numel():
+            state.gathered_shards = source.view(world_size, -1, state.shape[-1])
+        else:
+            param.init_all_gather_outputs(sizes, types, world_size, gathered.device)
+            param.alloc_all_gather_outputs()
+            (output,) = param.all_gather_outputs
+            destinations.append(output.view(world_size, -1).view(torch.uint8))
+            other_sources.append(source)
+    if destinations:
+        with torch.autograd._unsafe_preserve_version_counter(
+            tuple(t for t in destinations if not t.is_inference())
+        ):
+            torch._foreach_copy_(destinations, other_sources)
 
 
 fp8_states: list[FP8ParamState] = []
@@ -173,6 +220,7 @@ def install_fp8_param_gather(
     fp8_groups.clear()
     multi_launch_cache.clear()
     seen_groups = set()
+    gather_pack = fp8_gather_pack_supported()
     by_group: dict[int, tuple[dist.ProcessGroup, list[tuple[FP8ParamState, int]]]] = {}
     param_groups = (
         group
@@ -184,6 +232,7 @@ def install_fp8_param_gather(
         if param_group in seen_groups:
             continue
         seen_groups.add(param_group)
+        dense_states = {}
         for fsdp_param in param_group.fsdp_params:
             module = fsdp_param._module_info.module
             if not isinstance(module, fp8_classes) or fsdp_param._module_info.param_name != "weight":  # fmt: skip
@@ -215,6 +264,10 @@ def install_fp8_param_gather(
             local.fsdp_post_all_gather = state.post_all_gather
             fsdp_param._init_extensions()
             fp8_states.append(state)
+            if gather_pack and len(shape) == 2 and N % (size * BLOCK) == K % 16 == 0:
+                dense_states[fsdp_param] = state
+        if dense_states and param_group._all_gather_output_fn is _default_all_gather_output_fn:
+            param_group._all_gather_output_fn = partial(copy_out_fp8_gather, states=dense_states)
 
     # One packed amax buffer per shard group, so each group reduces in a single collective.
     for group, entries in by_group.values():

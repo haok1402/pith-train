@@ -27,6 +27,8 @@ import torch
 import torch.nn.functional as F
 
 from pithtrain.kernels import (
+    fp8_gather_pack_supported,
+    fp8_pack_gathered_transpose,
     fp8_pack_transpose,
     fp8_quant_weight,
     fp8_quant_weight_grouped,
@@ -714,6 +716,22 @@ def test_pack_transpose(shape: tuple) -> None:
     fp8_pack_transpose(x, out)
     assert torch.equal(out[:numel], x.view(torch.uint8).reshape(-1))
     assert torch.equal(out[numel:], x.transpose(1, 2).contiguous().view(torch.uint8).reshape(-1))
+
+
+@pytest.mark.parametrize(
+    "rows,cols,offset,padding",
+    [(256, 512, 16, 32), (256, 512, 8, 8), (256, 512, 8, 12), (97, 193, 1, 2)],
+)
+def test_pack_gathered_transpose(rows: int, cols: int, offset: int, padding: int) -> None:
+    ranks, shard_numel = 8, rows * cols
+    bucket = torch.randint(0, 256, (ranks, shard_numel + padding), dtype=torch.uint8, device="cuda")
+    shards = bucket[:, offset : offset + shard_numel].view(ranks, rows, cols)
+    out = torch.empty((2 * ranks * shard_numel,), dtype=torch.uint8, device="cuda")
+    weight = shards.contiguous().view(ranks * rows, cols)
+    assert isinstance(fp8_gather_pack_supported(), bool)
+    fp8_pack_gathered_transpose(shards, out)
+    assert torch.equal(out[: weight.numel()], weight.reshape(-1))
+    assert torch.equal(out[weight.numel() :], weight.T.reshape(-1))
 
 
 # The FP8 weights of one FSDP shard group: 2D and 3D, tiles straddling shards, an unaligned K

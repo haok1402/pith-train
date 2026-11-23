@@ -24,7 +24,7 @@ from pithtrain.kernels.fp8_rowwise_transpose import fp8_quant_delta_grad, fp8_qu
 from pithtrain.kernels.fp8_scale_layout import act_scale_like
 from pithtrain.kernels.fp8_scatter_quant import scatter_quant
 from pithtrain.kernels.fp8_silu_mul_quant import fp8_silu_mul_bwd, fp8_silu_mul_gu_bwd, fp8_silu_mul_fwd, fp8_silu_mul_gu_fwd
-from pithtrain.kernels.fp8_weight_quant import fp8_pack_transpose, fp8_scales, fp8_scales_multi, fp8_shard_amax, fp8_shard_amax_multi, fp8_shard_cast, fp8_quant_weight, fp8_quant_weight_grouped
+from pithtrain.kernels.fp8_weight_quant import fp8_gather_pack_supported, fp8_pack_gathered_transpose, fp8_pack_transpose, fp8_scales, fp8_scales_multi, fp8_shard_amax, fp8_shard_amax_multi, fp8_shard_cast, fp8_quant_weight, fp8_quant_weight_grouped
 from pithtrain.kernels.gated_delta_rule_cp import chunk_gdr_cp_bwd_post, chunk_gdr_cp_bwd_pre, chunk_gdr_cp_fwd_post, chunk_gdr_cp_fwd_pre, chunk_gdr_cp_supported, gated_delta_rule_cp_plan, gated_delta_rule_cp_supported, gdr_cp_bwd_local, gdr_cp_bwd_output, gdr_cp_bwd_states, gdr_cp_fwd_local, gdr_cp_fwd_output, gdr_cp_merge
 from pithtrain.kernels.gated_delta_rule_pinned import chunk_gdr_bwd_pinned, chunk_gdr_fwd_pinned, gated_delta_rule_pinned_supported
 from pithtrain.kernels.group_bias_add import group_bias_add
@@ -63,6 +63,8 @@ __all__.append("fp8_quant_grouped")
 
 # FP8 weight quantization and parameter all-gather
 __all__.append("fp8_pack_transpose")
+__all__.append("fp8_pack_gathered_transpose")
+__all__.append("fp8_gather_pack_supported")
 __all__.append("fp8_scales")
 __all__.append("fp8_scales_multi")
 __all__.append("fp8_shard_amax")

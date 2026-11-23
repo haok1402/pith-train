@@ -15,7 +15,7 @@ import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR
 
-__all__ = ["fp8_pack_transpose", "fp8_scales", "fp8_scales_multi", "fp8_shard_amax", "fp8_shard_amax_multi", "fp8_shard_cast", "fp8_quant_weight", "fp8_quant_weight_grouped"]
+__all__ = ["fp8_pack_transpose", "fp8_pack_gathered_transpose", "fp8_gather_pack_supported", "fp8_scales", "fp8_scales_multi", "fp8_shard_amax", "fp8_shard_amax_multi", "fp8_shard_cast", "fp8_quant_weight", "fp8_quant_weight_grouped"]
 
 
 @torch.library.custom_op("pithtrain::fp8_quant_weight_sm100", mutates_args=())
@@ -168,6 +168,27 @@ def fp8_pack_transpose(x: torch.Tensor, out: torch.Tensor) -> None:
             fp8_pack_transpose_sm100(x, out)
         case _:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
+
+
+def fp8_gather_pack_supported() -> bool:
+    return ARCH_MAJOR == 9
+
+
+def fp8_pack_gathered_transpose(shards: torch.Tensor, out: torch.Tensor) -> None:
+    """
+    Write contiguous FP8 bytes and their transpose into out, from uint8 shards (R, N, K), with
+    stride (rank_stride, K, 1). Each shard contributes N consecutive rows, and out has 2*R*N*K
+    bytes. SM90 fuses copy and transpose for full 128-row tiles, 4-byte-aligned input and
+    16-byte-aligned output. Other layouts and SM100 concatenate the shards first.
+    """
+    if not shards.numel():
+        return
+    K = shards.shape[-1]
+    if fp8_gather_pack_supported() and shards.shape[1] % 128 == 0 and shards.stride()[1:] == (K, 1) and K % 16 == shards.stride(0) % 4 == shards.data_ptr() % 4 == out.data_ptr() % 16 == 0:
+        from pithtrain.kernels.fp8_weight_quant_sm90 import fp8_pack_gathered_transpose_sm90
+        fp8_pack_gathered_transpose_sm90(shards, out)
+        return
+    fp8_pack_transpose(shards.contiguous().view(1, -1, K), out)
 
 
 def fp8_shard_amax_multi(shards: Sequence[torch.Tensor], amaxes: Sequence[torch.Tensor], row_offsets: Sequence[int], group_offsets: Sequence[int]) -> Optional[Any]:

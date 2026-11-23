@@ -17,16 +17,16 @@ import cutlass.cute as cute
 import torch
 import tvm_ffi
 import tvm_ffi.libinfo
-from cutlass import Int32, Int64, Uint32, const_expr
+from cutlass import Int32, Int64, Uint8, Uint32, const_expr
 from torch.utils import cpp_extension
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from pithtrain.kernels.cute_compile_sm90 import TORCH2CUTE, fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import asm_args_last, lds_b32, lds_v4, max_u16x2, max_u32, prmt_args_last, st_b32, st_b8, st_v2, st_v4, sts_b32_raw, sts_v2, to_ir, unpack
+from pithtrain.kernels.cute_ptx_sm90 import asm_args_last, ld_v2, lds_b32, lds_v4, max_u16x2, max_u32, prmt_args_last, st_b32, st_b8, st_v2, st_v4, sts_b32_raw, sts_v2, to_ir, unpack
 from pithtrain.kernels.fp8_e8m0_scale_sm90 import AMAX_MIN, FP8_MAX_RCP, compute_scale_rcp_bits, quantize_four_from_bits
 
-__all__ = ["fp8_quant_weight_sm90", "fp8_quant_weight_grouped_sm90", "fp8_shard_amax_sm90", "fp8_shard_cast_sm90", "fp8_scales_sm90", "fp8_pack_transpose_sm90", "fp8_shard_amax_multi_sm90", "fp8_scales_multi_sm90"]
+__all__ = ["fp8_quant_weight_sm90", "fp8_quant_weight_grouped_sm90", "fp8_shard_amax_sm90", "fp8_shard_cast_sm90", "fp8_scales_sm90", "fp8_pack_transpose_sm90", "fp8_pack_gathered_transpose_sm90", "fp8_shard_amax_multi_sm90", "fp8_scales_multi_sm90"]
 
 BLOCK = 128
 # Below this many tiles the extra barrier of the shared-memory store path costs more than its
@@ -897,29 +897,33 @@ PACK_ROW_TILES = 8
 
 
 class PackTranspose:
-    def __init__(self, mode: str) -> None:
-        self.mode = mode
-        self.num_threads = PACK_THREADS if mode in ("wide", "wide_banded") else NUM_THREADS
+    def __init__(self, mode: str, load_bytes: int = 16) -> None:
+        self.mode, self.load_bytes = mode, load_bytes
+        self.num_threads = PACK_THREADS if mode in ("wide", "wide_banded", "gathered") else NUM_THREADS
 
     @cute.jit
     def __call__(self, mX: cute.Tensor, mOut: cute.Tensor, stream: cuda.CUstream):
         G, N, K = mX.shape[0], mX.shape[1], mX.shape[2]
+        shard_rows, shard_stride = Int32(N), Int64(mX.stride[0])
         num_row_tiles, num_col_tiles = (N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
-        if const_expr(self.mode == "wide_banded"):
+        if const_expr(self.mode == "gathered"):
+            grid = [num_row_tiles, num_col_tiles, G]
+            G, N = 1, G * N
+        elif const_expr(self.mode == "wide_banded"):
             grid = [num_row_tiles * num_col_tiles, 1, G]
         else:
             grid = [num_row_tiles, num_col_tiles, G]
-        self.kernel(mX.iterator.toint(), mOut.iterator.toint(), Int32(N), Int32(K), Int32(G)).launch(grid=grid, block=[self.num_threads, 1, 1], stream=stream)
+        self.kernel(mX.iterator.toint(), mOut.iterator.toint(), Int32(N), Int32(K), Int32(G), shard_rows, shard_stride).launch(grid=grid, block=[self.num_threads, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(self, x_base: Int64, out_base: Int64, N: Int32, K: Int32, G: Int32):
-        if const_expr(self.mode == "wide" or self.mode == "wide_banded"):
-            self.pack_wide_tile(x_base, out_base, N, K, G)
+    def kernel(self, x_base: Int64, out_base: Int64, N: Int32, K: Int32, G: Int32, shard_rows: Int32, shard_stride: Int64):
+        if const_expr(self.mode in ("wide", "wide_banded", "gathered")):
+            self.pack_wide_tile(x_base, out_base, N, K, G, shard_rows, shard_stride)
         else:
             self.pack_narrow_tile(x_base, out_base, N, K, G)
 
     @cute.jit
-    def pack_wide_tile(self, x_base: Int64, out_base: Int64, N: Int32, K: Int32, G: Int32):
+    def pack_wide_tile(self, x_base: Int64, out_base: Int64, N: Int32, K: Int32, G: Int32, shard_rows: Int32, shard_stride: Int64):
         """
         Assign each thread an 8x16 block and use coalesced 16-byte transposed stores.
         """
@@ -929,6 +933,9 @@ class PackTranspose:
             column_band = bx // PACK_ROW_TILES
             row_band = column_band // num_col_tiles
             bx, by = row_band * PACK_ROW_TILES + bx % PACK_ROW_TILES, column_band - row_band * num_col_tiles
+        if const_expr(self.mode == "gathered"):
+            x_base = x_base + Int64(bz) * (shard_stride - Int64(shard_rows) * Int64(K))
+            bx, bz = bx + bz * (shard_rows // BLOCK), 0
         tidx, _, _ = cute.arch.thread_idx()
         warp, lane = tidx // 32, tidx % 32
         thread_row_offset, thread_col_offset = warp * 32 + (lane // 8) * 8, (lane % 8) * 16
@@ -950,7 +957,15 @@ class PackTranspose:
         for i in cutlass.range_constexpr(8):
             row = tile_row_start + thread_row_offset + i
             row_addr = x_base + group_start + Int64(row) * Int64(K) + Int64(tile_col_start + thread_col_offset)
-            words.append(ld_v4_ordered(row_addr, Int32(row < N) & col_ok))
+            load_ok = Int32(row < N) & col_ok
+            if const_expr(self.load_bytes == 16):
+                packed = ld_v4_ordered(row_addr, load_ok)
+            elif const_expr(self.load_bytes == 8):
+                lo, hi = ld_v2(row_addr, load_ok), ld_v2(row_addr + 8, load_ok)
+                packed = [lo[0], lo[1], hi[0], hi[1]]
+            else:
+                packed = [ld_scalar_ordered(row_addr + word_idx * 4, load_ok, 4) for word_idx in range(4)]
+            words.append(packed)
         return words
 
     @cute.jit
@@ -1011,6 +1026,22 @@ def fp8_pack_transpose_sm90(x: torch.Tensor, out: torch.Tensor) -> None:
         fn = cute.compile(PackTranspose(mode), make_fake_row_major(TORCH2CUTE[x.dtype], 3, 1), make_fake_row_major(TORCH2CUTE[out.dtype], 1, 1), fake_stream(), options="--enable-tvm-ffi")
         COMPILED[key] = fn
     fn(x, out)
+
+
+def fp8_pack_gathered_transpose_sm90(shards: torch.Tensor, out: torch.Tensor) -> None:
+    """
+    Pack the rank-major byte shards directly into their concatenation and transpose.
+    """
+    alignment = shards.data_ptr() | shards.stride(0)
+    load_bytes = min(16, alignment & -alignment)
+    key = ("pack", "gathered", load_bytes)
+    fn = COMPILED.get(key)
+    if fn is None:
+        num_ranks, shard_rows, K = cute.sym_int(), cute.sym_int(), cute.sym_int(divisibility=16)
+        data = fake(Uint8, (num_ranks, shard_rows, K), (cute.sym_int64(divisibility=load_bytes), K, 1), load_bytes)
+        fn = cute.compile(PackTranspose("gathered", load_bytes), data, make_fake_row_major(Uint8, 1, 16), fake_stream(), options="--enable-tvm-ffi")
+        COMPILED[key] = fn
+    fn(shards, out)
 
 
 DESCRIPTOR_WORDS = 8  # int64 words per descriptor row
