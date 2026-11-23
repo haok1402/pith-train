@@ -13,7 +13,7 @@ from cutlass.utils import SmemAllocator
 from quack.layout_utils import reshape_acc_to_mn
 from quack.reduce import warp_reduce
 
-from pithtrain.kernels.delta_matching_sm90 import BLOCK_QUERY, LOG2_E, allocate_operand, allocate_staged_operand, copy_tma_operand, initialize_attention_barriers, issue_multiply_tile, launch_delta_matching_kernel, make_mma, make_operand_layout, make_operand_tma, multiply_tile, quantize_delta_matching
+from pithtrain.kernels.delta_matching_sm90 import BLOCK_QUERY, LOG2_E, THREADS, allocate_operand, allocate_staged_operand, copy_tma_operand, initialize_attention_barriers, issue_multiply_tile, launch_delta_matching_kernel, load_quant_block, make_mma, make_operand_layout, make_operand_tma, multiply_tile, quantize_delta_matching, reduce_quant_block
 
 __all__ = ["delta_matching_bwd_prepare_sm90", "delta_matching_bwd_sm90"]
 
@@ -929,12 +929,86 @@ def launch_query_gradients(mKeyT, mScoreGrad, mScoreScale, mGradQuery, softmax_s
     mainloop(mKeyT, mScoreGrad, mScoreScale, mGradQuery, softmax_scale, stream)
 
 
+@cute.jit
+def store_grad_codes(mCodes, values, s_codes, block_idx, head_idx, tidx, scale):
+    D = cute.size(mCodes, mode=[2])
+    VECTOR = 8
+    channel_idx = tidx % (D // VECTOR) * VECTOR
+    first_row = tidx // (D // VECTOR)
+    for repeat_idx in cutlass.range_constexpr(cute.size(values, mode=[1])):
+        row_idx = first_row + repeat_idx * (THREADS * VECTOR // D)
+        scaled = cute.make_rmem_tensor(VECTOR, Float32)
+        for elem_idx in cutlass.range_constexpr(VECTOR):
+            scaled[elem_idx] = values[elem_idx, repeat_idx] / scale
+        quantized = scaled.load().to(Float8E4M3FN)
+        output = cute.local_tile(mCodes[head_idx, block_idx * BLOCK_QUERY + row_idx, None], (VECTOR,), (channel_idx // VECTOR,))
+        output.store(quantized)
+        # Each group of eight source rows shifts the shared bank of a transpose read.
+        shared_channel = channel_idx ^ ((row_idx // VECTOR) * VECTOR)
+        scratch = cute.local_tile(s_codes[row_idx, None], (VECTOR,), (shared_channel // VECTOR,))
+        scratch.store(quantized)
+
+
+@cute.jit
+def store_grad_twin(mTwin, s_codes, block_idx, head_idx, tidx):
+    D = cute.size(mTwin, mode=[1])
+    VECTOR = 8
+    for repeat_idx in cutlass.range_constexpr(BLOCK_QUERY * D // (THREADS * VECTOR)):
+        vector_idx = tidx + repeat_idx * THREADS
+        channel_idx = vector_idx // (BLOCK_QUERY // VECTOR)
+        row_group = vector_idx % (BLOCK_QUERY // VECTOR)
+        row_idx = row_group * VECTOR
+        shared_channel = channel_idx ^ row_idx
+        codes = cute.make_rmem_tensor(VECTOR, Float8E4M3FN)
+        for elem_idx in cutlass.range_constexpr(VECTOR):
+            codes[elem_idx] = s_codes[row_idx + elem_idx, shared_channel]
+        output = cute.local_tile(mTwin[head_idx, channel_idx, None], (VECTOR,), (block_idx * (BLOCK_QUERY // VECTOR) + row_group,))
+        output.store(codes.load())
+
+
+@cute.kernel
+def quantize_grad_block(mGradOut, mCodes, mScale, mTwin):
+    tidx, _, _ = cute.arch.thread_idx()
+    block_idx, head_idx, _ = cute.arch.block_idx()
+    allocator = SmemAllocator()
+    s_amax = allocator.allocate_tensor(Float32, cute.make_layout(THREADS // 32), 16)
+    D = cute.size(mGradOut, mode=[3])
+    s_codes = allocator.allocate_tensor(Float8E4M3FN, cute.make_ordered_layout((BLOCK_QUERY, D), order=(1, 0)), 128)
+    values = load_quant_block(mGradOut, mScale, block_idx, head_idx, tidx, BLOCK_QUERY, False, 1.0)
+    scale = reduce_quant_block(values, s_amax, tidx, True)
+    if tidx == 0:
+        mScale[head_idx, block_idx] = scale
+    store_grad_codes(mCodes, values, s_codes, block_idx, head_idx, tidx, scale)
+    cute.arch.barrier()
+    store_grad_twin(mTwin, s_codes, block_idx, head_idx, tidx)
+
+
+@cute.jit
+def launch_grad_quantization(mGradOut, mCodes, mScale, mTwin, stream):
+    B, N, H, _ = mGradOut.shape
+    quantize_grad_block(mGradOut, mCodes, mScale, mTwin).launch(
+        grid=(N // BLOCK_QUERY, B * H, 1), block=(THREADS, 1, 1), stream=stream,
+    )
+
+
+def quantize_output_gradient(grad_out):
+    B, N, H, D = grad_out.shape
+    if D != 256:
+        return quantize_delta_matching(grad_out, 16384 // D, is_gradient=True)
+    grad_out = grad_out.contiguous()
+    codes = torch.empty((B * H, N, D), dtype=torch.float8_e4m3fn, device=grad_out.device)
+    scales = torch.empty((B * H, N // BLOCK_QUERY), dtype=torch.float32, device=grad_out.device)
+    twin = torch.empty((B * H, D, N), dtype=codes.dtype, device=grad_out.device)
+    launch_delta_matching_kernel("delta_matching_quantize_grad_out", launch_grad_quantization, (grad_out, codes, scales, twin))
+    return codes, scales, twin
+
+
 def delta_matching_bwd_prepare_sm90(grad_out, state):
     """
     Quantize dO and compute the matched correction from the backward probability and dP products.
     """
     lse, query, query_scale, _, key, key_scale, _, value, value_scale = state
-    grad, grad_scale, grad_t = quantize_delta_matching(grad_out, 16384 // grad_out.shape[-1], is_gradient=True)
+    grad, grad_scale, grad_t = quantize_output_gradient(grad_out)
     delta = torch.empty_like(lse)
     launch_delta_matching_kernel("delta_matching_delta", launch_matched_delta, (query, query_scale, key, key_scale, value, value_scale, grad, grad_scale, lse, delta))
     return grad, grad_scale, grad_t, delta

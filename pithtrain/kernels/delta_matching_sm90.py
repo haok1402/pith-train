@@ -15,9 +15,9 @@ from quack.reduce import warp_reduce
 from pithtrain.kernels.cute_compile_sm90 import TORCH2CUTE, fake, fake_stream
 
 __all__ = [
-    "BLOCK_QUERY", "LOG2_E", "allocate_operand", "allocate_staged_operand", "copy_tma_operand",
+    "BLOCK_QUERY", "LOG2_E", "THREADS", "allocate_operand", "allocate_staged_operand", "copy_tma_operand",
     "initialize_attention_barriers", "issue_multiply_tile", "launch_delta_matching_kernel", "make_mma",
-    "make_operand_layout", "make_operand_tma", "multiply_tile", "quantize_delta_matching", "reduce_mma_row",
+    "load_quant_block", "make_operand_layout", "make_operand_tma", "multiply_tile", "quantize_delta_matching", "reduce_mma_row", "reduce_quant_block",
 ]
 
 BLOCK_QUERY = 64
