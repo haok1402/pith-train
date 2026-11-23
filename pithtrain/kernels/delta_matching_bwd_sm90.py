@@ -505,7 +505,11 @@ class PipelinedKeyValueGradients:
         )
         tensors = (mQueryScale, mKeyScale, mValueScale, mGradScale, mScoreScale, mGradKey, mGradValue)
         copies = ((key_copy, value_copy), query_copies, grad_copies, score_store)
-        self.kernel(tensors, copies, N // BLOCK_QUERY).launch(grid=(H * (N // self.tile_keys), 1, 1), block=(384, 1, 1), stream=stream)
+        # The consumer register budgets rely on reassignment within a single CTA per SM.
+        self.kernel(tensors, copies, N // BLOCK_QUERY).launch(
+            grid=(H * (N // self.tile_keys), 1, 1), block=(384, 1, 1),
+            max_number_threads=(384, 1, 1), min_blocks_per_mp=1, stream=stream,
+        )
 
     @cute.kernel
     def kernel(self, tensors, copies, NUM_QUERIES: cutlass.Constexpr):
