@@ -17,6 +17,8 @@ from pithtrain.kernels import (
     fp8_gemm_fwd,
     fp8_gemm_nt,
     fp8_quant_act,
+    fp8_quant_delta_gate,
+    fp8_quant_delta_grad,
     fp8_quant_swiglu,
     fp8_quant_weight,
     fp8_silu_mul_bwd,
@@ -139,6 +141,18 @@ def _(input_2d):
     size = ((K + 127) // 128, (M + 127) // 128)
     scale_input_t = torch.empty(size, dtype=torch.float32, device=device)
     return input_fp8, scale_input, input_t_fp8, scale_input_t
+
+
+@torch.library.custom_op("pithtrain::fp8_quantize_delta_gate", mutates_args=())
+def fp8_quantize_delta_gate(
+    value: torch.Tensor, gate: torch.Tensor, norm_weight: torch.Tensor, inv_rms: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return fp8_quant_delta_gate(value, norm_weight, inv_rms, gate)
+
+
+@fp8_quantize_delta_gate.register_fake
+def _(value, gate, norm_weight, inv_rms):
+    return fp8_quantize_activation(value)
 
 
 @torch.library.custom_op("pithtrain::fp8_linear_fwd_prequantized", mutates_args=())
@@ -265,6 +279,128 @@ class FP8SwiGLUDownProjection(torch.autograd.Function):
         return grad_gate, grad_up, grad_weight, None, None
 
 
+@torch.library.custom_op("pithtrain::fp8_delta_gate_bwd_into", mutates_args=("main_grad",))
+def fp8_delta_gate_bwd_into(
+    grad: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    inv_rms: torch.Tensor,
+    weight_t_fp8: torch.Tensor,
+    scale_weight_t: torch.Tensor,
+    input_t_fp8: torch.Tensor,
+    scale_input_t: torch.Tensor,
+    K: int,
+    main_grad: torch.Tensor,
+) -> torch.Tensor:
+    quantized_grad = fp8_quant_delta_grad(grad, value, gate, weight, inv_rms)
+    grad_input, _ = fp8_gemm_bwd(
+        grad, weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t, K, main_grad, quantized_grad
+    )
+    return grad_input
+
+
+@fp8_delta_gate_bwd_into.register_fake
+def _(
+    grad,
+    value,
+    gate,
+    weight,
+    inv_rms,
+    weight_t_fp8,
+    scale_weight_t,
+    input_t_fp8,
+    scale_input_t,
+    K,
+    main_grad,
+):
+    return grad.new_empty((grad.shape[0], K))
+
+
+class FP8DeltaGateProjection(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        value,
+        hidden,
+        input_operands,
+        norm_weight,
+        eps,
+        weight,
+        quantized_weight,
+        main_grad,
+        z_weight,
+        z_quantized_weight,
+        z_main_grad,
+    ):
+        gate = fp8_linear_fwd_prequantized(hidden, z_weight, *z_quantized_weight, *input_operands)
+        width = norm_weight.numel()
+        inv_rms = torch.rsqrt(value.view(-1, width).float().pow(2).mean(-1, keepdim=True) + eps)
+        act_fp8, scale, act_t_fp8, scale_t = fp8_quantize_delta_gate(
+            value, gate, norm_weight.float(), inv_rms.flatten()
+        )
+        output = fp8_linear_fwd_prequantized(
+            value, weight, *quantized_weight, act_fp8, scale, act_t_fp8, scale_t
+        )
+        _, _, weight_t_fp8, scale_weight_t = quantized_weight
+        ctx.save_for_backward(
+            value,
+            gate,
+            norm_weight,
+            inv_rms,
+            weight_t_fp8,
+            scale_weight_t,
+            act_t_fp8,
+            scale_t,
+            *z_quantized_weight[2:],
+            *input_operands[2:],
+        )
+        ctx.main_grad = main_grad
+        ctx.z_main_grad = z_main_grad
+        ctx.hidden_width = hidden.shape[1]
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        value, gate, norm_weight, inv_rms, *operands = ctx.saved_tensors
+        out_operands, z_operands = operands[:4], operands[4:]
+        grad_activation = fp8_linear_bwd_into(
+            grad_output, *out_operands, value.shape[1], ctx.main_grad
+        )
+        width = norm_weight.numel()
+        x, z, grad = (tensor.view(-1, width).float() for tensor in (value, gate, grad_activation))
+        weight = norm_weight.float()
+        grad_gated = grad * F.silu(z)
+        grad_affine = grad_gated * weight
+        grad_inv_rms = (grad_affine * x).sum(-1, keepdim=True)
+        grad_mean = (grad_inv_rms * -0.5) * inv_rms.pow(3)
+        grad_value = (grad_affine * inv_rms) + (grad_mean / width) * (x * 2.0)
+        grad_norm_weight = (grad_gated * (x * inv_rms)).sum(0)
+        grad_hidden = fp8_delta_gate_bwd_into(
+            grad_activation,
+            value,
+            gate,
+            weight,
+            inv_rms.flatten(),
+            *z_operands,
+            ctx.hidden_width,
+            ctx.z_main_grad,
+        )
+        return (
+            grad_value.to(value.dtype).view_as(value),
+            grad_hidden,
+            None,
+            grad_norm_weight.to(norm_weight.dtype),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 class FP8Linear(nn.Linear):
     """
     Outside torch.compile, the bf16 weight is quantized once per step and reused by every
@@ -289,6 +425,30 @@ class FP8Linear(nn.Linear):
         if self.bias is not None:
             output = output + self.bias
         return output
+
+    def forward_delta_gate(
+        self,
+        value: torch.Tensor,
+        hidden: torch.Tensor,
+        input_operands: tuple[torch.Tensor, ...],
+        norm_weight: torch.Tensor,
+        eps: float,
+        z_proj,
+    ) -> torch.Tensor:
+        output = FP8DeltaGateProjection.apply(
+            value.flatten(0, -2),
+            hidden.flatten(0, -2),
+            input_operands,
+            norm_weight,
+            eps,
+            self.weight,
+            self.get_quantized_weight(),
+            self.main_grad,
+            z_proj.weight,
+            z_proj.get_quantized_weight(),
+            z_proj.main_grad,
+        ).view(*value.shape[:-1], self.out_features)
+        return output if self.bias is None else output + self.bias
 
     def get_quantized_weight(
         self,

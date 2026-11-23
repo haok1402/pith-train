@@ -2,7 +2,7 @@ import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR
 
-__all__ = ["fp8_quant_act", "fp8_quant_swiglu"]
+__all__ = ["fp8_quant_act", "fp8_quant_swiglu", "fp8_delta_gate_supported", "fp8_quant_delta_gate"]
 
 
 def fp8_quant_act(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -49,3 +49,14 @@ def fp8_quant_swiglu(gate: torch.Tensor, up: torch.Tensor) -> tuple[torch.Tensor
             return fp8_quant_act_sm100(silu_mul_fwd_sm100(gate, up))
         case _:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
+
+
+def fp8_delta_gate_supported() -> bool:
+    return ARCH_MAJOR == 9
+
+
+def fp8_quant_delta_gate(x: torch.Tensor, weight: torch.Tensor, inverse_rms: torch.Tensor, gate: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize the DeltaNet gated norm's BF16-rounded output on aligned SM90 tiles."""
+    from pithtrain.kernels.fp8_rowwise_blockwise_transpose_sm90 import fp8_quant_act_sm90
+
+    return fp8_quant_act_sm90(x, weight, inverse_rms, gate)

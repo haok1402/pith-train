@@ -58,6 +58,14 @@ def pack_scaled_e4m3(words: list, element_locations: list, input_format: str, rc
     return Uint32(asm(T.i32(), [operand.ir_value(loc=loc, ip=ip) for operand in operands], ptx, constraints))
 
 
+@dsl_user_op
+def silu_precise(gate: Float32, *, loc=None, ip=None) -> Float32:
+    denominator = 1.0 + cute.math.exp(-gate, loc=loc, ip=ip)
+    result = asm(T.f32(), [gate.ir_value(loc=loc, ip=ip), denominator.ir_value(loc=loc, ip=ip)],
+                 "div.full.f32 $0, $1, $2;", "=f,f,f")
+    return Float32(result)
+
+
 def make_global_ptr(base_ptr: cute.Pointer, elem_offset: Int64, elem_bytes: int, dtype: type, alignment: int) -> cute.Pointer:
     elem_addr = base_ptr.toint() + elem_offset * elem_bytes
     return cute.make_ptr(dtype, elem_addr, cute.AddressSpace.gmem, assumed_align=alignment)
@@ -82,9 +90,10 @@ class RowwiseBlockwiseTranspose:
     Fuse rowwise and transposed blockwise FP8 quantization.
     """
 
-    def __init__(self, dtype: type, col_vector_width: int, row_vector_width: int, num_rows_per_thread: int, has_full_tiles: bool, use_coalesced_transpose: bool, fuse_swiglu: bool) -> None:
+    def __init__(self, dtype: type, col_vector_width: int, row_vector_width: int, num_rows_per_thread: int, has_full_tiles: bool, use_coalesced_transpose: bool, fuse_swiglu: bool, fuse_delta_gate: bool) -> None:
         self.dtype, self.num_rows_per_thread = dtype, num_rows_per_thread
         self.fuse_swiglu = fuse_swiglu
+        self.fuse_delta_gate = fuse_delta_gate
         self.has_full_tiles, self.use_coalesced_transpose = has_full_tiles, use_coalesced_transpose
         self.num_threads, self.num_warps = 1024 // num_rows_per_thread, 32 // num_rows_per_thread
         self.input_format = {cutlass.BFloat16: "bf16", cutlass.Float16: "f16", Float32: "f32"}[dtype]
@@ -92,17 +101,17 @@ class RowwiseBlockwiseTranspose:
         self.col_vector_width, self.row_vector_width = col_vector_width, row_vector_width
 
     @cute.jit
-    def __call__(self, mX: cute.Tensor, mUp: cute.Tensor, mOut: cute.Tensor, mScale: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, stream) -> None:
+    def __call__(self, mX: cute.Tensor, mUp: cute.Tensor, mInvRms: cute.Tensor, mGate: cute.Tensor, mOut: cute.Tensor, mScale: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, stream) -> None:
         M, K = mX.shape[0], mX.shape[1]
         num_row_tiles, num_col_tiles = (M + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
         if cutlass.const_expr(self.use_coalesced_transpose):
             grid = [num_col_tiles, num_row_tiles, 1]
         else:
             grid = [num_row_tiles, num_col_tiles, 1]
-        self.kernel(mX, mUp, mOut, mScale, mOutT, mScaleT).launch(grid=grid, block=[self.num_threads, 1, 1], stream=stream)
+        self.kernel(mX, mUp, mInvRms, mGate, mOut, mScale, mOutT, mScaleT).launch(grid=grid, block=[self.num_threads, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(self, mX: cute.Tensor, mUp: cute.Tensor, mOut: cute.Tensor, mScale: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor) -> None:
+    def kernel(self, mX: cute.Tensor, mUp: cute.Tensor, mInvRms: cute.Tensor, mGate: cute.Tensor, mOut: cute.Tensor, mScale: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         bx, by, _ = cute.arch.block_idx()
         if cutlass.const_expr(self.use_coalesced_transpose):
@@ -115,6 +124,10 @@ class RowwiseBlockwiseTranspose:
         if cutlass.const_expr(self.fuse_swiglu):
             up_words = self.load_block(mUp, sub_block)
             x_words = self.apply_swiglu(x_words, up_words)
+
+        if cutlass.const_expr(self.fuse_delta_gate):
+            gate_words = self.load_block(mGate, sub_block)
+            x_words = self.apply_gated_norm(x_words, gate_words, mUp, mInvRms, sub_block)
 
         row_amax = self.reduce_row_amax(x_words)
 
@@ -163,6 +176,30 @@ class RowwiseBlockwiseTranspose:
             gate, up = Uint32(gate_words[word_idx]), Uint32(up_words[word_idx])
             out_lo, out_hi = swiglu_fwd(bf16_lo(gate), bf16_lo(up)), swiglu_fwd(bf16_hi(gate), bf16_hi(up))
             out_words[word_idx] = pack_bf16(out_lo, out_hi)
+        return out_words
+
+    @cute.jit
+    def apply_gated_norm(self, x_words: cute.Tensor, gate_words: cute.Tensor, mWeight: cute.Tensor, mInvRms: cute.Tensor, sub_block: SubBlock) -> cute.Tensor:
+        weight_block = cute.make_rmem_tensor(cute.make_layout(16), Float32)
+        out_words = cute.make_rmem_tensor(cute.make_layout(8 * self.num_rows_per_thread), Uint32)
+        for half_idx in cutlass.range_constexpr(2):
+            col = (sub_block.col_start + half_idx * 64) % BLOCK
+            src = cute.make_tensor(mWeight.iterator + col, cute.make_layout(8))
+            dst = cute.make_tensor(weight_block.iterator + half_idx * 8, cute.make_layout(8))
+            cute.autovec_copy(src, dst)
+        for row_idx in cutlass.range_constexpr(self.num_rows_per_thread):
+            row = (sub_block.row_start + row_idx) * (sub_block.K // BLOCK) + sub_block.col_tile_idx
+            inv_rms = mInvRms[row]
+            for word_idx in cutlass.range_constexpr(8):
+                value = Uint32(x_words[row_idx * 8 + word_idx])
+                weight_lo = weight_block[word_idx * 2]
+                weight_hi = weight_block[word_idx * 2 + 1]
+                value_lo = (bf16_lo(value) * inv_rms) * weight_lo
+                value_hi = (bf16_hi(value) * inv_rms) * weight_hi
+                gate = Uint32(gate_words[row_idx * 8 + word_idx])
+                value_lo = value_lo * silu_precise(bf16_lo(gate))
+                value_hi = value_hi * silu_precise(bf16_hi(gate))
+                out_words[row_idx * 8 + word_idx] = pack_bf16(value_lo, value_hi)
         return out_words
 
     @cute.jit
@@ -339,7 +376,7 @@ def choose_vector_width(size: int, max_width: int) -> int:
     return width
 
 
-def compile_fp8_quant_act(dtype: type, col_vector_width: int, row_vector_width: int, num_rows_per_thread: int, has_full_tiles: bool, use_coalesced_transpose: bool, fuse_swiglu: bool) -> Callable:
+def compile_fp8_quant_act(dtype: type, col_vector_width: int, row_vector_width: int, num_rows_per_thread: int, has_full_tiles: bool, use_coalesced_transpose: bool, fuse_swiglu: bool, fuse_delta_gate: bool) -> Callable:
     M, K, num_col_tiles, num_row_tiles = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
     elem_bytes = dtype.width // 8
     x = fake(dtype, (M, K), (cute.sym_int64(divisibility=col_vector_width), 1), col_vector_width * elem_bytes)
@@ -347,13 +384,16 @@ def compile_fp8_quant_act(dtype: type, col_vector_width: int, row_vector_width: 
     scale = fake(Float32, (M, num_col_tiles), (1, cute.sym_int64()))
     out_t = fake(cutlass.Float8E4M3FN, (K, M), (M, 1))
     scale_t = fake(Float32, (num_col_tiles, num_row_tiles), (num_row_tiles, 1))
-    return cute.compile(RowwiseBlockwiseTranspose(dtype, col_vector_width, row_vector_width, num_rows_per_thread, has_full_tiles, use_coalesced_transpose, fuse_swiglu), x, x, out, scale, out_t, scale_t, fake_stream(), options="--enable-tvm-ffi")
+    # The producer's vector operand is either SwiGLU's up activations or DeltaNet's norm weight.
+    up = fake(Float32, (BLOCK,), (1,), 16) if fuse_delta_gate else x
+    inv_rms = fake(Float32, (cute.sym_int(),), (1,), 16) if fuse_delta_gate else x
+    return cute.compile(RowwiseBlockwiseTranspose(dtype, col_vector_width, row_vector_width, num_rows_per_thread, has_full_tiles, use_coalesced_transpose, fuse_swiglu, fuse_delta_gate), x, up, inv_rms, x, out, scale, out_t, scale_t, fake_stream(), options="--enable-tvm-ffi")
 
 
 DISPATCH_CACHE: dict[tuple, Callable | None] = {}
 
 
-def resolve_fp8_quant_act(dtype: torch.dtype, M: int, K: int, x_row_stride: int, x_base: int, has_unit_col_stride: bool, num_tiles: int, fuse_swiglu: bool) -> Callable | None:
+def resolve_fp8_quant_act(dtype: torch.dtype, M: int, K: int, x_row_stride: int, x_base: int, has_unit_col_stride: bool, num_tiles: int, fuse_swiglu: bool, fuse_delta_gate: bool) -> Callable | None:
     if M == 0 or K == 0:
         return None
     elem_bytes = dtype.itemsize
@@ -362,20 +402,20 @@ def resolve_fp8_quant_act(dtype: torch.dtype, M: int, K: int, x_row_stride: int,
     col_vector_width = choose_vector_width(x_base // elem_bytes, col_vector_width)
     # These aligned dense BF16 shapes fill every tile, so loads and stores need no edge predicates.
     has_full_tiles = dtype == torch.bfloat16 and M in (4096, 8192) and K in (5120, 6144, 17408) and x_row_stride == K and col_vector_width == 8
-    has_full_tiles = has_full_tiles or fuse_swiglu
-    use_coalesced_transpose = fuse_swiglu or (has_unit_col_stride and has_full_tiles and K in (5120, 6144))
+    has_full_tiles = has_full_tiles or fuse_swiglu or fuse_delta_gate
+    use_coalesced_transpose = fuse_swiglu or fuse_delta_gate or (has_unit_col_stride and has_full_tiles and K in (5120, 6144))
     num_rows_per_thread = 4 if use_coalesced_transpose or num_tiles <= SMALL_GRID_TILES else 8
     row_vector_width = choose_vector_width(M, num_rows_per_thread)
-    key = ("fp8_quant_act", dtype, col_vector_width, row_vector_width, num_rows_per_thread, has_full_tiles, use_coalesced_transpose, fuse_swiglu)
+    key = ("fp8_quant_act", dtype, col_vector_width, row_vector_width, num_rows_per_thread, has_full_tiles, use_coalesced_transpose, fuse_swiglu, fuse_delta_gate)
     fn = COMPILE_CACHE.get(key)
     if fn is None:
-        fn = COMPILE_CACHE[key] = compile_fp8_quant_act(TORCH2CUTE[dtype], col_vector_width, row_vector_width, num_rows_per_thread, has_full_tiles, use_coalesced_transpose, fuse_swiglu)
+        fn = COMPILE_CACHE[key] = compile_fp8_quant_act(TORCH2CUTE[dtype], col_vector_width, row_vector_width, num_rows_per_thread, has_full_tiles, use_coalesced_transpose, fuse_swiglu, fuse_delta_gate)
     if len(DISPATCH_CACHE) > 4096:
         DISPATCH_CACHE.clear()
     return fn
 
 
-def fp8_quant_act_sm90(x: torch.Tensor, up: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8_quant_act_sm90(x: torch.Tensor, up: torch.Tensor | None = None, inv_rms: torch.Tensor | None = None, gate: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     SM90 implementation of fp8_quant_act.
     """
@@ -397,13 +437,14 @@ def fp8_quant_act_sm90(x: torch.Tensor, up: torch.Tensor | None = None) -> tuple
 
     # Cache shape dispatch to avoid recomputing vector alignment for repeated launches.
     dtype, x_base = x.dtype, x.data_ptr()
-    fuse_swiglu = up is not None
-    key = (dtype, M, K, x_row_stride, x_base & 15, has_unit_col_stride, fuse_swiglu)
+    fuse_delta_gate = gate is not None
+    fuse_swiglu = up is not None and not fuse_delta_gate
+    key = (dtype, M, K, x_row_stride, x_base & 15, has_unit_col_stride, fuse_swiglu, fuse_delta_gate)
     try:
         fn = DISPATCH_CACHE[key]
     except KeyError:
-        fn = DISPATCH_CACHE[key] = resolve_fp8_quant_act(dtype, M, K, x_row_stride, x_base, has_unit_col_stride, num_row_tiles * num_col_tiles, fuse_swiglu)
+        fn = DISPATCH_CACHE[key] = resolve_fp8_quant_act(dtype, M, K, x_row_stride, x_base, has_unit_col_stride, num_row_tiles * num_col_tiles, fuse_swiglu, fuse_delta_gate)
 
     if fn is not None:
-        fn(x, x if up is None else up, out, scale, out_t, scale_t)
+        fn(x, x if up is None else up, x if inv_rms is None else inv_rms, x if gate is None else gate, out, scale, out_t, scale_t)
     return out, scale, out_t, scale_t

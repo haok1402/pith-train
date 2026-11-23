@@ -15,6 +15,7 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5Moe
 from pithtrain.contexts import distributed, training
 from pithtrain.kernels import (
     bf16_experts_supported,
+    fp8_delta_gate_supported,
     fp8_fused_experts_supported,
     stage_compile_options,
 )
@@ -35,7 +36,7 @@ from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
 from pithtrain.operators.fp8_experts import fp8_scatter_quant, fp8_swiglu_gate_up_experts
 from pithtrain.operators.gated_delta_rule import gated_delta_rule
-from pithtrain.operators.linear import BF16Linear
+from pithtrain.operators.linear import BF16Linear, FP8Linear
 from pithtrain.operators.ring_attention import ring_attention_func
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
@@ -200,7 +201,24 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         B, S, _ = hidden_states.shape
         quantized_hidden = training.Linear.quantize_input(hidden_states)
         mixed_qkv = self.in_proj_qkv(hidden_states, quantized_hidden)
-        z = self.in_proj_z(hidden_states, quantized_hidden).reshape(B, S, -1, self.head_v_dim)
+        fuse_gate = (
+            fp8_delta_gate_supported()
+            and torch.compiler.is_compiling()
+            and torch.is_grad_enabled()
+            and isinstance(self.out_proj, FP8Linear)
+            and isinstance(self.in_proj_z, FP8Linear)
+            and self.out_proj.main_grad is not None
+            and self.in_proj_z.main_grad is not None
+            and self.in_proj_z.bias is None
+            and hidden_states.dtype == torch.bfloat16
+            and B * S > 0
+            and B * S % 128 == 0
+            and self.head_v_dim == 128
+            and distributed.cp_size == 1
+            and cu_seqlens is None
+        )
+        if not fuse_gate:
+            z = self.in_proj_z(hidden_states, quantized_hidden).reshape(B, S, -1, self.head_v_dim)
         b, a = self.project_gates(hidden_states)
         # Under CP, the tokens prepended from the previous rank replace the conv's zero padding, so
         # the valid output starts at offset.
@@ -228,6 +246,15 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
             core_attn_out = gated_delta_rule(query, key, value, g, beta, distributed.cp_group)
         else:
             core_attn_out = gated_delta_rule(query, key, value, g, beta)
+        if fuse_gate:
+            return self.out_proj.forward_delta_gate(
+                core_attn_out.reshape(B, S, -1),
+                hidden_states,
+                quantized_hidden,
+                self.norm.weight,
+                self.norm.eps,
+                self.in_proj_z,
+            )
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         core_attn_out = self.norm(core_attn_out, z)

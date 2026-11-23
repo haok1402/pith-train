@@ -2,7 +2,7 @@ import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR
 
-__all__ = ["fp8_quant_grad"]
+__all__ = ["fp8_quant_grad", "fp8_quant_delta_grad"]
 
 
 def fp8_quant_grad(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -28,3 +28,9 @@ def fp8_quant_grad(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.T
             return fp8_quant_grad_sm100(x)
         case _:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
+
+
+def fp8_quant_delta_grad(grad, value, gate, weight, inverse_rms):
+    from pithtrain.kernels.fp8_rowwise_transpose_sm90 import fp8_quant_delta_grad_sm90
+
+    return fp8_quant_delta_grad_sm90(grad, value, gate, weight, inverse_rms)

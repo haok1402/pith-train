@@ -8,7 +8,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from pithtrain.kernels import fp8_quant_act, fp8_quant_swiglu, silu_mul_fwd
+from pithtrain.kernels import (
+    fp8_delta_gate_supported,
+    fp8_quant_act,
+    fp8_quant_delta_gate,
+    fp8_quant_swiglu,
+    silu_mul_fwd,
+)
 
 BLOCK = 128
 
@@ -174,3 +180,29 @@ def test_swiglu_quantization(M, K):
     assert_scale_equal("scale", scale, ref_scale)
     assert_fp8_equal("out_t", out_t, ref_t)
     assert_scale_equal("scale_t", scale_t, ref_scale_t)
+
+
+def test_delta_gate_preserves_quantized_activation() -> None:
+    if not fp8_delta_gate_supported():
+        pytest.skip("DeltaNet gate fusion requires SM90")
+
+    @torch.compile(fullgraph=True, options={"triton.autotune_pointwise": False})
+    def reference(value, gate, weight, inverse_rms):
+        normalized = (value.float() * inverse_rms[:, None]) * weight
+        return (normalized * F.silu(gate.float())).to(value.dtype)
+
+    generator = torch.Generator(device="cuda").manual_seed(21)
+    value, gate = [
+        torch.randn((256, BLOCK * 8), dtype=torch.bfloat16, device="cuda", generator=generator)
+        for _ in range(2)
+    ]
+    weight = torch.randn((BLOCK,), device="cuda", generator=generator)
+    inverse_rms = (value.view(-1, BLOCK).float().square().mean(-1) + 1e-6).rsqrt()
+    rounded = reference(value.view(-1, BLOCK), gate.view(-1, BLOCK), weight, inverse_rms)
+    expected = fp8_quant_act(rounded.view_as(value))
+    actual = fp8_quant_delta_gate(value, weight, inverse_rms, gate)
+    for i, (got, want) in enumerate(zip(actual, expected, strict=True)):
+        if i % 2 == 0:
+            assert_fp8_equal(f"operand {i}", got, want)
+        else:
+            assert_scale_equal(f"scale {i}", got, want)

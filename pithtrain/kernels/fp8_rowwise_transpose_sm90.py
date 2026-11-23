@@ -7,16 +7,18 @@ from typing import Callable
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Int32, Int64, Uint32, const_expr
+from cutlass import Float32, Int32, Int64, Uint32, const_expr
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import asm_args_last, cp_async16, lds_b32, lds_v4, max2, prmt, st_b32, st_b8, st_v2, st_v4, sts_b32_raw, sts_v2, unpack
+from pithtrain.kernels.cute_ptx_sm90 import asm, asm_args_last, bf16_hi, bf16_lo, cp_async16, pack_bf16, lds_b32, lds_v4, max2, prmt, st_b32, st_b8, st_v2, st_v4, sts_b32_raw, sts_v2, unpack
 from pithtrain.kernels.fp8_e8m0_scale_sm90 import compute_scale_rcp_bits, quantize_four_from_bits, reduce_bf16x2_amax4
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale
 
-__all__ = ["fp8_quant_grad_sm90"]
+from pithtrain.kernels.silu_mul_sm90 import SIGMOID_PTX
+
+__all__ = ["fp8_quant_grad_sm90", "fp8_quant_delta_grad_sm90"]
 
 TILE = 128
 THREADS = 256
@@ -508,9 +510,58 @@ def store_transpose(sub_block: SubBlock, s_tile: Int32, out_t_base: Int64, num_r
                         st_b8(out_addr + 8 * half_idx + byte_idx, word >> (8 * (byte_idx % 4)), partial_ok & make_predicate(half_row_start + byte_idx < num_rows))
 
 
+@dsl_user_op
+def delta_gate_backward(grad: Float32, value: Float32, inv_rms: Float32, weight: Float32, gate: Float32, *, loc=None, ip=None) -> Float32:
+    """The compiled SiLU derivative, rounded to BF16 by the caller."""
+    ptx = (
+        "{\n.reg .f32 t, s, d;\n"
+        + SIGMOID_PTX.replace("$G", "$5")
+        + "mul.rn.f32 d, $2, $3;\n"
+        + "mul.rn.f32 d, d, $4;\n"
+        + "mul.rn.f32 d, $1, d;\n"
+        + "mul.rn.f32 d, d, s;\n"
+        + "sub.rn.f32 t, 0f3F800000, s;\n"
+        + "fma.rn.f32 t, t, $5, 0f3F800000;\n"
+        + "mul.rn.f32 $0, d, t;\n}"
+    )
+    operands = [val.ir_value(loc=loc, ip=ip) for val in (grad, value, inv_rms, weight, gate)]
+    return Float32(asm(T.f32(), operands, ptx, "=f,f,f,f,f,f"))
+
+
+def load_delta_gate_grad(mGrad, mValue, mGate, mWeight, mInvRms, sub_block, N):
+    """Produce the BF16-rounded gate gradient directly in the quantizer's registers."""
+    rows = []
+    x_base = mValue.iterator.toint()
+    gate_base = mGate.iterator.toint()
+    grad_base = mGrad.iterator.toint()
+    head_column = sub_block.col_start % TILE
+    for i in range(8):
+        row = sub_block.row_start + i
+        inverse_rms = mInvRms[row * (N // TILE) + sub_block.bx]
+        offset = (Int64(row) * Int64(N) + Int64(sub_block.col_start)) * 2
+        words = [
+            emit_words(LD_V4_NC_FULL_PTX, "=r,=r,=r,=r,l", [(base + offset).ir_value()], 4)
+            for base in (grad_base, x_base, gate_base)
+        ]
+        grad_words, value_words, gate_words = words
+        row_words = []
+        for j in range(4):
+            weight_lo = mWeight[head_column + 2 * j]
+            weight_hi = mWeight[head_column + 2 * j + 1]
+            grad_lo = delta_gate_backward(
+                bf16_lo(grad_words[j]), bf16_lo(value_words[j]), inverse_rms, weight_lo, bf16_lo(gate_words[j]),
+            )
+            grad_hi = delta_gate_backward(
+                bf16_hi(grad_words[j]), bf16_hi(value_words[j]), inverse_rms, weight_hi, bf16_hi(gate_words[j]),
+            )
+            row_words.append(pack_bf16(grad_lo, grad_hi))
+        rows.append(row_words)
+    return rows
+
+
 @cute.kernel
-def rowwise_transpose_kernel(mX: cute.Tensor, mOut: cute.Tensor, mScale: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor,
-    input_format: cutlass.Constexpr[str], is_out_aligned: cutlass.Constexpr[bool], transpose_alignment: cutlass.Constexpr[int], use_gather: cutlass.Constexpr[bool], use_full_tiles: cutlass.Constexpr[bool]) -> None:
+def rowwise_transpose_kernel(mX: cute.Tensor, auxiliaries: tuple, mOut: cute.Tensor, mScale: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor,
+    input_format: cutlass.Constexpr[str], is_out_aligned: cutlass.Constexpr[bool], transpose_alignment: cutlass.Constexpr[int], use_gather: cutlass.Constexpr[bool], use_full_tiles: cutlass.Constexpr[bool], fuse_delta_gate: cutlass.Constexpr[bool]) -> None:
     M, N = mX.shape[0], mX.shape[1]
     tidx, _, _ = cute.arch.thread_idx()
     bx, by, _ = cute.arch.block_idx()
@@ -527,7 +578,11 @@ def rowwise_transpose_kernel(mX: cute.Tensor, mOut: cute.Tensor, mScale: cute.Te
         rows = load_staged_rows(s_tile, sub_block, input_format)
     else:
         s_tile = smem.allocate_array(cutlass.Uint8, TILE * TILE, byte_alignment=128).toint()
-        rows = load_rows(mX.iterator.toint(), Int64(mX.stride[0]), sub_block, input_format)
+        if const_expr(fuse_delta_gate):
+            mValue, mGate, mWeight, mInvRms = auxiliaries
+            rows = load_delta_gate_grad(mX, mValue, mGate, mWeight, mInvRms, sub_block, N)
+        else:
+            rows = load_rows(mX.iterator.toint(), Int64(mX.stride[0]), sub_block, input_format)
 
     out_base, scale_base, out_t_base, scale_t_base = mOut.iterator.toint(), mScale.iterator.toint(), mOutT.iterator.toint(), mScaleT.iterator.toint()
     row_magnitude_bits = get_magnitude_bits(rows, num_words, input_format)
@@ -654,7 +709,7 @@ def launch_fp8_quant_grad(mX: cute.Tensor, mOut: cute.Tensor, mScale: cute.Tenso
     if const_expr(use_staging):
         StagedBf16Transpose().staged_bf16_kernel(mX, mOut, mScale, mOutT, mScaleT).launch(grid=grid, block=[THREADS, 1, 1], stream=stream)
     else:
-        rowwise_transpose_kernel(mX, mOut, mScale, mOutT, mScaleT, input_format, is_out_aligned, transpose_alignment, use_gather, use_full_tiles).launch(grid=grid, block=[THREADS, 1, 1], stream=stream)
+        rowwise_transpose_kernel(mX, (), mOut, mScale, mOutT, mScaleT, input_format, is_out_aligned, transpose_alignment, use_gather, use_full_tiles, False).launch(grid=grid, block=[THREADS, 1, 1], stream=stream)
 
 
 INPUT_FORMATS = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}
@@ -711,4 +766,40 @@ def fp8_quant_grad_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, to
         return launch_fp8_quant_grad_view(x, input_format, M, N, row_stride, col_stride)
     # Swap outputs so a unit row stride can use the contiguous-column path.
     out_t, scale_t, out, scale = launch_fp8_quant_grad_view(x.T, input_format, N, M, col_stride, 1)
+    return out, scale, out_t, scale_t
+
+
+@cute.jit
+def launch_delta_grad(mGrad, mValue, mGate, mWeight, mInvRms, mOut, mScale, mOutT, mScaleT, stream):
+    M, N = mGrad.shape
+    rowwise_transpose_kernel(
+        mGrad, (mValue, mGate, mWeight, mInvRms), mOut, mScale, mOutT, mScaleT,
+        "bf16", True, 16, False, True, True,
+    ).launch(grid=[N // TILE, M // TILE, 1], block=[THREADS, 1, 1], stream=stream)
+
+
+DELTA_GRAD_KERNEL = None
+
+
+def fp8_quant_delta_grad_sm90(grad, value, gate, weight, inv_rms):
+    global DELTA_GRAD_KERNEL
+    if DELTA_GRAD_KERNEL is None:
+        M, N, scale_rows, scale_cols = (cute.sym_int() for _ in range(4))
+        x = fake(cutlass.BFloat16, (M, N), (N, 1), 16)
+        weight_fake = fake(Float32, (TILE,), (1,), 16)
+        inv_rms_fake = fake(Float32, (cute.sym_int(),), (1,), 16)
+        out = fake(cutlass.Float8E4M3FN, (M, N), (N, 1), 16)
+        out_t = fake(cutlass.Float8E4M3FN, (N, M), (M, 1), 16)
+        scale = fake(Float32, (M, scale_cols), (1, cute.sym_int64()))
+        scale_t = fake(Float32, (N, scale_rows), (1, cute.sym_int64()))
+        DELTA_GRAD_KERNEL = cute.compile(
+            launch_delta_grad, x, x, x, weight_fake, inv_rms_fake, out, scale, out_t, scale_t,
+            fake_stream(), options="--enable-tvm-ffi",
+        )
+    M, N = grad.shape
+    out = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=grad.device)
+    out_t = torch.empty((N, M), dtype=torch.float8_e4m3fn, device=grad.device)
+    scale = mn_major_scale(M, N // TILE, grad.device)
+    scale_t = mn_major_scale(N, M // TILE, grad.device)
+    DELTA_GRAD_KERNEL(grad, value, gate, weight, inv_rms, out, scale, out_t, scale_t)
     return out, scale, out_t, scale_t
