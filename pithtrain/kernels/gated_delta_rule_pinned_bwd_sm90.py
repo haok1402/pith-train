@@ -7,7 +7,7 @@ dg fused in). They follow FLA 0.5.2's chunk algorithm and rounding points: bf16 
 dv_local, dh, du, dw, ds and dA, fp32 accumulation, exp2 of the log2 gate, and a TF32 (q 2^g)^T do
 product in the dh update with truncated operands, as FLA's tl.dot on Hopper; dk and dg stay in fp32
 where FLA adds them through bf16 / fp32 buffers. When T is not a multiple of the chunk size each
-kernel runs its ragged variant, whose last chunk behaves as if zero-padded to 64 rows (copy_rows'
+kernel runs its ragged variant, whose last chunk behaves as if zero-padded to 64 rows (copy_gdr_rows'
 zero-filled loads, gate rows past T reading g_cum[T - 1], stores of rows below T only); the
 intermediates keep T rows.
 """
@@ -23,7 +23,7 @@ from quack import sm90_utils
 from quack.layout_utils import reshape_acc_to_frgA
 
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
-from pithtrain.kernels.gated_delta_rule_pinned_fwd_sm90 import BT, HEAD_DIM, STATE_BV, STATE_STAGES, STATE_THREADS, chunk_copies, copy_rows, multiply_a, operand_copies, scale_kv
+from pithtrain.kernels.gated_delta_rule_pinned_fwd_sm90 import CHUNK_ROWS as BT, HEAD_DIM, STATE_COLS as STATE_BV, STATE_STAGES, STATE_THREADS, make_gdr_chunk_copies, copy_gdr_rows, apply_gdr_wy_matrix, make_gdr_mma_copies, scale_gdr_operands
 
 __all__ = ["BwdPrologue", "ChunkGradients", "StateGradient", "StateRecompute", "bwd_prologue", "chunk_gdr_bwd_pinned_sm90", "chunk_gradients", "state_final", "state_gradient", "state_gradient_initial", "state_recompute"]
 
@@ -75,9 +75,9 @@ class BwdPrologue:
         s_a = smem.allocate_tensor(BFloat16, a_layout, 1024)
         s_gcum = smem.allocate_tensor(Float32, cute.make_layout(BT), 16)
         s_beta = smem.allocate_tensor(Float32, cute.make_layout(BT), 16)
-        load, store_128, _ = chunk_copies(PROLOGUE_THREADS, tidx)
+        load, store_128, _ = make_gdr_chunk_copies(PROLOGUE_THREADS, tidx)
         load_64 = cute.make_tiled_copy_tv(cute.make_copy_atom(cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL), BFloat16, num_bits_per_copy=128), cute.make_ordered_layout((PROLOGUE_THREADS // 8, 8), order=(1, 0)), cute.make_layout((1, 8))).get_slice(tidx)
-        ld_A, ld_B, _, ldt_B, st_C, _, _ = operand_copies(mma, tidx)
+        ld_A, ld_B, _, ldt_B, st_C, _, _ = make_gdr_mma_copies(mma, tidx)
         thr = mma.get_slice(tidx)
         tile = lambda m, head: cute.local_tile(m[None, head, None], (BT, HEAD_DIM), (chunk_idx, 0))
         if const_expr(self.ragged):
@@ -85,12 +85,12 @@ class BwdPrologue:
             valid = T - chunk_idx * BT
             rows_128 = load.partition_D(cute.make_identity_tensor((BT, HEAD_DIM)))
             rows_64 = load_64.partition_D(cute.make_identity_tensor((BT, BT)))
-            copy_rows(load, load.partition_S(tile(mK, key_head_idx)), load.partition_D(s_k), rows_128, valid, True)
-            copy_rows(load, load.partition_S(tile(mQ, key_head_idx)), load.partition_D(s_q), rows_128, valid, True)
+            copy_gdr_rows(load, load.partition_S(tile(mK, key_head_idx)), load.partition_D(s_k), rows_128, valid, True)
+            copy_gdr_rows(load, load.partition_S(tile(mQ, key_head_idx)), load.partition_D(s_q), rows_128, valid, True)
             cute.arch.cp_async_commit_group()
-            copy_rows(load, load.partition_S(tile(mDo, head_idx)), load.partition_D(s_do), rows_128, valid, True)
-            copy_rows(load, load.partition_S(tile(mV, head_idx)), load.partition_D(s_v), rows_128, valid, True)
-            copy_rows(load_64, load_64.partition_S(cute.local_tile(mA[None, head_idx, None], (BT, BT), (chunk_idx, 0))), load_64.partition_D(s_a), rows_64, valid, True)
+            copy_gdr_rows(load, load.partition_S(tile(mDo, head_idx)), load.partition_D(s_do), rows_128, valid, True)
+            copy_gdr_rows(load, load.partition_S(tile(mV, head_idx)), load.partition_D(s_v), rows_128, valid, True)
+            copy_gdr_rows(load_64, load_64.partition_S(cute.local_tile(mA[None, head_idx, None], (BT, BT), (chunk_idx, 0))), load_64.partition_D(s_a), rows_64, valid, True)
             cute.arch.cp_async_commit_group()
             if tidx < BT:
                 # both loads at the clamped row, issued together; beta past T is then
@@ -138,16 +138,16 @@ class BwdPrologue:
         cute.copy(st_C, st_C.retile(r_dv), st_C.partition_D(s_q))  # q is no longer read
         cute.arch.barrier()
         if const_expr(self.ragged):
-            copy_rows(store_128, store_128.partition_S(s_q), store_128.partition_D(tile(mDvLocal, head_idx)), rows_128, valid, False)
+            copy_gdr_rows(store_128, store_128.partition_S(s_q), store_128.partition_D(tile(mDvLocal, head_idx)), rows_128, valid, False)
         else:
             cute.copy(store_128, store_128.partition_S(s_q), store_128.partition_D(tile(mDvLocal, head_idx)))
-        scale_kv(load, s_k, s_v, s_gcum, s_beta, True)
+        scale_gdr_operands(load, s_k, s_v, s_gcum, s_beta, True)
         for which in cutlass.range_constexpr(2):
             s_x = s_v if const_expr(which == 0) else s_k
             mOut = mU if const_expr(which == 0) else mW
-            multiply_a(mma, thr, ld_A, ldt_B, s_a, s_x)
+            apply_gdr_wy_matrix(mma, thr, ld_A, ldt_B, s_a, s_x)
             if const_expr(self.ragged):
-                copy_rows(store_128, store_128.partition_S(s_x), store_128.partition_D(tile(mOut, head_idx)), rows_128, valid, False)
+                copy_gdr_rows(store_128, store_128.partition_S(s_x), store_128.partition_D(tile(mOut, head_idx)), rows_128, valid, False)
             else:
                 cute.copy(store_128, store_128.partition_S(s_x), store_128.partition_D(tile(mOut, head_idx)))
 
@@ -196,7 +196,7 @@ class StateRecompute:
         s_gcum = smem.allocate_tensor(Float32, cute.make_layout((BT, STATE_STAGES), stride=(1, BT)), 16)
         num_chunks = (mGcum.shape[0] + BT - 1) // BT if const_expr(self.ragged) else mGcum.shape[0] // BT
         key_head_idx = head_idx // (self.HV // self.H)
-        load, store_128, _ = chunk_copies(STATE_THREADS, tidx)
+        load, store_128, _ = make_gdr_chunk_copies(STATE_THREADS, tidx)
         atom_load = cute.make_copy_atom(cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL), BFloat16, num_bits_per_copy=128)
         atom_store = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=128)
         narrow = cute.make_ordered_layout((STATE_THREADS // (STATE_BV // 8), STATE_BV // 8), order=(1, 0))
@@ -228,7 +228,7 @@ class StateRecompute:
                         cute.copy(load_gate, t_g_src[None, None, stage], t_g_dst[None, None, stage])
             cute.arch.cp_async_commit_group()
         thr = mma.get_slice(tidx)
-        ld_A, ld_B, ldt_A, _, st_C, st_C_t, ld_C = operand_copies(mma, tidx)
+        ld_A, ld_B, ldt_A, _, st_C, st_C_t, ld_C = make_gdr_mma_copies(mma, tidx)
         acc_h = cute.make_rmem_tensor(thr.partition_shape_C((HEAD_DIM, STATE_BV)), Float32)
         acc_h.fill(0.0)
         h_coords = thr.partition_C(cute.make_identity_tensor((HEAD_DIM, STATE_BV)))
@@ -271,7 +271,7 @@ class StateRecompute:
             cute.arch.barrier()
             if const_expr(self.store_states):
                 if const_expr(self.ragged):
-                    copy_rows(store_v, t_vnew_store, store_v.partition_D(gVnew[None, None, chunk]), rows_v, T - chunk * BT, False)
+                    copy_gdr_rows(store_v, t_vnew_store, store_v.partition_D(gVnew[None, None, chunk]), rows_v, T - chunk * BT, False)
                 else:
                     cute.copy(store_v, t_vnew_store, store_v.partition_D(gVnew[None, None, chunk]))
             s_k_n_t = cute.composition(s_k_n, cute.make_ordered_layout((HEAD_DIM, BT), order=(1, 0)))
@@ -304,9 +304,9 @@ class StateRecompute:
         t_k_src, t_w_src, t_u_src, t_g_src = sources
         t_k_dst, t_w_dst, t_u_dst, t_g_dst = targets
         rows_wide, rows_narrow = rows
-        copy_rows(load, t_k_src[None, None, None, chunk], t_k_dst[None, None, None, stage], rows_wide, valid, True)
-        copy_rows(load, t_w_src[None, None, None, chunk], t_w_dst[None, None, None, stage], rows_wide, valid, True)
-        copy_rows(load_u, t_u_src[None, None, None, chunk], t_u_dst[None, None, None, stage], rows_narrow, valid, True)
+        copy_gdr_rows(load, t_k_src[None, None, None, chunk], t_k_dst[None, None, None, stage], rows_wide, valid, True)
+        copy_gdr_rows(load, t_w_src[None, None, None, chunk], t_w_dst[None, None, None, stage], rows_wide, valid, True)
+        copy_gdr_rows(load_u, t_u_src[None, None, None, chunk], t_u_dst[None, None, None, stage], rows_narrow, valid, True)
         if tidx < BT:
             if tidx < valid:
                 cute.copy(load_gate, t_g_src[None, None, chunk], t_g_dst[None, None, stage])
@@ -386,9 +386,9 @@ class StateGradient:
             T = mGcum.shape[0]
             valid = T - chunk * BT
             for i in cutlass.range_constexpr(3):
-                copy_rows(load, sources[i][None, None, None, chunk], targets[i][None, None, None, buffer], rows_wide, valid, True)
+                copy_gdr_rows(load, sources[i][None, None, None, chunk], targets[i][None, None, None, buffer], rows_wide, valid, True)
             for i in cutlass.range_constexpr(3, 5):
-                copy_rows(load_cols, sources[i][None, None, None, chunk], targets[i][None, None, None, buffer], rows_cols, valid, True)
+                copy_gdr_rows(load_cols, sources[i][None, None, None, chunk], targets[i][None, None, None, buffer], rows_cols, valid, True)
             if tidx < BT:
                 if tidx < valid:
                     cute.copy(load_gate, sources[5][None, None, chunk], targets[5][None, None, buffer])
@@ -409,7 +409,7 @@ class StateGradient:
         num_chunks = (mGcum.shape[0] + BT - 1) // BT if const_expr(self.ragged) else mGcum.shape[0] // BT
         key_head_idx = head_idx // (self.HV // self.H)
         threads = STATE_THREADS
-        load, _, _ = chunk_copies(threads, tidx)
+        load, _, _ = make_gdr_chunk_copies(threads, tidx)
         atom_load = cute.make_copy_atom(cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL), BFloat16, num_bits_per_copy=128)
         load_cols = cute.make_tiled_copy_tv(atom_load, cute.make_ordered_layout((threads // (GRAD_BV // 8), GRAD_BV // 8), order=(1, 0)), cute.make_layout((1, 8))).get_slice(tidx)
         load_gate = cute.make_tiled_copy_tv(cute.make_copy_atom(cpasync.CopyG2SOp(), Float32, num_bits_per_copy=32), cute.make_layout(BT), cute.make_layout(1)).get_slice(tidx % BT)
@@ -474,11 +474,11 @@ class StateGradient:
     def chain_loop(self, mDh: cute.Tensor, mDu: cute.Tensor, mDht: cute.Tensor, mDh0: cute.Tensor, mma: cute.TiledMma, buffers: tuple, tidx, col_tile, head_idx, num_chunks):
         s_k, s_w, _, s_dv_local, _, s_dh, s_du_t, s_du, s_gcum, s_p, _ = buffers
         threads = STATE_THREADS
-        _, store_128, _ = chunk_copies(threads, tidx)
+        _, store_128, _ = make_gdr_chunk_copies(threads, tidx)
         atom_store = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=128)
         store_cols = cute.make_tiled_copy_tv(atom_store, cute.make_ordered_layout((threads // (GRAD_BV // 8), GRAD_BV // 8), order=(1, 0)), cute.make_layout((1, 8))).get_slice(tidx)
         thr = mma.get_slice(tidx)
-        ld_A, ld_B, ldt_A, _, st_C, st_C_t, ld_C = operand_copies(mma, tidx)
+        ld_A, ld_B, ldt_A, _, st_C, st_C_t, ld_C = make_gdr_mma_copies(mma, tidx)
         if const_expr(self.store_states):
             gDu = cute.local_tile(mDu[None, head_idx, None], (BT, GRAD_BV), (None, col_tile))
         acc_dh = cute.make_rmem_tensor(thr.partition_shape_C((HEAD_DIM, GRAD_BV)), Float32)
@@ -523,7 +523,7 @@ class StateGradient:
             cute.arch.barrier(barrier_id=BAR_CHAIN, number_of_threads=threads)
             if const_expr(self.store_states):
                 if const_expr(self.ragged):
-                    copy_rows(store_cols, t_du_store, store_cols.partition_D(gDu[None, None, chunk]), rows_du, T - chunk * BT, False)
+                    copy_gdr_rows(store_cols, t_du_store, store_cols.partition_D(gDu[None, None, chunk]), rows_du, T - chunk * BT, False)
                 else:
                     cute.copy(store_cols, t_du_store, store_cols.partition_D(gDu[None, None, chunk]))
             s_w_n_t = cute.composition(s_w_n, cute.make_ordered_layout((HEAD_DIM, BT), order=(1, 0)))
@@ -614,7 +614,7 @@ class ChunkGradients:
         s_kbg = cute.make_tensor(s_h.iterator, chunk_layout.outer)
         s_kb = cute.make_tensor(s_h.iterator + BT * HEAD_DIM, chunk_layout.outer)
         s_vb = cute.make_tensor(s_dh.iterator, chunk_layout.outer)
-        load, store_128, _ = chunk_copies(GRAD_THREADS, tidx)
+        load, store_128, _ = make_gdr_chunk_copies(GRAD_THREADS, tidx)
         load_64 = cute.make_tiled_copy_tv(cute.make_copy_atom(cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL), BFloat16, num_bits_per_copy=128), cute.make_ordered_layout((GRAD_THREADS // 8, 8), order=(1, 0)), cute.make_layout((1, 8))).get_slice(tidx)
         mma_wide, mma_wide_t, mma_square, mma_square_t = mmas
         warp_group = cute.make_layout(GRAD_THREADS // 128, stride=128)(cute.arch.make_warp_uniform(tidx // 128))
@@ -660,16 +660,16 @@ class ChunkGradients:
             valid = T - chunk_idx * BT
             rows_128 = load.partition_D(cute.make_identity_tensor((BT, HEAD_DIM)))
             rows_64 = load_64.partition_D(cute.make_identity_tensor((BT, BT)))
-            copy_rows(load, load.partition_S(tile(mDu, head_idx)), load.partition_D(s_du), rows_128, valid, True)
+            copy_gdr_rows(load, load.partition_S(tile(mDu, head_idx)), load.partition_D(s_du), rows_128, valid, True)
             cute.copy(load, load.partition_S(state_tile(mH)), load.partition_D(s_h))
-            copy_rows(load, load.partition_S(tile(mDo, head_idx)), load.partition_D(s_do), rows_128, valid, True)
-            copy_rows(load, load.partition_S(tile(mVnew, head_idx)), load.partition_D(s_vnew), rows_128, valid, True)
+            copy_gdr_rows(load, load.partition_S(tile(mDo, head_idx)), load.partition_D(s_do), rows_128, valid, True)
+            copy_gdr_rows(load, load.partition_S(tile(mVnew, head_idx)), load.partition_D(s_vnew), rows_128, valid, True)
             cute.copy(load, load.partition_S(state_tile(mDh)), load.partition_D(s_dh))
             cute.arch.cp_async_commit_group()
-            copy_rows(load, load.partition_S(tile(mK, key_head_idx)), load.partition_D(s_k), rows_128, valid, True)
-            copy_rows(load, load.partition_S(tile(mQ, key_head_idx)), load.partition_D(s_q), rows_128, valid, True)
-            copy_rows(load, load.partition_S(tile(mV, head_idx)), load.partition_D(s_v), rows_128, valid, True)
-            copy_rows(load_64, load_64.partition_S(cute.local_tile(mA[None, head_idx, None], (BT, BT), (chunk_idx, 0))), load_64.partition_D(s_a), rows_64, valid, True)
+            copy_gdr_rows(load, load.partition_S(tile(mK, key_head_idx)), load.partition_D(s_k), rows_128, valid, True)
+            copy_gdr_rows(load, load.partition_S(tile(mQ, key_head_idx)), load.partition_D(s_q), rows_128, valid, True)
+            copy_gdr_rows(load, load.partition_S(tile(mV, head_idx)), load.partition_D(s_v), rows_128, valid, True)
+            copy_gdr_rows(load_64, load_64.partition_S(cute.local_tile(mA[None, head_idx, None], (BT, BT), (chunk_idx, 0))), load_64.partition_D(s_a), rows_64, valid, True)
             cute.arch.cp_async_commit_group()
             if tidx < BT:
                 # both loads at the clamped row, issued together; beta past T is then
@@ -794,7 +794,7 @@ class ChunkGradients:
                 t_vb[None, i, j].store((t_v[None, i, j].load().to(Float32) * beta).to(BFloat16))
         sync()
         if const_expr(self.ragged):
-            copy_rows(store_128, store_128.partition_S(s_do), store_128.partition_D(tile(mDq, head_idx)), rows_128, valid, False)
+            copy_gdr_rows(store_128, store_128.partition_S(s_do), store_128.partition_D(tile(mDq, head_idx)), rows_128, valid, False)
         else:
             cute.copy(store_128, store_128.partition_S(s_do), store_128.partition_D(tile(mDq, head_idx)))
         acc_da = cute.make_rmem_tensor(thr_square.partition_shape_C((BT, BT)), Float32)
@@ -840,7 +840,7 @@ class ChunkGradients:
         cute.copy(st_C_square, st_C_square.retile(r_da), st_C_square.partition_D(s_sq))
         sync()
         if const_expr(self.ragged):
-            copy_rows(store_128, store_128.partition_S(s_vnew), store_128.partition_D(tile(mDv, head_idx)), rows_128, valid, False)
+            copy_gdr_rows(store_128, store_128.partition_S(s_vnew), store_128.partition_D(tile(mDv, head_idx)), rows_128, valid, False)
         else:
             cute.copy(store_128, store_128.partition_S(s_vnew), store_128.partition_D(tile(mDv, head_idx)))
         acc_da.fill(0.0)
@@ -909,7 +909,7 @@ class ChunkGradients:
         cute.copy(st_C, st_C.retile(r_out), st_C.partition_D(s_q))
         sync()
         if const_expr(self.ragged):
-            copy_rows(store_128, store_128.partition_S(s_q), store_128.partition_D(tile(mDk, head_idx)), rows_128, valid, False)
+            copy_gdr_rows(store_128, store_128.partition_S(s_q), store_128.partition_D(tile(mDk, head_idx)), rows_128, valid, False)
         else:
             cute.copy(store_128, store_128.partition_S(s_q), store_128.partition_D(tile(mDk, head_idx)))
         if tidx < BT:
