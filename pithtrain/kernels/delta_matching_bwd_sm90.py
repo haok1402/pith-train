@@ -84,6 +84,8 @@ class MatchedCorrection:
         self.group_keys, self.tile_keys = 8192 // head_dim, 128
         self.stages, self.consumer_groups, self.load_group = 2, 2, 0
         self.consumer_registers, self.load_registers = 200, 24
+        self.split_key_value = head_dim == 256
+        self.key_load_warp, self.value_load_warp = 1, 2
 
     @cute.jit
     def __call__(self, mQuery, mQueryScale, mKey, mKeyScale, mValue, mValueScale, mGrad, mGradScale, mLse, mDelta, stream):
@@ -97,7 +99,8 @@ class MatchedCorrection:
     def kernel(self, tensors, copies):
         tidx, _, _ = cute.arch.thread_idx()
         bx, by, _ = cute.arch.block_idx()
-        warp_group = cute.arch.make_warp_uniform(cute.arch.warp_idx()) // 4
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        warp_group = warp // 4
         query_block = bx * self.consumer_groups
         last_tile = query_block * BLOCK_QUERY // self.tile_keys
         key_head = by // (cute.size(tensors[0], mode=[0]) // cute.size(tensors[1], mode=[0]))
@@ -107,11 +110,21 @@ class MatchedCorrection:
         s_keys = allocate_staged_operand(allocator, self.tile_keys, self.head_dim, self.stages)
         s_values = allocate_staged_operand(allocator, self.tile_keys, self.head_dim, self.stages)
         buffers = (s_query, s_grad, s_keys, s_values)
-        barriers = initialize_attention_barriers(allocator, tidx, self.stages, self.consumer_groups)
+        ring_slots = 2 * self.stages if cutlass.const_expr(self.split_key_value) else self.stages
+        readers = 4 * self.consumer_groups if cutlass.const_expr(self.split_key_value) else self.consumer_groups
+        barriers = initialize_attention_barriers(allocator, tidx, ring_slots, readers)
 
         if warp_group == self.load_group:
             cute.arch.setmaxregister_decrease(self.load_registers)
-            if tidx == 0:
+            if cutlass.const_expr(self.split_key_value):
+                if warp == 0:
+                    self.load_resident(copies, buffers, barriers[0], query_block, by, tidx % 32)
+                elif warp == self.key_load_warp:
+                    self.load_key_value_stream(copies[2], s_keys, barriers[1], barriers[2], key_head, last_tile, tidx % 32)
+                elif warp == self.value_load_warp:
+                    self.load_key_value_stream(copies[3], s_values, barriers[1] + self.stages,
+                                               barriers[2] + self.stages, key_head, last_tile, tidx % 32)
+            elif tidx == 0:
                 self.load_loop(copies, buffers, barriers, query_block, by, key_head, last_tile)
         else:
             cute.arch.setmaxregister_increase(self.consumer_registers)
@@ -119,14 +132,36 @@ class MatchedCorrection:
             self.compute_loop(tensors, buffers, barriers, query_block + consumer_idx, by, key_head, last_tile, consumer_idx, tidx % 128)
 
     @cute.jit
-    def load_loop(self, copies, buffers, barriers, query_block_idx, query_head_idx, key_head_idx, last_tile):
-        query_copy, grad_copy, key_copy, value_copy = copies
-        s_queries, s_grads, s_keys, s_values = buffers
-        resident_ready, tile_ready, tile_released = barriers
-        cute.arch.mbarrier_arrive_and_expect_tx(resident_ready, 2 * cute.size(s_queries))
+    def load_resident(self, copies, buffers, resident_ready, query_block_idx, query_head_idx, lane):
+        query_copy, grad_copy, _, _ = copies
+        s_queries, s_grads, _, _ = buffers
+        if lane == 0:
+            cute.arch.mbarrier_arrive_and_expect_tx(resident_ready, 2 * cute.size(s_queries))
+        if cutlass.const_expr(self.split_key_value):
+            cute.arch.sync_warp()
         for query_idx in cutlass.range_constexpr(self.consumer_groups):
             copy_tma_operand(query_copy, s_queries[None, None, query_idx], query_block_idx + query_idx, 0, query_head_idx, resident_ready)
             copy_tma_operand(grad_copy, s_grads[None, None, query_idx], query_block_idx + query_idx, 0, query_head_idx, resident_ready)
+
+    @cute.jit
+    def load_key_value_stream(self, copy, tiles, ready, released, key_head_idx, last_tile, lane):
+        for key_block_idx in range(last_tile + 1):
+            stage = key_block_idx % self.stages
+            phase = (key_block_idx // self.stages) % 2
+            barrier = ready + stage
+            if lane == 0:
+                if key_block_idx >= self.stages:
+                    cute.arch.mbarrier_wait(released + stage, phase ^ 1)
+                cute.arch.mbarrier_arrive_and_expect_tx(barrier, self.tile_keys * self.head_dim)
+            cute.arch.sync_warp()
+            copy_tma_operand(copy, tiles[None, None, stage], key_block_idx, 0, key_head_idx, barrier)
+
+    @cute.jit
+    def load_loop(self, copies, buffers, barriers, query_block_idx, query_head_idx, key_head_idx, last_tile):
+        _, _, key_copy, value_copy = copies
+        _, _, s_keys, s_values = buffers
+        resident_ready, tile_ready, tile_released = barriers
+        self.load_resident(copies, buffers, resident_ready, query_block_idx, query_head_idx, 0)
         for key_block_idx in range(last_tile + 1):
             stage_idx, phase = key_block_idx % self.stages, (key_block_idx // self.stages) % 2
             if key_block_idx >= self.stages:
@@ -158,12 +193,26 @@ class MatchedCorrection:
         for key_block_idx in range(last_tile + 1):
             stage_idx, phase = key_block_idx % self.stages, (key_block_idx // self.stages) % 2
             cute.arch.mbarrier_wait(tile_ready + stage_idx, phase)
-            products = (s_query, s_keys[None, None, stage_idx], s_grad, s_values[None, None, stage_idx])
-            compute_backward_products(mma, mma_thread, probabilities, probability_grad, products)
-            if tidx == 0:
-                cute.arch.mbarrier_arrive(tile_released + stage_idx)
+            if cutlass.const_expr(self.split_key_value):
+                issue_multiply_tile(mma, mma_thread, probabilities, s_query, s_keys[None, None, stage_idx], False)
+                cute.arch.mbarrier_wait(tile_ready + self.stages + stage_idx, phase)
+                issue_multiply_tile(mma, mma_thread, probability_grad, s_grad, s_values[None, None, stage_idx], False)
+                warpgroup.wait_group(1)
+                cute.arch.sync_warp()
+                if tidx % 32 == 0:
+                    cute.arch.mbarrier_arrive(tile_released + stage_idx)
+            else:
+                products = (s_query, s_keys[None, None, stage_idx], s_grad, s_values[None, None, stage_idx])
+                compute_backward_products(mma, mma_thread, probabilities, probability_grad, products)
+                if tidx == 0:
+                    cute.arch.mbarrier_arrive(tile_released + stage_idx)
             key_start = key_block_idx * self.tile_keys
             reconstruct_probabilities(probabilities, coords, mKeyScale, lse_rows, key_head_idx, query_start, key_start, query_scale, self.group_keys)
+            if cutlass.const_expr(self.split_key_value):
+                warpgroup.wait_group(0)
+                cute.arch.sync_warp()
+                if tidx % 32 == 0:
+                    cute.arch.mbarrier_arrive(tile_released + self.stages + stage_idx)
             reduce_delta_tile(probabilities, probability_grad, coords, acc_delta, mValueScale, key_head_idx, key_start, grad_out_scale, self.group_keys)
 
         if tidx % 4 == 0:
