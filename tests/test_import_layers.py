@@ -48,7 +48,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PKG = ROOT / "pithtrain"
 KERNELS = PKG / "kernels"
 
-# SM90 kernels with no SM100 kernel to pair with: SM100 runs a non-kernel path.
+# SM90 kernels with no SM100 sibling.
 SM90_ONLY = {
     "delta_matching_bwd_sm90",
     "delta_matching_fwd_sm90",

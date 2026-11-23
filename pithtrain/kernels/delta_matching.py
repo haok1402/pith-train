@@ -16,6 +16,7 @@ def delta_matching_supported(query: torch.Tensor, key: torch.Tensor, value: torc
     Whether SM90 Delta-Matching supports these CUDA BF16 BSHD inputs on the same device.
     Self-attention requires D in {128, 256}, equal sequence lengths divisible by 32768 / D,
     and a positive number of query heads divisible by the number of key/value heads.
+    Batch times query heads must be at most 65535.
     """
     if ARCH_MAJOR != 9 or any(tensor.ndim != 4 or tensor.dtype != torch.bfloat16 or tensor.device != query.device for tensor in (query, key, value)) or not query.is_cuda:
         return False
@@ -32,7 +33,8 @@ def delta_matching_fwd(query: torch.Tensor, key: torch.Tensor, value: torch.Tens
     transposed codes, and the E4M3 value codes and FP32 scales. Codes are (batch times heads,
     sequence, channels), transposed codes swap the last two axes, and scales are (batch times
     heads, sequence blocks). Blocks cover 16384 / D query rows and 8192 / D key or value rows.
-    Noncontiguous input tensors are accepted. See delta_matching_supported for supported shapes.
+    The query scale includes the softmax scale. Keys are centered per sequence and KV head before
+    quantization. Returns newly allocated tensors. See delta_matching_supported for geometry.
     """
     match ARCH_MAJOR:
         case 9:
@@ -52,7 +54,8 @@ def delta_matching_bwd_prepare(grad_out: torch.Tensor, state: tuple[torch.Tensor
     pre-cast probabilities and FP8 dP product. The state is delta_matching_fwd's outputs after
     the BF16 attention output. Returns E4M3 gradient codes (batch times heads, sequence,
     channels), FP32 scales (batch times heads, sequence blocks of 16384 / D rows), transposed
-    codes and the FP32 correction (batch times heads, sequence). SM90 only.
+    codes and the FP32 correction (batch times heads, sequence). Accepts strided or expanded
+    gradients and returns newly allocated tensors. SM90 only.
     """
     match ARCH_MAJOR:
         case 9:
@@ -71,7 +74,8 @@ def delta_matching_bwd(grad_out: torch.Tensor, state: tuple[torch.Tensor, ...], 
     """
     Apply the Delta-Matching backward on SM90. Takes the BF16 BSHD output gradient, the saved
     state from delta_matching_fwd, delta_matching_bwd_prepare's result and the forward softmax
-    scale. Returns fresh BF16 BSHD query, key and value gradients. The GQA reductions use FP32.
+    scale. Returns fresh BF16 BSHD gradients matching the original query, key and value shapes.
+    Key and value gradients are summed within each GQA group in FP32 before the BF16 cast.
     """
     match ARCH_MAJOR:
         case 9:

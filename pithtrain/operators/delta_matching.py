@@ -84,8 +84,21 @@ def delta_matching_attn_func(
     causal: bool = True,
 ) -> torch.Tensor:
     """
-    Causal SM90 attention for BF16 BSHD Q, K and V, with D in {128, 256} and grouped KV heads.
-    The sequence length must be divisible by 32768 / D. Returns BF16 BSHD attention output.
+    Apply causal FP8 Delta-Matching self-attention on an SM90 CUDA device.
+
+    Query has shape (batch, sequence, query_heads, head_dim). Key and value have
+    shape (batch, sequence, kv_heads, head_dim). All three inputs are BF16 on the
+    same CUDA device and may be strided. Each KV head serves a consecutive group
+    of query_heads // kv_heads query heads. Head dim is 128 or 256 and sequence
+    length must be a positive multiple of 256 or 128, respectively.
+
+    The softmax scale defaults to head_dim ** -0.5. An explicit scale must be
+    positive and finite. Causal must be true. Returns a contiguous BF16 tensor
+    with the query shape. First-order backward accepts any BF16 gradient with
+    that shape, including strided or expanded tensors. It uses the matched
+    correction from its own FP8 operand products and returns deterministic
+    BF16 gradients of query, key and value. Quantization and key centering
+    use straight-through gradients.
     """
     if not causal:
         raise ValueError("Delta-Matching attention requires causal=True")

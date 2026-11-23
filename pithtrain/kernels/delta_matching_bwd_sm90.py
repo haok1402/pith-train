@@ -17,6 +17,7 @@ from pithtrain.kernels.delta_matching_sm90 import BLOCK_QUERY, LOG2_E, allocate_
 
 __all__ = ["delta_matching_bwd_prepare_sm90", "delta_matching_bwd_sm90"]
 
+# Pi is scaled by 2**8 until a gradient or correction is promoted.
 PROBABILITY_SCALE = 1.0 / 256.0
 PROMOTION_ROWS = 512
 
@@ -49,6 +50,7 @@ def compute_backward_products(mma, mma_thread, probabilities, probability_grad, 
 def reduce_delta_tile(probabilities, probability_grad, coords, acc_delta, mValueScale, key_head_idx, key_start, grad_out_scale, GROUP_KEYS: cutlass.Constexpr):
     prob_rows, grad_rows = reshape_acc_to_mn(probabilities), reshape_acc_to_mn(probability_grad)  # (query rows, key columns)
     positions = reshape_acc_to_mn(coords)  # (query rows, key columns)
+    # Match the kernel's own FP32 Pi and dequantized dP, then combine 32-key partials in FP64.
     COLS_PER_GROUP = 32 // 4
     for row_idx in cutlass.range_constexpr(cute.size(prob_rows, mode=[0])):
         for group_idx in cutlass.range_constexpr(cute.size(prob_rows, mode=[1]) // COLS_PER_GROUP):
@@ -63,6 +65,9 @@ def reduce_delta_tile(probabilities, probability_grad, coords, acc_delta, mValue
 
 
 class MatchedCorrection:
+    """
+    Recompute FP8 code products and form the backward row correction.
+    """
     def __init__(self, head_dim):
         self.head_dim = head_dim
         self.group_keys, self.tile_keys = 8192 // head_dim, 128
@@ -163,6 +168,7 @@ def launch_matched_delta(mQuery, mQueryScale, mKey, mKeyScale, mValue, mValueSca
 @cute.jit
 def center_score_gradient(probabilities, probability_grad, coords, scales, mDelta, query_head_idx, key_head_idx, query_start, key_start, grad_out_scale, GROUP_KEYS: cutlass.Constexpr):
     mKeyScale, mValueScale = scales
+    # Fold the key scale into dS so dQ can multiply its codes by the original key codes.
     amax = Float32(0.0)
     for elem_idx in cutlass.range_constexpr(cute.size(probabilities)):
         query_row, key_col = coords[elem_idx]
@@ -185,6 +191,7 @@ def choose_score_scale(amax, s_amax, tidx, max_weight, query_scale):
     cute.arch.barrier(barrier_id=1, number_of_threads=256)
     for warp_idx in cutlass.range_constexpr(8):
         amax = cute.arch.fmax(amax, s_amax[warp_idx])
+    # Bound the weight change from the largest preceding dK contribution.
     base_scale = amax * (1.0 / 448.0)
     floor_scale = (max_weight * 256.0e-8) * cute.arch.rcp_approx(query_scale)
     return cute.arch.fmax(base_scale, floor_scale) if base_scale >= 1e-30 else Float32(0.0)
@@ -245,6 +252,9 @@ def write_key_value_gradients(mGradKey, mGradValue, mKeyScale, accumulators, mma
 
 
 class KeyValueGradients:
+    """
+    Accumulate dK and dV over causal query tiles and save quantized dS for dQ.
+    """
     def __init__(self, head_dim):
         self.head_dim = head_dim
         self.group_keys = 8192 // head_dim
@@ -383,6 +393,9 @@ def apply_query_tile(mma, mma_thread, acc_window, s_score_grad, s_keys, scale, w
 
 
 class QueryGradients:
+    """
+    Apply the saved dS scales and promote the FP8 dQ products in 512-key windows.
+    """
     def __init__(self, head_dim):
         self.head_dim = head_dim
         self.tile_keys = 16384 // head_dim

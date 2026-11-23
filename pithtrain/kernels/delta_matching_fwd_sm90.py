@@ -36,6 +36,7 @@ def scale_causal_scores(scores, coords, mKeyScale, head_idx, query_start, key_st
 @cute.jit
 def update_softmax(scores, row_max, row_sum, rescale):
     rows = reshape_acc_to_mn(scores)  # (query rows, key columns)
+    # The normalizer uses FP32 probabilities so the backward can reconstruct them from LSE.
     for row_idx in cutlass.range_constexpr(cute.size(rows, mode=[0])):
         tile_max = reduce_mma_row(scores, row_idx, Float32(float("-inf")), cute.arch.fmax)
         next_max = cute.arch.fmax(row_max[row_idx], tile_max)
@@ -85,6 +86,7 @@ def encode_probability_group(scores, fragment, row_max, weight, value_scale, gro
         for col_idx in cutlass.range_constexpr(GROUP_COLUMNS):
             group_max = cute.arch.fmax(group_max, rows[row_idx, group_idx * GROUP_COLUMNS + col_idx])
         group_max = warp_reduce(group_max, cute.arch.fmax, threads_in_group=4)
+        # The floor limits the spread between group bases in a promoted tile.
         basis[row_idx] = cute.arch.fmax(group_max, row_max[row_idx] - 12.0)
         weight[row_idx] = cute.math.exp2(basis[row_idx] - row_max[row_idx], fastmath=True) * (value_scale / 448.0)
     pack_probability_operand(rows, basis, fragment, group_idx, GROUP_KEYS, tidx)
@@ -142,6 +144,9 @@ def store_attention(mOut, mLse, acc_output, row_sum, row_max, mma_thread, query_
 
 
 class CausalAttention:
+    """
+    Stage a shared causal K/V tile for two independent query warpgroups.
+    """
     def __init__(self, head_dim):
         self.head_dim = head_dim
         self.group_keys, self.tile_keys = 8192 // head_dim, 32768 // head_dim

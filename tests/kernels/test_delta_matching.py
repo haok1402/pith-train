@@ -61,9 +61,9 @@ def relative_error(actual, expected):
 
 
 @pytest.mark.parametrize("dim", [128, 256])
-@pytest.mark.parametrize("num_key_heads", [1, 2, 4])
-def test_delta_matching_fp32_and_determinism(dim, num_key_heads):
-    query, key, value, grad_output = attention_inputs(dim, 4, num_key_heads, 512, batch=2)
+@pytest.mark.parametrize(("num_heads", "num_key_heads"), [(4, 1), (4, 2), (4, 4), (6, 1)])
+def test_delta_matching_fp32_and_determinism(dim, num_heads, num_key_heads):
+    query, key, value, grad_output = attention_inputs(dim, num_heads, num_key_heads, 512, batch=2)
     require_delta_matching(query, key, value)
     # Mimic the varying gradient magnitude produced by a gate outside the attention core.
     grad_output = (grad_output.float() * grad_output.float().sigmoid()).to(torch.bfloat16)
@@ -132,3 +132,18 @@ def test_delta_matching_reference_library(dim):
     expected = (output, *torch.autograd.grad(output, inputs, grad_output))
     for name, tensor, target in zip(("O", "dQ", "dK", "dV"), actual, expected, strict=True):
         assert (error := relative_error(tensor, target)) < 0.035, f"{name}: {error:.5f}"
+
+
+def test_delta_matching_geometry():
+    query, key, value, _ = attention_inputs(256, 6, 2, 128)
+    require_delta_matching(query, key, value)
+    for invalid in (
+        (query[:, :127], key[:, :127], value[:, :127]),
+        (query[:, :, :5], key, value),
+        (query[..., :64], key[..., :64], value[..., :64]),
+        (query.float(), key, value),
+        (query, key[:, :-1], value),
+    ):
+        assert not delta_matching_supported(*invalid)
+        with pytest.raises(ValueError, match="BF16 CUDA BSHD self-attention"):
+            delta_matching_fwd(*invalid, softmax_scale=256**-0.5)

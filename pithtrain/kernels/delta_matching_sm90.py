@@ -27,6 +27,9 @@ COMPILE_CACHE = {}
 
 
 def launch_delta_matching_kernel(name, launcher, tensors, constants=()):
+    """
+    Compile each tensor layout and launch through the active TVM-FFI stream.
+    """
     layouts = tuple((tensor.dtype, tuple(tensor.shape), tensor.stride()) for tensor in tensors)
     key = (name, *layouts, *constants)
     fn = COMPILE_CACHE.get(key)
@@ -60,6 +63,9 @@ def allocate_staged_operand(allocator, rows: cutlass.Constexpr, columns: cutlass
 
 @cute.jit
 def initialize_attention_barriers(allocator, tidx, STAGES: cutlass.Constexpr, CONSUMERS: cutlass.Constexpr):
+    """
+    Publish resident operands once and reclaim each streamed tile after all consumers release it.
+    """
     barriers = allocator.allocate_tensor(Int64, cute.make_layout(1 + 2 * STAGES), 8).iterator
     query_ready, tile_ready, tile_released = barriers, barriers + 1, barriers + 1 + STAGES
     if tidx == 0:
@@ -97,9 +103,13 @@ def make_mma(columns: cutlass.Constexpr, use_register_operand: cutlass.Constexpr
 
 @cute.jit
 def issue_multiply_tile(mma, mma_thread, acc_product, left_operand, s_right, accumulate):
+    """
+    Commit an FP8 WGMMA chain and defer completion to the caller.
+    """
     left = left_operand if const_expr(left_operand.memspace == cute.AddressSpace.rmem) else mma_thread.make_fragment_A(mma_thread.partition_A(left_operand))  # (MMA, MMA_M, MMA_K)
     right = mma_thread.make_fragment_B(mma_thread.partition_B(s_right))  # (MMA, MMA_N, MMA_K)
     warpgroup.fence()
+    # Keep the per-issue accumulator flag local to this region.
     atom = cute.make_mma_atom(mma.op)
     atom.set(warpgroup.Field.ACCUMULATE, accumulate)
     for col_idx in cutlass.range_constexpr(cute.size(left, mode=[2])):
@@ -124,7 +134,7 @@ def reduce_mma_row(fragment, row_idx: cutlass.Constexpr, initial, op: cutlass.Co
 
 
 @cute.kernel
-def sum_key_channels(mKey, mPartial, B: cutlass.Constexpr, H: cutlass.Constexpr, N: cutlass.Constexpr):
+def sum_key_channels(mKey, mPartial, H: cutlass.Constexpr, N: cutlass.Constexpr):
     tidx, _, _ = cute.arch.thread_idx()
     bx, by, bz = cute.arch.block_idx()
     batch_idx, head_idx = bz // H, bz % H
@@ -145,12 +155,12 @@ def sum_key_channels(mKey, mPartial, B: cutlass.Constexpr, H: cutlass.Constexpr,
 @cute.jit
 def launch_key_sum(mKey, mPartial, stream):
     B, N, H, D = mKey.shape
-    sum_key_channels(mKey, mPartial, B, H, N).launch(grid=(D // 32, N // 128, B * H), block=(256, 1, 1), stream=stream)
+    sum_key_channels(mKey, mPartial, H, N).launch(grid=(D // 32, N // 128, B * H), block=(256, 1, 1), stream=stream)
 
 
 @cute.jit
 def load_quant_block(mInput, mCenter, bx, by, tidx, BLOCK: cutlass.Constexpr, center_key: cutlass.Constexpr, input_scale: cutlass.Constexpr):
-    B, N, H, D = mInput.shape
+    _, _, H, D = mInput.shape
     batch_idx, head_idx = by // H, by % H
     VEC = 8
     REPEATS = BLOCK * D // (THREADS * VEC)
@@ -186,6 +196,7 @@ def reduce_quant_block(values, s_amax, tidx, is_gradient: cutlass.Constexpr):
     for warp_idx in cutlass.range_constexpr(THREADS // 32):
         amax = cute.arch.fmax(amax, s_amax[warp_idx])
     amax = cute.arch.fmax(amax, 1e-30)
+    # The dO producer rounds a multiply by 1 / 448 and the input producers divide.
     if const_expr(is_gradient):
         return amax * (1.0 / 448.0)
     return amax / Float32(448.0)
@@ -235,7 +246,7 @@ def quantize_block(mInput, mCenter, mCodes, mScale, mTwin, BLOCK: cutlass.Conste
 
 @cute.jit
 def launch_quant_block(mInput, mCenter, mCodes, mScale, mTwin, BLOCK: cutlass.Constexpr, center_key: cutlass.Constexpr, input_scale: cutlass.Constexpr, is_gradient: cutlass.Constexpr, stream):
-    B, N, H, D = mInput.shape
+    B, N, H, _ = mInput.shape
     quantize_block(mInput, mCenter, mCodes, mScale, mTwin, BLOCK, center_key, input_scale, is_gradient).launch(grid=(N // BLOCK, B * H, 1), block=(THREADS, 1, 1), stream=stream)
 
 
@@ -250,6 +261,7 @@ def quantize_delta_matching(x, block_rows, *, center_key=False, input_scale=1.0,
     twin = torch.empty((B * H, D, N), dtype=codes.dtype, device=x.device)
     center = torch.empty((B * H, N // 128, D) if center_key else (1, 1, 1), dtype=torch.float32, device=x.device)
 
+    # Centering leaves the exact softmax unchanged and reduces the key quantization range.
     if center_key:
         launch_delta_matching_kernel("delta_matching_key_sum", launch_key_sum, (x, center))
     launch_delta_matching_kernel("delta_matching_quantize", launch_quant_block, (x, center, codes, scales, twin), (block_rows, center_key, input_scale, is_gradient))
