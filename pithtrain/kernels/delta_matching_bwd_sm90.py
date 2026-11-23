@@ -476,6 +476,17 @@ def issue_gradient_stripes(mma, mma_thread, accumulators, s_twin, s_operand, con
     warpgroup.commit_group()
 
 
+@cute.jit
+def store_pipelined_score_tile(score_store, s_score_output, score_tile_idx):
+    atom, coordinates = score_store
+    target = coordinates[None, None, score_tile_idx]
+    source_part, target_part = cpasync.tma_partition(
+        atom, 0, cute.make_layout(1), cute.group_modes(s_score_output, 0, 2), cute.group_modes(target, 0, 2),
+    )
+    cute.copy(atom, source_part, target_part)
+    cute.arch.cp_async_bulk_commit_group()
+
+
 class PipelinedKeyValueGradients:
     """
     Use separate TMA lifetimes for the four query-side operands at D=256.
@@ -490,6 +501,8 @@ class PipelinedKeyValueGradients:
         self.grad_t_slot = self.query_t_slot + self.query_stages
         self.num_stages = self.grad_t_slot + self.grad_stages
         self.head_section = 4
+        self.load_group, self.num_threads = 0, 384
+        self.load_registers, self.consumer_registers = 40, 232
 
     @cute.jit
     def __call__(self, mQuery, mQueryScale, mKey, mKeyScale, mValue, mValueScale, mQueryT, mGrad, mGradScale, mGradT, mLse, mDelta, mScoreGrad, mScoreScale, mGradKey, mGradValue, stream):
@@ -507,8 +520,8 @@ class PipelinedKeyValueGradients:
         copies = ((key_copy, value_copy), query_copies, grad_copies, score_store)
         # The consumer register budgets rely on reassignment within a single CTA per SM.
         self.kernel(tensors, copies, N // BLOCK_QUERY).launch(
-            grid=(H * (N // self.tile_keys), 1, 1), block=(384, 1, 1),
-            max_number_threads=(384, 1, 1), min_blocks_per_mp=1, stream=stream,
+            grid=(H * (N // self.tile_keys), 1, 1), block=(self.num_threads, 1, 1),
+            max_number_threads=(self.num_threads, 1, 1), min_blocks_per_mp=1, stream=stream,
         )
 
     @cute.kernel
@@ -564,19 +577,19 @@ class PipelinedKeyValueGradients:
         cute.arch.barrier()
         barriers = (resident_ready, ready, released)
         coords = (key_block_idx, query_head_idx, key_head_idx)
-        if warp_group == 0:
-            cute.arch.setmaxregister_decrease(40)
+        if warp_group == self.load_group:
+            cute.arch.setmaxregister_decrease(self.load_registers)
             if tidx == 0:
-                self.load_tiles(copies, resident, query_buffers, grad_buffers, barriers, coords, NUM_QUERIES)
+                self.load_loop(copies, resident, query_buffers, grad_buffers, barriers, coords, NUM_QUERIES)
         else:
-            cute.arch.setmaxregister_increase(232)
-            self.accumulate_tiles(
+            cute.arch.setmaxregister_increase(self.consumer_registers)
+            self.compute_loop(
                 tensors, resident, query_buffers, grad_buffers, score_buffers, s_grad_value,
                 copies[3], barriers, coords, NUM_QUERIES, tidx - 128, warp_group - 1,
             )
 
     @cute.jit
-    def load_tiles(self, copies, resident, query_buffers, grad_buffers, barriers, coords, NUM_QUERIES: cutlass.Constexpr):
+    def load_loop(self, copies, resident, query_buffers, grad_buffers, barriers, coords, NUM_QUERIES: cutlass.Constexpr):
         (key_copy, value_copy), query_copies, grad_copies, _ = copies
         s_key, s_value = resident
         resident_ready, ready, released = barriers
@@ -596,7 +609,7 @@ class PipelinedKeyValueGradients:
                 stage_backward_operands(query_copies, query_buffers, query_ready, query_released, offset + 1, query_block_idx + 1, query_head_idx, self.query_stages)
 
     @cute.jit
-    def accumulate_tiles(self, tensors, resident, query_buffers, grad_buffers, score_buffers, s_grad_value, score_store, barriers, coords, NUM_QUERIES: cutlass.Constexpr, tidx, consumer_idx):
+    def compute_loop(self, tensors, resident, query_buffers, grad_buffers, score_buffers, s_grad_value, score_store, barriers, coords, NUM_QUERIES: cutlass.Constexpr, tidx, consumer_idx):
         mQueryScale, mKeyScale, mValueScale, mGradScale, mScoreScale, mGradKey, mGradValue = tensors
         key_block_idx, query_head_idx, key_head_idx = coords
         s_keys, s_values = resident
@@ -627,7 +640,6 @@ class PipelinedKeyValueGradients:
         key_scale, value_scale = mKeyScale[key_head_idx, group_idx], mValueScale[key_head_idx, group_idx]
         next_query_scale = mQueryScale[query_head_idx, key_block_idx]
         next_grad_scale = mGradScale[query_head_idx, key_block_idx]
-        store_atom, store_coords = score_store
 
         cute.arch.mbarrier_wait(resident_ready, 0)
         probabilities = cute.make_rmem_tensor(thread_score.partition_shape_C(score_shape), Float32)
@@ -671,12 +683,7 @@ class PipelinedKeyValueGradients:
             stage_pipelined_score_operands(probabilities, probability_grad, score_coords, s_prob_group, s_grad_group, s_output_group, score_scale)
             if tidx == 0:
                 score_tile_idx = score_head_idx * NUM_QUERIES + key_block_idx
-                target = store_coords[None, None, score_tile_idx]
-                source_part, target_part = cpasync.tma_partition(
-                    store_atom, 0, cute.make_layout(1), cute.group_modes(s_score_output, 0, 2), cute.group_modes(target, 0, 2)
-                )
-                cute.copy(store_atom, source_part, target_part)
-                cute.arch.cp_async_bulk_commit_group()
+                store_pipelined_score_tile(score_store, s_score_output, score_tile_idx)
             key_weight, value_weight = (score_scale * PROBABILITY_SCALE) * query_scale, grad_scale * PROBABILITY_SCALE
             ratio = cute.arch.fmin(cute.arch.fmax(previous_weight * cute.arch.rcp_approx(value_weight), 1e-8), 1e8)
             acc_window.store(acc_window.load() * ratio)
