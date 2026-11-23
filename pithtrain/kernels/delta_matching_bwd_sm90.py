@@ -47,21 +47,31 @@ def compute_backward_products(mma, mma_thread, probabilities, probability_grad, 
 
 
 @cute.jit
-def reduce_delta_tile(probabilities, probability_grad, coords, acc_delta, mValueScale, key_head_idx, key_start, grad_out_scale, GROUP_KEYS: cutlass.Constexpr):
-    prob_rows, grad_rows = reshape_acc_to_mn(probabilities), reshape_acc_to_mn(probability_grad)  # (query rows, key columns)
-    positions = reshape_acc_to_mn(coords)  # (query rows, key columns)
-    # Match the kernel's own FP32 Pi and dequantized dP, then combine 32-key partials in FP64.
+def accumulate_matched_delta(scores, probability_grad, coords, acc_delta, log2_lse, mKeyScale, mValueScale,
+                             key_head_idx, key_start, query_start, query_scale, grad_out_scale,
+                             GROUP_KEYS: cutlass.Constexpr, MASKED: cutlass.Constexpr):
+    score_rows = reshape_acc_to_mn(scores)
+    grad_rows = reshape_acc_to_mn(probability_grad)
+    positions = reshape_acc_to_mn(coords)
     COLS_PER_GROUP = 32 // 4
-    for row_idx in cutlass.range_constexpr(cute.size(prob_rows, mode=[0])):
-        for group_idx in cutlass.range_constexpr(cute.size(prob_rows, mode=[1]) // COLS_PER_GROUP):
-            group_col = group_idx * COLS_PER_GROUP
-            key_pos = key_start + positions[row_idx, group_col][1]
-            product_scale = grad_out_scale * mValueScale[key_head_idx, key_pos // GROUP_KEYS]
+    for row in cutlass.range_constexpr(cute.size(score_rows, mode=[0])):
+        query_pos = query_start + positions[row, 0][0]
+        for group in cutlass.range_constexpr(cute.size(score_rows, mode=[1]) // COLS_PER_GROUP):
+            group_start = group * COLS_PER_GROUP
+            group_key_pos = key_start + positions[row, group_start][1]
+            scale_idx = group_key_pos // GROUP_KEYS
+            log2_scale = (query_scale * mKeyScale[key_head_idx, scale_idx]) * LOG2_E
+            product_scale = grad_out_scale * mValueScale[key_head_idx, scale_idx]
             partial = Float32(0.0)
-            for col_idx in cutlass.range_constexpr(COLS_PER_GROUP):
-                elem_idx = group_col + col_idx
-                partial += prob_rows[row_idx, elem_idx] * (grad_rows[row_idx, elem_idx] * product_scale)
-            acc_delta[row_idx] += (warp_reduce(partial, operator.add, threads_in_group=4) * PROBABILITY_SCALE).to(Float64)
+            for col in cutlass.range_constexpr(COLS_PER_GROUP):
+                index = group_start + col
+                exponent = score_rows[row, index] * log2_scale - log2_lse[row] + 8.0
+                probability = cute.math.exp2(cute.arch.fmin(exponent, 12.0), fastmath=True)
+                if cutlass.const_expr(MASKED):
+                    if key_start + positions[row, index][1] > query_pos:
+                        probability = Float32(0.0)
+                partial += probability * (grad_rows[row, index] * product_scale)
+            acc_delta[row] += (warp_reduce(partial, operator.add, threads_in_group=4) * PROBABILITY_SCALE).to(Float64)
 
 
 class MatchedCorrection:
@@ -141,6 +151,10 @@ class MatchedCorrection:
         probabilities, probability_grad = (cute.make_rmem_tensor(mma_thread.partition_shape_C(shape), Float32) for _ in range(2))
         acc_delta = cute.make_rmem_tensor(2, Float64)
         acc_delta.fill(0.0)
+        log2_lse = cute.make_rmem_tensor(2, Float32)
+        positions = reshape_acc_to_mn(coords)
+        for row in cutlass.range_constexpr(2):
+            log2_lse[row] = mLse[query_head_idx, query_start + positions[row, 0][0]] * LOG2_E
 
         cute.arch.mbarrier_wait(resident_ready, 0)
         for key_block_idx in range(last_tile + 1):
@@ -151,8 +165,14 @@ class MatchedCorrection:
             if tidx == 0:
                 cute.arch.mbarrier_arrive(tile_released + stage_idx)
             key_start = key_block_idx * self.tile_keys
-            reconstruct_probabilities(probabilities, coords, mKeyScale, mLse, query_head_idx, key_head_idx, query_start, key_start, query_scale, self.group_keys)
-            reduce_delta_tile(probabilities, probability_grad, coords, acc_delta, mValueScale, key_head_idx, key_start, grad_out_scale, self.group_keys)
+            if key_block_idx == last_tile:
+                accumulate_matched_delta(probabilities, probability_grad, coords, acc_delta, log2_lse, mKeyScale, mValueScale,
+                                         key_head_idx, key_start, query_start, query_scale, grad_out_scale,
+                                         self.group_keys, True)
+            else:
+                accumulate_matched_delta(probabilities, probability_grad, coords, acc_delta, log2_lse, mKeyScale, mValueScale,
+                                         key_head_idx, key_start, query_start, query_scale, grad_out_scale,
+                                         self.group_keys, False)
 
         if tidx % 4 == 0:
             positions = reshape_acc_to_mn(coords)
