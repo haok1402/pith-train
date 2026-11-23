@@ -32,7 +32,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from pithtrain.kernels.cute_compile_sm90 import TORCH2CUTE, fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import lds_b32, lds_v4, max_u16x2, prmt_args_last, st_v2, st_v4
+from pithtrain.kernels.cute_ptx_sm90 import lds_b32, lds_v4, max_u16x2, prmt_args_last, st_v2, st_v4, sts_v2
 from pithtrain.kernels.fp8_e8m0_scale_sm90 import AMAX_MIN, FP8_MAX_RCP
 
 __all__ = ["fp8_quant_weight_sm90", "fp8_quant_weight_grouped_sm90", "fp8_shard_amax_sm90", "fp8_shard_cast_sm90", "fp8_scales_sm90", "fp8_pack_transpose_sm90", "fp8_shard_amax_multi_sm90", "fp8_scales_multi_sm90"]
@@ -334,7 +334,7 @@ def write_smem_block(s_tile: Int32, quant: list, tile_row0: Int32, tile_col0: In
     Write [row][lo, hi] words of the 8x8 block at tile (tile_row0, tile_col0) into the staged tile.
     """
     for i in cutlass.range_constexpr(8):
-        asm(None, "st.shared.v2.b32 [$0], {$1, $2};", "r,r,r", [Int32(s_tile + swizzle(tile_row0 + i, tile_col0 >> 4) + (tile_col0 & 8)), Uint32(quant[i][0]), Uint32(quant[i][1])], side_effects=True)
+        sts_v2(s_tile + swizzle(tile_row0 + i, tile_col0 >> 4) + (tile_col0 & 8), quant[i][0], quant[i][1])
 
 
 @cute.jit

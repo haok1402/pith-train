@@ -26,7 +26,7 @@ from pithtrain.kernels.arch import SM_COUNT
 from pithtrain.kernels.clamped_swiglu_sm90 import clamped_swiglu_bwd_sm90, clamped_swiglu_fwd_sm90, f32, make_bwd_op, make_fwd_op
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
 from pithtrain.kernels.cute_ptx_sm90 import abs2, asm_args_last, bf16_hi, bf16_lo, bf16_sel, cp_async16, f32_as_u32, ld_b32_coherent, ld_v4, lds_b32_pred, lds_v4, max2, pack_bf16, prmt_args_last, selp_args_last, st_f32, st_v2_args_last, st_v4_args_last, sts_b32_nopred, sts_v4, to_ir, u32_as_f32, unpack
-from pithtrain.kernels.fp8_e8m0_scale_sm90 import e8m0_scale_f32, quant4_e4m3
+from pithtrain.kernels.fp8_e8m0_scale_sm90 import e8m0_scale_f32, quant4_e4m3, reduce_bf16x2_amax4
 from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import fp8cast_rowwise_kmajor_sm90
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale, mn_pad
 from pithtrain.kernels.segment_sum_sm90 import block_segment_sum_sm90
@@ -312,7 +312,7 @@ class ClampedSwiGLUQuant:
         lane, warp, col_vec_idx = tile.lane, tile.warp, tile.col_vec_idx
         col_amax = [None] * 4
         for j in cutlass.range_constexpr(4):
-            amax = max2(max2(abs_words[0][j], abs_words[1][j]), max2(abs_words[2][j], abs_words[3][j]))
+            amax = reduce_bf16x2_amax4(abs_words[0][j], abs_words[1][j], abs_words[2][j], abs_words[3][j])
             amax_peer = Uint32(cute.arch.shuffle_sync_bfly(Int32(amax), offset=16))
             col_amax[j] = max2(amax, amax_peer)
         if lane < 16:
@@ -341,7 +341,7 @@ class ClampedSwiGLUQuant:
         Amax of the thread's rows over the whole tile row, packed per pair: row_pair_amax[pair]
         holds rows 2 * pair and 2 * pair + 1, reduced over the 16 column vectors by butterfly.
         """
-        row_half_amax = [max2(max2(abs_words[k][0], abs_words[k][1]), max2(abs_words[k][2], abs_words[k][3])) for k in range(4)]
+        row_half_amax = [reduce_bf16x2_amax4(abs_words[k][0], abs_words[k][1], abs_words[k][2], abs_words[k][3]) for k in range(4)]
         row_pair_amax = [None] * 2
         for pair in range(2):
             amax_even, amax_odd = row_half_amax[2 * pair], row_half_amax[2 * pair + 1]
