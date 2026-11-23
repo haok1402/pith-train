@@ -653,7 +653,8 @@ def build_ops() -> str:
     Build and cache the shared library implementing the two opaque weight-quantization ops.
     """
     digest = hashlib.sha256("\n".join([OPS_SOURCE, torch.__version__, tvm_ffi.__version__, sys.version]).encode()).hexdigest()[:16]
-    root = os.path.join(os.path.expanduser("~/.cache/pithtrain"), "fp8_weight_quant_ops_sm90", digest)
+    cache_home = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    root = os.path.join(cache_home, "pithtrain", "fp8_weight_quant_ops_sm90", digest)
     library = os.path.join(root, "ops.so")
     os.makedirs(root, exist_ok=True)
     with open(os.path.join(root, "lock"), "w") as lock:
