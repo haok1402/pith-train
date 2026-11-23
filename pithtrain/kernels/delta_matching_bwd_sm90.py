@@ -824,9 +824,107 @@ class QueryGradients:
         mma_thread.partition_C(tile).store((acc_query.load() * (softmax_scale * PROBABILITY_SCALE)).to(BFloat16))
 
 
+class PipelinedQueryGradients:
+    """
+    Own one dQ tile per warpgroup and promote its 512-key windows in FP32 shared memory.
+    """
+
+    def __init__(self):
+        self.head_dim = 256
+        self.tile_keys = 64
+        self.stages = 2
+        self.num_threads = 128
+
+    @cute.jit
+    def __call__(self, mKeyT, mScoreGrad, mScoreScale, mGradQuery, softmax_scale: cutlass.Constexpr, stream):
+        H, N, D = mGradQuery.shape
+        head_group = H // cute.size(mKeyT, mode=[0])
+        copies = make_operand_tma(mScoreGrad, BLOCK_QUERY, self.tile_keys), make_operand_tma(mKeyT, D, self.tile_keys)
+        self.kernel(mScoreScale, mGradQuery, copies, head_group, N // BLOCK_QUERY, softmax_scale).launch(
+            grid=(N // BLOCK_QUERY, H, 1), block=(self.num_threads, 1, 1), stream=stream, min_blocks_per_mp=1,
+        )
+
+    @cute.kernel
+    def kernel(self, mScoreScale, mGradQuery, copies, HEAD_GROUP: cutlass.Constexpr, NUM_QUERIES: cutlass.Constexpr, softmax_scale: cutlass.Constexpr):
+        tidx, _, _ = cute.arch.thread_idx()
+        query_block_idx, query_head_idx, _ = cute.arch.block_idx()
+        score_head_idx = query_head_idx * NUM_QUERIES + query_block_idx
+        coords = (query_block_idx, score_head_idx, query_head_idx // HEAD_GROUP)
+        allocator = SmemAllocator()
+        buffers = (
+            allocate_staged_operand(allocator, BLOCK_QUERY, self.tile_keys, self.stages),
+            allocate_staged_operand(allocator, self.head_dim, self.tile_keys, self.stages),
+        )
+        ready = allocator.allocate_array(Int64, self.stages)
+        mma = make_mma(self.head_dim)
+        mma_thread = mma.get_slice(tidx)
+        tile_shape = (BLOCK_QUERY, self.head_dim)
+        fragment_shape = mma_thread.partition_shape_C(tile_shape)
+        # Store adjacent register pairs contiguously and distribute pairs across the shared banks.
+        num_pairs = cute.size(fragment_shape) // 2
+        lane_pairs = cute.make_ordered_layout((2, self.num_threads, num_pairs), order=(0, 1, 2))
+        s_query_pairs = allocator.allocate_tensor(Float32, lane_pairs, 128)
+        lane_acc = s_query_pairs[None, tidx, None]
+        s_query = cute.make_tensor(lane_acc.iterator, cute.composition(lane_acc.layout, cute.make_layout(fragment_shape)))
+        s_query.fill(0.0)
+        if tidx == 0:
+            for stage_idx in cutlass.range_constexpr(self.stages):
+                cute.arch.mbarrier_init(ready + stage_idx, 1)
+            cute.arch.mbarrier_init_fence()
+        cute.arch.barrier()
+        if tidx == 0:
+            for stage_idx in cutlass.range_constexpr(self.stages):
+                if stage_idx <= query_block_idx:
+                    self.load_tile(copies, buffers, ready, coords, stage_idx, stage_idx, NUM_QUERIES)
+        self.compute_loop(mScoreScale, buffers, ready, s_query, (mma, mma_thread), copies, coords, tidx, NUM_QUERIES)
+        output = cute.local_tile(mGradQuery[query_head_idx, None, None], tile_shape, (query_block_idx, 0))
+        mma_thread.partition_C(output).store((s_query.load() * (softmax_scale * PROBABILITY_SCALE)).to(BFloat16))
+
+    @cute.jit
+    def load_tile(self, copies, buffers, ready, coords, key_block_idx, stage_idx, NUM_QUERIES: cutlass.Constexpr):
+        score_copy, key_copy = copies
+        s_score_grad, s_key_t = buffers
+        _, score_head_idx, key_head_idx = coords
+        barrier = ready + stage_idx
+        score_tile_idx = score_head_idx * NUM_QUERIES + key_block_idx
+        cute.arch.mbarrier_arrive_and_expect_tx(barrier, (BLOCK_QUERY + self.head_dim) * self.tile_keys)
+        copy_tma_operand(score_copy, s_score_grad[None, None, stage_idx], 0, 0, score_tile_idx, barrier)
+        copy_tma_operand(key_copy, s_key_t[None, None, stage_idx], 0, key_block_idx, key_head_idx, barrier)
+
+    @cute.jit
+    def compute_loop(self, mScoreScale, buffers, ready, s_query, mma_parts, copies, coords, tidx, NUM_QUERIES: cutlass.Constexpr):
+        last_tile, score_head_idx, _ = coords
+        s_score_grad, s_key_t = buffers
+        mma, mma_thread = mma_parts
+        acc_window = cute.make_rmem_tensor(s_query.shape, Float32)
+        acc_window.fill(0.0)
+        max_scale, window_scale = Float32(0.0), Float32(0.0)
+        next_scale = mScoreScale[score_head_idx, 0]
+        for key_block_idx in range(last_tile + 1):
+            stage_idx, phase = key_block_idx % self.stages, (key_block_idx // self.stages) % 2
+            scale = next_scale
+            if key_block_idx < last_tile:
+                next_scale = mScoreScale[score_head_idx, key_block_idx + 1]
+            cute.arch.mbarrier_wait(ready + stage_idx, phase)
+            if scale > 0.0 and scale >= max_scale * 1e-8:
+                apply_query_tile(mma, mma_thread, acc_window, s_score_grad[None, None, stage_idx], s_key_t[None, None, stage_idx], scale, window_scale)
+                max_scale, window_scale = cute.arch.fmax(max_scale, scale), scale
+            next_key = key_block_idx + self.stages
+            if tidx == 0 and next_key <= last_tile:
+                self.load_tile(copies, buffers, ready, coords, next_key, stage_idx, NUM_QUERIES)
+            if (key_block_idx + 1) % (PROMOTION_ROWS // self.tile_keys) == 0 or key_block_idx == last_tile:
+                if window_scale > 0.0:
+                    s_query.store(s_query.load() + acc_window.load() * window_scale)
+                    window_scale = Float32(0.0)
+
+
 @cute.jit
 def launch_query_gradients(mKeyT, mScoreGrad, mScoreScale, mGradQuery, softmax_scale: cutlass.Constexpr, stream):
-    QueryGradients(mGradQuery.shape[2])(mKeyT, mScoreGrad, mScoreScale, mGradQuery, softmax_scale, stream)
+    if cutlass.const_expr(mGradQuery.shape[2] == 256):
+        mainloop = PipelinedQueryGradients()
+    else:
+        mainloop = QueryGradients(mGradQuery.shape[2])
+    mainloop(mKeyT, mScoreGrad, mScoreScale, mGradQuery, softmax_scale, stream)
 
 
 def delta_matching_bwd_prepare_sm90(grad_out, state):
