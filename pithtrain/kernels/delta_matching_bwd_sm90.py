@@ -573,7 +573,7 @@ class PipelinedKeyValueGradients:
             cute.arch.mbarrier_init(resident_ready, 1)
             for stage_idx in cutlass.range_constexpr(self.num_stages):
                 cute.arch.mbarrier_init(ready + stage_idx, 1)
-                consumers = 1 if stage_idx < self.query_t_slot else 2
+                consumers = 4 if stage_idx < self.query_t_slot else 2
                 cute.arch.mbarrier_init(released + stage_idx, consumers)
             for stage_idx in cutlass.range_constexpr(self.score_stages):
                 cute.arch.mbarrier_init(score_ready + stage_idx, 1)
@@ -702,7 +702,9 @@ class PipelinedKeyValueGradients:
             cute.arch.mbarrier_wait(ready + self.grad_slot + grad_stage, grad_phase)
             issue_multiply_tile(mma, mma_thread, probability_grad, s_grads[None, None, grad_stage], s_values, False)
             warpgroup.wait_group(1)
-            if tidx == 0:
+            # Every score warp must finish its ordinary shared LSE reads before TMA refills Q/LSE.
+            cute.arch.sync_warp()
+            if tidx % 32 == 0:
                 cute.arch.mbarrier_arrive(released + query_stage)
             log2_scales = ((query_scale * key_scales[0]) * LOG2_E, (query_scale * key_scales[1]) * LOG2_E)
             self.reconstruct_scores(prob_rows, positions_rows, lse_rows, query_block_idx * BLOCK_QUERY, key_start, log2_scales)
@@ -710,7 +712,9 @@ class PipelinedKeyValueGradients:
             for row_idx in cutlass.range_constexpr(cute.size(delta_rows)):
                 delta_rows[row_idx] = s_delta[positions_rows[row_idx, 0][0], 0, grad_stage]
             warpgroup.wait_group(0)
-            if tidx == 0:
+            # WGMMA completion is no rendezvous for another warp's shared delta loads.
+            cute.arch.sync_warp()
+            if tidx % 32 == 0:
                 cute.arch.mbarrier_arrive(released + self.grad_slot + grad_stage)
             amax = self.center_scores(prob_rows, grad_rows, delta_rows, key_scales, value_scales, grad_scale)
             score_stage, score_phase = offset % self.score_stages, (offset // self.score_stages) % 2
