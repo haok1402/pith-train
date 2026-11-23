@@ -48,11 +48,14 @@ ROOT = Path(__file__).resolve().parents[1]
 PKG = ROOT / "pithtrain"
 KERNELS = PKG / "kernels"
 
-# SM90 kernels with no SM100 kernel to pair with: SM100 runs a non-kernel path.
+# SM90 kernels with no SM100 sibling.
 SM90_ONLY = {
-    "pack_reduce_scatter_sm90",
+    "delta_matching_bwd_sm90",
+    "delta_matching_fwd_sm90",
+    "delta_matching_sm90",
     "group_indices_sm90",
     "fp8_rowwise_kmajor_sm90",
+    "pack_reduce_scatter_sm90",
 }
 # Shared CuTe helpers that only SM90 code uses (rule 6).
 SM90_HELPERS = {"cute_ptx_sm90", "cute_compile_sm90", "fp8_e8m0_scale_sm90", "row_slice_sm90"}

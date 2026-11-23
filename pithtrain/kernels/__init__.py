@@ -15,6 +15,7 @@ from pithtrain.kernels.bf16_expert_support import bf16_experts_supported
 from pithtrain.kernels.causal_conv1d import causal_conv1d_bwd, causal_conv1d_fwd, causal_conv1d_empty
 from pithtrain.kernels.clamped_swiglu import clamped_swiglu_bwd, clamped_swiglu_fwd
 from pithtrain.kernels.cross_entropy import cross_entropy_fwd_bwd
+from pithtrain.kernels.delta_matching import delta_matching_bwd, delta_matching_bwd_prepare, delta_matching_fwd, delta_matching_supported
 from pithtrain.kernels.ep_dispatch import ep_dispatch_recv_idx, ep_dispatch_send_idx
 from pithtrain.kernels.flash_attn_memoize import memoized_launch
 from pithtrain.kernels.fp8_clamped_swiglu_quant import fp8_clamped_swiglu_bwd, fp8_clamped_swiglu_kmajor, fp8_clamped_swiglu_rowwise
@@ -145,3 +146,9 @@ __all__.append("tune_kernels")
 
 # Inductor options of the models' compiled stages
 __all__.append("stage_compile_options")
+
+# Delta-Matching FP8 attention on SM90
+__all__.append("delta_matching_bwd")
+__all__.append("delta_matching_bwd_prepare")
+__all__.append("delta_matching_fwd")
+__all__.append("delta_matching_supported")
