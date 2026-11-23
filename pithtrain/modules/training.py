@@ -226,6 +226,12 @@ class TrainingCfg(SlottedDefault):
     Train the linear layers in FP8 through DeepGEMM with 128-element block scaling; False is BF16.
     """
 
+    fp8_attention: bool = False
+    """
+    Use SM90 Delta-Matching for Qwen3.5 full attention on unpacked inputs without context
+    parallelism. Independent of the precision for linear layers.
+    """
+
     init_std: float = 0.02
 
     nsys_start: Optional[int] = None
@@ -377,6 +383,7 @@ def setup_model(
     shard_dense_model: Callable[[Qwen35TextModel, DeviceMesh], None] | None = None,
 ) -> None:
     training.fp8 = cfg.fp8
+    training.fp8_attention = cfg.fp8_attention
     training.Linear = FP8Linear if cfg.fp8 else BF16Linear
     training.GroupedLinear = FP8GroupedLinear if cfg.fp8 else GroupedLinear
 
@@ -388,6 +395,12 @@ def setup_model(
     if module_config.model_type in ("qwen3_5", "qwen3_5_moe"):
         module_config = module_config.text_config
     module_config.max_position_embeddings = cfg.sequence_length
+
+    if cfg.fp8_attention:
+        if module_config.model_type not in ("qwen3_5_text", "qwen3_5_moe_text"):
+            raise ValueError("FP8 Delta-Matching attention requires Qwen3.5")
+        if cp_size != 1:
+            raise ValueError("FP8 Delta-Matching attention requires context parallel size 1")
 
     assert hasattr(module_config, "hidden_size")
     assert isinstance(module_config.hidden_size, int)

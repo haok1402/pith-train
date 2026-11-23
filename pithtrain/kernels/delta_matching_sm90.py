@@ -19,7 +19,7 @@ from pithtrain.kernels.cute_ptx_sm90 import asm, to_ir
 __all__ = [
     "BACKWARD_THREADS", "BLOCK_QUERY", "LOG2_E", "allocate_operand", "allocate_staged_operand", "copy_tma_operand",
     "initialize_attention_barriers", "issue_multiply_tile", "launch_delta_matching_kernel", "make_mma",
-    "load_quant_block", "make_operand_layout", "make_operand_tma", "multiply_tile", "quantize_centered_kv", "quantize_delta_matching", "reduce_mma_row", "reduce_quant_block",
+    "load_quant_block", "make_operand_layout", "make_operand_tma", "multiply_tile", "quantize_centered_kv", "quantize_delta_matching", "quantizer_input", "reduce_mma_row", "reduce_quant_block",
 ]
 
 BLOCK_QUERY = 64
@@ -502,8 +502,17 @@ def allocate_quantized_twins(x, block_rows):
     return codes, scales, twin
 
 
+def quantizer_input(x):
+    """
+    Preserve BSHD views when each BF16 channel vector is aligned to 16 bytes.
+    """
+    if x.stride(-1) == 1 and x.data_ptr() % 16 == 0 and all(stride % 8 == 0 for stride in x.stride()[:-1]):
+        return x
+    return x.clone(memory_format=torch.contiguous_format)
+
+
 def quantize_centered_kv(key, value, ticket):
-    key, value = key.contiguous(), value.contiguous()
+    key, value = quantizer_input(key), quantizer_input(value)
     batch, length, heads, channels = key.shape
     partial = torch.empty((batch * heads, length // 128, channels), dtype=torch.float32, device=key.device)
     center = torch.empty((batch * heads, 1, channels), dtype=torch.float32, device=key.device)
@@ -526,7 +535,7 @@ def quantize_delta_matching(x, block_rows, *, center_key=False, input_scale=1.0,
     Quantize dense BSHD BF16 to E4M3 head-major and channel-major codes and per-head FP32 scales.
     """
     B, N, H, D = x.shape
-    x = x.contiguous()
+    x = quantizer_input(x)
     codes, scales, twin = allocate_quantized_twins(x, block_rows)
     center = torch.empty((B * H, N // 128, D) if center_key else (1, 1, 1), dtype=torch.float32, device=x.device)
 

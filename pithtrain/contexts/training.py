@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 __all__ = [
     "PARAM_DTYPE",
     "fp8",
+    "fp8_attention",
     "Linear",
     "GroupedLinear",
     "model",
@@ -39,6 +40,9 @@ Whether layers are built for FP8 compute, False for BF16.
 This and the two class bindings below are read by models and operators that hold no configuration
 object, so they live here rather than being passed down.
 """
+
+fp8_attention: bool = False
+"""Whether Qwen3.5 full attention uses FP8 Delta-Matching."""
 
 
 Linear: type[linear.BF16Linear | linear.FP8Linear]

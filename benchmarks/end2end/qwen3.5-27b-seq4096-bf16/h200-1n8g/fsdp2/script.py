@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from pithtrain.models.qwen35 import Qwen35TextModel
 
 
-def checkpoint_layers(model: Qwen35TextModel, *, mlp_tail: int) -> None:
+def checkpoint_layers(model: Qwen35TextModel, *, mlp_tail: int, fp8_attention: bool = False) -> None:
     """Checkpoint stock decoder stages, replaying only the MLP in the tail."""
     # Inductor reuses FP8 projection output storage inside compiled stages.
     # Recompute those projections so this eager checkpoint never retains their aliases.
@@ -29,6 +29,8 @@ def checkpoint_layers(model: Qwen35TextModel, *, mlp_tail: int) -> None:
         torch.ops.pithtrain.gated_delta_rule_dense_fwd.default,
         torch.ops.pithtrain.flash_attn4_mha_fwd.default,
     ]
+    if fp8_attention:
+        saved_ops.append(torch.ops.pithtrain.delta_matching_attn_fwd.default)
     selective_checkpoint = partial(
         checkpoint,
         use_reentrant=False,
@@ -44,9 +46,14 @@ def checkpoint_layers(model: Qwen35TextModel, *, mlp_tail: int) -> None:
 
 
 def shard_model(
-    model: Qwen35TextModel, mesh: DeviceMesh, *, mlp_tail: int = 12, fp8: bool = False
+    model: Qwen35TextModel,
+    mesh: DeviceMesh,
+    *,
+    mlp_tail: int = 12,
+    fp8: bool = False,
+    fp8_attention: bool = False,
 ) -> None:
-    checkpoint_layers(model, mlp_tail=mlp_tail)
+    checkpoint_layers(model, mlp_tail=mlp_tail, fp8_attention=fp8_attention)
 
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
     for blocks in batched(model.layers, 2):
@@ -104,6 +111,7 @@ if __name__ == "__main__":
         "--checkpoint-mlp-tail", type=int, help="Layers that checkpoint only their MLP"
     )
     parser.add_argument("--fp8", action="store_true")
+    parser.add_argument("--fp8-attention", action="store_true", help="Use FP8 Delta-Matching attention")
     args = parser.parse_args()
 
     # PithTrain's kernel imports query the current GPU.
@@ -123,10 +131,12 @@ if __name__ == "__main__":
     train.max_steps = args.steps
     train.lr = 1e-5
     train.fp8 = args.fp8
+    train.fp8_attention = args.fp8_attention
     train.optimizer = partial(make_adamw_optimizer, fused=True)
     train.scheduler = make_constant_scheduler
     mlp_tail = args.checkpoint_mlp_tail
     if mlp_tail is None:
         mlp_tail = 29 if args.fp8 else 12
+    shard = partial(shard_model, mlp_tail=mlp_tail, fp8=args.fp8, fp8_attention=args.fp8_attention)
     with bulk_reduce_scatter_packing(args.fp8):
-        launch(cfg, shard_dense_model=partial(shard_model, mlp_tail=mlp_tail, fp8=args.fp8))
+        launch(cfg, shard_dense_model=shard)

@@ -57,3 +57,31 @@ def test_delta_matching_operator_validates_causal_and_scale():
         delta_matching_attn_func(query, key, key, causal=False)
     with pytest.raises(ValueError, match="positive, finite"):
         delta_matching_attn_func(query, key, key, softmax_scale=0.0)
+
+
+def test_delta_matching_strided_projections():
+    generator = torch.Generator(device="cuda").manual_seed(88)
+
+    def operand(heads, channels):
+        return torch.randn(
+            (2, 128, heads, channels), device="cuda", dtype=torch.bfloat16, generator=generator
+        )
+
+    query = operand(6, 512)[..., :256].requires_grad_()
+    key = operand(2, 256)[:, :, 1:].requires_grad_()
+    value = operand(1, 512)[..., ::2].requires_grad_()
+    inputs = query, key, value
+    if not delta_matching_supported(*inputs):
+        pytest.skip("Delta-Matching requires SM90")
+
+    contiguous = tuple(x.detach().contiguous().requires_grad_() for x in inputs)
+    grad_out = operand(6, 512)[..., 256:]
+    actual = delta_matching_attn_func(*inputs)
+    expected = delta_matching_attn_func(*contiguous)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for actual_grad, expected_grad in zip(
+        torch.autograd.grad(actual, inputs, grad_out),
+        torch.autograd.grad(expected, contiguous, grad_out.contiguous()),
+        strict=True,
+    ):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)

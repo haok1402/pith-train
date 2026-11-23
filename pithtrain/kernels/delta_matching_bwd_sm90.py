@@ -15,7 +15,7 @@ from cutlass.utils import SmemAllocator
 from quack.layout_utils import reshape_acc_to_mn
 from quack.reduce import warp_reduce
 
-from pithtrain.kernels.delta_matching_sm90 import BLOCK_QUERY, LOG2_E, BACKWARD_THREADS, allocate_operand, allocate_staged_operand, copy_tma_operand, initialize_attention_barriers, issue_multiply_tile, launch_delta_matching_kernel, load_quant_block, make_mma, make_operand_layout, make_operand_tma, multiply_tile, quantize_delta_matching, reduce_quant_block
+from pithtrain.kernels.delta_matching_sm90 import BACKWARD_THREADS, BLOCK_QUERY, LOG2_E, allocate_operand, allocate_staged_operand, copy_tma_operand, initialize_attention_barriers, issue_multiply_tile, launch_delta_matching_kernel, load_quant_block, make_mma, make_operand_layout, make_operand_tma, multiply_tile, quantize_delta_matching, quantizer_input, reduce_quant_block
 
 __all__ = ["delta_matching_bwd_prepare_sm90", "delta_matching_bwd_sm90"]
 
@@ -1162,7 +1162,7 @@ def quantize_output_gradient(grad_out):
     B, N, H, D = grad_out.shape
     if D != 256:
         return quantize_delta_matching(grad_out, 16384 // D, is_gradient=True)
-    grad_out = grad_out.contiguous()
+    grad_out = quantizer_input(grad_out)
     codes = torch.empty((B * H, N, D), dtype=torch.float8_e4m3fn, device=grad_out.device)
     scales = torch.empty((B * H, N // BLOCK_QUERY), dtype=torch.float32, device=grad_out.device)
     twin = torch.empty((B * H, D, N), dtype=codes.dtype, device=grad_out.device)

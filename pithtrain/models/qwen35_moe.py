@@ -32,6 +32,7 @@ from pithtrain.operators.cp_sequence import (
     zigzag_spans,
     zigzag_to_contiguous,
 )
+from pithtrain.operators.delta_matching import delta_matching_attn_func
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
 from pithtrain.operators.fp8_experts import fp8_scatter_quant, fp8_swiglu_gate_up_experts
@@ -77,6 +78,7 @@ def recompute_policy(ctx, func, *args, **kwargs) -> CheckpointPolicy:
         ops.prepend_conv_state.default,
         ops.fp8_quantize_activation.default, ops.flash_attn4_mha_fwd.default,
         ops.flash_attn4_varlen_fwd.default, ops.zigzag_ring_fwd.default,
+        ops.delta_matching_attn_fwd.default,
     ):  # fmt: skip
         return CheckpointPolicy.MUST_SAVE
     return CheckpointPolicy.PREFER_SAVE
@@ -270,6 +272,7 @@ class Qwen35MoeAttention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.scaling = self.head_dim**-0.5
+        self.fp8_attention = training.fp8_attention
         attention_bias = config.attention_bias
         self.q_proj = training.Linear(self.hidden_size, self.num_heads * self.head_dim * 2, bias=attention_bias)  # fmt: skip
         self.k_proj = training.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=attention_bias)  # fmt: skip
@@ -320,7 +323,13 @@ class Qwen35MoeAttention(nn.Module):
         key_states = self.k_norm(self.k_proj(hidden_states, quantized_hidden).view(B, S, self.num_kv_heads, self.head_dim))  # fmt: skip
         value_states = self.v_proj(hidden_states, quantized_hidden).view(B, S, self.num_kv_heads, self.head_dim)  # fmt: skip
         query_states, key_states = self.apply_rotary_posemb(query_states, key_states, rotary_posemb)
-        if distributed.cp_size > 1:
+        if self.fp8_attention:
+            if cu_seqlens is not None or distributed.cp_size != 1:
+                raise ValueError("FP8 Delta-Matching attention requires unpacked input and CP=1")
+            attn_output = delta_matching_attn_func(
+                query_states, key_states, value_states, softmax_scale=self.scaling
+            )
+        elif distributed.cp_size > 1:
             attn_output = ring_attention_func(query_states, key_states, value_states, sm_scale=self.scaling, cp_group=distributed.cp_group)  # fmt: skip
         elif cu_seqlens is not None:
             attn_output = flash_attn_varlen_func(query_states.squeeze(0), key_states.squeeze(0), value_states.squeeze(0), cu_seqlens, S, softmax_scale=self.scaling, causal=True).unsqueeze(0)  # fmt: skip
