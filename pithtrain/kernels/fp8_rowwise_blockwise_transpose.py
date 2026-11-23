@@ -2,7 +2,7 @@ import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR
 
-__all__ = ["fp8_quant_act"]
+__all__ = ["fp8_quant_act", "fp8_quant_swiglu"]
 
 
 def fp8_quant_act(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -26,5 +26,26 @@ def fp8_quant_act(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Te
         case 10:
             from pithtrain.kernels.fp8_rowwise_blockwise_transpose_sm100 import fp8_quant_act_sm100
             return fp8_quant_act_sm100(x)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
+
+
+def fp8_quant_swiglu(gate: torch.Tensor, up: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Quantize BF16-rounded silu(gate) * up with the same two layouts as fp8_quant_act, without
+    changing either input. The inputs are contiguous BF16 tensors of the same 2D shape. On SM90,
+    aligned whole tiles fuse SwiGLU into the quantizer. Other shapes and SM100 use two launches.
+    """
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.fp8_rowwise_blockwise_transpose_sm90 import fp8_quant_act_sm90
+            if gate.ndim == 2 and gate.shape == up.shape and gate.dtype == up.dtype == torch.bfloat16 and gate.is_contiguous() and up.is_contiguous() and all(size % 128 == 0 for size in gate.shape) and gate.data_ptr() % 16 == up.data_ptr() % 16 == 0:
+                return fp8_quant_act_sm90(gate, up)
+            from pithtrain.kernels.silu_mul_sm90 import silu_mul_fwd_sm90
+            return fp8_quant_act_sm90(silu_mul_fwd_sm90(gate, up))
+        case 10:
+            from pithtrain.kernels.fp8_rowwise_blockwise_transpose_sm100 import fp8_quant_act_sm100
+            from pithtrain.kernels.silu_mul_sm100 import silu_mul_fwd_sm100
+            return fp8_quant_act_sm100(silu_mul_fwd_sm100(gate, up))
         case _:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")

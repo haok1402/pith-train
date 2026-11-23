@@ -18,7 +18,7 @@ from pithtrain.kernels.ep_dispatch import ep_dispatch_recv_idx, ep_dispatch_send
 from pithtrain.kernels.flash_attn_memoize import memoized_launch
 from pithtrain.kernels.fp8_clamped_swiglu_quant import fp8_clamped_swiglu_bwd, fp8_clamped_swiglu_kmajor, fp8_clamped_swiglu_rowwise
 from pithtrain.kernels.fp8_gemm import fp8_channels_as_rows, fp8_gemm_fwd, fp8_gemm_bwd, fp8_fused_experts_supported, fp8_gemm_nt, fp8_grouped_wgrad_empty, fp8_grouped_gemm, k_grouped_fp8_gemm, fp8_group_indices, fp8_quant_grouped
-from pithtrain.kernels.fp8_rowwise_blockwise_transpose import fp8_quant_act
+from pithtrain.kernels.fp8_rowwise_blockwise_transpose import fp8_quant_act, fp8_quant_swiglu
 from pithtrain.kernels.fp8_rowwise_transpose import fp8_quant_grad
 from pithtrain.kernels.fp8_scale_layout import act_scale_like
 from pithtrain.kernels.fp8_scatter_quant import scatter_quant
@@ -43,6 +43,7 @@ __all__.append("fp8_gemm_bwd")
 __all__.append("fp8_gemm_nt")
 __all__.append("fp8_channels_as_rows")
 __all__.append("fp8_quant_act")
+__all__.append("fp8_quant_swiglu")
 __all__.append("fp8_quant_grad")
 
 # FP8 grouped (expert) GEMMs

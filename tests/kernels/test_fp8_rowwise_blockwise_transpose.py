@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from pithtrain.kernels import fp8_quant_act
+from pithtrain.kernels import fp8_quant_act, fp8_quant_swiglu, silu_mul_fwd
 
 BLOCK = 128
 
@@ -156,3 +156,21 @@ def test_degenerate_shapes() -> None:
     x = torch.empty(0, 256, device="cuda", dtype=torch.bfloat16)
     out = fp8_quant_act(x)
     assert [tuple(t.shape) for t in out] == [(0, 256), (0, 2), (256, 0), (2, 0)]
+
+
+@pytest.mark.parametrize("M,K", [(128, 128), (256, 256), (130, 129), (0, 256)])
+def test_swiglu_quantization(M, K):
+    torch.manual_seed(42)
+    gate = torch.randn((M, K), dtype=torch.bfloat16, device="cuda")
+    up = torch.randn_like(gate)
+    out, scale, out_t, scale_t = fp8_quant_swiglu(gate, up)
+
+    # The eager SiLU approximation can differ from PyTorch before BF16 rounding.
+    # Verify the FP8 recipe in PyTorch on the exact baseline SwiGLU values.
+    activation = silu_mul_fwd(gate, up)
+    ref, ref_scale = ref_rowwise(activation)
+    ref_t, ref_scale_t = ref_blockwise(activation.T)
+    assert_fp8_equal("out", out, ref)
+    assert_scale_equal("scale", scale, ref_scale)
+    assert_fp8_equal("out_t", out_t, ref_t)
+    assert_scale_equal("scale_t", scale_t, ref_scale_t)

@@ -16,7 +16,9 @@ from pithtrain.kernels import (
     fp8_gemm_fwd,
     fp8_gemm_nt,
     fp8_quant_act,
+    fp8_quant_swiglu,
     fp8_quant_weight,
+    silu_mul_bwd,
 )
 
 __all__ = ["BF16Linear", "BF16LinearFunc", "FP8Linear"]
@@ -226,6 +228,41 @@ class FP8LinearMainGradFunc(torch.autograd.Function):
         return grad_input, None, None, None, None, None, None, None
 
 
+class FP8SwiGLUDownProjection(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, gate, up, weight, quantized_weight, main_grad):
+        weight_fp8, scale_weight, weight_t_fp8, scale_weight_t = quantized_weight
+        activation_fp8, scale, activation_t_fp8, scale_t = fp8_quant_swiglu(gate, up)
+        output = fp8_linear_fwd_prequantized(
+            gate,
+            weight,
+            weight_fp8,
+            scale_weight,
+            weight_t_fp8,
+            scale_weight_t,
+            activation_fp8,
+            scale,
+            activation_t_fp8,
+            scale_t,
+        )
+        ctx.save_for_backward(gate, up, weight_t_fp8, scale_weight_t, activation_t_fp8, scale_t)
+        ctx.main_grad = main_grad
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        gate, up, *operands = ctx.saved_tensors
+        if ctx.main_grad is None:
+            grad_activation, grad_weight = fp8_linear_bwd(grad_output, *operands, gate.shape[1])
+        else:
+            grad_activation = fp8_linear_bwd_into(
+                grad_output, *operands, gate.shape[1], ctx.main_grad
+            )
+            grad_weight = None
+        grad_gate, grad_up = silu_mul_bwd(grad_activation, gate, up)
+        return grad_gate, grad_up, grad_weight, None, None
+
+
 class FP8Linear(nn.Linear):
     """
     Outside torch.compile, the bf16 weight is quantized once per step and reused by every
@@ -240,6 +277,16 @@ class FP8Linear(nn.Linear):
         super().__init__(*args, **kwargs)
         self.quantized_weight_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None  # fmt: skip
         self.quantized_weight_version: int = -1
+
+    def forward_swiglu(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        """Project silu(gate) * up with fused activation quantization in eager execution."""
+        gate_2d, up_2d = gate.flatten(0, -2), up.flatten(0, -2)
+        output = FP8SwiGLUDownProjection.apply(
+            gate_2d, up_2d, self.weight, self.get_quantized_weight(), self.main_grad
+        ).view(*gate.shape[:-1], self.out_features)
+        if self.bias is not None:
+            output = output + self.bias
+        return output
 
     def get_quantized_weight(
         self,

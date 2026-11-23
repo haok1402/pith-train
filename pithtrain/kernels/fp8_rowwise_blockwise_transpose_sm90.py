@@ -11,9 +11,10 @@ from cutlass import Float32, Int32, Int64, Uint8, Uint32
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from pithtrain.kernels.cute_compile_sm90 import TORCH2CUTE, fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import asm
+from pithtrain.kernels.cute_ptx_sm90 import asm, bf16_hi, bf16_lo, pack_bf16
 from pithtrain.kernels.fp8_e8m0_scale_sm90 import e8m0_scale, exact_rcp
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale
+from pithtrain.kernels.silu_mul_sm90 import swiglu_fwd
 
 __all__ = ["fp8_quant_act_sm90"]
 
@@ -81,8 +82,9 @@ class RowwiseBlockwiseTranspose:
     Fuse rowwise and transposed blockwise FP8 quantization.
     """
 
-    def __init__(self, dtype: type, col_vector_width: int, row_vector_width: int, num_rows_per_thread: int, has_full_tiles: bool, use_coalesced_transpose: bool) -> None:
+    def __init__(self, dtype: type, col_vector_width: int, row_vector_width: int, num_rows_per_thread: int, has_full_tiles: bool, use_coalesced_transpose: bool, fuse_swiglu: bool) -> None:
         self.dtype, self.num_rows_per_thread = dtype, num_rows_per_thread
+        self.fuse_swiglu = fuse_swiglu
         self.has_full_tiles, self.use_coalesced_transpose = has_full_tiles, use_coalesced_transpose
         self.num_threads, self.num_warps = 1024 // num_rows_per_thread, 32 // num_rows_per_thread
         self.input_format = {cutlass.BFloat16: "bf16", cutlass.Float16: "f16", Float32: "f32"}[dtype]
@@ -90,17 +92,17 @@ class RowwiseBlockwiseTranspose:
         self.col_vector_width, self.row_vector_width = col_vector_width, row_vector_width
 
     @cute.jit
-    def __call__(self, mX: cute.Tensor, mOut: cute.Tensor, mScale: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, stream) -> None:
+    def __call__(self, mX: cute.Tensor, mUp: cute.Tensor, mOut: cute.Tensor, mScale: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, stream) -> None:
         M, K = mX.shape[0], mX.shape[1]
         num_row_tiles, num_col_tiles = (M + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
         if cutlass.const_expr(self.use_coalesced_transpose):
             grid = [num_col_tiles, num_row_tiles, 1]
         else:
             grid = [num_row_tiles, num_col_tiles, 1]
-        self.kernel(mX, mOut, mScale, mOutT, mScaleT).launch(grid=grid, block=[self.num_threads, 1, 1], stream=stream)
+        self.kernel(mX, mUp, mOut, mScale, mOutT, mScaleT).launch(grid=grid, block=[self.num_threads, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(self, mX: cute.Tensor, mOut: cute.Tensor, mScale: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor) -> None:
+    def kernel(self, mX: cute.Tensor, mUp: cute.Tensor, mOut: cute.Tensor, mScale: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         bx, by, _ = cute.arch.block_idx()
         if cutlass.const_expr(self.use_coalesced_transpose):
@@ -110,6 +112,9 @@ class RowwiseBlockwiseTranspose:
         sub_block = SubBlock(tidx, row_tile_idx, col_tile_idx, Int32(mX.shape[0]), Int32(mX.shape[1]), self.num_rows_per_thread)
 
         x_words = self.load_block(mX, sub_block)
+        if cutlass.const_expr(self.fuse_swiglu):
+            up_words = self.load_block(mUp, sub_block)
+            x_words = self.apply_swiglu(x_words, up_words)
 
         row_amax = self.reduce_row_amax(x_words)
 
@@ -147,6 +152,18 @@ class RowwiseBlockwiseTranspose:
                             dest = cute.make_tensor(x_block.iterator + (row_idx * 16 + half_idx * 8 + vector_idx * COL_VECTOR_WIDTH), cute.make_layout(COL_VECTOR_WIDTH))
                             cute.autovec_copy(source, dest)
         return cute.recast_tensor(x_block, Uint32)
+
+    @cute.jit
+    def apply_swiglu(self, gate_words: cute.Tensor, up_words: cute.Tensor) -> cute.Tensor:
+        """
+        Apply the eager SwiGLU arithmetic and pack its rounded BF16 values for quantization.
+        """
+        out_words = cute.make_rmem_tensor(cute.make_layout(8 * self.num_rows_per_thread), Uint32)  # (packed BF16 word,)
+        for word_idx in cutlass.range_constexpr(8 * self.num_rows_per_thread):
+            gate, up = Uint32(gate_words[word_idx]), Uint32(up_words[word_idx])
+            out_lo, out_hi = swiglu_fwd(bf16_lo(gate), bf16_lo(up)), swiglu_fwd(bf16_hi(gate), bf16_hi(up))
+            out_words[word_idx] = pack_bf16(out_lo, out_hi)
+        return out_words
 
     @cute.jit
     def reduce_row_amax(self, x_words: cute.Tensor) -> cute.Tensor:
@@ -322,7 +339,7 @@ def choose_vector_width(size: int, max_width: int) -> int:
     return width
 
 
-def compile_fp8_quant_act(dtype: type, col_vector_width: int, row_vector_width: int, num_rows_per_thread: int, has_full_tiles: bool, use_coalesced_transpose: bool) -> Callable:
+def compile_fp8_quant_act(dtype: type, col_vector_width: int, row_vector_width: int, num_rows_per_thread: int, has_full_tiles: bool, use_coalesced_transpose: bool, fuse_swiglu: bool) -> Callable:
     M, K, num_col_tiles, num_row_tiles = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
     elem_bytes = dtype.width // 8
     x = fake(dtype, (M, K), (cute.sym_int64(divisibility=col_vector_width), 1), col_vector_width * elem_bytes)
@@ -330,13 +347,13 @@ def compile_fp8_quant_act(dtype: type, col_vector_width: int, row_vector_width: 
     scale = fake(Float32, (M, num_col_tiles), (1, cute.sym_int64()))
     out_t = fake(cutlass.Float8E4M3FN, (K, M), (M, 1))
     scale_t = fake(Float32, (num_col_tiles, num_row_tiles), (num_row_tiles, 1))
-    return cute.compile(RowwiseBlockwiseTranspose(dtype, col_vector_width, row_vector_width, num_rows_per_thread, has_full_tiles, use_coalesced_transpose), x, out, scale, out_t, scale_t, fake_stream(), options="--enable-tvm-ffi")
+    return cute.compile(RowwiseBlockwiseTranspose(dtype, col_vector_width, row_vector_width, num_rows_per_thread, has_full_tiles, use_coalesced_transpose, fuse_swiglu), x, x, out, scale, out_t, scale_t, fake_stream(), options="--enable-tvm-ffi")
 
 
 DISPATCH_CACHE: dict[tuple, Callable | None] = {}
 
 
-def resolve_fp8_quant_act(dtype: torch.dtype, M: int, K: int, x_row_stride: int, x_base: int, has_unit_col_stride: bool, num_tiles: int) -> Callable | None:
+def resolve_fp8_quant_act(dtype: torch.dtype, M: int, K: int, x_row_stride: int, x_base: int, has_unit_col_stride: bool, num_tiles: int, fuse_swiglu: bool) -> Callable | None:
     if M == 0 or K == 0:
         return None
     elem_bytes = dtype.itemsize
@@ -345,19 +362,20 @@ def resolve_fp8_quant_act(dtype: torch.dtype, M: int, K: int, x_row_stride: int,
     col_vector_width = choose_vector_width(x_base // elem_bytes, col_vector_width)
     # These aligned dense BF16 shapes fill every tile, so loads and stores need no edge predicates.
     has_full_tiles = dtype == torch.bfloat16 and M in (4096, 8192) and K in (5120, 6144, 17408) and x_row_stride == K and col_vector_width == 8
-    use_coalesced_transpose = has_unit_col_stride and has_full_tiles and K in (5120, 6144)
+    has_full_tiles = has_full_tiles or fuse_swiglu
+    use_coalesced_transpose = fuse_swiglu or (has_unit_col_stride and has_full_tiles and K in (5120, 6144))
     num_rows_per_thread = 4 if use_coalesced_transpose or num_tiles <= SMALL_GRID_TILES else 8
     row_vector_width = choose_vector_width(M, num_rows_per_thread)
-    key = ("fp8_quant_act", dtype, col_vector_width, row_vector_width, num_rows_per_thread, has_full_tiles, use_coalesced_transpose)
+    key = ("fp8_quant_act", dtype, col_vector_width, row_vector_width, num_rows_per_thread, has_full_tiles, use_coalesced_transpose, fuse_swiglu)
     fn = COMPILE_CACHE.get(key)
     if fn is None:
-        fn = COMPILE_CACHE[key] = compile_fp8_quant_act(TORCH2CUTE[dtype], col_vector_width, row_vector_width, num_rows_per_thread, has_full_tiles, use_coalesced_transpose)
+        fn = COMPILE_CACHE[key] = compile_fp8_quant_act(TORCH2CUTE[dtype], col_vector_width, row_vector_width, num_rows_per_thread, has_full_tiles, use_coalesced_transpose, fuse_swiglu)
     if len(DISPATCH_CACHE) > 4096:
         DISPATCH_CACHE.clear()
     return fn
 
 
-def fp8_quant_act_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8_quant_act_sm90(x: torch.Tensor, up: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     SM90 implementation of fp8_quant_act.
     """
@@ -379,12 +397,13 @@ def fp8_quant_act_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, tor
 
     # Cache shape dispatch to avoid recomputing vector alignment for repeated launches.
     dtype, x_base = x.dtype, x.data_ptr()
-    key = (dtype, M, K, x_row_stride, x_base & 15, has_unit_col_stride)
+    fuse_swiglu = up is not None
+    key = (dtype, M, K, x_row_stride, x_base & 15, has_unit_col_stride, fuse_swiglu)
     try:
         fn = DISPATCH_CACHE[key]
     except KeyError:
-        fn = DISPATCH_CACHE[key] = resolve_fp8_quant_act(dtype, M, K, x_row_stride, x_base, has_unit_col_stride, num_row_tiles * num_col_tiles)
+        fn = DISPATCH_CACHE[key] = resolve_fp8_quant_act(dtype, M, K, x_row_stride, x_base, has_unit_col_stride, num_row_tiles * num_col_tiles, fuse_swiglu)
 
     if fn is not None:
-        fn(x, out, scale, out_t, scale_t)
+        fn(x, x if up is None else up, out, scale, out_t, scale_t)
     return out, scale, out_t, scale_t
