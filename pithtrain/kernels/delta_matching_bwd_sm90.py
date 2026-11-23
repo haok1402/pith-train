@@ -798,9 +798,8 @@ class PipelinedKeyValueGradients:
         acc_key = cute.make_rmem_tensor(grad_shape, Float32)
         acc_window = cute.make_rmem_tensor(grad_shape, Float32)
         value_registers = cute.make_rmem_tensor(self.value_register_values, Float32)
-        lane_values = s_grad_value[None, tidx, None]
-        shared_shape = cute.make_layout(cute.size(acc_window) - self.value_register_values)
-        s_value = cute.make_tensor(lane_values.iterator, cute.composition(lane_values.layout, shared_shape))
+        s_value = s_grad_value[None, tidx, None]
+        shared_shape = cute.make_layout(s_value.shape)
         register_window = cute.make_tensor(acc_window.iterator, value_registers.layout)
         shared_window = cute.make_tensor(acc_window.iterator + self.value_register_values, shared_shape)
         acc_key.fill(0.0)
