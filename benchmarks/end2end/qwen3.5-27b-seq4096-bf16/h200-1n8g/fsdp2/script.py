@@ -70,7 +70,7 @@ if __name__ == "__main__":
     parser.add_argument("--seq", type=int, default=4096)
     parser.add_argument("--batch", type=int, default=64)
     parser.add_argument("--micro-batch", type=int, default=2)
-    parser.add_argument("--checkpoint-mlp-tail", type=int, default=12)
+    parser.add_argument("--checkpoint-mlp-tail", type=int, help="Layers that checkpoint only their MLP")
     parser.add_argument("--fp8", action="store_true")
     args = parser.parse_args()
 
@@ -93,4 +93,7 @@ if __name__ == "__main__":
     train.fp8 = args.fp8
     train.optimizer = partial(make_adamw_optimizer, fused=True)
     train.scheduler = make_constant_scheduler
-    launch(cfg, shard_dense_model=partial(shard_model, mlp_tail=args.checkpoint_mlp_tail))
+    mlp_tail = args.checkpoint_mlp_tail
+    if mlp_tail is None:
+        mlp_tail = 24 if args.fp8 else 12
+    launch(cfg, shard_dense_model=partial(shard_model, mlp_tail=mlp_tail))
