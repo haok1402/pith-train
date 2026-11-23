@@ -347,11 +347,10 @@ def store_quant_tile(descriptor, source, row, column, head):
     cute.copy(atom, src, dst)
 
 
-@cute.kernel
-def quantize_tma_twins(mInput, mCenter, mScale, code_store, twin_store, BLOCK: cutlass.Constexpr,
-                        center_key: cutlass.Constexpr, input_scale: cutlass.Constexpr, is_gradient: cutlass.Constexpr):
-    tidx, _, _ = cute.arch.thread_idx()
-    bx, by, _ = cute.arch.block_idx()
+@cute.jit
+def quantize_tma_twins_block(mInput, mCenter, mScale, code_store, twin_store, tidx, bx, by,
+                             BLOCK: cutlass.Constexpr, center_key: cutlass.Constexpr,
+                             input_scale: cutlass.Constexpr, is_gradient: cutlass.Constexpr):
     heads = cute.size(mInput, mode=[2])
     DIM, ROWS = 256, 16
     COLUMNS = 4 if const_expr(BLOCK == 64) else 2
@@ -391,6 +390,45 @@ def quantize_tma_twins(mInput, mCenter, mScale, code_store, twin_store, BLOCK: c
         store_quant_tile(twin_store, s_twin, 0, bx, by)
         cute.arch.cp_async_bulk_commit_group()
         cute.arch.cp_async_bulk_wait_group(0)
+
+
+
+@cute.kernel
+def quantize_tma_twins(mInput, mCenter, mScale, code_store, twin_store, BLOCK: cutlass.Constexpr,
+                        center_key: cutlass.Constexpr, input_scale: cutlass.Constexpr, is_gradient: cutlass.Constexpr):
+    tidx, _, _ = cute.arch.thread_idx()
+    bx, by, _ = cute.arch.block_idx()
+    quantize_tma_twins_block(mInput, mCenter, mScale, code_store, twin_store,
+                             tidx, bx, by, BLOCK, center_key, input_scale, is_gradient)
+
+
+@cute.kernel
+def quantize_value_and_fold_key(mValue, mValueScale, code_store, twin_store, mPartial, mCenter, mTicket):
+    tidx, _, _ = cute.arch.thread_idx()
+    block, head, _ = cute.arch.block_idx()
+    BLOCK = 32
+    value_blocks = cute.size(mValue, mode=[1]) // BLOCK
+    if block < value_blocks:
+        quantize_tma_twins_block(mValue, mCenter, mValueScale, code_store, twin_store,
+                                 tidx, block, head, BLOCK, False, 1.0, False)
+    else:
+        # A disjoint CTA per head folds key partials while the value tiles quantize.
+        center = Float32(0.0)
+        for partial in range(cute.size(mPartial, mode=[1])):
+            center += mPartial[head, partial, tidx]
+        mCenter[head, 0, tidx] = center
+        if tidx == 0 and head == 0:
+            mTicket[0] = 0
+
+
+@cute.jit
+def launch_value_and_fold_key(mValue, mValueScale, mValueCodes, mValueTwin, mPartial, mCenter, mTicket, stream):
+    batch, length, heads, dim = mValue.shape
+    code_store = make_quant_store(mValueCodes, 32, dim)
+    twin_store = make_quant_store(mValueTwin, dim, 32)
+    quantize_value_and_fold_key(mValue, mValueScale, code_store, twin_store, mPartial, mCenter, mTicket).launch(
+        grid=(length // 32 + 1, batch * heads, 1), block=(FORWARD_THREADS, 1, 1), stream=stream,
+    )
 
 
 @cute.kernel
@@ -457,15 +495,40 @@ def launch_key_fold(mPartial, mCenter, mTicket, RESET_TICKET: cutlass.Constexpr,
     )
 
 
+def allocate_quantized_twins(x, block_rows):
+    batch, length, heads, channels = x.shape
+    codes = torch.empty((batch * heads, length, channels), dtype=torch.float8_e4m3fn, device=x.device)
+    scales = torch.empty((batch * heads, length // block_rows), dtype=torch.float32, device=x.device)
+    twin = torch.empty((batch * heads, channels, length), dtype=codes.dtype, device=x.device)
+    return codes, scales, twin
+
+
+def quantize_centered_kv(key, value, ticket):
+    key, value = key.contiguous(), value.contiguous()
+    batch, length, heads, channels = key.shape
+    partial = torch.empty((batch * heads, length // 128, channels), dtype=torch.float32, device=key.device)
+    center = torch.empty((batch * heads, 1, channels), dtype=torch.float32, device=key.device)
+    key_codes, key_scales, key_twin = allocate_quantized_twins(key, 32)
+    value_codes, value_scales, value_twin = allocate_quantized_twins(value, 32)
+    launch_delta_matching_kernel("delta_matching_key_sum", launch_key_sum, (key, partial))
+    launch_delta_matching_kernel(
+        "delta_matching_value_and_key_mean", launch_value_and_fold_key,
+        (value, value_scales, value_codes, value_twin, partial, center, ticket),
+    )
+    launch_delta_matching_kernel(
+        "delta_matching_quantize", launch_quant_block, (key, center, key_codes, key_scales, key_twin),
+        (32, True, 1.0, False, True),
+    )
+    return (key_codes, key_scales, key_twin), (value_codes, value_scales, value_twin)
+
+
 def quantize_delta_matching(x, block_rows, *, center_key=False, input_scale=1.0, is_gradient=False, is_forward=False, scheduler_ticket=None):
     """
     Quantize dense BSHD BF16 to E4M3 head-major and channel-major codes and per-head FP32 scales.
     """
     B, N, H, D = x.shape
     x = x.contiguous()
-    codes = torch.empty((B * H, N, D), dtype=torch.float8_e4m3fn, device=x.device)
-    scales = torch.empty((B * H, N // block_rows), dtype=torch.float32, device=x.device)
-    twin = torch.empty((B * H, D, N), dtype=codes.dtype, device=x.device)
+    codes, scales, twin = allocate_quantized_twins(x, block_rows)
     center = torch.empty((B * H, N // 128, D) if center_key else (1, 1, 1), dtype=torch.float32, device=x.device)
 
     # Centering leaves the exact softmax unchanged and reduces the key quantization range.

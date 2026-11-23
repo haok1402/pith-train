@@ -17,7 +17,7 @@ from quack.reduce import warp_reduce
 
 from pithtrain.kernels.arch import SM_COUNT
 from pithtrain.kernels.cute_ptx_sm90 import asm, to_ir
-from pithtrain.kernels.delta_matching_sm90 import BLOCK_QUERY, LOG2_E, allocate_staged_operand, copy_tma_operand, issue_multiply_tile, launch_delta_matching_kernel, make_mma, make_operand_tma, multiply_tile, quantize_delta_matching
+from pithtrain.kernels.delta_matching_sm90 import BLOCK_QUERY, LOG2_E, allocate_staged_operand, copy_tma_operand, issue_multiply_tile, launch_delta_matching_kernel, make_mma, make_operand_tma, multiply_tile, quantize_centered_kv, quantize_delta_matching
 
 __all__ = ["delta_matching_fwd_sm90"]
 
@@ -669,10 +669,13 @@ def delta_matching_fwd_sm90(query, key, value, softmax_scale):
     group_keys = 8192 // D
     query_codes, query_scales, query_t = quantize_delta_matching(query, group_keys * 2, input_scale=softmax_scale, is_forward=True)
     ticket = torch.empty(1, dtype=torch.int32, device=query.device)
-    key_codes, key_scales, key_t = quantize_delta_matching(
-        key, group_keys, center_key=True, is_forward=True, scheduler_ticket=ticket,
-    )
-    value_codes, value_scales, value_t = quantize_delta_matching(value, group_keys, is_forward=True)
+    if D == 256:
+        (key_codes, key_scales, key_t), (value_codes, value_scales, value_t) = quantize_centered_kv(key, value, ticket)
+    else:
+        key_codes, key_scales, key_t = quantize_delta_matching(
+            key, group_keys, center_key=True, is_forward=True, scheduler_ticket=ticket,
+        )
+        value_codes, value_scales, value_t = quantize_delta_matching(value, group_keys, is_forward=True)
     out = torch.empty((B, N, H, D), dtype=query.dtype, device=query.device)
     lse = torch.empty((B * H, N), dtype=torch.float32, device=query.device)
     launch_delta_matching_kernel("delta_matching_forward", launch_forward_attention,
