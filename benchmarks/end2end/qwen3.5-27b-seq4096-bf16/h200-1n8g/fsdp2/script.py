@@ -43,7 +43,9 @@ def checkpoint_layers(model: Qwen35TextModel, *, mlp_tail: int) -> None:
             layer.forward_stage3 = partial(selective_checkpoint, layer.forward_stage3)
 
 
-def shard_model(model: Qwen35TextModel, mesh: DeviceMesh, *, mlp_tail: int = 12) -> None:
+def shard_model(
+    model: Qwen35TextModel, mesh: DeviceMesh, *, mlp_tail: int = 12, fp8: bool = False
+) -> None:
     checkpoint_layers(model, mlp_tail=mlp_tail)
 
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
@@ -52,9 +54,12 @@ def shard_model(model: Qwen35TextModel, mesh: DeviceMesh, *, mlp_tail: int = 12)
         blocks[0].set_gradient_divide_factor(1.0)
 
     fully_shard(model.embed_tokens, mesh=mesh, mp_policy=mp, reshard_after_forward=True)
+    if fp8:
+        # Embedding backward uses only the saved token indices.
+        model.embed_tokens.set_unshard_in_backward(False)
     model.embed_tokens.set_gradient_divide_factor(1.0)
 
-    fully_shard(model.lm_head, mesh=mesh, mp_policy=mp, reshard_after_forward=True)
+    fully_shard(model.lm_head, mesh=mesh, mp_policy=mp, reshard_after_forward=not fp8)
     model.lm_head.set_gradient_divide_factor(1.0)
 
     # The root owns the final norm and drives FSDP's implicit prefetch.
@@ -124,4 +129,4 @@ if __name__ == "__main__":
     if mlp_tail is None:
         mlp_tail = 29 if args.fp8 else 12
     with bulk_reduce_scatter_packing(args.fp8):
-        launch(cfg, shard_dense_model=partial(shard_model, mlp_tail=mlp_tail))
+        launch(cfg, shard_dense_model=partial(shard_model, mlp_tail=mlp_tail, fp8=args.fp8))
