@@ -52,4 +52,17 @@ Tail 26 led the short Delta-Matching sweep by 0.70% throughput and 0.41 MFU poin
 
 The backward branch advanced to `116959f` during the 300-step run. Merge `d77de7d` combines its split K/V matched-correction streams, 256-thread dO producer and transposed matrix stores with the forward branch's descending head-major matched-correction dispatch and the training branch's strided input support. All 19 kernel, operator and import tests passed at the new merge. The running convergence pair uses the earlier pinned kernels at `121c6cb`.
 
+The two integrated operator revisions returned bit-identical O, dQ, dK and dV on the same random operands at the dense 4K, 24:4 GQA, D=256 shape with batches 2 and 4. This check ran in job `1291198` on `pool1-00601`.
+
+The follow-up same-node run `1291031` on `pool1-00397` measured another 12 steps per setting. All four arms were retry-free after warmup.
+
+| FP8 recipe attention | MLP-only tail | Median seconds | Tokens/s | MFU | Peak allocated / reserved GiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| FA4 BF16 | 29 | 8.771 | 29,889 | 59.31% | 124.20 / 136.42 |
+| Delta-Matching, `116959f` backward | 27 | 8.707 | 30,106 | 59.74% | 124.47 / 136.39 |
+| Delta-Matching, `116959f` backward | 26 | 8.719 | 30,068 | 59.66% | 123.30 / 136.37 |
+| Delta-Matching, `da20ba8` backward | 26 | 8.715 | 30,081 | 59.69% | 123.30 / 136.37 |
+
+The latest Delta-Matching arm at tail 27 delivered 0.73% more tokens/s and 0.43 more MFU points than FA4 at tail 29. Both had one warmup retry per GPU. Tail 26 had zero retries including warmup, and the two backward revisions differed by 4 ms in median step time at tail 26. For those two full-model runs, the first microbatch losses matched bit for bit on six of eight ranks, and the largest logged loss gap over 12 steps was 0.0020 nats. The operating default stays at tail 24, where the paired run measures long-run allocator behavior.
+
 Per-step logs, Slurm and GPU gate output, input preparation, and the analysis script are in `.cache/fp8-attention-training/`. Slurm accepted submissions and warned that the account is approaching its stale-data submission threshold.
