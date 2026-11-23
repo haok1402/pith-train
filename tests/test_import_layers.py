@@ -50,6 +50,7 @@ KERNELS = PKG / "kernels"
 
 # SM90 kernels with no SM100 kernel to pair with: SM100 runs a non-kernel path.
 SM90_ONLY = {
+    "pack_reduce_scatter_sm90",
     "group_indices_sm90",
     "fp8_rowwise_kmajor_sm90",
 }

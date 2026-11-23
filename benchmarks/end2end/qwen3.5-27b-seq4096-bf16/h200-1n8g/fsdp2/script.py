@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from contextlib import contextmanager
 from functools import partial
 from itertools import batched
 from pathlib import Path
@@ -61,6 +62,30 @@ def shard_model(model: Qwen35TextModel, mesh: DeviceMesh, *, mlp_tail: int = 12)
     model.set_gradient_divide_factor(1.0)
 
 
+@contextmanager
+def bulk_reduce_scatter_packing(enabled: bool):
+    """Use bulk copies for eligible FSDP buckets during this benchmark."""
+    if not enabled:
+        yield
+        return
+
+    from torch.distributed.fsdp._fully_shard import _fsdp_collectives
+
+    from pithtrain.kernels import pack_reduce_scatter
+
+    original = _fsdp_collectives.foreach_reduce_scatter_copy_in
+
+    def copy_in(grads, output, world_size):
+        if not pack_reduce_scatter(grads, output, world_size):
+            original(grads, output, world_size)
+
+    _fsdp_collectives.foreach_reduce_scatter_copy_in = copy_in
+    try:
+        yield
+    finally:
+        _fsdp_collectives.foreach_reduce_scatter_copy_in = original
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=Path("examples/pretrain_lm/qwen3.5-27b"))
@@ -70,7 +95,9 @@ if __name__ == "__main__":
     parser.add_argument("--seq", type=int, default=4096)
     parser.add_argument("--batch", type=int, default=64)
     parser.add_argument("--micro-batch", type=int, default=2)
-    parser.add_argument("--checkpoint-mlp-tail", type=int, help="Layers that checkpoint only their MLP")
+    parser.add_argument(
+        "--checkpoint-mlp-tail", type=int, help="Layers that checkpoint only their MLP"
+    )
     parser.add_argument("--fp8", action="store_true")
     args = parser.parse_args()
 
@@ -96,4 +123,5 @@ if __name__ == "__main__":
     mlp_tail = args.checkpoint_mlp_tail
     if mlp_tail is None:
         mlp_tail = 29 if args.fp8 else 12
-    launch(cfg, shard_dense_model=partial(shard_model, mlp_tail=mlp_tail))
+    with bulk_reduce_scatter_packing(args.fp8):
+        launch(cfg, shard_dense_model=partial(shard_model, mlp_tail=mlp_tail))

@@ -8,6 +8,7 @@ gated_delta_rule_cp_supported and chunk_gdr_cp_supported. Importing the package 
 QuACK or tvm_tirx.
 """
 
+from pithtrain.kernels.pack_reduce_scatter import pack_reduce_scatter
 from pithtrain.kernels.bf16_expert_gemm import bf16_expert_down_dgrad, bf16_expert_gate_up_dgrad, bf16_expert_down_fwd, bf16_expert_gate_up_fwd, bf16_expert_down_wgrad, bf16_expert_gate_up_wgrad
 from pithtrain.kernels.bf16_expert_slots import bf16_expert_gather_rows, bf16_expert_gather_sum, bf16_expert_group_slots, bf16_expert_segment_sum
 from pithtrain.kernels.bf16_expert_support import bf16_experts_supported
@@ -35,6 +36,9 @@ from pithtrain.kernels.token_scatter import scatter_by_expert
 from pithtrain.kernels.tuning import tune_kernels
 
 __all__ = []
+
+# FSDP gradient packing
+__all__.append("pack_reduce_scatter")
 
 # FP8 dense GEMMs and activation quantization
 __all__.append("act_scale_like")
