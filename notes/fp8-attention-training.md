@@ -52,7 +52,17 @@ Mean Delta-Matching minus FA4 loss was **+0.000142 nats**, with a mean absolute 
 | 51–150 | +0.000085 | 0.996× |
 | 151–300 | +0.000266 | 1.000× |
 
-The first-step norm ratio was 1.182×. The persistent gap faded, with isolated higher norms later. Steps 119 and 293 were 3.2209 versus 0.5191 and 3.4872 versus 0.5768, respectively. Delta-Matching exceeded 2× the FA4 norm at five later steps and fell below 0.5× at two. Gradient clipping applied at 10 steps with Delta-Matching and 6 with FA4. The BF16 compute arm started after the FP8 pair finished.
+The first-step norm ratio was 1.182×. The persistent gap faded, with isolated higher norms later. Steps 119 and 293 were 3.2209 versus 0.5191 and 3.4872 versus 0.5768, respectively. Delta-Matching exceeded 2× the FA4 norm at five later steps and fell below 0.5× at two. Gradient clipping applied at 10 steps with Delta-Matching and 6 with FA4.
+
+## BF16 compute control
+
+The third arm in job `1290664` completed all 300 steps on the same node and verified the same batch-order hash. It used microbatch 2 and MLP-only tail 12 with FP32 gradients, reduction, master weights and optimizer moments. It had three allocator retries per GPU in warmup and zero afterward. The job released all eight GPUs after 2 h 39 min.
+
+| Loss step 1 → 300 | Mean loss (nats) | Pre-clip norm step 1 → 300 | Median seconds | Tokens/s | MFU | Peak allocated / reserved GiB |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2.0085 → 1.6861 | 1.675485 | 31.0787 → 0.5274 | 11.389 | 23,017 | 45.67% | 125.42 / 135.40 |
+
+BF16 compute averaged 0.003156 nats less loss than FP8 with FA4 and 0.003298 nats less than FP8 with Delta-Matching. It clipped on 11 steps. The BF16 compute comparison includes a different microbatch size and checkpoint tail.
 
 ## Throughput at each backend's best measured tail
 
@@ -68,7 +78,7 @@ Job `1290659` on `pool1-00909` held the node, checkpoint, shuffled WikiText batc
 
 Tail 26 led the short Delta-Matching sweep by 0.70% throughput and 0.41 MFU points versus stock FA4. Tail 26 had zero warmup retries. Tail 27 and stock FA4 each had one warmup retry per GPU. The tail-26 and tail-27 median step times were 3 ms apart.
 
-The backward branch advanced to `116959f` during the 300-step run. Merge `d77de7d` combines its split K/V matched-correction streams, 256-thread dO producer and transposed matrix stores with the forward branch's descending head-major matched-correction dispatch and the training branch's strided input support. All 19 kernel, operator and import tests passed at the new merge. The running convergence pair uses the earlier pinned kernels at `121c6cb`.
+The backward branch advanced to `116959f` during the 300-step run. Merge `d77de7d` combines its split K/V matched-correction streams, 256-thread dO producer and transposed matrix stores with the forward branch's descending head-major matched-correction dispatch and the training branch's strided input support. All 19 kernel, operator and import tests passed at the new merge. The convergence pair used the earlier pinned kernels at `121c6cb`.
 
 The two integrated operator revisions returned bit-identical O, dQ, dK and dV on the same random operands at the dense 4K, 24:4 GQA, D=256 shape with batches 2 and 4. This check ran in job `1291198` on `pool1-00601`.
 
@@ -81,6 +91,6 @@ The follow-up same-node run `1291031` on `pool1-00397` measured another 12 steps
 | Delta-Matching, `116959f` backward | 26 | 8.719 | 30,068 | 59.66% | 123.30 / 136.37 |
 | Delta-Matching, `da20ba8` backward | 26 | 8.715 | 30,081 | 59.69% | 123.30 / 136.37 |
 
-The latest Delta-Matching arm at tail 27 delivered 0.73% more tokens/s and 0.43 more MFU points than FA4 at tail 29. Both had one warmup retry per GPU. Tail 26 had zero retries including warmup, and the two backward revisions differed by 4 ms in median step time at tail 26. For those two full-model runs, the first microbatch losses matched bit for bit on six of eight ranks, and the largest logged loss gap over 12 steps was 0.0020 nats. The operating default stays at tail 24, where the paired run measures long-run allocator behavior.
+The latest Delta-Matching arm at tail 27 delivered 0.73% more tokens/s and 0.43 more MFU points than FA4 at tail 29. Both had one warmup retry per GPU. Tail 26 had zero retries including warmup, and the two backward revisions differed by 4 ms in median step time at tail 26. For those two full-model runs, the first microbatch losses matched bit for bit on six of eight ranks, and the largest logged loss gap over 12 steps was 0.0020 nats. The operating default stays at tail 24, which completed the 300-step allocator check.
 
 Per-step logs, Slurm and GPU gate output, input preparation, and the analysis script are in `.cache/fp8-attention-training/`. Slurm accepted submissions and warned that the account is approaching its stale-data submission threshold.
