@@ -187,15 +187,19 @@ def output_slab(acc_output, cached_output, slab: cutlass.Constexpr, SLABS: cutla
 @cute.jit
 def accumulate_value_tile(acc_output, cached_output, mma, mma_thread, s_values, weights, operands,
                           rescale, stage_idx, GROUP_KEYS: cutlass.Constexpr, GROUPS: cutlass.Constexpr,
-                          VALUE_COLUMNS: cutlass.Constexpr, SLABS: cutlass.Constexpr):
+                          VALUE_COLUMNS: cutlass.Constexpr, SLABS: cutlass.Constexpr, GROUP_QUERY_HEADS: cutlass.Constexpr):
     ratios = value_basis_ratios(weights, GROUPS)
     for slab in cutlass.range_constexpr(SLABS):
         acc_tile = cute.make_rmem_tensor(mma_thread.partition_shape_C((BLOCK_QUERY, VALUE_COLUMNS)), Float32)
         for group in cutlass.range_constexpr(GROUPS):
             if cutlass.const_expr(group > 0):
                 rebase_value_accumulator(acc_tile, ratios, group)
-            source = s_values[None, None, stage_idx * GROUPS + group]
-            value_tile = cute.local_tile(source, (VALUE_COLUMNS, GROUP_KEYS), (slab, 0))
+            if cutlass.const_expr(GROUP_QUERY_HEADS):
+                source = s_values[None, None, stage_idx]
+                value_tile = cute.local_tile(source, (VALUE_COLUMNS, GROUP_KEYS), (slab, group))
+            else:
+                source = s_values[None, None, stage_idx * GROUPS + group]
+                value_tile = cute.local_tile(source, (VALUE_COLUMNS, GROUP_KEYS), (slab, 0))
             multiply_tile(mma, mma_thread, acc_tile, operands[None, None, None, group], value_tile, group > 0)
         output = reshape_acc_to_mn(output_slab(acc_output, cached_output, slab, SLABS))
         partial = reshape_acc_to_mn(acc_tile)
@@ -234,25 +238,33 @@ def store_attention(mOut, mLse, acc_output, cached_output, row_sum, row_max, mma
 
 class CausalAttention:
     """
-    Persistent 128-row CTAs with independent K/V stages and a PV-first consumer schedule.
+    Persistent causal work with a PV-first consumer schedule.
     """
-    def __init__(self, head_dim):
+    def __init__(self, head_dim, group_query_heads):
         self.head_dim = head_dim
         self.group_keys, self.tile_keys = 8192 // head_dim, 32768 // head_dim
         self.groups = self.tile_keys // self.group_keys
         self.value_columns = min(head_dim, 128)
-        self.stages = 2
-        self.consumer_groups, self.load_group = 2, 0
-        self.consumer_registers, self.load_registers = 240, 24
+        self.group_query_heads = group_query_heads
+        self.stages = 1 if group_query_heads else 2
+        self.consumer_groups = 3 if group_query_heads else 2
+        self.load_group = 0
+        self.consumer_registers = 160 if group_query_heads else 240
+        self.load_registers = 24
+        self.heads_per_task = self.consumer_groups if group_query_heads else 1
+        self.query_blocks_per_task = 1 if group_query_heads else self.consumer_groups
+        self.head_step = 1 if group_query_heads else 0
+        self.query_block_step = 0 if group_query_heads else 1
 
     @cute.jit
     def __call__(self, mQuery, mQueryScale, mKey, mKeyScale, mValueT, mValueScale, mOut, mLse, mTicket, stream):
         H, N, D = mQuery.shape
         query_copy, key_copy = make_operand_tma(mQuery, BLOCK_QUERY, D), make_operand_tma(mKey, self.tile_keys, D)
-        value_copy = make_operand_tma(mValueT, D, self.group_keys)
+        value_keys = self.tile_keys if self.group_query_heads else self.group_keys
+        value_copy = make_operand_tma(mValueT, D, value_keys)
         inputs = (mQueryScale, mKeyScale, mValueScale, mOut, mLse)
-        query_groups = N // (BLOCK_QUERY * self.consumer_groups)
-        ctas = min(SM_COUNT, query_groups * H)
+        query_groups = N // (BLOCK_QUERY * self.query_blocks_per_task)
+        ctas = min(SM_COUNT, query_groups * (H // self.heads_per_task))
         self.kernel(inputs, (query_copy, key_copy, value_copy), mTicket, query_groups, ctas).launch(
             grid=(ctas, 1, 1), block=((1 + self.consumer_groups) * 128, 1, 1), stream=stream,
         )
@@ -268,7 +280,9 @@ class CausalAttention:
         allocator = SmemAllocator()
         s_query = allocate_staged_operand(allocator, BLOCK_QUERY, self.head_dim, self.consumer_groups)
         s_keys = allocate_staged_operand(allocator, self.tile_keys, self.head_dim, self.stages)
-        s_values = allocate_staged_operand(allocator, self.head_dim, self.group_keys, self.stages * self.groups)
+        value_keys = self.tile_keys if self.group_query_heads else self.group_keys
+        value_stages = self.stages if self.group_query_heads else self.stages * self.groups
+        s_values = allocate_staged_operand(allocator, self.head_dim, value_keys, value_stages)
         s_output_cache = None
         if cutlass.const_expr(self.head_dim == 256):
             # Each lane accesses pairs of adjacent FP32 values.
@@ -281,7 +295,7 @@ class CausalAttention:
         work_slot = allocator.allocate_tensor(Int32, cute.make_layout(1), 4)
         barriers = self.initialize_barriers(allocator, tidx)
 
-        task_count = QUERY_GROUPS * query_heads
+        task_count = QUERY_GROUPS * (query_heads // self.heads_per_task)
         if warp_group == self.load_group:
             cute.arch.setmaxregister_decrease(self.load_registers)
             if tidx == 0:
@@ -309,8 +323,10 @@ class CausalAttention:
                 head_idx, query_block, last_tile, key_head = self.work_item(
                     task_idx, query_heads, key_heads, QUERY_GROUPS,
                 )
-                self.compute_loop(inputs, buffers, s_output_cache, barriers, query_block + consumer_group, head_idx,
-                                  key_head, last_tile, consumer_group, tidx % 128, tile_base)
+                self.compute_loop(inputs, buffers, s_output_cache, barriers,
+                                  query_block + consumer_group * self.query_block_step,
+                                  head_idx + consumer_group * self.head_step, key_head, last_tile,
+                                  consumer_group, tidx % 128, tile_base)
                 tile_base += last_tile + 1
                 wave += 1
                 task_idx = self.read_work(work_slot, barriers[0], wave % 2)
@@ -322,8 +338,9 @@ class CausalAttention:
 
     @cute.jit
     def work_item(self, task_idx, query_heads, key_heads, QUERY_GROUPS: cutlass.Constexpr):
-        head_idx = task_idx % query_heads
-        query_block = (QUERY_GROUPS - 1 - task_idx // query_heads) * self.consumer_groups
+        head_groups = query_heads // self.heads_per_task
+        head_idx = (task_idx % head_groups) * self.heads_per_task
+        query_block = (QUERY_GROUPS - 1 - task_idx // head_groups) * self.query_blocks_per_task
         last_tile = query_block * BLOCK_QUERY // self.tile_keys
         key_head = head_idx // (query_heads // key_heads)
         return head_idx, query_block, last_tile, key_head
@@ -354,7 +371,9 @@ class CausalAttention:
         query_ready, key_ready, key_empty, value_ready, value_empty, query_empty = barriers
         cute.arch.mbarrier_arrive_and_expect_tx(query_ready, cute.size(s_query))
         for group_idx in cutlass.range_constexpr(self.consumer_groups):
-            copy_tma_operand(query_copy, s_query[None, None, group_idx], query_block + group_idx, 0, head_idx, query_ready)
+            copy_tma_operand(query_copy, s_query[None, None, group_idx],
+                             query_block + group_idx * self.query_block_step, 0,
+                             head_idx + group_idx * self.head_step, query_ready)
         for tile_offset in range(last_tile + 1):
             stream_offset = tile_base + tile_offset
             stage, phase = stream_offset % self.stages, (stream_offset // self.stages) % 2
@@ -374,9 +393,12 @@ class CausalAttention:
                 cute.arch.mbarrier_wait(value_empty + stage, phase ^ 1)
             v_ready = value_ready + stage
             cute.arch.mbarrier_arrive_and_expect_tx(v_ready, self.tile_keys * self.head_dim)
-            for group_idx in cutlass.range_constexpr(self.groups):
-                s_value = s_values[None, None, stage * self.groups + group_idx]
-                copy_tma_operand(value_copy, s_value, 0, tile_idx * self.groups + group_idx, key_head, v_ready)
+            if cutlass.const_expr(self.group_query_heads):
+                copy_tma_operand(value_copy, s_values[None, None, stage], 0, tile_idx, key_head, v_ready)
+            else:
+                for group_idx in cutlass.range_constexpr(self.groups):
+                    s_value = s_values[None, None, stage * self.groups + group_idx]
+                    copy_tma_operand(value_copy, s_value, 0, tile_idx * self.groups + group_idx, key_head, v_ready)
 
     @cute.jit
     def build_probabilities(self, s_key_scale, s_value_scale, stage, query, key, mma, thread, row_max, row_sum,
@@ -386,7 +408,7 @@ class CausalAttention:
         # The QK destination is born after the previous tile's PV fragment dies.
         scores = cute.make_rmem_tensor(thread.partition_shape_C(shape), Float32)
         issue_multiply_tile(mma, thread, scores, query, key, False)
-        if cutlass.const_expr(not MASKED):
+        if cutlass.const_expr(not MASKED and not self.group_query_heads):
             cute.arch.barrier_arrive(barrier_id=peer_barrier, number_of_threads=256)
         key_scales, value_scales = read_tile_scales(s_key_scale, s_value_scale, stage, scale, self.groups)
         warpgroup.wait_group(0)
@@ -433,17 +455,19 @@ class CausalAttention:
                                  mma_score, score_thread, row_max, row_sum, rescale, weights, probabilities,
                                  query_start, last_tile, scale, tidx, key_empty + first_stage,
                                  peer_barrier, True)
-        if consumer_group == 1:
-            cute.arch.barrier_arrive(barrier_id=1, number_of_threads=256)
+        if cutlass.const_expr(not self.group_query_heads):
+            if consumer_group == 1:
+                cute.arch.barrier_arrive(barrier_id=1, number_of_threads=256)
 
         for tile_offset in range(last_tile):
             stream_offset = tile_base + tile_offset
             stage, phase = stream_offset % self.stages, (stream_offset // self.stages) % 2
             tile_idx = last_tile - tile_offset
             cute.arch.mbarrier_wait(value_ready + stage, phase)
-            cute.arch.barrier(barrier_id=own_barrier, number_of_threads=256)
+            if cutlass.const_expr(not self.group_query_heads):
+                cute.arch.barrier(barrier_id=own_barrier, number_of_threads=256)
             accumulate_value_tile(acc_output, cached_output, mma_value, value_thread, s_values, weights, probabilities,
-                                  rescale, stage, self.group_keys, self.groups, self.value_columns, SLABS)
+                                  rescale, stage, self.group_keys, self.groups, self.value_columns, SLABS, self.group_query_heads)
             if tidx == 0:
                 cute.arch.mbarrier_arrive(value_empty + stage)
             next_offset = stream_offset + 1
@@ -455,15 +479,16 @@ class CausalAttention:
                                      peer_barrier, False)
 
         # Drain the last turn so the named barriers start empty for the next query pair.
-        if consumer_group == 0:
-            cute.arch.barrier(barrier_id=1, number_of_threads=256)
+        if cutlass.const_expr(not self.group_query_heads):
+            if consumer_group == 0:
+                cute.arch.barrier(barrier_id=1, number_of_threads=256)
         if tidx == 0:
             cute.arch.mbarrier_arrive(query_empty)
         tail_offset = tile_base + last_tile
         stage, phase = tail_offset % self.stages, (tail_offset // self.stages) % 2
         cute.arch.mbarrier_wait(value_ready + stage, phase)
         accumulate_value_tile(acc_output, cached_output, mma_value, value_thread, s_values, weights, probabilities,
-                              rescale, stage, self.group_keys, self.groups, self.value_columns, SLABS)
+                              rescale, stage, self.group_keys, self.groups, self.value_columns, SLABS, self.group_query_heads)
         if tidx == 0:
             cute.arch.mbarrier_arrive(value_empty + stage)
         store_attention(mOut, mLse, acc_output, cached_output, row_sum, row_max, value_thread,
@@ -472,7 +497,12 @@ class CausalAttention:
 
 @cute.jit
 def launch_forward_attention(mQuery, mQueryScale, mKey, mKeyScale, mValueT, mValueScale, mOut, mLse, mTicket, stream):
-    CausalAttention(mQuery.shape[2])(mQuery, mQueryScale, mKey, mKeyScale, mValueT, mValueScale, mOut, mLse, mTicket, stream)
+    head_dim = mQuery.shape[2]
+    heads_per_kv = mQuery.shape[0] // mKey.shape[0]
+    group_query_heads = head_dim == 256 and heads_per_kv % 3 == 0
+    CausalAttention(head_dim, group_query_heads)(
+        mQuery, mQueryScale, mKey, mKeyScale, mValueT, mValueScale, mOut, mLse, mTicket, stream,
+    )
 
 
 def delta_matching_fwd_sm90(query, key, value, softmax_scale):
