@@ -1659,7 +1659,7 @@ def chunk_gdr_bwd_pinned_sm90(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     Run the SM90 pinned backward, using a zero-padded chunk for a partial tail.
     """
     T, H, HV = k.shape[1], k.shape[2], v.shape[2]
-    use_folded_tma = (T, H, HV) == (4096, 32, 96)
+    use_folded_tma = T == 4096 and (H, HV) in ((32, 96), (64, 192))
 
     w, u, dv_local = launch_dense_prologue(q, k, v, do, g_cum, beta, A, use_folded_tma)
     h, v_new = launch_dense_state_recompute(k, w, u, g_cum, use_folded_tma)
