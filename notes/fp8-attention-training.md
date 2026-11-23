@@ -36,6 +36,8 @@ The same job also ran the full model with FP8 linears and BF16 attention at tail
 
 The 300-step pair uses tail 24 for both FP8 arms to isolate the attention implementation. Slurm job `1290664` on `pool1-00350` runs the native Delta-Matching arm, the FA4 control, then the optional BF16 compute arm. The separate steady-state sweep in job `1290659` on `pool1-00909` runs 12 steps per setting with FA4 at its stock tail 29 and Delta-Matching at tails 24–27. Steps 3–12 are timed and any post-warmup retry disqualifies a setting.
 
+Delta-Matching completed all 300 steps with zero allocator retries on every rank, including warmup. The median over steps 3–300 was 8.757 seconds, 29,935 tokens/s, or 59.40% MFU. Peak allocated and reserved memory were 121.56 and 134.63 GiB per GPU. Loss moved from 1.9772 to 1.6886 and averaged 1.678783 nats. The pre-clip gradient norm was 30.0696 at step 1 and 0.4960 at step 300, with clipping on 10 steps. The paired FA4 run started on the same node.
+
 ## Throughput at each backend's best measured tail
 
 The tail sweep held the node, checkpoint, shuffled WikiText batches, microbatch 4 and revision `121c6cb` fixed. All five settings ran 12 steps with zero post-warmup retries.
