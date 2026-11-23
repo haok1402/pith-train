@@ -137,6 +137,9 @@ if __name__ == "__main__":
     mlp_tail = args.checkpoint_mlp_tail
     if mlp_tail is None:
         mlp_tail = 29 if args.fp8 else 12
+        if args.fp8 and args.fp8_attention:
+            # Free space for Delta-Matching's backward workspace at microbatch four.
+            mlp_tail = 24
     shard = partial(shard_model, mlp_tail=mlp_tail, fp8=args.fp8, fp8_attention=args.fp8_attention)
     with bulk_reduce_scatter_packing(args.fp8):
         launch(cfg, shard_dense_model=shard)
