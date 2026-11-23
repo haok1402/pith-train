@@ -6,6 +6,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Float8E4M3FN, Float32, Int64, const_expr
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.utils import LayoutEnum, SmemAllocator
 from cutlass.utils.hopper_helpers import get_smem_layout_atom, make_trivial_tiled_mma
@@ -13,6 +14,7 @@ from quack.layout_utils import reshape_acc_to_mn
 from quack.reduce import warp_reduce
 
 from pithtrain.kernels.cute_compile_sm90 import TORCH2CUTE, fake, fake_stream
+from pithtrain.kernels.cute_ptx_sm90 import asm, to_ir
 
 __all__ = [
     "BLOCK_QUERY", "LOG2_E", "allocate_operand", "allocate_staged_operand", "copy_tma_operand",
@@ -21,7 +23,8 @@ __all__ = [
 ]
 
 BLOCK_QUERY = 64
-THREADS = 128
+FORWARD_THREADS = 256
+BACKWARD_THREADS = 128
 LOG2_E = 1.4426950408889634
 COMPILE_CACHE = {}
 
@@ -159,7 +162,7 @@ def launch_key_sum(mKey, mPartial, stream):
 
 
 @cute.jit
-def load_quant_block(mInput, mCenter, bx, by, tidx, BLOCK: cutlass.Constexpr, center_key: cutlass.Constexpr, input_scale: cutlass.Constexpr):
+def load_quant_block(mInput, mCenter, bx, by, tidx, BLOCK: cutlass.Constexpr, THREADS: cutlass.Constexpr, center_key: cutlass.Constexpr, input_scale: cutlass.Constexpr):
     _, _, H, D = mInput.shape
     batch_idx, head_idx = by // H, by % H
     VEC = 8
@@ -185,7 +188,7 @@ def load_quant_block(mInput, mCenter, bx, by, tidx, BLOCK: cutlass.Constexpr, ce
 
 
 @cute.jit
-def reduce_quant_block(values, s_amax, tidx, is_gradient: cutlass.Constexpr):
+def reduce_quant_block(values, s_amax, tidx, THREADS: cutlass.Constexpr, is_gradient: cutlass.Constexpr):
     amax = Float32(0.0)
     for elem_idx in cutlass.range_constexpr(cute.size(values)):
         amax = cute.arch.fmax(amax, abs(values[elem_idx]))
@@ -203,7 +206,7 @@ def reduce_quant_block(values, s_amax, tidx, is_gradient: cutlass.Constexpr):
 
 
 @cute.jit
-def store_quant_block(mCodes, mTwin, values, s_codes, bx, by, tidx, scale, BLOCK: cutlass.Constexpr):
+def store_quant_block(mCodes, mTwin, values, s_codes, bx, by, tidx, scale, BLOCK: cutlass.Constexpr, THREADS: cutlass.Constexpr):
     D = cute.size(mCodes, mode=[2])
     VEC = 8
     col_idx, local_row = tidx % (D // VEC) * VEC, tidx // (D // VEC)
@@ -228,8 +231,83 @@ def store_quant_block(mCodes, mTwin, values, s_codes, bx, by, tidx, scale, BLOCK
         destination.store(transposed.load())
 
 
+@dsl_user_op
+def reciprocal_rn(scale, *, loc=None, ip=None):
+    operand = to_ir(scale, Float32, loc, ip)
+    return Float32(asm(T.f32(), [operand], "rcp.rn.f32 $0, $1;", "=f,f"))
+
+
+@dsl_user_op
+def refine_quotient(value, negative_scale, reciprocal, *, loc=None, ip=None):
+    # Reuse one correctly rounded reciprocal throughout the block.
+    instructions = """{
+        .reg .f32 q, residual;
+        mul.rn.f32 q, $1, $3;
+        fma.rn.f32 residual, $2, q, $1;
+        fma.rn.f32 q, residual, $3, q;
+        fma.rn.f32 residual, $2, q, $1;
+        fma.rn.f32 q, residual, $3, q;
+        copysign.f32 $0, $1, q;
+    }"""
+    operands = [to_ir(v, Float32, loc, ip) for v in (value, negative_scale, reciprocal)]
+    return Float32(asm(T.f32(), operands, instructions, "=f,f,f,f"))
+
+
 @cute.kernel
-def quantize_block(mInput, mCenter, mCodes, mScale, mTwin, BLOCK: cutlass.Constexpr, center_key: cutlass.Constexpr, input_scale: cutlass.Constexpr, is_gradient: cutlass.Constexpr):
+def quantize_register_twins(mInput, mCodes, mScale, mTwin, BLOCK: cutlass.Constexpr, input_scale: cutlass.Constexpr):
+    tidx, _, _ = cute.arch.thread_idx()
+    bx, by, _ = cute.arch.block_idx()
+    _, _, heads, dim = mInput.shape
+    COLUMNS = 2
+    ROWS = BLOCK * dim // (FORWARD_THREADS * COLUMNS)
+    col_start = tidx % (dim // COLUMNS) * COLUMNS
+    row_start = bx * BLOCK + tidx // (dim // COLUMNS) * ROWS
+    batch_idx, head_idx = by // heads, by % heads
+    allocator = SmemAllocator()
+    s_amax = allocator.allocate_tensor(Float32, cute.make_layout(FORWARD_THREADS // 32), 16)
+    values = cute.make_rmem_tensor((COLUMNS, ROWS), Float32)
+    for row_offset in cutlass.range_constexpr(ROWS):
+        source = cute.local_tile(mInput[batch_idx, row_start + row_offset, head_idx, None], (COLUMNS,), (col_start // COLUMNS,))
+        raw = source.load().to(Float32)
+        if const_expr(input_scale != 1.0):
+            raw = raw * input_scale
+        values[None, row_offset].store(raw)
+    scale = reduce_quant_block(values, s_amax, tidx, FORWARD_THREADS, False)
+    if tidx == 0:
+        mScale[by, bx] = scale
+
+    # Preserve direct division for tiny and nonfinite scales.
+    if (scale >= Float32(2.0 ** -88)) and (scale < Float32(float("inf"))):
+        store_register_twins(mCodes, mTwin, values, scale, by, row_start, col_start, ROWS, COLUMNS, True)
+    else:
+        store_register_twins(mCodes, mTwin, values, scale, by, row_start, col_start, ROWS, COLUMNS, False)
+
+
+@cute.jit
+def store_register_twins(mCodes, mTwin, values, scale, by, row_start, col_start,
+                         ROWS: cutlass.Constexpr, COLUMNS: cutlass.Constexpr, FAST: cutlass.Constexpr):
+    codes = cute.make_rmem_tensor(cute.make_ordered_layout((ROWS, COLUMNS), order=(0, 1)), Float8E4M3FN)
+    reciprocal = reciprocal_rn(scale) if const_expr(FAST) else Float32(0.0)
+    for row_offset in cutlass.range_constexpr(ROWS):
+        quotient = cute.make_rmem_tensor(COLUMNS, Float32)
+        for col_offset in cutlass.range_constexpr(COLUMNS):
+            value = values[col_offset, row_offset]
+            if const_expr(FAST):
+                quotient[col_offset] = refine_quotient(value, -scale, reciprocal)
+            else:
+                quotient[col_offset] = value / scale
+        quantized = quotient.load().to(Float8E4M3FN)
+        destination = cute.local_tile(mCodes[by, row_start + row_offset, None], (COLUMNS,), (col_start // COLUMNS,))
+        destination.store(quantized)
+        for col_offset in cutlass.range_constexpr(COLUMNS):
+            codes[row_offset, col_offset] = quantized[col_offset]
+    for col_offset in cutlass.range_constexpr(COLUMNS):
+        twin = cute.local_tile(mTwin[by, col_start + col_offset, None], (ROWS,), (row_start // ROWS,))
+        twin.store(codes[None, col_offset].load())
+
+
+@cute.kernel
+def quantize_block(mInput, mCenter, mCodes, mScale, mTwin, BLOCK: cutlass.Constexpr, THREADS: cutlass.Constexpr, center_key: cutlass.Constexpr, input_scale: cutlass.Constexpr, is_gradient: cutlass.Constexpr):
     tidx, _, _ = cute.arch.thread_idx()
     bx, by, _ = cute.arch.block_idx()
     D = cute.size(mCodes, mode=[2])
@@ -237,20 +315,47 @@ def quantize_block(mInput, mCenter, mCodes, mScale, mTwin, BLOCK: cutlass.Conste
     s_amax = allocator.allocate_tensor(Float32, cute.make_layout(THREADS // 32), 16)
     s_codes = allocate_operand(allocator, BLOCK, D)
 
-    values = load_quant_block(mInput, mCenter, bx, by, tidx, BLOCK, center_key, input_scale)
-    scale = reduce_quant_block(values, s_amax, tidx, is_gradient)
+    values = load_quant_block(mInput, mCenter, bx, by, tidx, BLOCK, THREADS, center_key, input_scale)
+    scale = reduce_quant_block(values, s_amax, tidx, THREADS, is_gradient)
     if tidx == 0:
         mScale[by, bx] = scale
-    store_quant_block(mCodes, mTwin, values, s_codes, bx, by, tidx, scale, BLOCK)
+    store_quant_block(mCodes, mTwin, values, s_codes, bx, by, tidx, scale, BLOCK, THREADS)
 
 
 @cute.jit
-def launch_quant_block(mInput, mCenter, mCodes, mScale, mTwin, BLOCK: cutlass.Constexpr, center_key: cutlass.Constexpr, input_scale: cutlass.Constexpr, is_gradient: cutlass.Constexpr, stream):
+def launch_quant_block(mInput, mCenter, mCodes, mScale, mTwin, BLOCK: cutlass.Constexpr, center_key: cutlass.Constexpr, input_scale: cutlass.Constexpr, is_gradient: cutlass.Constexpr, is_forward: cutlass.Constexpr, stream):
     B, N, H, _ = mInput.shape
-    quantize_block(mInput, mCenter, mCodes, mScale, mTwin, BLOCK, center_key, input_scale, is_gradient).launch(grid=(N // BLOCK, B * H, 1), block=(THREADS, 1, 1), stream=stream)
+    THREADS = FORWARD_THREADS if const_expr(is_forward) else BACKWARD_THREADS
+    if const_expr(is_forward and not center_key and not is_gradient and BLOCK * cute.size(mInput, mode=[3]) == 16384):
+        quantize_register_twins(mInput, mCodes, mScale, mTwin, BLOCK, input_scale).launch(
+            grid=(N // BLOCK, B * H, 1), block=(THREADS, 1, 1), stream=stream,
+        )
+    else:
+        quantize_block(mInput, mCenter, mCodes, mScale, mTwin, BLOCK, THREADS, center_key, input_scale, is_gradient).launch(
+            grid=(N // BLOCK, B * H, 1), block=(THREADS, 1, 1), stream=stream,
+        )
 
 
-def quantize_delta_matching(x, block_rows, *, center_key=False, input_scale=1.0, is_gradient=False):
+@cute.kernel
+def fold_key_partials(mPartial, mCenter):
+    tidx, _, _ = cute.arch.thread_idx()
+    channel_block, head_idx, _ = cute.arch.block_idx()
+    channel = channel_block * 128 + tidx
+    center = Float32(0.0)
+    for partial_idx in range(cute.size(mPartial, mode=[1])):
+        center += mPartial[head_idx, partial_idx, channel]
+    mCenter[head_idx, 0, channel] = center
+
+
+@cute.jit
+def launch_key_fold(mPartial, mCenter, stream):
+    heads, _, channels = mPartial.shape
+    fold_key_partials(mPartial, mCenter).launch(
+        grid=(channels // 128, heads, 1), block=(128, 1, 1), stream=stream,
+    )
+
+
+def quantize_delta_matching(x, block_rows, *, center_key=False, input_scale=1.0, is_gradient=False, is_forward=False):
     """
     Quantize dense BSHD BF16 to E4M3 head-major and channel-major codes and per-head FP32 scales.
     """
@@ -264,5 +369,12 @@ def quantize_delta_matching(x, block_rows, *, center_key=False, input_scale=1.0,
     # Centering leaves the exact softmax unchanged and reduces the key quantization range.
     if center_key:
         launch_delta_matching_kernel("delta_matching_key_sum", launch_key_sum, (x, center))
-    launch_delta_matching_kernel("delta_matching_quantize", launch_quant_block, (x, center, codes, scales, twin), (block_rows, center_key, input_scale, is_gradient))
+        if is_forward:
+            mean = torch.empty((B * H, 1, D), dtype=torch.float32, device=x.device)
+            launch_delta_matching_kernel("delta_matching_key_mean", launch_key_fold, (center, mean))
+            center = mean
+    launch_delta_matching_kernel(
+        "delta_matching_quantize", launch_quant_block, (x, center, codes, scales, twin),
+        (block_rows, center_key, input_scale, is_gradient, is_forward),
+    )
     return codes, scales, twin
