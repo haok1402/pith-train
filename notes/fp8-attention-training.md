@@ -112,7 +112,7 @@ The follow-up same-node run `1291031` on `pool1-00397` measured another 12 steps
 | Delta-Matching, `116959f` backward | 26 | 8.719 | 30,068 | 59.66% | 123.30 / 136.37 |
 | Delta-Matching, `da20ba8` backward | 26 | 8.715 | 30,081 | 59.69% | 123.30 / 136.37 |
 
-The latest Delta-Matching arm at tail 27 delivered 0.73% more tokens/s and 0.43 more MFU points than FA4 at tail 29. Both had one warmup retry per GPU. Tail 26 had zero retries including warmup, and the two backward revisions differed by 4 ms in median step time at tail 26. For those two full-model runs, the first microbatch losses matched bit for bit on six of eight ranks, and the largest logged loss gap over 12 steps was 0.0020 nats. The operating default stays at tail 24, which completed the 300-step allocator check.
+The Delta-Matching arm at tail 27 delivered 0.73% more tokens/s and 0.43 more MFU points than FA4 at tail 29. Both had one warmup retry per GPU. Tail 26 had zero retries including warmup, and the two backward revisions differed by 4 ms in median step time at tail 26. For those two full-model runs, the step-1 microbatch losses matched bit for bit on six of eight ranks, and the largest logged loss gap over 12 steps was 0.0020 nats. That recipe used tail 24 as its default and completed the 300-step allocator check.
 
 Per-step logs, Slurm and GPU gate output, input preparation, and the analysis script are in `.cache/fp8-attention-training/`. Slurm accepted submissions and warned that the account is approaching its stale-data submission threshold.
 
@@ -133,3 +133,12 @@ The same job screened Delta-Matching tails 24–30 with the 1 GiB cache, using e
 | Delta-Matching | 29 | 29,980 | 8.7440 s | 127.20 / 136.08 |
 
 All settings in the table had zero post-warmup retries. The fastest tested Delta-Matching tail was 29, which gave 1.303× the 23,017 tok/s same-run BF16 control and 1.300× the best confirmed 23,058 tok/s BF16 result.
+
+Commit `0b7e708` sets tail 29 for the default `--fp8 --fp8-attention` recipe. Job `1296796` on `pool1-00653` confirmed the two default CLI paths in 24 steps each, with Delta-Matching first and steps 3–24 timed. It verified the same batch-order hash in both arms. The allocator had two retries per GPU during warmup for each arm and zero retries afterward.
+
+| Default FP8 recipe | Tokens/s per node | Median step time | Speedup vs 23,017 tok/s BF16 | Speedup vs 23,058 tok/s BF16 |
+| --- | ---: | ---: | ---: | ---: |
+| Delta-Matching, tail 29 | 29,939 | 8.7560 s | 1.301× | 1.298× |
+| BF16 FA4, tail 30 + earlier mixer | 29,713 | 8.8225 s | 1.291× | 1.289× |
+
+Delta-Matching delivered 0.76% more tokens/s than FA4 in the confirmation. Peak allocated and reserved memory were 127.20 and 136.08 GiB per GPU for Delta-Matching, and 127.15 and 136.49 GiB for FA4. The secondary BF16-peak MFU figures were 59.40% and 58.96%. The timing job released all eight GPUs. Raw logs are under `.cache/fp8-attention-training/fusion-refresh/`.
