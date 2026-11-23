@@ -14,7 +14,7 @@ from pithtrain.models.qwen35_moe import (
     Qwen35MoeRotaryEmbedding,
 )
 from pithtrain.operators.cp_sequence import contiguous_to_zigzag, zigzag_to_contiguous
-from pithtrain.operators.linear import BF16Linear, FP8Linear
+from pithtrain.operators.linear import BF16Linear, FP8Linear, fp8_swiglu_main_grad
 from pithtrain.operators.silu_mul import silu_mul
 
 __all__ = ["Qwen35Model", "Qwen35TextModel"]
@@ -30,6 +30,17 @@ class Qwen35MLP(nn.Module):
         self.down_proj = training.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            not torch.compiler.is_compiling()
+            and torch.is_grad_enabled()
+            and x.numel()
+            and x.numel() // x.shape[-1] % 128 == 0
+            and all(
+                isinstance(layer, FP8Linear) and layer.main_grad is not None and layer.bias is None
+                for layer in (self.gate_proj, self.up_proj, self.down_proj)
+            )
+        ):
+            return fp8_swiglu_main_grad(x, self.gate_proj, self.up_proj, self.down_proj)
         quantized_x = training.Linear.quantize_input(x)
         gate = self.gate_proj(x, quantized_x)
         up = self.up_proj(x, quantized_x)

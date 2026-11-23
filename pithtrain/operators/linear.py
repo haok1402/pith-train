@@ -12,16 +12,18 @@ from torch._inductor.lowering import fallback_handler, register_lowering
 from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
 from pithtrain.kernels import (
     act_scale_like,
+    fp8_channels_as_rows,
     fp8_gemm_bwd,
     fp8_gemm_fwd,
     fp8_gemm_nt,
     fp8_quant_act,
     fp8_quant_swiglu,
     fp8_quant_weight,
+    fp8_silu_mul_bwd,
     silu_mul_bwd,
 )
 
-__all__ = ["BF16Linear", "BF16LinearFunc", "FP8Linear"]
+__all__ = ["BF16Linear", "BF16LinearFunc", "FP8Linear", "fp8_swiglu_main_grad"]
 
 
 @torch.library.custom_op("pithtrain::fp8_linear_fwd", mutates_args=())
@@ -344,6 +346,90 @@ class FP8Linear(nn.Linear):
         if self.bias is not None:
             output = output + self.bias
         return output
+
+
+class FP8SwiGLUMainGrad(torch.autograd.Function):
+    """Quantize both rounded SwiGLU adjoints before the gate and up projection backpropagation."""
+
+    @staticmethod
+    def forward(ctx, x, gate_weight, up_weight, down_weight, qweights, main_grads):
+        gate_quantized, up_quantized, down_quantized = qweights
+        quantized_x = fp8_quantize_activation(x)
+        gate = fp8_linear_fwd_prequantized(x, gate_weight, *gate_quantized, *quantized_x)
+        up = fp8_linear_fwd_prequantized(x, up_weight, *up_quantized, *quantized_x)
+        quantized_hidden = fp8_quant_swiglu(gate, up)
+        output = fp8_linear_fwd_prequantized(gate, down_weight, *down_quantized, *quantized_hidden)
+        ctx.save_for_backward(
+            gate,
+            up,
+            *quantized_x[2:],
+            *gate_quantized[2:],
+            *up_quantized[2:],
+            *down_quantized[2:],
+            *quantized_hidden[2:],
+        )
+        ctx.main_grads = main_grads
+        ctx.input_features = x.shape[1]
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (
+            gate,
+            up,
+            input_t,
+            input_scale_t,
+            weight_gate_t,
+            scale_gate_t,
+            weight_up_t,
+            scale_up_t,
+            weight_down_t,
+            scale_down_t,
+            hidden_t,
+            hidden_scale_t,
+        ) = ctx.saved_tensors
+        gate_main_grad, up_main_grad, down_main_grad = ctx.main_grads
+        M, N = gate.shape
+        grad_hidden = fp8_linear_bwd_into(
+            grad_output, weight_down_t, scale_down_t, hidden_t, hidden_scale_t, N, down_main_grad
+        )
+        offsets = torch.full((1,), M, dtype=torch.int32, device=gate.device)
+        grad_gate, grad_up = fp8_silu_mul_bwd(grad_hidden, gate, up, offsets)
+
+        def project(grad, activation, weight_t, scale_t, main_grad):
+            grad_fp8, grad_scale, grad_ch_fp8, grad_ch_scale = grad
+            grad_t = fp8_channels_as_rows(grad_ch_fp8, grad_ch_scale, M, N)
+            grad_input, _ = fp8_gemm_bwd(
+                activation,
+                weight_t,
+                scale_t,
+                input_t,
+                input_scale_t,
+                ctx.input_features,
+                main_grad,
+                (grad_fp8, grad_scale, *grad_t),
+            )
+            return grad_input
+
+        grad_x_up = project(grad_up, up, weight_up_t, scale_up_t, up_main_grad)
+        grad_x_gate = project(grad_gate, gate, weight_gate_t, scale_gate_t, gate_main_grad)
+        return grad_x_up + grad_x_gate, None, None, None, None, None
+
+
+def fp8_swiglu_main_grad(x, gate_proj, up_proj, down_proj):
+    """Run an eager, bias-free FP8 SwiGLU MLP with an FP32 main_grad for each projection."""
+    projections = gate_proj, up_proj, down_proj
+    quantized_weights = tuple(layer.get_quantized_weight() for layer in projections)
+    main_grads = tuple(layer.main_grad for layer in projections)
+    output = FP8SwiGLUMainGrad.apply(
+        x.flatten(0, -2),
+        gate_proj.weight,
+        up_proj.weight,
+        down_proj.weight,
+        quantized_weights,
+        main_grads,
+    )
+    return output.view(*x.shape[:-1], down_proj.out_features)
 
 
 # Inductor has no single-GEMM lowering for addmm with out_dtype, so the fused GEMM is its own op.

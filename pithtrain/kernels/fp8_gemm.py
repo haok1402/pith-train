@@ -63,7 +63,7 @@ def fp8_gemm_fwd(input_2d: torch.Tensor, weight_fp8: torch.Tensor, scale_weight:
     return output, input_t_fp8, scale_input_t
 
 
-def fp8_gemm_bwd(grad_2d: torch.Tensor, weight_t_fp8: torch.Tensor, scale_weight_t: torch.Tensor, input_t_fp8: torch.Tensor, scale_input_t: torch.Tensor, k: int, main_grad: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
+def fp8_gemm_bwd(grad_2d: torch.Tensor, weight_t_fp8: torch.Tensor, scale_weight_t: torch.Tensor, input_t_fp8: torch.Tensor, scale_input_t: torch.Tensor, k: int, main_grad: torch.Tensor | None = None, quantized_grad: tuple[torch.Tensor, ...] | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Backward FP8 linear of y = x @ W.T, returning (grad_input, weight_grad).
 
@@ -75,9 +75,12 @@ def fp8_gemm_bwd(grad_2d: torch.Tensor, weight_t_fp8: torch.Tensor, scale_weight
     - grad_input = grad @ W, fresh (m, k); weight_grad = grad.T @ x, fresh (n, k) (not accumulated);
       both in grad_2d's dtype by default. With main_grad, accumulate the FP32 wgrad there and return
       None for it.
+    - quantized_grad: optional prequantized fp8_quant_grad operands with identical scales.
     """
     M, N = grad_2d.shape
-    grad_fp8, scale_grad, grad_t_fp8, scale_grad_t = fp8_quant_grad(grad_2d)
+    if quantized_grad is None:
+        quantized_grad = fp8_quant_grad(grad_2d)
+    grad_fp8, scale_grad, grad_t_fp8, scale_grad_t = quantized_grad
     grad_input = fp8_gemm_nt(grad_fp8, scale_grad, weight_t_fp8, scale_weight_t, M, k, grad_2d.device, grad_2d.dtype)
     if main_grad is not None:
         # Hopper's block-scaled (1D x 2D) GEMM only emits BF16. Repeat each activation block's
