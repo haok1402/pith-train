@@ -71,10 +71,10 @@ def install_wgrad_accumulation(model: nn.Module, *, overwrite: bool = False) -> 
                     overwrite and isinstance(owner, FP8Linear)
                 ):
                     continue
-                if overwrite:
-                    if not isinstance(owner, (BF16Linear, FP8Linear)):
-                        raise ValueError("Overwriting wgrad requires single-use dense linears")
-                    owner.overwrite_main_grad = isinstance(owner, BF16Linear)
+                if overwrite and not isinstance(owner, FP8Linear):
+                    if not isinstance(owner, BF16Linear):
+                        raise ValueError("Overwriting wgrad requires single-use BF16 linears")
+                    owner.overwrite_main_grad = True
                 size, device = fsdp_param._orig_size, fsdp_param.device
                 if isinstance(owner, FP8GroupedLinear):
                     # Laid out as the k-grouped FP8 wgrad accumulates in place (transposed where
@@ -100,7 +100,9 @@ def _attach_main_grads(
         for fsdp_param, main_grad in pairs:
             if main_grad.untyped_storage().size() == 0:
                 main_grad.untyped_storage().resize_(main_grad.numel() * main_grad.element_size())
-                if not overwrite or not fsdp_param._module_info.module.overwrite_main_grad:
+                if not overwrite:
+                    main_grad.zero_()
+                elif isinstance(fsdp_param._module_info.module, FP8Linear):
                     # The compiled FP8 backward holds this work buffer as a graph input.
                     # Initialize its storage without changing the saved input's version.
                     main_grad.data.zero_()
