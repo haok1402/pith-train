@@ -20,6 +20,9 @@ from functools import lru_cache
 from typing import List, Optional, Tuple
 
 import torch
+from torch._inductor.custom_graph_pass import CustomSchedulerPass, get_hash_for_files
+from torch._inductor.ir import FallbackKernel, MultiOutput
+from torch._inductor.virtualized import V
 from torch.distributed import ProcessGroup, all_gather_into_tensor, get_rank, get_world_size
 from torch.distributed.distributed_c10d import _resolve_process_group
 
@@ -42,7 +45,7 @@ from pithtrain.kernels import (
     gdr_cp_merge,
 )
 
-__all__ = ["dense_gated_delta_rule", "gated_delta_rule"]
+__all__ = ["PreserveGatedDeltaRuleOutput", "dense_gated_delta_rule", "gated_delta_rule"]
 
 # mypy: ignore-errors
 
@@ -253,6 +256,25 @@ def dense_backward(ctx, do: torch.Tensor, *_) -> tuple:
 
 
 dense_fwd.register_autograd(dense_backward, setup_context=dense_setup_context)
+
+
+class PreserveGatedDeltaRuleOutput(CustomSchedulerPass):
+    """Keep the dense Gated DeltaNet result alive for outer checkpoint replay."""
+
+    def __call__(self, nodes):
+        # An outer selective checkpoint can retain a detached reference to the first result.
+        # Inductor may drop its own reference after its last use, but cannot recycle that storage.
+        op = torch.ops.pithtrain.gated_delta_rule_dense_fwd.default
+        for node in nodes:
+            output = node.node
+            if isinstance(output, MultiOutput) and output.indices == [(tuple, 0)]:
+                producer = output.inputs[0]
+                if isinstance(producer, FallbackKernel) and producer.op_overload == op:
+                    V.graph.never_reuse_but_free_buffers.add(output.get_name())
+        return nodes
+
+    def uuid(self):
+        return get_hash_for_files((__file__,))
 
 
 def dense_gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:  # fmt: skip

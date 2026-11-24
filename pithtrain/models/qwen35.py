@@ -14,6 +14,7 @@ from pithtrain.models.qwen35_moe import (
     Qwen35MoeRotaryEmbedding,
 )
 from pithtrain.operators.cp_sequence import contiguous_to_zigzag, zigzag_to_contiguous
+from pithtrain.operators.gated_delta_rule import PreserveGatedDeltaRuleOutput
 from pithtrain.operators.linear import BF16Linear, FP8Linear, fp8_swiglu_main_grad
 from pithtrain.operators.silu_mul import silu_mul
 
@@ -80,7 +81,13 @@ class Qwen35DecoderLayer(nn.Module):
         self.to_contiguous = sharded and self.is_linear and not linear_at(layer_idx - 1)
         self.to_zigzag = sharded and self.is_linear and not linear_at(layer_idx + 1)
 
-    @torch.compile(fullgraph=True, options=stage_compile_options() or None)
+    @torch.compile(
+        fullgraph=True,
+        options={
+            **stage_compile_options(),
+            "_pre_fusion_custom_pass": PreserveGatedDeltaRuleOutput(),
+        },
+    )
     def forward_stage1(self, hidden_states, rotary_posemb, cu_seqlens=None):
         if self.to_contiguous:
             hidden_states = zigzag_to_contiguous(hidden_states, distributed.cp_group)
