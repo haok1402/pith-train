@@ -227,8 +227,9 @@ class WeightGradient:
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 144, 7, 2, 1)
         )
         self.m64_n48_n8_a = (
-            not rowwise and num_sms == 98 and N == 8 and (self.num_m, self.num_k) == (197, 1953)
-            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 48, 13, 1, 2)
+            not rowwise and num_sms == 98 and N == 8 and self.num_m == 197
+            and (self.block_m, self.block_n, self.cluster_m, self.cluster_n) == (64, 48, 1, 2)
+            and (self.stages, self.num_k) in ((11, 5601), (12, 3777), (13, 1953))
         )
         self.n32_two_sm_narrow = (
             not rowwise and num_sms == 2 and self.num_m == 2 and N == 8 and self.num_k == 1473
@@ -383,7 +384,11 @@ class WeightGradient:
             not rowwise and num_sms == 132 and (self.num_m, self.num_n) == (44, 51) and K <= 16
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 80, 7, 1, 2)
         )
-        self.static_ring = self.m16_n128_stage8_single or self.n112_stage4_two_waves or self.n16_u_stage11 or self.n144_unicast_one_wave or self.m16_n160_stage8 or self.cluster_size == 1 and not rowwise and starts_at_zero and (self.block_m < 64 and self.uniform_scale or self.block_n == 96 or self.single_n80_tile or self.static_n16_stage8_math or self.long_n80_stage4 or self.narrow_n160_four_stages or self.wide_n192_four_math or self.n32_reuse_grad or self.n32_single_tile or (self.block_m, self.block_n) == (128, 48) or self.m64_n112_one_wave)
+        self.m64_n32_long_stage8 = (
+            not rowwise and aligned_fp8_rows and num_sms == 2 and (self.num_m, self.num_n, self.num_k) == (1, 1, 30912)
+            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 32, 8, 1)
+        )
+        self.static_ring = self.m64_n32_long_stage8 or self.m16_n128_stage8_single or self.n112_stage4_two_waves or self.n16_u_stage11 or self.n144_unicast_one_wave or self.m16_n160_stage8 or self.cluster_size == 1 and not rowwise and starts_at_zero and (self.block_m < 64 and self.uniform_scale or self.block_n == 96 or self.single_n80_tile or self.static_n16_stage8_math or self.long_n80_stage4 or self.narrow_n160_four_stages or self.wide_n192_four_math or self.n32_reuse_grad or self.n32_single_tile or (self.block_m, self.block_n) == (128, 48) or self.m64_n112_one_wave)
         self.dynamic_n96_stage7_producer = (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 96, 7, 1) and self.num_m == self.num_n == 1 and not rowwise
         self.n80_three_tile_mn_scales = self.long_n80_stage4 and self.num_n <= 3 and not compact_k_scale
         self.rolling_n128_producer = (not rowwise and self.num_m == self.num_n == 1
@@ -670,6 +675,8 @@ class WeightGradient:
 
     @cute.jit
     def tile_coords(self, tile_idx):
+        if cutlass.const_expr(self.m64_n32_long_stage8):
+            return Int32(0), Int32(0), cutlass.Boolean(False)
         if cutlass.const_expr(self.m64_n48_n8_a):
             return tile_idx, Int32(0), cutlass.Boolean(False)
         if cutlass.const_expr(self.m16_n128_stage8_single):
@@ -842,7 +849,7 @@ class WeightGradient:
             elif cutlass.const_expr(
                 self.u128_stage4_one_wave or self.n80_sustained_mn
                 or self.static_ring and not (
-                    self.m16_n128_stage8_single or
+                    self.m64_n32_long_stage8 or self.m16_n128_stage8_single or
                     self.n16_u_stage11 or
                     self.two_sm_single_tile or self.m16_n160_stage8 or self.n96_stage9_wave or self.dynamic_n96_stage7_producer or self.static_n16_stage8_math
                     or self.rolling_n128_producer or self.narrow_n160_four_stages or self.wide_n192_four_math
@@ -1416,7 +1423,10 @@ class WeightGradient:
             if cutlass.const_expr(not self.uniform_scale):
                 activation_hi = s_activation_scale[k_tile, 1]
         activation_stage = k_tile if cutlass.const_expr(self.n64_a_single_n) else stage
-        self.wait_stage(full + stage, phase)
+        if cutlass.const_expr(self.m64_n32_long_stage8):
+            cute.arch.mbarrier_wait(full + stage, phase)
+        else:
+            self.wait_stage(full + stage, phase)
         grad_lo, grad_hi = Float32(0), Float32(0)
         if cutlass.const_expr((self.inline_small_mma and self.block_n == 96 and self.num_n == 1)
                               or self.m16_n128_stage8_single or self.rolling_n128_producer or self.m16_n32_stage8_full):
