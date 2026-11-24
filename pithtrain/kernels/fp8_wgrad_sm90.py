@@ -300,7 +300,7 @@ class WeightGradient:
                  n80_b_stage7_aligned_storage=False, aligned_m32_n96_stage4_operands=False,
                  aligned_m16_n64_stage4_prefetch_operands=False, n128_stage4_wide=False,
                  n80_b_stage9_aligned_storage=False,
-                 aligned_stage11_spill_operands=False, n32_a_stage13_aligned_storage=False):
+                 aligned_stage11_spill_operands=False, n32_a_stage13_aligned_storage=False, aligned_n32_stage12_operands=False):
         self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n = select_layout(M, N, K, num_sms, rowwise, block_n_multiple)
         self.num_m, self.num_n, self.num_k = divide_up(M, self.block_m), divide_up(N, self.block_n), divide_up(K, BLOCK_K)
         if (not rowwise and compact_rows and block_n_multiple == 32
@@ -1182,8 +1182,12 @@ class WeightGradient:
             self.n96_u_stage4_two_sm or self.m32_n64_stage4_two_waves or self.m32_n96_stage4_one_tile
             or self.m64_n80_stage4_two_m_waves or self.m16_n64_stage4_prefetch_b
         )
+        self.n32_u_stage12_one_wave = (
+            aligned_n32_stage12_operands and self.num_m == 1 and self.num_n == num_sms
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 32, 12, 1, 1)
+        )
         self.use_cta_local_stage_wait = (
-            self.m32_n96_stage4_one_tile
+            self.n32_u_stage12_one_wave or self.m32_n96_stage4_one_tile
             or self.m32_n64_stage4_two_waves
             or self.n96_u_stage4_two_sm
             or self.n32_u_stage10_single_tile
@@ -1230,7 +1234,7 @@ class WeightGradient:
             ProducerRoute.DYNAMIC_RING,
             (ProducerRoute.RESIDENT_A_PANELS, self.resident_a_panels),
             (ProducerRoute.RESIDENT_GRADIENT, self.n32_reuse_grad or self.n64_reuse_grad),
-            (ProducerRoute.STATIC_RING, self.n16_u_stage9_one_tile or self.n32_u_stage5_one_tile
+            (ProducerRoute.STATIC_RING, self.n32_u_stage12_one_wave or self.n16_u_stage9_one_tile or self.n32_u_stage5_one_tile
              or self.n32_u_stage10_single_tile or self.n32_u_stage14_one_tile
              or self.n48_u_stage8_single_tile or self.n16_u_stage5_shifted or self.n16_u_stage5_aligned
              or self.n16_u_stage14_shifted or self.n16_u_stage14_aligned or self.n16_u_stage10_pair or self.n160_stage4_full_panel
@@ -1242,7 +1246,7 @@ class WeightGradient:
         self.math_route = select_route(
             MathRoute.DYNAMIC_RING,
             (MathRoute.RESIDENT_A_PANELS, self.resident_a_panels),
-            (MathRoute.ASYNC_PAIRS, self.n32_u_stage10_single_tile or self.n32_u_stage14_one_tile
+            (MathRoute.ASYNC_PAIRS, self.n32_u_stage12_one_wave or self.n32_u_stage10_single_tile or self.n32_u_stage14_one_tile
              or self.n48_u_stage8_single_tile or self.n16_u_stage5_aligned or self.n16_u_stage14_aligned
              or self.two_sm_single_tile or self.n16_u_stage10_pair),
             (MathRoute.LONG_A_PAIRS, self.long_a_n64_full_second_wave or self.n32_a_paired_single_n
@@ -1270,7 +1274,8 @@ class WeightGradient:
              or self.n16_u_stage14_aligned or self.n16_u_stage10_pair or self.stream_b_scale_row or self.n16_u_stage7 or self.m64_n32_long_stage8),
             (TileOrder.M_LINEAR, self.m64_n48_narrow_a or self.n48_a_stage8_one_n),
             (TileOrder.SINGLE_TILE, self.m16_n128_stage8_single),
-            (TileOrder.N_LINEAR, self.n112_stage4_two_waves or self.n64_reuse_grad or self.n128_u_stage4_two_sm),
+            (TileOrder.N_LINEAR, self.n32_u_stage12_one_wave or self.n112_stage4_two_waves
+             or self.n64_reuse_grad or self.n128_u_stage4_two_sm),
             (TileOrder.SINGLE_TILE, self.n16_u_stage11 or self.two_sm_single_tile),
             (TileOrder.M_LINEAR, self.n32_two_sm_narrow),
             (TileOrder.N144_B_WIDE, self.wide_n144_schedule),
@@ -2740,6 +2745,12 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 0
                 for tensor in (grad, activation))
     )
+    aligned_n32_stage12_operands = (
+        not rowwise and num_sms == 2 and M <= 64 and 32 < N <= 64 and 15232 < num_k <= 18368
+        and all(tensor.data_ptr() % BLOCK_K == 0
+                and tensor.stride(0) * tensor.element_size() % BLOCK_K == 0
+                for tensor in (grad, activation))
+    )
     aligned_n96_stage5_narrow_operands = False
     if full_device_sm_budget and not rowwise and M <= 64 and 0 < N <= 32 and N % 8 == 0 and block_n_multiple == 96:
         fp8_pitches = tuple(tensor.stride(0) * tensor.element_size() % BLOCK_K for tensor in (grad, activation))
@@ -2818,7 +2829,7 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
            aligned_n96_stage4_operands, n96_stage4_tail_storage, aligned_n32_stage10_operands,
            aligned_m32_n64_stage4_operands, n80_b_stage7_aligned_storage,
            aligned_m32_n96_stage4_operands, aligned_m16_n64_stage4_prefetch_operands,
-           n80_b_stage9_aligned_storage, aligned_stage11_spill_operands, n32_a_stage13_aligned_storage)
+           n80_b_stage9_aligned_storage, aligned_stage11_spill_operands, n32_a_stage13_aligned_storage, aligned_n32_stage12_operands)
     compiled = CACHE.get(key)
     if compiled is None:
         dtypes = (Float8E4M3FN, Float32, Float8E4M3FN, Float32, Float32)
@@ -2866,7 +2877,8 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                                    n128_stage4_wide=n128_stage4_wide,
                                    n80_b_stage9_aligned_storage=n80_b_stage9_aligned_storage,
                                    aligned_stage11_spill_operands=aligned_stage11_spill_operands,
-                                   n32_a_stage13_aligned_storage=n32_a_stage13_aligned_storage)
+                                   n32_a_stage13_aligned_storage=n32_a_stage13_aligned_storage,
+                                   aligned_n32_stage12_operands=aligned_n32_stage12_operands)
         compiled = cute.compile(operation, *operands, fake_stream(), options="--enable-tvm-ffi")
         CACHE[key] = compiled
     compiled(*tensors)
