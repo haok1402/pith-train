@@ -1079,7 +1079,14 @@ class WeightGradient:
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 32, 10, 1, 1)
             and self.num_k % 2 == 0
         )
-        self.stage4_two_wave_b_prefetch = self.n96_u_stage4_two_sm or self.m32_n64_stage4_two_waves
+        self.m64_n80_stage4_two_m_waves = (
+            not rowwise and compact_rows and num_sms == 2
+            and self.num_m == 3 and self.num_n == 1 and N == self.block_n
+            and self.num_k % (2 * self.stages) == 0
+            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 80, 4, 1)
+        )
+        self.stage4_two_wave_b_prefetch = (self.n96_u_stage4_two_sm or self.m32_n64_stage4_two_waves
+                                          or self.m64_n80_stage4_two_m_waves)
         self.use_cta_local_stage_wait = (
             self.m32_n64_stage4_two_waves
             or self.n96_u_stage4_two_sm
@@ -1131,7 +1138,7 @@ class WeightGradient:
              or self.n48_u_stage8_single_tile or self.n16_u_stage5_shifted or self.n16_u_stage5_aligned
              or self.n16_u_stage14_shifted or self.n16_u_stage14_aligned or self.n16_u_stage10_pair or self.n160_stage4_full_panel
              or self.n160_stage4_grad_offset or self.n128_u_stage4_two_sm
-             or self.n80_stage7_block or self.stream_b_scale_row
+             or self.m64_n80_stage4_two_m_waves or self.n80_stage7_block or self.stream_b_scale_row
              or self.n16_u_stage7 or self.u128_stage4_one_wave or self.n80_sustained_mn
              or (self.static_ring and not dynamic_producer)),
         )
