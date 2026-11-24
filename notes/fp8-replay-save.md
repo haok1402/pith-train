@@ -63,6 +63,10 @@ The MLP-save repeats first differed in pre-clip gradients at steps 2 and 3 respe
 
 On rank 0, all three layer-63 MLP weight gradients matched at onset in both repeats. Layer 63's attention Q and K projection gradients differed in the first repeat, and its Q and K norm gradients differed in the second. The highest-indexed changed parameter in model order was `layers.63.input_layernorm.weight` in both repeats. The first producing operation and whether any saved activation storage changed between save and replay remain open.
 
+### Saved MLP operand check
+
+The final diagnostic paired the mixer-only and MLP-save recipes on `pool1-00521` in Slurm `1332257` (ticket `7418`). It fingerprinted all 12 saved SwiGLU operands in layers 40–63 at save and backward unpack, including BF16 gate and up pre-activations, FP8 weights and activations, and their scales. All 18,432 operand pairs per arm matched across steps 2 and 3. All 4,608 selective-checkpoint output cache entries in the MLP-save arm also matched at store and retrieval. The two arms matched at MLP dY and dX, and at every model gradient and weight through step 3. The drift did not reproduce during the operand check, so the cause remains open and MLP saving remains unsafe.
+
 ## Run the experiment
 
 Use the benchmark script inside an eight-H200 allocation, with the tokenized corpus and checkpoint supplied as `DATA` and `MODEL`.
