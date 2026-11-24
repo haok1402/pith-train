@@ -400,6 +400,10 @@ class WeightGradient:
             not rowwise and (self.num_m, self.num_n, self.num_k, num_sms) == (9, 26, 30, 132)
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 112, 5, 1, 2)
         )
+        self.m32_n112_two_waves = (
+            not rowwise and self.num_m == self.num_k == 1 and self.num_n == num_sms + 2
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (32, 112, 11, 1, 2)
+        )
         self.short_a_n112 = (
             not rowwise and self.num_k == 1 and (self.num_m, self.num_n, num_sms) == (5, 37, 98)
             and M % self.block_m > self.block_m // 2
@@ -419,7 +423,7 @@ class WeightGradient:
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 144, 7, 2, 1)
         )
         self.use_linear_stage_index = (
-            self.reuse_full_b_n144 or self.short_a_n64 or self.short_n144_cluster or self.short_a_n16 or self.short_a_n144
+            self.m32_n112_two_waves or self.reuse_full_b_n144 or self.short_a_n64 or self.short_n144_cluster or self.short_a_n16 or self.short_a_n144
             or self.short_a_n96_no_wrap or self.short_a_n128 or self.short_a_n112 or self.short_b_n80
             or (not rowwise and self.multicast_a and self.num_n == 1
                 and (self.block_m, self.block_n, self.stages) == (64, 16, 16))
@@ -623,6 +627,8 @@ class WeightGradient:
         if cutlass.const_expr(self.short_a_n32 or self.short_a_n64):
             tile_n, tile_m, multicast = self.short_cluster_coords(tile_idx, True)
             return tile_m, tile_n, multicast
+        if cutlass.const_expr(self.m32_n112_two_waves):
+            return Int32(0), tile_idx, cutlass.Boolean(True)
         if cutlass.const_expr(self.short_a_n16 or self.short_a_n144 or self.short_a_n96 or self.short_a_n128):
             return Int32(0), tile_idx, (tile_idx ^ 1) < self.num_n
         if cutlass.const_expr(self.short_b_n128):
@@ -863,6 +869,8 @@ class WeightGradient:
 
     @cute.jit
     def linear_ring_position(self, tile_idx, k_tile):
+        if cutlass.const_expr(self.m32_n112_two_waves):
+            return Int32(tile_idx >= self.num_sms) + k_tile, Int32(0)
         if cutlass.const_expr(self.n16_a_single_n):
             return k_tile, (tile_idx // self.num_sms) & 1
         if cutlass.const_expr(self.reuse_full_b_n144):
