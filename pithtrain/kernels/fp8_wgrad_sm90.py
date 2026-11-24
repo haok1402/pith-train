@@ -357,6 +357,12 @@ class WeightGradient:
             and N == self.block_n
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 32, 14, 1, 1)
         )
+        self.n32_u_stage5_one_tile = (
+            not rowwise and block_n_multiple == 32 and K == 4759553
+            and (M, N, num_sms) in ((33, 8, 132), (64, 32, 2))
+            and self.num_m == self.num_n == 1
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 32, 5, 1, 1)
+        )
         # The output map still stores a 32-column tile. Only real columns need tensor-core work.
         self.n32_single_tile = (not rowwise and self.num_m == self.num_n == 1 and N < self.block_n and N % 8 == 0
                                and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 32, 4, 1, 1))
@@ -391,6 +397,10 @@ class WeightGradient:
             not rowwise and num_sms == 98 and N == 8 and self.num_m == 197
             and (self.block_m, self.block_n, self.cluster_m, self.cluster_n) == (64, 48, 1, 2)
             and (self.stages, self.num_k) in ((10, 7425), (11, 5601), (12, 3777), (13, 1953))
+        )
+        self.n48_a_stage8_one_n = (
+            not rowwise and compact_rows and 8 <= N < self.block_n and N % 8 == 0 and self.num_n == 1
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 48, 8, 1, 2)
         )
         stage14_one_n = (
             not rowwise and self.num_n == 1 and N % 8 == 0
@@ -438,6 +448,13 @@ class WeightGradient:
             and (self.stages == 15 or local_one_n_ring)
             and self.num_m > num_sms and self.num_k > self.stages
         )
+        self.n48_a_stage8_grad_l2_128 = (
+            self.n48_a_stage8_one_n and N > 8 and fp8_row_alignment[0] == 16
+        )
+        self.n48_a_stage8_activation_l2_128 = (
+            self.n48_a_stage8_one_n and N > 8 and fp8_row_alignment[1] == 16
+        )
+        self.one_n_a_local_release = self.n16_single_n_local_barriers or self.n48_a_stage8_one_n
         self.n160_single_scale_panel = self.n160_stage4_single_tile and N <= BLOCK_K and N % 8 == 0
         self.narrow_n16_unicast = (
             not rowwise and N == 8 and self.num_m == num_sms
@@ -458,7 +475,7 @@ class WeightGradient:
             or self.n96_u_stage5_narrow
         )
         use_narrow_math = (self.n32_single_tile or self.n32_two_sm_narrow or self.skinny_short_n144
-                           or self.m64_n48_narrow_a or narrow_unicast)
+                           or self.m64_n48_narrow_a or self.n48_a_stage8_one_n or narrow_unicast)
         self.math_block_n = N if use_narrow_math else self.block_n
         self.long_a_n64 = (
             long_a_storage_ok and N % 8 == 0 and self.num_n % 2 == 1 and self.num_m <= num_sms
@@ -596,7 +613,9 @@ class WeightGradient:
         if self.n96_sustained and self.num_k == 128:
             self.math_registers = 216
         self.store_threads = min(self.math_threads, self.block_m * 2)
-        self.uniform_scale = BLOCK_K % self.block_n == 0 or self.n160_single_scale_panel
+        self.uniform_scale = (
+            BLOCK_K % self.block_n == 0 or self.n160_single_scale_panel or self.n48_a_stage8_one_n
+        )
         self.scale_columns = 1 if self.uniform_scale else 2
         starts_at_zero = self.num_m * self.num_n <= self.num_sms or self.num_k % (2 * self.stages) == 0
         # Persistent M waves reuse one B panel and restart the four-stage ring at phase zero.
@@ -1024,9 +1043,9 @@ class WeightGradient:
         self.prefetch_n16 = (not rowwise and
                              (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 16, 16, 1))
         self.narrow_activation = (self.skinny_short_n144 or self.n32_two_sm_narrow
-                                  or self.m64_n48_narrow_a or narrow_unicast)
+                                  or self.m64_n48_narrow_a or self.n48_a_stage8_one_n or narrow_unicast)
         self.clear_output_padding = (self.n32_single_tile or self.n32_two_sm_narrow
-                                     or self.m64_n48_narrow_a or narrow_unicast)
+                                     or self.m64_n48_narrow_a or self.n48_a_stage8_one_n or narrow_unicast)
         self.activation_block_n = self.math_block_n if self.narrow_activation else self.block_n
         self.transaction_bytes = (self.block_m + self.activation_block_n) * BLOCK_K + 4 * self.block_m + (4 * self.block_n if rowwise else 0)
         self.b144_three_wave = (
@@ -1125,7 +1144,7 @@ class WeightGradient:
             or self.m32_n64_stage8_full
             or self.m32_n32_stage8_full
             or self.small_stage8_full_tile
-            or self.n16_single_n_local_barriers
+            or self.one_n_a_local_release
             or self.n16_u_stage10_pair
             or self.n160_stage4_grad_offset
             or self.n128_u_stage4_two_sm
@@ -1161,7 +1180,8 @@ class WeightGradient:
             ProducerRoute.DYNAMIC_RING,
             (ProducerRoute.RESIDENT_A_PANELS, self.resident_a_panels),
             (ProducerRoute.RESIDENT_GRADIENT, self.n32_reuse_grad or self.n64_reuse_grad),
-            (ProducerRoute.STATIC_RING, self.n32_u_stage10_single_tile or self.n32_u_stage14_one_tile
+            (ProducerRoute.STATIC_RING, self.n32_u_stage5_one_tile
+             or self.n32_u_stage10_single_tile or self.n32_u_stage14_one_tile
              or self.n48_u_stage8_single_tile or self.n16_u_stage5_shifted or self.n16_u_stage5_aligned
              or self.n16_u_stage14_shifted or self.n16_u_stage14_aligned or self.n16_u_stage10_pair or self.n160_stage4_full_panel
              or self.n160_stage4_grad_offset or self.n128_u_stage4_two_sm
@@ -1181,7 +1201,7 @@ class WeightGradient:
             (MathRoute.SINGLE_N_A, self.single_n_a_cluster),
             (MathRoute.PREFIX_RING, self.n112_unicast_ring or self.n112_a_full_ring or self.long_b_n128),
             (MathRoute.DYNAMIC_RING, self.n96_stage5_full_n_wave),
-            (MathRoute.STATIC_RING, self.n16_default_full_width_static_math
+            (MathRoute.STATIC_RING, self.n32_u_stage5_one_tile or self.n16_default_full_width_static_math
              or self.n16_default_grid_static_math
              or self.u128_stage4_one_wave or self.static_ring
              or self.full_a128_stage4 or self.a128_stage4_full_groups),
@@ -1194,10 +1214,11 @@ class WeightGradient:
                 self.a_tail_first_tiles = repeat_tiles
         self.tile_order = select_route(
             TileOrder.PERSISTENT,
-            (TileOrder.SINGLE_TILE, self.n32_u_stage10_single_tile or self.n32_u_stage14_one_tile
+            (TileOrder.SINGLE_TILE, self.n32_u_stage5_one_tile
+             or self.n32_u_stage10_single_tile or self.n32_u_stage14_one_tile
              or self.n48_u_stage8_single_tile or self.n192_u_stage4_aligned or self.n16_u_stage5_aligned
              or self.n16_u_stage14_aligned or self.n16_u_stage10_pair or self.stream_b_scale_row or self.n16_u_stage7 or self.m64_n32_long_stage8),
-            (TileOrder.M_LINEAR, self.m64_n48_narrow_a),
+            (TileOrder.M_LINEAR, self.m64_n48_narrow_a or self.n48_a_stage8_one_n),
             (TileOrder.SINGLE_TILE, self.m16_n128_stage8_single),
             (TileOrder.N_LINEAR, self.n112_stage4_two_waves or self.n64_reuse_grad or self.n128_u_stage4_two_sm),
             (TileOrder.SINGLE_TILE, self.n16_u_stage11 or self.two_sm_single_tile),
@@ -1206,7 +1227,7 @@ class WeightGradient:
             (TileOrder.SINGLE_TILE, self.m16_n160_stage8),
             (TileOrder.SHORT_A, self.m128_n16_a_stage11),
             (TileOrder.SHORT_UNICAST, self.n16_u_short),
-            (TileOrder.M_LINEAR, self.single_n_a_cluster or self.n16_single_n_local_barriers),
+            (TileOrder.M_LINEAR, self.single_n_a_cluster or self.one_n_a_local_release),
             (TileOrder.N48_MN_TAIL, self.n48_mn_tail),
             (TileOrder.M_LINEAR_MULTICAST, self.reuse_full_b_n144),
             (TileOrder.N_LINEAR, self.n192_one_wave),
@@ -1271,7 +1292,7 @@ class WeightGradient:
         grad_promotion = input_promotion
         if cutlass.const_expr(self.n32_a_paired_single_n or self.stage14_grad_l2_128 or self.n32_a_multi_n_grad_l2_128 or self.n32_a_stage12_multi_n):
             grad_promotion = TensorMapL2Promotion.l2_128b
-        if cutlass.const_expr(self.n160_stage4_grad_offset or self.m64_n112_a_stage5_l2):
+        if cutlass.const_expr(self.n160_stage4_grad_offset or self.m64_n112_a_stage5_l2 or self.n48_a_stage8_grad_l2_128):
             grad_promotion = TensorMapL2Promotion.l2_128b
         grad = create_tensor_map_tiled(mGrad.iterator.toint(), Float8E4M3FN, [mGrad.shape[1], mGrad.shape[0]], [Int64(mGrad.stride[0]) // 16], [BLOCK_K, self.block_m], swizzle=swizzle, l2_promotion=grad_promotion)
         activation_promotion = input_promotion
@@ -1280,7 +1301,7 @@ class WeightGradient:
             and mGrad.stride[0] % 256 == mActivation.stride[0] % 256 == 16
         )
         if cutlass.const_expr(self.stage14_activation_l2_128 or stage5_b_promotion
-                              or self.m64_n112_a_stage5_l2):
+                              or self.m64_n112_a_stage5_l2 or self.n48_a_stage8_activation_l2_128):
             activation_promotion = TensorMapL2Promotion.l2_128b
         if cutlass.const_expr(self.n96_short_n_tail):
             activation_promotion = TensorMapL2Promotion.l2_128b
@@ -1398,7 +1419,7 @@ class WeightGradient:
             with cute.arch.elect_one():
                 for stage in cutlass.range_constexpr(self.stages):
                     cute.arch.mbarrier_init(full + stage, 1)
-                    consumers = 1 if self.single_n_a_cluster or self.n16_single_n_local_barriers else self.cluster_size
+                    consumers = 1 if self.single_n_a_cluster or self.one_n_a_local_release else self.cluster_size
                     cute.arch.mbarrier_init(empty + stage, consumers * (self.math_threads // 32))
                 cute.arch.mbarrier_init_fence()
         if cutlass.const_expr(self.cluster_size > 1):
@@ -1674,7 +1695,7 @@ class WeightGradient:
                         stage, phase = self.advance_stage(stage, phase)
                 if cutlass.const_expr(self.use_linear_stage_index):
                     stage, phase = self.linear_ring_position(tile_idx, self.num_k)
-        if cutlass.const_expr(self.cluster_size > 1 and not (self.single_n_a_cluster or self.n16_single_n_local_barriers)):
+        if cutlass.const_expr(self.cluster_size > 1 and not (self.single_n_a_cluster or self.one_n_a_local_release)):
             live_stages = 4 if self.reuse_short_a128 else self.stages
             for _ in cutlass.range_constexpr(live_stages):
                 self.wait_stage(empty + stage, phase ^ 1)
@@ -1885,7 +1906,7 @@ class WeightGradient:
     def release_stage(self, empty, tile_idx, lane):
         if cutlass.const_expr(self.n64_a_single_n):
             return
-        if cutlass.const_expr(self.cluster_size == 1 or self.single_n_a_cluster or self.n16_single_n_local_barriers):
+        if cutlass.const_expr(self.cluster_size == 1 or self.single_n_a_cluster or self.one_n_a_local_release):
             if lane == 0:
                 cute.arch.mbarrier_arrive(empty)
         else:
