@@ -208,6 +208,15 @@ def load_tma_with_hint(descriptor, dst, barrier, coord_lo, coord_hi, multicast, 
 
 
 @dsl_user_op
+def load_bulk_b_scales(dst, source, size, barrier, *, loc=None, ip=None):
+    values = ((dst.toint(), Int32), (source.toint(), Int64), (size, Int32), (barrier.toint(), Int32))
+    operands = [to_ir(value, dtype, loc, ip) for value, dtype in values]
+    asm(None, operands,
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [$0], [$1], $2, [$3];",
+        "r,l,r,r", side_effects=True)
+
+
+@dsl_user_op
 def unused_scale(*, loc=None, ip=None):
     return Float32(llvm.UndefOp(T.f32(), loc=loc, ip=ip).result)
 
@@ -276,7 +285,9 @@ class WeightGradient:
                  compact_k_scale=False, aligned_fp8_rows=False, compact_rows=True, compact_output=True,
                  misaligned_fp8_rows=False, aligned_two_sm_operands=False,
                  long_a_storage_ok=False, aligned_stage11_tail=False, fp8_row_alignment=(0, 0), aligned_n160_operands=False,
-                 n80_streamed_scale_storage=False, aligned_a128_tail=False):
+                 n80_streamed_scale_storage=False, aligned_a128_tail=False,
+                 n16_stage10_bulk_storage=False, n16_stage10_pair_storage=False,
+                 n160_grad_offset_only=False, aligned_grid_n16_operands=False):
         self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n = select_layout(M, N, K, num_sms, rowwise, block_n_multiple)
         self.num_m, self.num_n, self.num_k = divide_up(M, self.block_m), divide_up(N, self.block_n), divide_up(K, BLOCK_K)
         self.N, self.num_sms, self.rowwise = N, num_sms, rowwise
@@ -470,9 +481,20 @@ class WeightGradient:
         self.scale_columns = 1 if self.uniform_scale else 2
         starts_at_zero = self.num_m * self.num_n <= self.num_sms or self.num_k % (2 * self.stages) == 0
         self.single_n80_tile = (self.block_m, self.block_n, self.cluster_size) == (64, 80, 1) and self.num_m == self.num_n == 1 and not rowwise
+        self.n16_u_stage10 = (
+            not rowwise and compact_rows and N == self.block_n and self.num_m == self.num_n == 1
+            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 16, 10, 1)
+        )
+        self.n16_u_stage10_pair = self.n16_u_stage10 and n16_stage10_pair_storage
+        self.n16_u_stage10_bulk_scale = self.n16_u_stage10 and n16_stage10_bulk_storage
         self.n16_default_full_width_static_math = (
             not rowwise and N == 16 and block_n_multiple == 1
             and self.num_m == self.num_n == 1 and self.num_k >= 512
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 16, 16, 1, 1)
+        )
+        self.n16_default_grid_static_math = (
+            aligned_grid_n16_operands and self.num_m > 1 and self.num_n > 1
+            and self.num_m * self.num_n <= num_sms and 1024 <= self.num_k <= 8192
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 16, 16, 1, 1)
         )
         long_n16_static_math = (
@@ -554,6 +576,8 @@ class WeightGradient:
             and self.num_m == self.num_n == 1 and self.num_k > 2 * self.stages
             and (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 160, 4, 1)
         )
+        self.n160_stage4_grad_offset = self.n160_stage4_single_tile and n160_grad_offset_only
+        self.n160_stage4_ordinal_math = self.n160_stage4_full_panel or self.n160_stage4_grad_offset
         self.m16_n160_stage8 = (
             not rowwise and (M, N, K, num_sms) == (16, 160, 651264, 2)
             and (self.block_m, self.block_n, self.stages, self.cluster_size) == (16, 160, 8, 1)
@@ -834,13 +858,15 @@ class WeightGradient:
         self.producer_route = select_route(
             ProducerRoute.DYNAMIC_RING,
             (ProducerRoute.RESIDENT_GRADIENT, self.n32_reuse_grad or self.n64_reuse_grad),
-            (ProducerRoute.STATIC_RING, self.n160_stage4_full_panel or self.n80_stage7_block or self.stream_b_scale_row
+            (ProducerRoute.STATIC_RING, self.n16_u_stage10_pair or self.n160_stage4_full_panel
+             or self.n160_stage4_grad_offset
+             or self.n80_stage7_block or self.stream_b_scale_row
              or self.n16_u_stage7 or self.u128_stage4_one_wave or self.n80_sustained_mn
              or (self.static_ring and not dynamic_producer)),
         )
         self.math_route = select_route(
             MathRoute.DYNAMIC_RING,
-            (MathRoute.ASYNC_PAIRS, self.two_sm_single_tile),
+            (MathRoute.ASYNC_PAIRS, self.two_sm_single_tile or self.n16_u_stage10_pair),
             (MathRoute.LONG_A_PAIRS, self.long_a_n64_full_second_wave or self.n32_a_paired_single_n
              or self.stage14_full_panel_pairs),
             (MathRoute.RESIDENT_ACTIVATION, self.n64_a_single_n),
@@ -848,6 +874,7 @@ class WeightGradient:
             (MathRoute.PREFIX_RING, self.n112_unicast_ring or self.n112_a_full_ring or self.long_b_n128),
             (MathRoute.DYNAMIC_RING, self.n96_stage5_full_n_wave),
             (MathRoute.STATIC_RING, self.n16_default_full_width_static_math
+             or self.n16_default_grid_static_math
              or self.u128_stage4_one_wave or self.static_ring
              or self.full_a128_stage4 or self.a128_stage4_full_groups),
         )
@@ -859,7 +886,7 @@ class WeightGradient:
                 self.a_tail_first_tiles = repeat_tiles
         self.tile_order = select_route(
             TileOrder.PERSISTENT,
-            (TileOrder.SINGLE_TILE, self.stream_b_scale_row or self.n16_u_stage7 or self.m64_n32_long_stage8),
+            (TileOrder.SINGLE_TILE, self.n16_u_stage10_pair or self.stream_b_scale_row or self.n16_u_stage7 or self.m64_n32_long_stage8),
             (TileOrder.M_LINEAR, self.m64_n48_narrow_a),
             (TileOrder.SINGLE_TILE, self.m16_n128_stage8_single),
             (TileOrder.N_LINEAR, self.n112_stage4_two_waves or self.n64_reuse_grad),
@@ -900,7 +927,7 @@ class WeightGradient:
              or self.n112_misaligned_unicast or self.n112_a_full_ring),
             (ScalePromotion.SELECT_FIRST, self.select_scale_before_product),
         )
-        self.double_producer_phase = (self.n112_stage4_two_waves or self.n144_unicast_one_wave
+        self.double_producer_phase = (self.n160_stage4_grad_offset or self.n112_stage4_two_waves or self.n144_unicast_one_wave
                                       or self.long_n80_stage4 or self.wide_n192_four_math)
         self.double_math_phase = (self.n112_stage4_two_waves or self.n144_unicast_one_wave
                                   or self.u128_stage4_one_wave or self.long_n80_stage4
@@ -930,6 +957,8 @@ class WeightGradient:
         swizzle = TensorMapSwizzle.s128b
         grad_promotion = input_promotion
         if cutlass.const_expr(self.n32_a_paired_single_n or self.stage14_grad_l2_128 or self.n32_a_multi_n_grad_l2_128):
+            grad_promotion = TensorMapL2Promotion.l2_128b
+        if cutlass.const_expr(self.n160_stage4_grad_offset):
             grad_promotion = TensorMapL2Promotion.l2_128b
         grad = create_tensor_map_tiled(mGrad.iterator.toint(), Float8E4M3FN, [mGrad.shape[1], mGrad.shape[0]], [Int64(mGrad.stride[0]) // 16], [BLOCK_K, self.block_m], swizzle=swizzle, l2_promotion=grad_promotion)
         activation_promotion = input_promotion
@@ -1006,9 +1035,18 @@ class WeightGradient:
         elif cutlass.const_expr(self.rowwise):
             s_activation_scale = smem.allocate_tensor(Float32, activation_scale_layout, byte_alignment=128)
         else:
-            s_activation_scale = smem.allocate_tensor(Float32, cute.make_layout((self.num_k, self.scale_columns)), byte_alignment=8)
+            scale_alignment = 16 if self.n16_u_stage10_bulk_scale else 8
+            s_activation_scale = smem.allocate_tensor(
+                Float32, cute.make_layout((self.num_k, self.scale_columns)), byte_alignment=scale_alignment
+            )
         full = smem.allocate_array(Int64, self.stages)
         empty = smem.allocate_array(Int64, self.stages)
+        b_scale_ready = None
+        if cutlass.const_expr(self.n16_u_stage10_bulk_scale):
+            b_scale_ready = smem.allocate_array(Int64, 1)
+            if warp == self.first_producer_warp + 1:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_init(b_scale_ready, 1)
 
         descriptors = (grad, activation, grad_scale, out, activation_scale)
         self.initialize(warp, descriptors, full, empty, prefetch_warp)
@@ -1021,7 +1059,7 @@ class WeightGradient:
                     self.load_loop(bx, descriptors, inputs, barriers)
         else:
             cute.arch.warpgroup_reg_alloc(self.math_registers)
-            self.compute_loop(tidx, warp, bx, mma, inputs, barriers, s_out, descriptors[3], mActivationScale, first_scale_loader)
+            self.compute_loop(tidx, warp, bx, mma, inputs, barriers, s_out, descriptors[3], mActivationScale, first_scale_loader, b_scale_ready)
 
     @cute.jit
     def initialize(self, warp, descriptors, full, empty, prefetch_warp: cutlass.Constexpr):
@@ -1372,7 +1410,8 @@ class WeightGradient:
 
     @cute.jit
     def wait_stage(self, buffer, phase):
-        if cutlass.const_expr(self.n16_single_n_local_barriers):
+        if cutlass.const_expr(self.n16_single_n_local_barriers or self.n16_u_stage10_pair
+                              or self.n160_stage4_grad_offset):
             wait_n16_stage7(buffer, phase)
             return
         if cutlass.const_expr(self.n32_single_tile or self.n80_full_sms_unicast):
@@ -1464,7 +1503,7 @@ class WeightGradient:
                 cute.arch.mbarrier_arrive(empty, target)
 
     @cute.jit
-    def compute_loop(self, tidx, warp, bx, mma, inputs, barriers, s_out, out, mActivationScale, first_scale_loader: cutlass.Constexpr):
+    def compute_loop(self, tidx, warp, bx, mma, inputs, barriers, s_out, out, mActivationScale, first_scale_loader: cutlass.Constexpr, b_scale_ready):
         s_grad, s_activation, s_grad_scale, s_activation_scale = inputs
         mma_slice = mma.get_slice(cute.arch.make_warp_uniform(warp // 4 * 128))
         # Small M uses the first lanes of a 64-row WGMMA tile. The descriptor
@@ -1505,7 +1544,16 @@ class WeightGradient:
             tile_m, tile_n, _ = self.tile_coords(tile_idx)
             former_groups = cutlass.min(self.block_n, BLOCK_K - tile_n * self.block_n % BLOCK_K) // 8
             output_groups = cutlass.min(self.N - tile_n * self.block_n, self.block_n) // 8
-            if cutlass.const_expr(not (self.stream_b_scale_row or self.rowwise or self.reuse_full_b_n144 or self.single_n_a_cluster or self.m128_n16_a_stage11)):
+            if cutlass.const_expr(self.n16_u_stage10_bulk_scale):
+                bulk_values = self.num_k // 4 * 4
+                if tidx == 0:
+                    for tail in cutlass.range_constexpr(bulk_values, self.num_k):
+                        s_activation_scale[tail, 0] = mActivationScale[0, tail]
+                    cute.arch.mbarrier_arrive_and_expect_tx(b_scale_ready, bulk_values * 4)
+                    load_bulk_b_scales(s_activation_scale.iterator, mActivationScale.iterator,
+                                       bulk_values * 4, b_scale_ready)
+                self.wait_stage(b_scale_ready, Int32(0))
+            elif cutlass.const_expr(not (self.stream_b_scale_row or self.rowwise or self.reuse_full_b_n144 or self.single_n_a_cluster or self.m128_n16_a_stage11)):
                 self.load_block_scales(tidx, tile_n, former_groups, output_groups, mActivationScale, s_activation_scale, first_scale_loader)
             full_tile = True
             if cutlass.const_expr(self.long_tail_n):
@@ -1645,7 +1693,7 @@ class WeightGradient:
         for k_tile in cutlass.range(self.num_k, unroll=8):
             if cutlass.const_expr(self.use_linear_stage_index):
                 stage, phase = self.linear_ring_position(tile_idx, k_tile)
-            if cutlass.const_expr(self.n160_stage4_full_panel):
+            if cutlass.const_expr(self.n160_stage4_ordinal_math):
                 # A single output tile enters the ring at stage and phase zero.
                 stage, phase = k_tile % self.stages, (k_tile // self.stages) & 1
             else:
@@ -1659,7 +1707,7 @@ class WeightGradient:
                     activation_hi = s_activation_scale[k_tile, 1]
             self.wait_stage(full + stage, phase)
             grad_lo, grad_hi = Float32(0), Float32(0)
-            if cutlass.const_expr(not self.n160_stage4_full_panel):
+            if cutlass.const_expr(not self.n160_stage4_ordinal_math):
                 if do_store:
                     grad_lo, grad_hi = s_grad_scale[row_lo, 0, stage], s_grad_scale[row_hi, 0, stage]
 
@@ -1684,7 +1732,7 @@ class WeightGradient:
                     mma.set(warpgroup.Field.ACCUMULATE, mma_k != 0)
                     cute.gemm(mma, mma_acc, grad_desc[None, None, mma_k, stage], activation_desc[None, None, mma_k, b_stage], mma_acc)
                 warpgroup.commit_group()
-                if cutlass.const_expr(self.n160_stage4_full_panel):
+                if cutlass.const_expr(self.n160_stage4_ordinal_math):
                     # Read the current A scales while the WGMMA group is in flight.
                     grad_lo, grad_hi = s_grad_scale[row_lo, 0, stage], s_grad_scale[row_hi, 0, stage]
                 warpgroup.wait_group(0)
@@ -1698,7 +1746,7 @@ class WeightGradient:
             if cutlass.const_expr(self.n80_b_multicast):
                 b_scale_lo = values[self.block_n // 2]
                 b_scale_hi = values[self.block_n // 2 + 1]
-            if cutlass.const_expr(not (self.use_linear_stage_index or self.n160_stage4_full_panel)):
+            if cutlass.const_expr(not (self.use_linear_stage_index or self.n160_stage4_ordinal_math)):
                 stage, phase = self.advance_stage(stage, phase)
         if cutlass.const_expr(self.use_linear_stage_index):
             stage, phase = self.linear_ring_position(tile_idx, self.num_k)
@@ -2078,9 +2126,36 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
         and all(tensor.stride(0) * tensor.element_size() % BLOCK_K for tensor in (grad, activation))
         and out.stride(0) * out.element_size() % 32 == 0
     )
+    aligned_grid_n16_operands = (
+        not rowwise and block_n_multiple == 1 and M > 64 and N > 16 and 1024 <= num_k <= 8192
+        and all(tensor.data_ptr() % BLOCK_K == 0
+                and tensor.stride(0) * tensor.element_size() % BLOCK_K == 0
+                for tensor in (grad, activation))
+    )
+    # Identical strides can describe an aligned allocation or an offset FP8 view.
+    n16_stage10_pair_storage = (
+        not rowwise and M <= 64 and N == 16
+        and all(tensor.data_ptr() % BLOCK_K == 0 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 0
+                for tensor in (grad, activation))
+    )
+    n16_stage10_bulk_storage = (
+        not rowwise and M <= 64 and N == 16 and activation_scale.stride(1) == 1
+        and activation_scale.data_ptr() % 16 == 0
+        and all(tensor.data_ptr() % BLOCK_K == 0
+                and tensor.stride(0) * tensor.element_size() % BLOCK_K in (0, 16)
+                for tensor in (grad, activation))
+    )
+    # This route requires a compact native tile with only grad shifted by 16 bytes.
+    n160_grad_offset_only = (
+        not rowwise and num_sms == 2 and M <= 64 and N == 160 and block_n_multiple == 160
+        and K % BLOCK_K == 0 and out.stride(0) == N
+        and grad.data_ptr() % BLOCK_K == 16 and activation.data_ptr() % BLOCK_K == 0
+        and all(tensor.stride(0) * tensor.element_size() == K for tensor in (grad, activation))
+    )
     key = ("fp8_wgrad", M, N, K, num_sms, rowwise, block_n_multiple,
            tuple(tensor.stride() for tensor in tensors), aligned_two_sm_operands, long_a_storage_ok,
-           aligned_stage11_tail, aligned_n160_operands, n80_streamed_scale_storage, aligned_a128_tail)
+           aligned_stage11_tail, aligned_n160_operands, n80_streamed_scale_storage, aligned_a128_tail,
+           n16_stage10_bulk_storage, n16_stage10_pair_storage, n160_grad_offset_only, aligned_grid_n16_operands)
     compiled = CACHE.get(key)
     if compiled is None:
         dtypes = (Float8E4M3FN, Float32, Float8E4M3FN, Float32, Float32)
@@ -2103,7 +2178,11 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                                    compact_output, misaligned_fp8_rows, aligned_two_sm_operands,
                                    long_a_storage_ok, aligned_stage11_tail, fp8_row_alignment, aligned_n160_operands,
                                    n80_streamed_scale_storage=n80_streamed_scale_storage,
-                                   aligned_a128_tail=aligned_a128_tail)
+                                   aligned_a128_tail=aligned_a128_tail,
+                                   n16_stage10_bulk_storage=n16_stage10_bulk_storage,
+                                   n16_stage10_pair_storage=n16_stage10_pair_storage,
+                                   n160_grad_offset_only=n160_grad_offset_only,
+                                   aligned_grid_n16_operands=aligned_grid_n16_operands)
         compiled = cute.compile(operation, *operands, fake_stream(), options="--enable-tvm-ffi")
         CACHE[key] = compiled
     compiled(*tensors)
