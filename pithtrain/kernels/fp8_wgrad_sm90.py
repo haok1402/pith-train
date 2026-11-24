@@ -422,7 +422,12 @@ class WeightGradient:
             and self.num_m <= (self.stages - 1) * num_sms
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 144, 7, 2, 1)
         )
+        self.m128_n16_a_stage11 = (
+            not rowwise and (self.num_m, self.num_n, self.num_k, num_sms) == (76, 5, 1, 132)
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 16, 11, 1, 2)
+        )
         self.use_linear_stage_index = (
+            self.m128_n16_a_stage11 or
             self.m32_n112_two_waves or self.reuse_full_b_n144 or self.short_a_n64 or self.short_n144_cluster or self.short_a_n16 or self.short_a_n144
             or self.short_a_n96_no_wrap or self.short_a_n128 or self.short_a_n112 or self.short_b_n80
             or (not rowwise and self.multicast_a and self.num_n == 1
@@ -581,6 +586,12 @@ class WeightGradient:
 
     @cute.jit
     def tile_coords(self, tile_idx):
+        if cutlass.const_expr(self.m128_n16_a_stage11):
+            tile_n, tile_m, multicast = self.short_cluster_coords(tile_idx, True)
+            return tile_m, tile_n, multicast
+        if cutlass.const_expr(self.n16_u_short):
+            tile_m, tile_n, _ = self.short_cluster_coords(tile_idx, False)
+            return tile_m, tile_n, cutlass.Boolean(False)
         if cutlass.const_expr(self.n16_u_short):
             tile_m, tile_n, _ = self.short_cluster_coords(tile_idx, False)
             return tile_m, tile_n, cutlass.Boolean(False)
@@ -757,6 +768,10 @@ class WeightGradient:
                             self.load_input(activation_scale, b, barrier, k_offset, n_offset)
                         else:
                             self.load_input(activation, b, barrier, k_offset, n_offset)
+                    elif cutlass.const_expr(self.m128_n16_a_stage11):
+                        # The first four N tiles retain their position until the odd tail.
+                        if tile_idx < self.num_sms or tile_idx >= 4 * self.num_m:
+                            self.load_input(activation, b, barrier, k_offset, n_offset)
                     elif cutlass.const_expr(self.n16_a_single_n):
                         # Each K block keeps its B panel for the CTA's later M tiles.
                         if tile_idx < self.num_sms:
@@ -777,6 +792,9 @@ class WeightGradient:
                         scale_b = s_activation_scale.iterator + stage * align_up(self.block_n, 32)
                         self.load_input(activation_scale, scale_b, barrier, n_offset, k_tile)
                     transaction_bytes = Int32(self.transaction_bytes)
+                    if cutlass.const_expr(self.m128_n16_a_stage11):
+                        retain_b = tile_idx >= self.num_sms and tile_idx < 4 * self.num_m
+                        transaction_bytes = select_(retain_b, transaction_bytes - self.block_n * BLOCK_K, transaction_bytes)
                     if cutlass.const_expr(self.reuse_full_b_n144 or self.n16_a_single_n):
                         transaction_bytes = select_(tile_idx < self.num_sms, transaction_bytes,
                                                     transaction_bytes - self.block_n * BLOCK_K)
@@ -869,6 +887,8 @@ class WeightGradient:
 
     @cute.jit
     def linear_ring_position(self, tile_idx, k_tile):
+        if cutlass.const_expr(self.m128_n16_a_stage11):
+            return tile_idx // self.num_sms + k_tile, Int32(0)
         if cutlass.const_expr(self.m32_n112_two_waves):
             return Int32(tile_idx >= self.num_sms) + k_tile, Int32(0)
         if cutlass.const_expr(self.n16_a_single_n):
@@ -976,14 +996,14 @@ class WeightGradient:
         output_tiles = self.num_m * self.num_n
         if cutlass.const_expr(self.n32_reuse_grad):
             output_tiles = self.num_sms
-        if cutlass.const_expr(self.reuse_full_b_n144 or self.n16_a_single_n):
+        if cutlass.const_expr(self.reuse_full_b_n144 or self.n16_a_single_n or self.m128_n16_a_stage11):
             self.load_block_scales(tidx, Int32(0), Int32(BLOCK_K // 8), Int32(self.block_n // 8), mActivationScale,
                                    s_activation_scale, first_scale_loader)
         for tile_idx in cutlass.range(bx, output_tiles, self.num_sms):
             tile_m, tile_n, _ = self.tile_coords(tile_idx)
             former_groups = cutlass.min(self.block_n, BLOCK_K - tile_n * self.block_n % BLOCK_K) // 8
             output_groups = cutlass.min(self.N - tile_n * self.block_n, self.block_n) // 8
-            if cutlass.const_expr(not (self.rowwise or self.reuse_full_b_n144 or self.n16_a_single_n)):
+            if cutlass.const_expr(not (self.rowwise or self.reuse_full_b_n144 or self.n16_a_single_n or self.m128_n16_a_stage11)):
                 self.load_block_scales(tidx, tile_n, former_groups, output_groups, mActivationScale, s_activation_scale, first_scale_loader)
             full_tile = True
             if cutlass.const_expr(self.long_tail_n):
@@ -1118,6 +1138,8 @@ class WeightGradient:
                     partial[index] = values[index]
             else:
                 b_stage = Int32(0) if self.reuse_full_b_n144 else stage
+                if cutlass.const_expr(self.m128_n16_a_stage11):
+                    b_stage = select_(tile_idx < 4 * self.num_m, Int32(0), stage)
                 warpgroup.fence()
                 for mma_k in cutlass.range_constexpr(BLOCK_K // 32):
                     mma.set(warpgroup.Field.ACCUMULATE, mma_k != 0)
