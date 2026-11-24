@@ -293,7 +293,8 @@ class WeightGradient:
                  n160_grad_offset_only=False, aligned_grid_n16_operands=False, aligned_m128_n32_a=False,
                  n48_a_stage9_storage=False, aligned_n192_stage4=False, n16_stage8_local_storage=False,
                  aligned_n16_stage14_operands=False, full_device_sm_budget=False, n112_stage5_l2_storage=False,
-                 aligned_n32_stage14_operands=False, aligned_n48_stage8_operands=False):
+                 aligned_n32_stage14_operands=False, aligned_n48_stage8_operands=False,
+                 aligned_n96_stage5_narrow_operands=False):
         self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n = select_layout(M, N, K, num_sms, rowwise, block_n_multiple)
         self.num_m, self.num_n, self.num_k = divide_up(M, self.block_m), divide_up(N, self.block_n), divide_up(K, BLOCK_K)
         self.m64_n48_a_stage9_wide = False
@@ -413,7 +414,14 @@ class WeightGradient:
             and self.num_m == self.num_n == 1 and self.num_k > self.stages
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 16, 16, 1, 1)
         )
-        narrow_unicast = self.narrow_n16_unicast or self.n160_single_scale_panel or self.narrow_n16_default
+        self.n96_u_stage5_narrow = (
+            aligned_n96_stage5_narrow_operands and self.num_m == self.num_n == 1
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 96, 5, 1, 1)
+        )
+        narrow_unicast = (
+            self.narrow_n16_unicast or self.n160_single_scale_panel or self.narrow_n16_default
+            or self.n96_u_stage5_narrow
+        )
         use_narrow_math = (self.n32_single_tile or self.n32_two_sm_narrow or self.skinny_short_n144
                            or self.m64_n48_narrow_a or narrow_unicast)
         self.math_block_n = N if use_narrow_math else self.block_n
@@ -2531,13 +2539,20 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 0
                 for tensor in (grad, activation))
     )
+    aligned_n96_stage5_narrow_operands = False
+    if full_device_sm_budget and not rowwise and M <= 64 and 0 < N <= 32 and N % 8 == 0 and block_n_multiple == 96:
+        fp8_pitches = tuple(tensor.stride(0) * tensor.element_size() % BLOCK_K for tensor in (grad, activation))
+        aligned_n96_stage5_narrow_operands = (
+            fp8_pitches in ((0, 0), (16, 16))
+            and all(tensor.data_ptr() % BLOCK_K == 0 for tensor in (grad, activation))
+        )
     key = ("fp8_wgrad", M, N, K, num_sms, rowwise, block_n_multiple,
            tuple(tensor.stride() for tensor in tensors), aligned_two_sm_operands, long_a_storage_ok,
            aligned_stage11_tail, aligned_n160_operands, n80_streamed_scale_storage, aligned_a128_tail,
            n16_stage10_bulk_storage, n16_stage10_pair_storage, n160_grad_offset_only, aligned_grid_n16_operands,
            aligned_m128_n32_a, n48_a_stage9_storage, aligned_n192_stage4, n16_stage8_local_storage,
            aligned_n16_stage14_operands, full_device_sm_budget, n112_stage5_l2_storage, aligned_n32_stage14_operands,
-           aligned_n48_stage8_operands)
+           aligned_n48_stage8_operands, aligned_n96_stage5_narrow_operands)
     compiled = CACHE.get(key)
     if compiled is None:
         dtypes = (Float8E4M3FN, Float32, Float8E4M3FN, Float32, Float32)
@@ -2573,7 +2588,8 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                                    full_device_sm_budget=full_device_sm_budget,
                                    n112_stage5_l2_storage=n112_stage5_l2_storage,
                                    aligned_n32_stage14_operands=aligned_n32_stage14_operands,
-                                   aligned_n48_stage8_operands=aligned_n48_stage8_operands)
+                                   aligned_n48_stage8_operands=aligned_n48_stage8_operands,
+                                   aligned_n96_stage5_narrow_operands=aligned_n96_stage5_narrow_operands)
         compiled = cute.compile(operation, *operands, fake_stream(), options="--enable-tvm-ffi")
         CACHE[key] = compiled
     compiled(*tensors)
