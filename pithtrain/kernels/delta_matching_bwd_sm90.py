@@ -501,13 +501,17 @@ def allocate_score_exchange(allocator, STAGES: cutlass.Constexpr, STORE_STAGES: 
 
 
 @dsl_user_op
-def pack_e4m3_pair(low, high, *, loc=None, ip=None):
+def pack_e4m3_word(first, second, third, fourth, *, loc=None, ip=None):
     bits = llvm.inline_asm(
-        T.i16(), [high.ir_value(loc=loc, ip=ip), low.ir_value(loc=loc, ip=ip)],
-        "cvt.rn.satfinite.e4m3x2.f32 $0, $1, $2;", "=h,f,f",
+        T.i32(), [value.ir_value(loc=loc, ip=ip) for value in (first, second, third, fourth)],
+        "{ .reg .b16 low, high;\n"
+        "cvt.rn.satfinite.e4m3x2.f32 low, $2, $1;\n"
+        "cvt.rn.satfinite.e4m3x2.f32 high, $4, $3;\n"
+        "mov.b32 $0, {low, high}; }",
+        "=r,f,f,f,f",
         has_side_effects=False, is_align_stack=False, loc=loc, ip=ip,
     )
-    return Uint16(bits)
+    return Uint32(bits)
 
 
 @dsl_user_op
@@ -521,9 +525,8 @@ def store_transposed_score_matrices(destination, words, *, loc=None, ip=None):
 
 
 @cute.jit
-def score_query_pairs(first_row, second_row, even_lane, selector):
+def score_query_pairs(packed, even_lane, selector):
     # Each C lane has one key pair in each of two rows eight queries apart.
-    packed = cute.arch.prmt(first_row.to(Uint32), second_row.to(Uint32), 0x5410)
     even = cute.arch.shuffle_sync(packed, offset=even_lane, mask_and_clamp=31)
     odd = cute.arch.shuffle_sync(packed, offset=even_lane + 4, mask_and_clamp=31)
     return cute.arch.prmt(even, odd, selector)
@@ -531,16 +534,7 @@ def score_query_pairs(first_row, second_row, even_lane, selector):
 
 @cute.jit
 def stage_pipelined_score_operands(probabilities, score_grad, coords, buffers, scale, tidx):
-    s_probability, s_score_grad, s_score_output = buffers
-    output_pairs = cute.make_tensor(
-        cute.recast_ptr(s_score_output.iterator, dtype=Uint16), cute.make_layout(BLOCK_QUERY * BLOCK_QUERY // 2)
-    )
-    output_offsets = cute.make_rmem_tensor(2, Int32)
-    for row in cutlass.range_constexpr(2):
-        query, key = coords[2 * row]
-        offset = query * BLOCK_QUERY + key
-        output_offsets[row] = (offset ^ ((offset >> 3) & 0x30)) // 2
-
+    s_probability, s_score_grad = buffers
     lane = tidx % 32
     query_pair = lane // 4
     even_lane = (query_pair % 4) * 8 + lane % 4
@@ -552,6 +546,7 @@ def stage_pipelined_score_operands(probabilities, score_grad, coords, buffers, s
     probability_ptr = cute.recast_ptr(s_probability.iterator, dtype=Uint8)
     grad_ptr = cute.recast_ptr(s_score_grad.iterator, dtype=Uint8)
     rcp = cute.arch.rcp_approx(scale) if scale > 0.0 else Float32(0.0)
+    packed_grad = cute.make_rmem_tensor(8, Uint32)
 
     for section in cutlass.range_constexpr(2):
         prob_words = cute.make_rmem_tensor(4, Uint32)
@@ -559,18 +554,34 @@ def stage_pipelined_score_operands(probabilities, score_grad, coords, buffers, s
         for matrix in cutlass.range_constexpr(4):
             quad = 4 * section + matrix
             elem = 4 * quad
-            p0 = pack_e4m3_pair(probabilities[elem], probabilities[elem + 1])
-            p1 = pack_e4m3_pair(probabilities[elem + 2], probabilities[elem + 3])
-            ds0 = pack_e4m3_pair(score_grad[elem] * rcp, score_grad[elem + 1] * rcp)
-            ds1 = pack_e4m3_pair(score_grad[elem + 2] * rcp, score_grad[elem + 3] * rcp)
-            output_pairs[output_offsets[0] ^ (4 * quad)] = ds0
-            output_pairs[output_offsets[1] ^ (4 * quad)] = ds1
-            prob_words[matrix] = score_query_pairs(p0, p1, even_lane, selector)
-            grad_words[matrix] = score_query_pairs(ds0, ds1, even_lane, selector)
+            packed_prob = pack_e4m3_word(
+                probabilities[elem], probabilities[elem + 1], probabilities[elem + 2], probabilities[elem + 3],
+            )
+            packed_grad[quad] = pack_e4m3_word(
+                score_grad[elem] * rcp, score_grad[elem + 1] * rcp,
+                score_grad[elem + 2] * rcp, score_grad[elem + 3] * rcp,
+            )
+            prob_words[matrix] = score_query_pairs(packed_prob, even_lane, selector)
+            grad_words[matrix] = score_query_pairs(packed_grad[quad], even_lane, selector)
         offset = matrix_offset + section * 32 * BLOCK_QUERY
         store_transposed_score_matrices(probability_ptr + offset, tuple(prob_words[i] for i in range(4)))
         store_transposed_score_matrices(grad_ptr + offset, tuple(grad_words[i] for i in range(4)))
 
+    cute.arch.fence_proxy("async.shared", space="cta")
+    return packed_grad
+
+
+@cute.jit
+def stage_score_output(s_score_output, coords, packed_grad):
+    output_pairs = cute.make_tensor(
+        cute.recast_ptr(s_score_output.iterator, dtype=Uint16), cute.make_layout(BLOCK_QUERY * BLOCK_QUERY // 2)
+    )
+    for row in cutlass.range_constexpr(2):
+        query, key = coords[2 * row]
+        offset = query * BLOCK_QUERY + key
+        pair_offset = (offset ^ ((offset >> 3) & 0x30)) // 2
+        for quad in cutlass.range_constexpr(cute.size(packed_grad)):
+            output_pairs[pair_offset ^ (4 * quad)] = (packed_grad[quad] >> (16 * row)).to(Uint16)
     cute.arch.fence_proxy("async.shared", space="cta")
     cute.arch.barrier(barrier_id=1, number_of_threads=128)
 
@@ -758,33 +769,26 @@ class PipelinedKeyValueGradients:
             )
 
     @cute.jit
-    def reconstruct_scores(self, probabilities, coords, lse_rows, query_start, key_start, log2_scales):
-        GROUP_COLUMNS = self.group_keys // 4
-        for group_idx in cutlass.range_constexpr(2):
-            for row_idx in cutlass.range_constexpr(cute.size(probabilities, mode=[0])):
-                query_pos = query_start + coords[row_idx, 0][0]
-                for col_idx in cutlass.range_constexpr(GROUP_COLUMNS):
-                    local_col = group_idx * GROUP_COLUMNS + col_idx
-                    key_pos = key_start + coords[row_idx, local_col][1]
-                    exponent = probabilities[row_idx, local_col] * log2_scales[group_idx] - lse_rows[row_idx] + 8.0
-                    probabilities[row_idx, local_col] = (
-                        cute.math.exp2(cute.arch.fmin(exponent, 12.0), fastmath=True)
-                        if key_pos <= query_pos else Float32(0.0)
-                    )
-
-    @cute.jit
-    def center_scores(self, prob_rows, grad_rows, delta_rows, key_scales, value_scales, grad_scale):
+    def reconstruct_and_center_scores(self, prob_rows, grad_rows, coords, lse_rows, delta_rows, query_start, key_start, log2_scales, key_scales, value_scales, grad_scale):
         amax = Float32(0.0)
         GROUP_COLUMNS = self.group_keys // 4
         for group_idx in cutlass.range_constexpr(2):
             key_scale, value_scale = key_scales[group_idx], value_scales[group_idx]
             product_scale = (grad_scale * value_scale) * key_scale
             for row_idx in cutlass.range_constexpr(cute.size(prob_rows, mode=[0])):
+                query_pos = query_start + coords[row_idx, 0][0]
                 scaled_delta = delta_rows[row_idx] * key_scale
                 for col_idx in cutlass.range_constexpr(GROUP_COLUMNS):
                     local_col = group_idx * GROUP_COLUMNS + col_idx
+                    key_pos = key_start + coords[row_idx, local_col][1]
+                    exponent = prob_rows[row_idx, local_col] * log2_scales[group_idx] - lse_rows[row_idx] + 8.0
+                    probability = (
+                        cute.math.exp2(cute.arch.fmin(exponent, 12.0), fastmath=True)
+                        if key_pos <= query_pos else Float32(0.0)
+                    )
                     centered = grad_rows[row_idx, local_col] * product_scale - scaled_delta
-                    score_grad = prob_rows[row_idx, local_col] * centered
+                    score_grad = probability * centered
+                    prob_rows[row_idx, local_col] = probability
                     grad_rows[row_idx, local_col] = score_grad
                     amax = cute.arch.fmax(amax, abs(score_grad))
         return amax
@@ -835,7 +839,6 @@ class PipelinedKeyValueGradients:
             if tidx % 32 == 0:
                 cute.arch.mbarrier_arrive(released + query_stage)
             log2_scales = ((query_scale * key_scales[0]) * LOG2_E, (query_scale * key_scales[1]) * LOG2_E)
-            self.reconstruct_scores(prob_rows, positions_rows, lse_rows, query_block_idx * BLOCK_QUERY, key_start, log2_scales)
             delta_rows = cute.make_rmem_tensor(cute.size(prob_rows, mode=[0]), Float32)
             for row_idx in cutlass.range_constexpr(cute.size(delta_rows)):
                 delta_rows[row_idx] = s_delta[positions_rows[row_idx, 0][0], 0, grad_stage]
@@ -843,7 +846,10 @@ class PipelinedKeyValueGradients:
             cute.arch.sync_warp()
             if tidx % 32 == 0:
                 cute.arch.mbarrier_arrive(released + self.grad_slot + grad_stage)
-            amax = self.center_scores(prob_rows, grad_rows, delta_rows, key_scales, value_scales, grad_scale)
+            amax = self.reconstruct_and_center_scores(
+                prob_rows, grad_rows, positions_rows, lse_rows, delta_rows, query_block_idx * BLOCK_QUERY,
+                key_start, log2_scales, key_scales, value_scales, grad_scale,
+            )
             score_stage, score_phase = offset % self.score_stages, (offset // self.score_stages) % 2
             if offset >= self.score_stages:
                 cute.arch.mbarrier_wait(score_released + score_stage, score_phase ^ 1)
@@ -857,15 +863,17 @@ class PipelinedKeyValueGradients:
                 mScoreScale[score_head_idx, key_block_idx] = scale
                 s_key_weights[score_stage] = key_weight
             s_output = s_score_output[None, None, output_stage]
-            stage_pipelined_score_operands(
+            packed_grad = stage_pipelined_score_operands(
                 probabilities, probability_grad, positions,
-                (s_prob[None, None, score_stage], s_score_grad[None, None, score_stage], s_output), scale, tidx,
+                (s_prob[None, None, score_stage], s_score_grad[None, None, score_stage]), scale, tidx,
             )
             # The two gradient warpgroups join the score warpgroup at one
             # named barrier per slot. Only the gradient participants wait.
             cute.arch.barrier_arrive(
                 barrier_id=2 + score_stage, number_of_threads=self.score_participants, aligned=False,
             )
+            # dQ reads the separate row-major copy on its next launch.
+            stage_score_output(s_output, positions, packed_grad)
             if tidx == 0:
                 score_tile_idx = score_head_idx * NUM_QUERIES + key_block_idx
                 store_pipelined_score_tile(score_store, s_output, score_tile_idx)
@@ -1144,9 +1152,17 @@ class PipelinedQueryGradients:
             scale = next_scale
             if key_block_idx < last_tile:
                 next_scale = mScoreScale[score_head_idx, key_block_idx + 1]
+            use_tile = scale > 0.0 and scale >= max_scale * 1e-8
+            if use_tile:
+                # The FP32 window update is independent of the incoming operands.
+                ratio = cute.arch.fmin(cute.arch.fmax(window_scale * cute.arch.rcp_approx(scale), 1e-8), 1e8)
+                acc_window.store(acc_window.load() * ratio)
             cute.arch.mbarrier_wait(ready + stage_idx, phase)
-            if scale > 0.0 and scale >= max_scale * 1e-8:
-                apply_query_tile(mma, mma_thread, acc_window, s_score_grad[None, None, stage_idx], s_key_t[None, None, stage_idx], scale, window_scale)
+            if use_tile:
+                multiply_tile(
+                    mma, mma_thread, acc_window, s_score_grad[None, None, stage_idx],
+                    s_key_t[None, None, stage_idx], window_scale > 0.0,
+                )
                 max_scale, window_scale = cute.arch.fmax(max_scale, scale), scale
             # A skipped tile still needs all four warps to finish waiting on its phase.
             cute.arch.barrier(barrier_id=1, number_of_threads=self.math_threads)
@@ -1309,6 +1325,18 @@ def launch_fold_attention_gradients(mGradKey, mGradValue, mKey, mValue, stream):
     fold_attention_gradients(mGradKey, mGradValue, mKey, mValue).launch(grid=(elements // 512, output_heads, 2), block=(128, 1, 1), stream=stream)
 
 
+def launch_query_and_fold(query_operands, fold_operands, softmax_scale):
+    device = query_operands[0].device
+    caller_stream = torch.cuda.current_stream(device)
+    fold_stream = torch.cuda.Stream(device=device)
+    # The two consumers share only the preceding dK/dV launch.
+    fold_stream.wait_stream(caller_stream)
+    launch_delta_matching_kernel("delta_matching_query_gradients", launch_query_gradients, query_operands, (softmax_scale,))
+    with torch.cuda.stream(fold_stream):
+        launch_delta_matching_kernel("delta_matching_fold_gradients", launch_fold_attention_gradients, fold_operands)
+    caller_stream.wait_stream(fold_stream)
+
+
 def delta_matching_bwd_sm90(grad_out, state, backward_state, softmax_scale):
     """
     Compute the three BF16 gradients with E4M3 operands and deterministic GQA reduction.
@@ -1331,12 +1359,13 @@ def delta_matching_bwd_sm90(grad_out, state, backward_state, softmax_scale):
     grad_key, grad_value = (torch.empty_like(grad, dtype=torch.float32) for _ in range(2))
 
     launch_delta_matching_kernel("delta_matching_kv_gradients", launch_key_value_gradients, (query, query_scale, key, key_scale, value, value_scale, query_t, grad, grad_scale, grad_t, lse, delta, score_grad, score_scale, grad_key, grad_value))
-    launch_delta_matching_kernel("delta_matching_query_gradients", launch_query_gradients, (key_t, score_grad, score_scale, grad_query), (softmax_scale,))
-    grad_query = grad_query.reshape(B, H, N, D).transpose(1, 2)
+    query_operands = (key_t, score_grad, score_scale, grad_query)
+    query_out = grad_query.reshape(B, H, N, D).transpose(1, 2)
     if D == 256 and H == 6 * num_key_heads:
         folded_shape = (B * num_key_heads, N * D)
         key_out, value_out = (torch.empty(folded_shape, dtype=torch.bfloat16, device=query.device) for _ in range(2))
-        launch_delta_matching_kernel("delta_matching_fold_gradients", launch_fold_attention_gradients, (grad_key.flatten(1), grad_value.flatten(1), key_out, value_out))
-        return grad_query, key_out.reshape(B, num_key_heads, N, D).transpose(1, 2), value_out.reshape(B, num_key_heads, N, D).transpose(1, 2)
+        launch_query_and_fold(query_operands, (grad_key.flatten(1), grad_value.flatten(1), key_out, value_out), softmax_scale)
+        return query_out, key_out.reshape(B, num_key_heads, N, D).transpose(1, 2), value_out.reshape(B, num_key_heads, N, D).transpose(1, 2)
+    launch_delta_matching_kernel("delta_matching_query_gradients", launch_query_gradients, query_operands, (softmax_scale,))
     grad_key, grad_value = (tensor.reshape(B, num_key_heads, H // num_key_heads, N, D).sum(dim=2).to(torch.bfloat16).transpose(1, 2) for tensor in (grad_key, grad_value))
-    return grad_query, grad_key, grad_value
+    return query_out, grad_key, grad_value
