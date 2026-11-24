@@ -310,6 +310,14 @@ class WeightGradient:
             self.num_m, self.num_n = divide_up(M, self.block_m), divide_up(N, self.block_n)
             reserved, stage_bytes = shared_footprint(self.block_m, self.block_n, self.num_k, rowwise)
             self.stages = min(16, (SMEM_CAPACITY - reserved) // stage_bytes)
+        self.n32_stage4_balanced = (
+            not rowwise and compact_rows and (M, N, K, num_sms, block_n_multiple) == (32, 96, 6234112, 2, 1)
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (32, 32, 4, 1, 1)
+        )
+        if self.n32_stage4_balanced:
+            self.block_n, self.stages = 48, 8
+            self.num_n = divide_up(N, self.block_n)
+        self.stream_wide_b_scales = n128_stage4_wide or self.n32_stage4_balanced
         self.n128_stage4_wide = n128_stage4_wide
         if self.n128_stage4_wide:
             assert (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (M, 128, 4, 1, 1)
@@ -640,6 +648,7 @@ class WeightGradient:
         self.store_threads = min(self.math_threads, self.block_m * 2)
         self.uniform_scale = (
             BLOCK_K % self.block_n == 0 or self.n160_single_scale_panel or self.n48_a_stage8_one_n
+            or self.n32_stage4_balanced
         )
         self.scale_columns = 1 if self.uniform_scale else 2
         starts_at_zero = self.num_m * self.num_n <= self.num_sms or self.num_k % (2 * self.stages) == 0
@@ -1050,7 +1059,7 @@ class WeightGradient:
                                             or self.static_ring and (self.block_m, self.block_n) == (128, 48))
         self.scale_gap = gcd(BLOCK_K, self.block_n)
         self.specialize_scale = not self.uniform_scale and BLOCK_K // self.scale_gap <= 4
-        buffered_scales = 0 if self.stream_b_scale_row or self.n128_stage4_wide else self.num_k
+        buffered_scales = 0 if self.stream_b_scale_row or self.stream_wide_b_scales else self.num_k
         reserved, per_stage = shared_footprint(self.block_m, self.block_n, buffered_scales, rowwise)
         self.shared_bytes = reserved + self.stages * per_stage
         self.n80_full_sms_unicast = (
@@ -1410,7 +1419,7 @@ class WeightGradient:
         s_grad = smem.allocate_tensor(Float8E4M3FN, grad_layout.outer, byte_alignment=1024, swizzle=grad_layout.inner)
         s_activation = smem.allocate_tensor(Float8E4M3FN, activation_layout.outer, byte_alignment=1024, swizzle=activation_layout.inner)
         s_grad_scale = smem.allocate_tensor(Float32, grad_scale_layout, byte_alignment=16)
-        if cutlass.const_expr(self.n128_stage4_wide):
+        if cutlass.const_expr(self.stream_wide_b_scales):
             s_activation_scale = mActivationScale
         elif cutlass.const_expr(self.stream_b_scale_row):
             layout = cute.make_layout((self.num_k, 1), stride=(mActivationScale.stride[1], 1))
@@ -2026,7 +2035,7 @@ class WeightGradient:
             former_groups = cutlass.min(self.block_n, BLOCK_K - tile_n * self.block_n % BLOCK_K) // 8
             output_groups = cutlass.min(self.N - tile_n * self.block_n, self.block_n) // 8
             tile_activation_scale = s_activation_scale
-            if cutlass.const_expr(self.n128_stage4_wide):
+            if cutlass.const_expr(self.stream_wide_b_scales):
                 first_scale = tile_n * self.block_n // BLOCK_K
                 layout = cute.make_layout((self.num_k, self.scale_columns),
                                           stride=(mActivationScale.stride[1], mActivationScale.stride[0]))
