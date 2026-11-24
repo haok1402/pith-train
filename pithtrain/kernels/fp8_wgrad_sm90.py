@@ -550,6 +550,10 @@ class WeightGradient:
         self.long_n80_stage4 = not rowwise and self.num_k >= 4096 and (self.block_m, self.block_n, self.stages, self.cluster_size) == (128, 80, 4, 1)
         self.canonical_n16_scale = (not rowwise and N <= BLOCK_K
                                     and (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 16, 15, 1))
+        self.m32_n64_stage8_full = (
+            not rowwise and compact_rows and (M, N, K, num_sms) == (32, 64, 3989504, 2)
+            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (32, 64, 8, 1)
+        )
         self.m32_n32_stage8_full = (
             not rowwise and compact_rows and (M, N, K, num_sms) == (32, 32, 5169152, 2)
             and (self.block_m, self.block_n, self.stages, self.cluster_size) == (32, 32, 8, 1)
@@ -670,7 +674,7 @@ class WeightGradient:
             self.m16_n128_stage8_single or
             (self.n16_u_stage11 and compact_k_scale) or
             self.m16_n160_stage8 or
-            self.m16_n32_stage8_full or self.m32_n32_stage8_full or
+            self.m16_n32_stage8_full or self.m32_n32_stage8_full or self.m32_n64_stage8_full or
             self.block_m < 64 and (self.block_n == 16 or (self.block_n == 96 and self.stages == 8))
         )
         self.n192_one_wave = (
@@ -729,6 +733,11 @@ class WeightGradient:
             not rowwise and self.num_m == 1 and self.num_k == 2
             and self.num_n % 2 == 0 and self.num_n > 2 * num_sms
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 128, 5, 1, 2)
+        )
+        self.n16_stage4_two_phase = (
+            not rowwise and compact_rows and self.num_m == self.num_n == 1
+            and self.num_k >= 2 * self.stages
+            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (16, 16, 4, 1)
         )
         self.short_a_n32 = (not rowwise and self.num_k == 1
                             and self.num_m * self.num_n <= (2 * self.stages - 1) * self.num_sms
@@ -1012,7 +1021,7 @@ class WeightGradient:
              or self.n112_misaligned_unicast or self.n112_a_full_ring),
             (ScalePromotion.SELECT_FIRST, self.select_scale_before_product),
         )
-        self.double_producer_phase = (self.n96_stage5_mn_tail or self.n160_stage4_grad_offset or self.n112_stage4_two_waves or self.n144_unicast_one_wave
+        self.double_producer_phase = (self.n16_stage4_two_phase or self.n96_stage5_mn_tail or self.n160_stage4_grad_offset or self.n112_stage4_two_waves or self.n144_unicast_one_wave
                                       or self.long_n80_stage4 or self.wide_n192_four_math)
         self.double_math_phase = (self.n112_stage4_two_waves or self.n144_unicast_one_wave
                                   or self.u128_stage4_one_wave or self.long_n80_stage4
@@ -1523,6 +1532,11 @@ class WeightGradient:
         grad, activation, grad_scale, _, _ = descriptors
         s_grad, s_activation, s_grad_scale, _ = inputs
         full, empty = barriers
+        if cutlass.const_expr(self.n16_stage4_two_phase):
+            next_block = k_tile + 2 * self.stages
+            if next_block < self.num_k:
+                prefetch_activation_tile(grad, next_block * BLOCK_K, m_offset)
+                prefetch_activation_tile(activation, next_block * BLOCK_K, n_offset)
         if cutlass.const_expr(self.n160_stage4_full_panel or self.n128_u_stage4_two_sm):
             next_lookahead = k_tile + 2 * self.stages
             if next_lookahead < self.num_k:
@@ -1555,7 +1569,7 @@ class WeightGradient:
 
     @cute.jit
     def wait_stage(self, buffer, phase):
-        if cutlass.const_expr(self.m32_n32_stage8_full or self.n16_single_n_local_barriers or self.n16_u_stage10_pair
+        if cutlass.const_expr(self.m32_n64_stage8_full or self.m32_n32_stage8_full or self.n16_single_n_local_barriers or self.n16_u_stage10_pair
                               or self.n160_stage4_grad_offset or self.n128_u_stage4_two_sm
                               or self.n96_stage5_mn_tail or self.m64_n48_a_stage9_wide):
             wait_n16_stage7(buffer, phase)
@@ -2081,7 +2095,7 @@ class WeightGradient:
             self.wait_stage(full + stage, phase)
         grad_lo, grad_hi = Float32(0), Float32(0)
         if cutlass.const_expr((self.inline_small_mma and self.block_n == 96 and self.num_n == 1)
-                              or self.m16_n128_stage8_single or self.rolling_n128_producer or self.m16_n32_stage8_full or self.m32_n32_stage8_full):
+                              or self.m16_n128_stage8_single or self.rolling_n128_producer or self.m16_n32_stage8_full or self.m32_n32_stage8_full or self.m32_n64_stage8_full):
             grad_lo, grad_hi = unused_scale(), unused_scale()
         if do_store:
             grad_lo, grad_hi = s_grad_scale[row_lo, 0, stage], s_grad_scale[row_hi, 0, stage]
