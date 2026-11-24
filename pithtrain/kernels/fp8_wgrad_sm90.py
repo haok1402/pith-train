@@ -291,13 +291,13 @@ class WeightGradient:
                  n80_streamed_scale_storage=False, aligned_a128_tail=False,
                  n16_stage10_bulk_storage=False, n16_stage10_pair_storage=False,
                  n160_grad_offset_only=False, aligned_grid_n16_operands=False, aligned_m128_n32_a=False,
-                 n48_a_stage9_storage=False):
+                 n48_a_stage9_storage=False, aligned_n192_stage4=False):
         self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n = select_layout(M, N, K, num_sms, rowwise, block_n_multiple)
         self.num_m, self.num_n, self.num_k = divide_up(M, self.block_m), divide_up(N, self.block_n), divide_up(K, BLOCK_K)
         self.m64_n48_a_stage9_wide = False
         if (not rowwise and compact_rows and n48_a_stage9_storage and N % 8 == 0
                 and (self.block_m, self.block_n, self.cluster_m, self.cluster_n) == (64, 48, 1, 2)
-                and self.stages == 9):
+                and self.stages in (8, 9)):
             # One wider wave replaces two native waves while keeping the A multicast pairs.
             wide_n = 3 * self.block_n
             wide_tiles_n = divide_up(N, wide_n)
@@ -617,7 +617,6 @@ class WeightGradient:
                      and (self.block_m, self.block_n, self.stages, self.cluster_size) == (32, 160, 4, 1)))
         )
         self.n160_stage4_grad_offset = self.n160_stage4_single_tile and n160_grad_offset_only
-        self.n160_stage4_ordinal_math = self.n160_stage4_full_panel or self.n160_stage4_grad_offset
         self.m16_n160_stage8 = (
             not rowwise and (M, N, K, num_sms) == (16, 160, 651264, 2)
             and (self.block_m, self.block_n, self.stages, self.cluster_size) == (16, 160, 8, 1)
@@ -902,6 +901,13 @@ class WeightGradient:
             not rowwise and compact_rows and (M, N, K, num_sms) == (64, 1152, 3203072, 2)
             and (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 128, 4, 1)
         )
+        self.n192_u_stage4_aligned = (
+            aligned_n192_stage4 and num_sms == 2 and self.num_m == self.num_n == 1
+            and N == self.block_n
+            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 192, 4, 1)
+        )
+        self.stage4_ordinal_math = (self.n160_stage4_full_panel or self.n160_stage4_grad_offset
+                                    or self.n192_u_stage4_aligned)
         self.select_routes()
         for width in self.wgmma_widths():
             check_wgmma_width(width)
@@ -954,7 +960,7 @@ class WeightGradient:
                 self.a_tail_first_tiles = repeat_tiles
         self.tile_order = select_route(
             TileOrder.PERSISTENT,
-            (TileOrder.SINGLE_TILE, self.n16_u_stage10_pair or self.stream_b_scale_row or self.n16_u_stage7 or self.m64_n32_long_stage8),
+            (TileOrder.SINGLE_TILE, self.n192_u_stage4_aligned or self.n16_u_stage10_pair or self.stream_b_scale_row or self.n16_u_stage7 or self.m64_n32_long_stage8),
             (TileOrder.M_LINEAR, self.m64_n48_narrow_a),
             (TileOrder.SINGLE_TILE, self.m16_n128_stage8_single),
             (TileOrder.N_LINEAR, self.n112_stage4_two_waves or self.n64_reuse_grad or self.n128_u_stage4_two_sm),
@@ -1003,7 +1009,7 @@ class WeightGradient:
                                   or self.full_a128_stage4 or self.a128_stage4_full_groups)
         self.swizzle_tma_output = self.swizzle_fp32_output or self.sustained_swizzled_output
         self.input_l2_128b = self.m64_n48_a_stage9_wide or self.b144_three_wave or self.m64_n80_input_128b or self.m64_n112_a_stage7_two_waves or self.m64_n48_a_stage10_multi_n
-        self.fixed_scale_split = self.two_sm_single_tile or self.stream_n48_b_scales
+        self.fixed_scale_split = self.two_sm_single_tile or self.stream_n48_b_scales or self.n192_u_stage4_aligned
 
     @cute.jit
     def __call__(self, mGrad: cute.Tensor, mGradScale: cute.Tensor, mActivation: cute.Tensor, mActivationScale: cute.Tensor, mOut: cute.Tensor, stream):
@@ -1849,7 +1855,7 @@ class WeightGradient:
         for k_tile in cutlass.range(self.num_k, unroll=8):
             if cutlass.const_expr(self.use_linear_stage_index):
                 stage, phase = self.linear_ring_position(tile_idx, k_tile)
-            if cutlass.const_expr(self.n160_stage4_ordinal_math):
+            if cutlass.const_expr(self.stage4_ordinal_math):
                 # A single output tile enters the ring at stage and phase zero.
                 stage, phase = k_tile % self.stages, (k_tile // self.stages) & 1
             elif cutlass.const_expr(not self.n128_u_stage4_two_sm):
@@ -1863,7 +1869,7 @@ class WeightGradient:
                     activation_hi = s_activation_scale[k_tile, 1]
             self.wait_stage(full + stage, phase)
             grad_lo, grad_hi = Float32(0), Float32(0)
-            if cutlass.const_expr(not self.n160_stage4_ordinal_math):
+            if cutlass.const_expr(not self.stage4_ordinal_math):
                 if do_store:
                     grad_lo, grad_hi = s_grad_scale[row_lo, 0, stage], s_grad_scale[row_hi, 0, stage]
 
@@ -1888,7 +1894,7 @@ class WeightGradient:
                     mma.set(warpgroup.Field.ACCUMULATE, mma_k != 0)
                     cute.gemm(mma, mma_acc, grad_desc[None, None, mma_k, stage], activation_desc[None, None, mma_k, b_stage], mma_acc)
                 warpgroup.commit_group()
-                if cutlass.const_expr(self.n160_stage4_ordinal_math):
+                if cutlass.const_expr(self.stage4_ordinal_math):
                     # Read the current A scales while the WGMMA group is in flight.
                     grad_lo, grad_hi = s_grad_scale[row_lo, 0, stage], s_grad_scale[row_hi, 0, stage]
                 warpgroup.wait_group(0)
@@ -1902,7 +1908,7 @@ class WeightGradient:
             if cutlass.const_expr(self.n80_b_multicast):
                 b_scale_lo = values[self.block_n // 2]
                 b_scale_hi = values[self.block_n // 2 + 1]
-            if cutlass.const_expr(not (self.use_linear_stage_index or self.n160_stage4_ordinal_math)):
+            if cutlass.const_expr(not (self.use_linear_stage_index or self.stage4_ordinal_math)):
                 stage, phase = self.advance_stage(stage, phase)
         if cutlass.const_expr(self.use_linear_stage_index):
             stage, phase = self.linear_ring_position(tile_idx, self.num_k)
@@ -2326,11 +2332,17 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
         and all(tensor.data_ptr() % 32 == 0 and tensor.stride(0) * tensor.element_size() % 32 == 16
                 for tensor in (grad, activation))
     )
+    aligned_n192_stage4 = (
+        not rowwise and num_sms == 2 and block_n_multiple == 192 and M <= 64 and N == 192
+        and all(tensor.data_ptr() % BLOCK_K == 0
+                and tensor.stride(0) * tensor.element_size() % BLOCK_K == 0
+                for tensor in (grad, activation))
+    )
     key = ("fp8_wgrad", M, N, K, num_sms, rowwise, block_n_multiple,
            tuple(tensor.stride() for tensor in tensors), aligned_two_sm_operands, long_a_storage_ok,
            aligned_stage11_tail, aligned_n160_operands, n80_streamed_scale_storage, aligned_a128_tail,
            n16_stage10_bulk_storage, n16_stage10_pair_storage, n160_grad_offset_only, aligned_grid_n16_operands,
-           aligned_m128_n32_a, n48_a_stage9_storage)
+           aligned_m128_n32_a, n48_a_stage9_storage, aligned_n192_stage4)
     compiled = CACHE.get(key)
     if compiled is None:
         dtypes = (Float8E4M3FN, Float32, Float8E4M3FN, Float32, Float32)
@@ -2359,7 +2371,8 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                                    n160_grad_offset_only=n160_grad_offset_only,
                                    aligned_grid_n16_operands=aligned_grid_n16_operands,
                                    aligned_m128_n32_a=aligned_m128_n32_a,
-                                   n48_a_stage9_storage=n48_a_stage9_storage)
+                                   n48_a_stage9_storage=n48_a_stage9_storage,
+                                   aligned_n192_stage4=aligned_n192_stage4)
         compiled = cute.compile(operation, *operands, fake_stream(), options="--enable-tvm-ffi")
         CACHE[key] = compiled
     compiled(*tensors)
