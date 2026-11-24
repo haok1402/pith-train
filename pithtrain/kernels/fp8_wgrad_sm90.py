@@ -297,6 +297,10 @@ class WeightGradient:
             not rowwise and N == 8 and self.num_k == 1
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 144, 7, 2, 1)
         )
+        self.n160_stage4_single_tile = (
+            not rowwise and block_n_multiple == 160 and self.num_m == self.num_n == 1 and self.num_k > self.stages
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 160, 4, 1, 1)
+        )
         self.m64_n48_n8_a = (
             not rowwise and num_sms == 98 and N == 8 and self.num_m == 197
             and (self.block_m, self.block_n, self.cluster_m, self.cluster_n) == (64, 48, 1, 2)
@@ -324,7 +328,16 @@ class WeightGradient:
             and (self.stages == 15 or stage9_probe)
             and self.num_m > num_sms and self.num_k > self.stages
         )
-        self.math_block_n = N if self.n32_single_tile or self.n32_two_sm_narrow or self.skinny_short_n144 or self.m64_n48_narrow_a else self.block_n
+        self.n160_single_scale_panel = self.n160_stage4_single_tile and N <= BLOCK_K and N % 8 == 0
+        self.narrow_n16_unicast = (
+            not rowwise and N == 8 and self.num_m == num_sms
+            and (self.block_m, self.block_n, self.cluster_m, self.cluster_n) == (128, 16, 1, 1)
+            and self.stages in (4, 5, 6, 7, 10)
+        )
+        narrow_unicast = self.narrow_n16_unicast or self.n160_single_scale_panel
+        use_narrow_math = (self.n32_single_tile or self.n32_two_sm_narrow or self.skinny_short_n144
+                           or self.m64_n48_narrow_a or narrow_unicast)
+        self.math_block_n = N if use_narrow_math else self.block_n
         self.long_a_n64 = (
             long_a_storage_ok and N % 8 == 0 and self.num_n % 2 == 1 and self.num_m <= num_sms
             and num_sms < self.num_m * self.num_n <= 2 * num_sms
@@ -417,7 +430,7 @@ class WeightGradient:
         if self.n96_sustained and self.num_k == 128:
             self.math_registers = 216
         self.store_threads = min(self.math_threads, self.block_m * 2)
-        self.uniform_scale = BLOCK_K % self.block_n == 0
+        self.uniform_scale = BLOCK_K % self.block_n == 0 or self.n160_single_scale_panel
         self.scale_columns = 1 if self.uniform_scale else 2
         starts_at_zero = self.num_m * self.num_n <= self.num_sms or self.num_k % (2 * self.stages) == 0
         self.single_n80_tile = (self.block_m, self.block_n, self.cluster_size) == (64, 80, 1) and self.num_m == self.num_n == 1 and not rowwise
@@ -695,7 +708,10 @@ class WeightGradient:
         )
         self.prefetch_n16 = (not rowwise and
                              (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 16, 16, 1))
-        self.narrow_activation = self.skinny_short_n144 or self.n32_two_sm_narrow or self.m64_n48_narrow_a
+        self.narrow_activation = (self.skinny_short_n144 or self.n32_two_sm_narrow
+                                  or self.m64_n48_narrow_a or narrow_unicast)
+        self.clear_output_padding = (self.n32_single_tile or self.n32_two_sm_narrow
+                                     or self.m64_n48_narrow_a or narrow_unicast)
         self.activation_block_n = self.math_block_n if self.narrow_activation else self.block_n
         self.transaction_bytes = (self.block_m + self.activation_block_n) * BLOCK_K + 4 * self.block_m + (4 * self.block_n if rowwise else 0)
         self.b144_three_wave = (
@@ -1820,7 +1836,7 @@ class WeightGradient:
             values = cute.make_tensor(accumulator.iterator + group * 4, cute.make_layout((2, 2)))
             values.store(values.load() + Float32(0))
             cute.autovec_copy(values, tile)
-        if cutlass.const_expr(self.n32_single_tile or self.n32_two_sm_narrow or self.m64_n48_narrow_a):
+        if cutlass.const_expr(self.clear_output_padding):
             for group in cutlass.range_constexpr(self.math_block_n // 8, self.block_n // 8):
                 col = col_pair + group * 8
                 tile = cute.make_tensor(s_out.iterator + row_lo * self.block_n + col,
