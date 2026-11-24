@@ -25,6 +25,7 @@ class Qwen35MLP(nn.Module):
         super().__init__()
         if config.hidden_act != "silu":
             raise ValueError(f"Unsupported Qwen3.5 MLP activation: {config.hidden_act}")
+        self.replay_fp8_gate_up = False
         self.gate_proj = training.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.up_proj = training.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = training.Linear(config.intermediate_size, config.hidden_size, bias=False)
@@ -40,7 +41,9 @@ class Qwen35MLP(nn.Module):
                 for layer in (self.gate_proj, self.up_proj, self.down_proj)
             )
         ):
-            return fp8_swiglu_main_grad(x, self.gate_proj, self.up_proj, self.down_proj)
+            return fp8_swiglu_main_grad(
+                x, self.gate_proj, self.up_proj, self.down_proj, replay=self.replay_fp8_gate_up
+            )
         quantized_x = training.Linear.quantize_input(x)
         gate = self.gate_proj(x, quantized_x)
         up = self.up_proj(x, quantized_x)

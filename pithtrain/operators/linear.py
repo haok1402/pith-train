@@ -512,42 +512,87 @@ class FP8SwiGLUMainGrad(torch.autograd.Function):
     """Quantize both rounded SwiGLU adjoints before the gate and up projection backpropagation."""
 
     @staticmethod
-    def forward(ctx, x, gate_weight, up_weight, down_weight, qweights, main_grads):
+    def forward(ctx, x, gate_weight, up_weight, down_weight, qweights, main_grads, replay):
         gate_quantized, up_quantized, down_quantized = qweights
         quantized_x = fp8_quantize_activation(x)
         gate = fp8_linear_fwd_prequantized(x, gate_weight, *gate_quantized, *quantized_x)
         up = fp8_linear_fwd_prequantized(x, up_weight, *up_quantized, *quantized_x)
         quantized_hidden = fp8_quant_swiglu(gate, up)
         output = fp8_linear_fwd_prequantized(gate, down_weight, *down_quantized, *quantized_hidden)
-        ctx.save_for_backward(
-            gate,
-            up,
-            *quantized_x[2:],
-            *gate_quantized[2:],
-            *up_quantized[2:],
-            *down_quantized[2:],
-            *quantized_hidden[2:],
-        )
+        ctx.replay = replay
+        if replay:
+            ctx.save_for_backward(*quantized_x, *gate_quantized, *up_quantized, *down_quantized[2:])
+        else:
+            ctx.save_for_backward(
+                gate,
+                up,
+                *quantized_x[2:],
+                *gate_quantized[2:],
+                *up_quantized[2:],
+                *down_quantized[2:],
+                *quantized_hidden[2:],
+            )
         ctx.main_grads = main_grads
         ctx.input_features = x.shape[1]
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        (
-            gate,
-            up,
-            input_t,
-            input_scale_t,
-            weight_gate_t,
-            scale_gate_t,
-            weight_up_t,
-            scale_up_t,
-            weight_down_t,
-            scale_down_t,
-            hidden_t,
-            hidden_scale_t,
-        ) = ctx.saved_tensors
+        if ctx.replay:
+            (
+                input_fp8,
+                input_scale,
+                input_t,
+                input_scale_t,
+                gate_fp8,
+                gate_scale,
+                weight_gate_t,
+                scale_gate_t,
+                up_fp8,
+                up_scale,
+                weight_up_t,
+                scale_up_t,
+                weight_down_t,
+                scale_down_t,
+            ) = ctx.saved_tensors
+            # The down projection's output is unused by backward. Replay only its inputs.
+            M = input_fp8.shape[0]
+            gate = fp8_gemm_nt(
+                input_fp8,
+                input_scale,
+                gate_fp8,
+                gate_scale,
+                M,
+                gate_fp8.shape[0],
+                input_fp8.device,
+                grad_output.dtype,
+            )
+            up = fp8_gemm_nt(
+                input_fp8,
+                input_scale,
+                up_fp8,
+                up_scale,
+                M,
+                up_fp8.shape[0],
+                input_fp8.device,
+                grad_output.dtype,
+            )
+            _, _, hidden_t, hidden_scale_t = fp8_quant_swiglu(gate, up)
+        else:
+            (
+                gate,
+                up,
+                input_t,
+                input_scale_t,
+                weight_gate_t,
+                scale_gate_t,
+                weight_up_t,
+                scale_up_t,
+                weight_down_t,
+                scale_down_t,
+                hidden_t,
+                hidden_scale_t,
+            ) = ctx.saved_tensors
         gate_main_grad, up_main_grad, down_main_grad = ctx.main_grads
         M, N = gate.shape
         grad_hidden = fp8_linear_bwd_into(
@@ -573,10 +618,10 @@ class FP8SwiGLUMainGrad(torch.autograd.Function):
 
         grad_x_up = project(grad_up, up, weight_up_t, scale_up_t, up_main_grad)
         grad_x_gate = project(grad_gate, gate, weight_gate_t, scale_gate_t, gate_main_grad)
-        return grad_x_up + grad_x_gate, None, None, None, None, None
+        return grad_x_up + grad_x_gate, None, None, None, None, None, None
 
 
-def fp8_swiglu_main_grad(x, gate_proj, up_proj, down_proj):
+def fp8_swiglu_main_grad(x, gate_proj, up_proj, down_proj, *, replay=False):
     """Run an eager, bias-free FP8 SwiGLU MLP with an FP32 main_grad for each projection."""
     projections = gate_proj, up_proj, down_proj
     quantized_weights = tuple(layer.get_quantized_weight() for layer in projections)
@@ -588,6 +633,7 @@ def fp8_swiglu_main_grad(x, gate_proj, up_proj, down_proj):
         down_proj.weight,
         quantized_weights,
         main_grads,
+        replay,
     )
     return output.view(*x.shape[:-1], down_proj.out_features)
 
