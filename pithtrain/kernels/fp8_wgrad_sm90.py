@@ -817,9 +817,14 @@ class WeightGradient:
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 128, 5, 1, 2)
         )
         self.n16_stage4_two_phase = (
-            not rowwise and compact_rows and self.num_m == self.num_n == 1
+            not rowwise and compact_rows and self.num_m == 1
             and self.num_k >= 2 * self.stages
-            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (16, 16, 4, 1)
+            and (self.block_m, self.stages, self.cluster_size) == (16, 4, 1)
+            and (
+                (self.num_n == 1 and self.block_n == 16)
+                or (num_sms == 2 and N == 96 and self.block_n == 32
+                    and self.num_k % (2 * self.stages) == 0)
+            )
         )
         # Widen short N groups when FP32 stores stream past the 60 MiB H200 L2.
         self.wide_n48_a_one_k = (
