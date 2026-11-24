@@ -292,7 +292,8 @@ class WeightGradient:
                  n16_stage10_bulk_storage=False, n16_stage10_pair_storage=False,
                  n160_grad_offset_only=False, aligned_grid_n16_operands=False, aligned_m128_n32_a=False,
                  n48_a_stage9_storage=False, aligned_n192_stage4=False, n16_stage8_local_storage=False,
-                 aligned_n16_stage14_operands=False, full_device_sm_budget=False, n112_stage5_l2_storage=False):
+                 aligned_n16_stage14_operands=False, full_device_sm_budget=False, n112_stage5_l2_storage=False,
+                 aligned_n32_stage14_operands=False, aligned_n48_stage8_operands=False):
         self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n = select_layout(M, N, K, num_sms, rowwise, block_n_multiple)
         self.num_m, self.num_n, self.num_k = divide_up(M, self.block_m), divide_up(N, self.block_n), divide_up(K, BLOCK_K)
         self.m64_n48_a_stage9_wide = False
@@ -313,6 +314,13 @@ class WeightGradient:
             if self.m64_n48_a_stage9_wide:
                 self.block_n, self.num_n, self.stages = wide_n, wide_tiles_n, wide_stages
         self.N, self.num_sms, self.rowwise = N, num_sms, rowwise
+        # Aligned FP8 tiles sustain the two-GMMA-group pipeline on this single-CTA route.
+        self.n32_u_stage14_one_tile = (
+            not rowwise and compact_rows and aligned_n32_stage14_operands
+            and num_sms == 2 and self.num_m == self.num_n == 1
+            and N == self.block_n
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 32, 14, 1, 1)
+        )
         # The output map still stores a 32-column tile. Only real columns need tensor-core work.
         self.n32_single_tile = (not rowwise and self.num_m == self.num_n == 1 and N < self.block_n and N % 8 == 0
                                and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 32, 4, 1, 1))
@@ -1001,6 +1009,26 @@ class WeightGradient:
         self.n16_u_bulk_scale = self.n16_u_stage14_shifted or self.n16_u_stage5_shifted or (
             self.n16_u_stage10 and n16_stage10_bulk_storage
         )
+        self.n48_u_stage8_single_tile = (
+            aligned_n48_stage8_operands and self.num_m == self.num_n == 1
+            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 48, 8, 1)
+            and self.num_k % 2 == 0
+        )
+        self.use_cta_local_stage_wait = (
+            self.n32_u_stage14_one_tile
+            or self.n48_u_stage8_single_tile
+            or self.n16_u_stage5_aligned
+            or self.n16_u_stage14_aligned
+            or self.m32_n64_stage8_full
+            or self.m32_n32_stage8_full
+            or self.small_stage8_full_tile
+            or self.n16_single_n_local_barriers
+            or self.n16_u_stage10_pair
+            or self.n160_stage4_grad_offset
+            or self.n128_u_stage4_two_sm
+            or self.n96_stage5_mn_tail
+            or self.m64_n48_a_stage9_wide
+        )
         self.select_routes()
         for width in self.wgmma_widths():
             check_wgmma_width(width)
@@ -1024,7 +1052,8 @@ class WeightGradient:
             ProducerRoute.DYNAMIC_RING,
             (ProducerRoute.RESIDENT_A_PANELS, self.resident_a_panels),
             (ProducerRoute.RESIDENT_GRADIENT, self.n32_reuse_grad or self.n64_reuse_grad),
-            (ProducerRoute.STATIC_RING, self.n16_u_stage5_shifted or self.n16_u_stage5_aligned
+            (ProducerRoute.STATIC_RING, self.n32_u_stage14_one_tile
+             or self.n48_u_stage8_single_tile or self.n16_u_stage5_shifted or self.n16_u_stage5_aligned
              or self.n16_u_stage14_shifted or self.n16_u_stage14_aligned or self.n16_u_stage10_pair or self.n160_stage4_full_panel
              or self.n160_stage4_grad_offset or self.n128_u_stage4_two_sm
              or self.n80_stage7_block or self.stream_b_scale_row
@@ -1034,7 +1063,8 @@ class WeightGradient:
         self.math_route = select_route(
             MathRoute.DYNAMIC_RING,
             (MathRoute.RESIDENT_A_PANELS, self.resident_a_panels),
-            (MathRoute.ASYNC_PAIRS, self.n16_u_stage5_aligned or self.n16_u_stage14_aligned
+            (MathRoute.ASYNC_PAIRS, self.n32_u_stage14_one_tile
+             or self.n48_u_stage8_single_tile or self.n16_u_stage5_aligned or self.n16_u_stage14_aligned
              or self.two_sm_single_tile or self.n16_u_stage10_pair),
             (MathRoute.LONG_A_PAIRS, self.long_a_n64_full_second_wave or self.n32_a_paired_single_n
              or self.stage14_full_panel_pairs),
@@ -1055,7 +1085,8 @@ class WeightGradient:
                 self.a_tail_first_tiles = repeat_tiles
         self.tile_order = select_route(
             TileOrder.PERSISTENT,
-            (TileOrder.SINGLE_TILE, self.n192_u_stage4_aligned or self.n16_u_stage5_aligned
+            (TileOrder.SINGLE_TILE, self.n32_u_stage14_one_tile
+             or self.n48_u_stage8_single_tile or self.n192_u_stage4_aligned or self.n16_u_stage5_aligned
              or self.n16_u_stage14_aligned or self.n16_u_stage10_pair or self.stream_b_scale_row or self.n16_u_stage7 or self.m64_n32_long_stage8),
             (TileOrder.M_LINEAR, self.m64_n48_narrow_a),
             (TileOrder.SINGLE_TILE, self.m16_n128_stage8_single),
@@ -1660,11 +1691,7 @@ class WeightGradient:
 
     @cute.jit
     def wait_stage(self, buffer, phase):
-        if cutlass.const_expr(self.n16_u_stage5_aligned or self.n16_u_stage14_aligned
-                              or self.m32_n64_stage8_full or self.m32_n32_stage8_full
-                              or self.small_stage8_full_tile or self.n16_single_n_local_barriers or self.n16_u_stage10_pair
-                              or self.n160_stage4_grad_offset or self.n128_u_stage4_two_sm
-                              or self.n96_stage5_mn_tail or self.m64_n48_a_stage9_wide):
+        if cutlass.const_expr(self.use_cta_local_stage_wait):
             wait_n16_stage7(buffer, phase)
             return
         if cutlass.const_expr(self.n32_single_tile or self.n80_full_sms_unicast):
@@ -2490,12 +2517,27 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
         and all(tensor.data_ptr() % 32 == 0 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
+    # The native 64x32 tile fits fourteen stages for 8,961 to 12,096 K blocks.
+    # Gate async pairs on the actual 128-byte TMA tile bases and row pitches.
+    aligned_n32_stage14_operands = (
+        not rowwise and num_sms == 2 and M <= 64 and N == 32 and 8960 < num_k <= 12096
+        and all(tensor.data_ptr() % BLOCK_K == 0
+                and tensor.stride(0) * tensor.element_size() % BLOCK_K == 0
+                for tensor in (grad, activation))
+    )
+    aligned_n48_stage8_operands = (
+        not rowwise and num_sms == 2 and M == 64 and N == block_n_multiple == 48
+        and all(tensor.data_ptr() % BLOCK_K == 0
+                and tensor.stride(0) * tensor.element_size() % BLOCK_K == 0
+                for tensor in (grad, activation))
+    )
     key = ("fp8_wgrad", M, N, K, num_sms, rowwise, block_n_multiple,
            tuple(tensor.stride() for tensor in tensors), aligned_two_sm_operands, long_a_storage_ok,
            aligned_stage11_tail, aligned_n160_operands, n80_streamed_scale_storage, aligned_a128_tail,
            n16_stage10_bulk_storage, n16_stage10_pair_storage, n160_grad_offset_only, aligned_grid_n16_operands,
            aligned_m128_n32_a, n48_a_stage9_storage, aligned_n192_stage4, n16_stage8_local_storage,
-           aligned_n16_stage14_operands, full_device_sm_budget, n112_stage5_l2_storage)
+           aligned_n16_stage14_operands, full_device_sm_budget, n112_stage5_l2_storage, aligned_n32_stage14_operands,
+           aligned_n48_stage8_operands)
     compiled = CACHE.get(key)
     if compiled is None:
         dtypes = (Float8E4M3FN, Float32, Float8E4M3FN, Float32, Float32)
@@ -2529,7 +2571,9 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                                    n16_stage8_local_storage=n16_stage8_local_storage,
                                    aligned_n16_stage14_operands=aligned_n16_stage14_operands,
                                    full_device_sm_budget=full_device_sm_budget,
-                                   n112_stage5_l2_storage=n112_stage5_l2_storage)
+                                   n112_stage5_l2_storage=n112_stage5_l2_storage,
+                                   aligned_n32_stage14_operands=aligned_n32_stage14_operands,
+                                   aligned_n48_stage8_operands=aligned_n48_stage8_operands)
         compiled = cute.compile(operation, *operands, fake_stream(), options="--enable-tvm-ffi")
         CACHE[key] = compiled
     compiled(*tensors)
