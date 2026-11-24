@@ -59,3 +59,22 @@ retries, per-step cross-entropy and gradient norm, and the maximum paired loss d
 uses Megatron's causal BSHD dense Gated DeltaNet estimator and H200's 989.4 TFLOP/s dense BF16 peak.
 Share both JSON files, the winning arm specs, any failed candidates and the evidence behind any
 attribution of time to GEMMs, Gated DeltaNet or attention. Keep raw logs in the run directories.
+
+## Qwen3.5-0.8B recipe
+
+[The 0.8B launcher](run-qwen35-0p8b.sh) runs the selected microbatch-8, group-8,
+expandable-segments recipe with explicit checkpoints disabled in both formats.
+Use the official `Qwen/Qwen3.5-0.8B` snapshot at
+`2fc06364715b967f1860aea9cf38778875588b17`. The launcher takes `bf16`, `fp8`,
+`matched`, or `tuned` and runs 12 steps per arm. Use an unused output directory for each run.
+Set `family_checkout` to the `e2efp8-qwen35-0p8b` checkout.
+
+```bash
+runner="$family_checkout/benchmarks/end2end/qwen35-family/run-qwen35-0p8b.sh"
+bash bench/gpu-run.sh --timing --gpus 8 --time 12 -- \
+    bash "$runner" matched "$model_dir" "$corpus_bin" "$matched_dir"
+bash bench/gpu-run.sh --timing --gpus 8 --time 12 -- \
+    bash "$runner" tuned "$model_dir" "$corpus_bin" "$tuned_dir"
+```
+
+[Measured results](../../../notes/qwen35-0p8b.md)
