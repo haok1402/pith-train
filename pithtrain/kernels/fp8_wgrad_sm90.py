@@ -195,7 +195,8 @@ def unused_scale(*, loc=None, ip=None):
 
 class WeightGradient:
     def __init__(self, M, N, K, num_sms, rowwise, block_n_multiple,
-                 compact_k_scale=False, aligned_fp8_rows=False, compact_rows=True, compact_output=True):
+                 compact_k_scale=False, aligned_fp8_rows=False, compact_rows=True, compact_output=True,
+                 misaligned_fp8_rows=False):
         self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n = select_layout(M, N, K, num_sms, rowwise, block_n_multiple)
         self.num_m, self.num_n, self.num_k = divide_up(M, self.block_m), divide_up(N, self.block_n), divide_up(K, BLOCK_K)
         self.N, self.num_sms, self.rowwise = N, num_sms, rowwise
@@ -206,6 +207,11 @@ class WeightGradient:
         self.n112_unicast_ring = (
             not rowwise and self.num_k >= 3 * self.stages
             and (aligned_fp8_rows or (self.num_m == 1 and self.num_k >= 256))
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 112, 5, 1, 1)
+        )
+        self.n112_misaligned_unicast = (
+            not rowwise and misaligned_fp8_rows and self.num_m > 1 and self.num_n > 1
+            and self.num_k >= 3 * self.stages
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 112, 5, 1, 1)
         )
         # Retain the inline WGMMA path on the previously qualified tile grids.
@@ -220,7 +226,11 @@ class WeightGradient:
             not rowwise and N == 8 and self.num_k == 1
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 144, 7, 2, 1)
         )
-        self.math_block_n = N if self.n32_single_tile or self.skinny_short_n144 else self.block_n
+        self.n32_two_sm_narrow = (
+            not rowwise and num_sms == 2 and self.num_m == 2 and N == 8 and self.num_k == 1473
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 32, 9, 1, 1)
+        )
+        self.math_block_n = N if self.n32_single_tile or self.n32_two_sm_narrow or self.skinny_short_n144 else self.block_n
         self.long_b_m16_n128 = (
             not rowwise and self.num_m == 1 and self.num_k >= 512 and self.num_n == num_sms + 1 and N % 128 == 8
             and (self.block_m, self.block_n, self.cluster_m, self.cluster_n) == (16, 128, 2, 1)
@@ -339,7 +349,11 @@ class WeightGradient:
             not rowwise and (M, N, K, num_sms) == (16, 160, 651264, 2)
             and (self.block_m, self.block_n, self.stages, self.cluster_size) == (16, 160, 8, 1)
         )
-        self.static_ring = self.m16_n160_stage8 or self.cluster_size == 1 and not rowwise and starts_at_zero and (self.block_m < 64 and self.uniform_scale or self.block_n == 96 or self.single_n80_tile or self.static_n16_stage8_math or self.long_n80_stage4 or self.narrow_n160_four_stages or self.wide_n192_four_math or self.n32_reuse_grad or self.n32_single_tile or (self.block_m, self.block_n) == (128, 48) or self.m64_n112_one_wave)
+        self.n144_unicast_one_wave = (
+            not rowwise and num_sms == 132 and (self.num_m, self.num_n, self.num_k) == (32, 4, 56)
+            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (128, 144, 4, 1)
+        )
+        self.static_ring = self.n144_unicast_one_wave or self.m16_n160_stage8 or self.cluster_size == 1 and not rowwise and starts_at_zero and (self.block_m < 64 and self.uniform_scale or self.block_n == 96 or self.single_n80_tile or self.static_n16_stage8_math or self.long_n80_stage4 or self.narrow_n160_four_stages or self.wide_n192_four_math or self.n32_reuse_grad or self.n32_single_tile or (self.block_m, self.block_n) == (128, 48) or self.m64_n112_one_wave)
         self.dynamic_n96_stage7_producer = (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 96, 7, 1) and self.num_m == self.num_n == 1 and not rowwise
         self.n80_three_tile_mn_scales = self.long_n80_stage4 and self.num_n <= 3 and not compact_k_scale
         self.rolling_n128_producer = (not rowwise and self.num_m == self.num_n == 1
@@ -381,7 +395,12 @@ class WeightGradient:
         self.n64_a_swizzled_output = (
             self.n64_a_single_n and (compact_output or m_waves * self.num_k < self.stages)
         )
+        self.m64_n128_b_short = (
+            not rowwise and (self.num_m, self.num_n, self.num_k, num_sms) == (17, 31, 1, 132)
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 128, 8, 2, 1)
+        )
         self.swizzle_fp32_output = (
+            self.m64_n128_b_short or
             self.n192_one_wave or (self.u128_stage4_one_wave and N % 128 == 0) or self.short_a_n64 or self.n96_stage9_wave or self.n64_a_swizzled_output or self.n128_block_output_strips
         )
         self.full_a128_stage4 = (
@@ -490,7 +509,7 @@ class WeightGradient:
         )
         self.prefetch_n16 = (not rowwise and
                              (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 16, 16, 1))
-        activation_block_n = self.math_block_n if self.skinny_short_n144 else self.block_n
+        activation_block_n = self.math_block_n if self.skinny_short_n144 or self.n32_two_sm_narrow else self.block_n
         self.transaction_bytes = (self.block_m + activation_block_n) * BLOCK_K + 4 * self.block_m + (4 * self.block_n if rowwise else 0)
 
     @cute.jit
@@ -506,10 +525,11 @@ class WeightGradient:
         out_layout = cute.make_layout(out_tile, stride=(self.block_n, 1))
 
         promote = TensorMapL2Promotion.l2_256b
+        input_promotion = TensorMapL2Promotion.l2_128b if self.n112_misaligned_unicast else promote
         swizzle = TensorMapSwizzle.s128b
-        grad = create_tensor_map_tiled(mGrad.iterator.toint(), Float8E4M3FN, [mGrad.shape[1], mGrad.shape[0]], [Int64(mGrad.stride[0]) // 16], [BLOCK_K, self.block_m], swizzle=swizzle, l2_promotion=promote)
-        activation_block_n = self.math_block_n if self.skinny_short_n144 else self.block_n
-        activation = create_tensor_map_tiled(mActivation.iterator.toint(), Float8E4M3FN, [mActivation.shape[1], mActivation.shape[0]], [Int64(mActivation.stride[0]) // 16], [BLOCK_K, activation_block_n], swizzle=swizzle, l2_promotion=promote)
+        grad = create_tensor_map_tiled(mGrad.iterator.toint(), Float8E4M3FN, [mGrad.shape[1], mGrad.shape[0]], [Int64(mGrad.stride[0]) // 16], [BLOCK_K, self.block_m], swizzle=swizzle, l2_promotion=input_promotion)
+        activation_block_n = self.math_block_n if self.skinny_short_n144 or self.n32_two_sm_narrow else self.block_n
+        activation = create_tensor_map_tiled(mActivation.iterator.toint(), Float8E4M3FN, [mActivation.shape[1], mActivation.shape[0]], [Int64(mActivation.stride[0]) // 16], [BLOCK_K, activation_block_n], swizzle=swizzle, l2_promotion=input_promotion)
         grad_scale = create_tensor_map_tiled(mGradScale.iterator.toint(), Float32, [align_up(mGradScale.shape[0], 4), self.num_k], [Int64(mGradScale.stride[1]) // 4], [self.block_m, 1], l2_promotion=promote)
         if cutlass.const_expr(self.swizzle_fp32_output or self.sustained_swizzled_output):
             out = create_tensor_map_tiled(mOut.iterator.toint(), Float32, [mOut.shape[1], mOut.shape[0]],
@@ -615,6 +635,8 @@ class WeightGradient:
 
     @cute.jit
     def tile_coords(self, tile_idx):
+        if cutlass.const_expr(self.n32_two_sm_narrow):
+            return tile_idx, Int32(0), cutlass.Boolean(False)
         if cutlass.const_expr(self.wide_n144_schedule):
             # Keep both M pairs within each 128-tile N group.
             pair = tile_idx // 2
@@ -683,6 +705,8 @@ class WeightGradient:
             return Int32(0), tile_idx, cutlass.Boolean(True)
         if cutlass.const_expr(self.short_a_n16 or self.short_a_n144 or self.short_a_n96 or self.short_a_n128):
             return Int32(0), tile_idx, (tile_idx ^ 1) < self.num_n
+        if cutlass.const_expr(self.m64_n128_b_short):
+            return self.short_cluster_coords(tile_idx, False)
         if cutlass.const_expr(self.short_b_n128):
             if cutlass.const_expr(self.num_m == 1):
                 return Int32(0), tile_idx, cutlass.Boolean(False)
@@ -879,7 +903,7 @@ class WeightGradient:
 
     @cute.jit
     def load_static_ring(self, m_offset, n_offset, descriptors, inputs, barriers):
-        if cutlass.const_expr(self.long_n80_stage4 or self.wide_n192_four_math):
+        if cutlass.const_expr(self.n144_unicast_one_wave or self.long_n80_stage4 or self.wide_n192_four_math):
             period = 2 * self.stages
             for group in cutlass.range(self.num_k // period, unroll=1):
                 for index in cutlass.range_constexpr(period):
@@ -1016,7 +1040,7 @@ class WeightGradient:
         if cutlass.const_expr(self.block_m < 64):
             grad_layout = cute.make_layout((64, BLOCK_K, self.stages), stride=(BLOCK_K, 1, self.block_m * BLOCK_K))
             s_grad = cute.make_tensor(s_grad.iterator, grad_layout)
-        if cutlass.const_expr(self.n32_single_tile or self.skinny_short_n144):
+        if cutlass.const_expr(self.n32_single_tile or self.n32_two_sm_narrow or self.skinny_short_n144):
             activation_layout = cute.make_layout((self.math_block_n, BLOCK_K, self.stages),
                                                   stride=(BLOCK_K, 1, self.block_n * BLOCK_K))
             s_activation = cute.make_tensor(s_activation.iterator, activation_layout)
@@ -1235,7 +1259,10 @@ class WeightGradient:
 
     @cute.jit
     def compute_static_ring(self, tidx, tile_idx, barriers, compute_args, former_groups):
-        if cutlass.const_expr(self.u128_stage4_one_wave or self.long_n80_stage4 or self.full_a128_stage4 or self.a128_stage4_full_groups):
+        if cutlass.const_expr(
+            self.n144_unicast_one_wave or self.u128_stage4_one_wave or self.long_n80_stage4
+            or self.full_a128_stage4 or self.a128_stage4_full_groups
+        ):
             period = 2 * self.stages
             for group in cutlass.range(self.num_k // period, unroll=1):
                 for index in cutlass.range_constexpr(period):
@@ -1313,7 +1340,9 @@ class WeightGradient:
     @cute.jit
     def promote_blocks(self, accumulator, partial, grad_lo, grad_hi, activation_lo, activation_hi, former_groups):
         if cutlass.const_expr(
-            self.n80_unicast_scale_pairs or self.m64_n112_one_wave or self.n112_unicast_ring or self.n112_a_full_ring
+            self.n80_unicast_scale_pairs or self.n144_unicast_one_wave or self.m64_n112_one_wave
+            or self.n112_unicast_ring
+            or self.n112_misaligned_unicast or self.n112_a_full_ring
         ):
             lo_a, hi_a = grad_lo * activation_lo, grad_hi * activation_lo
             lo_b, hi_b = grad_lo * activation_hi, grad_hi * activation_hi
@@ -1356,8 +1385,8 @@ class WeightGradient:
 
     @cute.jit
     def store_tile(self, tidx, accumulator, s_out, out, tile_m, tile_n, math_n: cutlass.Constexpr = 0):
-        if cutlass.const_expr(self.short_a_n64 or self.n64_a_swizzled_output):
-            # The two issuing lanes must finish reading before the CTA reuses either strip.
+        if cutlass.const_expr(self.m64_n128_b_short or self.short_a_n64 or self.n64_a_swizzled_output):
+            # Each issuing lane must finish reading before the CTA reuses the shared tile.
             if tidx < self.block_n // 32:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
             cute.arch.barrier(barrier_id=2, number_of_threads=self.store_threads)
@@ -1386,7 +1415,7 @@ class WeightGradient:
             values = cute.make_tensor(accumulator.iterator + group * 4, cute.make_layout((2, 2)))
             values.store(values.load() + Float32(0))
             cute.autovec_copy(values, tile)
-        if cutlass.const_expr(self.n32_single_tile):
+        if cutlass.const_expr(self.n32_single_tile or self.n32_two_sm_narrow):
             for group in cutlass.range_constexpr(self.math_block_n // 8, self.block_n // 8):
                 col = col_pair + group * 8
                 tile = cute.make_tensor(s_out.iterator + row_lo * self.block_n + col,
@@ -1472,12 +1501,13 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 shape = tuple(cute.sym_int32() if extent == 1 else extent for extent in tensor.shape)
                 operands.append(fake(dtype, shape, tensor.stride()))
         aligned_fp8_rows = grad.stride(0) % 32 == 0 and activation.stride(0) % 32 == 0
+        misaligned_fp8_rows = grad.stride(0) % 32 == activation.stride(0) % 32 == 16
         natural_k_stride = align_up(K, 16)
         compact_output = out.stride(0) == N
         compact_rows = grad.stride(0) == activation.stride(0) == natural_k_stride and compact_output
         operation = WeightGradient(M, N, K, num_sms, rowwise, block_n_multiple,
                                    activation_scale.stride() == (num_k, 1), aligned_fp8_rows, compact_rows,
-                                   compact_output)
+                                   compact_output, misaligned_fp8_rows)
         compiled = cute.compile(operation, *operands, fake_stream(), options="--enable-tvm-ffi")
         CACHE[key] = compiled
     compiled(*tensors)
