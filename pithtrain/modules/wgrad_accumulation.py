@@ -97,15 +97,11 @@ def _attach_main_grads(
     orig_pre_backward, orig_post_backward = group.pre_backward, group.post_backward
 
     def pre_backward(*args: Any) -> None:
-        for fsdp_param, main_grad in pairs:
+        for _, main_grad in pairs:
             if main_grad.untyped_storage().size() == 0:
                 main_grad.untyped_storage().resize_(main_grad.numel() * main_grad.element_size())
                 if not overwrite:
                     main_grad.zero_()
-                elif isinstance(fsdp_param._module_info.module, FP8Linear):
-                    # The compiled FP8 backward holds this work buffer as a graph input.
-                    # Initialize its storage without changing the saved input's version.
-                    main_grad.data.zero_()
         orig_pre_backward(*args)
 
     def post_backward(*args: Any) -> None:

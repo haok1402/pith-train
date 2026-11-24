@@ -56,6 +56,7 @@ SM90_ONLY = {
     "group_indices_sm90",
     "fp8_rowwise_kmajor_sm90",
     "pack_reduce_scatter_sm90",
+    "fp8_wgrad_sm90",
 }
 # Shared CuTe helpers that only SM90 code uses (rule 6).
 SM90_HELPERS = {"cute_ptx_sm90", "cute_compile_sm90", "fp8_e8m0_scale_sm90", "row_slice_sm90"}
