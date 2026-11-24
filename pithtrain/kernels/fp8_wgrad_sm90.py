@@ -298,7 +298,7 @@ class WeightGradient:
                  aligned_n96_stage4_operands=False, n96_stage4_tail_storage=False,
                  aligned_n32_stage10_operands=False, aligned_m32_n64_stage4_operands=False,
                  n80_b_stage7_aligned_storage=False, aligned_m32_n96_stage4_operands=False,
-                 aligned_m16_n64_stage4_prefetch_operands=False, m32_n128_wide_stage4=False,
+                 aligned_m16_n64_stage4_prefetch_operands=False, n128_stage4_wide=False,
                  n80_b_stage9_aligned_storage=False,
                  aligned_stage11_spill_operands=False):
         self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n = select_layout(M, N, K, num_sms, rowwise, block_n_multiple)
@@ -310,9 +310,9 @@ class WeightGradient:
             self.num_m, self.num_n = divide_up(M, self.block_m), divide_up(N, self.block_n)
             reserved, stage_bytes = shared_footprint(self.block_m, self.block_n, self.num_k, rowwise)
             self.stages = min(16, (SMEM_CAPACITY - reserved) // stage_bytes)
-        self.m32_n128_wide_stage4 = m32_n128_wide_stage4
-        if self.m32_n128_wide_stage4:
-            assert (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (32, 128, 4, 1, 1)
+        self.n128_stage4_wide = n128_stage4_wide
+        if self.n128_stage4_wide:
+            assert (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (M, 128, 4, 1, 1)
             self.block_n = 192
             self.num_n = divide_up(N, self.block_n)
         self.n80_b_stage7_one_wave = False
@@ -1040,7 +1040,7 @@ class WeightGradient:
                                             or self.static_ring and (self.block_m, self.block_n) == (128, 48))
         self.scale_gap = gcd(BLOCK_K, self.block_n)
         self.specialize_scale = not self.uniform_scale and BLOCK_K // self.scale_gap <= 4
-        buffered_scales = 0 if self.stream_b_scale_row or self.m32_n128_wide_stage4 else self.num_k
+        buffered_scales = 0 if self.stream_b_scale_row or self.n128_stage4_wide else self.num_k
         reserved, per_stage = shared_footprint(self.block_m, self.block_n, buffered_scales, rowwise)
         self.shared_bytes = reserved + self.stages * per_stage
         self.n80_full_sms_unicast = (
@@ -1398,7 +1398,7 @@ class WeightGradient:
         s_grad = smem.allocate_tensor(Float8E4M3FN, grad_layout.outer, byte_alignment=1024, swizzle=grad_layout.inner)
         s_activation = smem.allocate_tensor(Float8E4M3FN, activation_layout.outer, byte_alignment=1024, swizzle=activation_layout.inner)
         s_grad_scale = smem.allocate_tensor(Float32, grad_scale_layout, byte_alignment=16)
-        if cutlass.const_expr(self.m32_n128_wide_stage4):
+        if cutlass.const_expr(self.n128_stage4_wide):
             s_activation_scale = mActivationScale
         elif cutlass.const_expr(self.stream_b_scale_row):
             layout = cute.make_layout((self.num_k, 1), stride=(mActivationScale.stride[1], 1))
@@ -2014,7 +2014,7 @@ class WeightGradient:
             former_groups = cutlass.min(self.block_n, BLOCK_K - tile_n * self.block_n % BLOCK_K) // 8
             output_groups = cutlass.min(self.N - tile_n * self.block_n, self.block_n) // 8
             tile_activation_scale = s_activation_scale
-            if cutlass.const_expr(self.m32_n128_wide_stage4):
+            if cutlass.const_expr(self.n128_stage4_wide):
                 first_scale = tile_n * self.block_n // BLOCK_K
                 layout = cute.make_layout((self.num_k, self.scale_columns),
                                           stride=(mActivationScale.stride[1], mActivationScale.stride[0]))
@@ -2585,11 +2585,12 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
     if not 1 <= block_n_multiple <= 192:
         raise ValueError("expected a positive block-N multiple at most 192")
     # The widened streamed-scale route reads consecutive K scales in each row.
-    m32_n128_wide_stage4 = (
-        not rowwise and (M, N, K, num_sms, block_n_multiple) == (32, 1152, 4268032, 2, 1)
+    n128_stage4_wide = (
+        not rowwise and (M, K) in ((16, 4792320), (32, 4268032))
+        and (N, num_sms, block_n_multiple) == (1152, 2, 1)
         and (grad.stride(0), activation.stride(0), out.stride(0)) == (K, K, N)
     )
-    if m32_n128_wide_stage4:
+    if n128_stage4_wide:
         activation_scale = activation_scale.contiguous()
     tensors = (grad, grad_scale, activation, activation_scale, out)
     long_a_storage_ok = False
@@ -2833,7 +2834,7 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                                    n80_b_stage7_aligned_storage=n80_b_stage7_aligned_storage,
                                    aligned_m32_n96_stage4_operands=aligned_m32_n96_stage4_operands,
                                    aligned_m16_n64_stage4_prefetch_operands=aligned_m16_n64_stage4_prefetch_operands,
-                                   m32_n128_wide_stage4=m32_n128_wide_stage4,
+                                   n128_stage4_wide=n128_stage4_wide,
                                    n80_b_stage9_aligned_storage=n80_b_stage9_aligned_storage,
                                    aligned_stage11_spill_operands=aligned_stage11_spill_operands)
         compiled = cute.compile(operation, *operands, fake_stream(), options="--enable-tvm-ffi")
