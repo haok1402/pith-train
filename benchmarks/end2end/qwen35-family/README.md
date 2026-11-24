@@ -37,7 +37,10 @@ bash bench/gpu-run.sh --priority normal --timing --gpus 8 --time 50 -- \
 
 An arm is `MICROBATCH:MLP_ONLY_TAIL:KEPT_TAIL:MIXERS:FSDP_GROUP[:FP8_CACHE_MIB[:replay]]`.
 `MIXERS` is `none`, `gated-delta`, `full` or `both`. It controls which mixer outputs the outer
-checkpoint replays. `replay` enables the FP8 MLP's specialized replay. Use microbatch 1, 2, 4 or 8.
+checkpoint replays. Use `gated-delta` or `both` for checkpointed family arms. Saving Gated DeltaNet
+in the outer checkpoint corrupted gradients in the 2B and 9B screens. Compare the pre-clip norm
+and loss trajectories, including warmup, with the no-recompute BF16 control before accepting a
+checkpointed candidate. `replay` enables the FP8 MLP's specialized replay. Use microbatch 1, 2, 4 or 8.
 Set `MLP_ONLY_TAIL=0` and `KEPT_TAIL` to the model depth to disable explicit recompute. `matched`
 copies the BF16 arm and uses the FP8 stack with cache and specialized replay off. `fp8` runs a
 single FP8 candidate. `QWEN35_ARM_TIMEOUT` bounds each arm and defaults to `12m`. Use the shared
