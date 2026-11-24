@@ -1,278 +1,1396 @@
+from math import gcd, lcm
+from struct import pack, unpack
+
 import cutlass
 import cutlass.cute as cute
-import cutlass.pipeline as pipeline
 import torch
-from cutlass import Float32, Float8E4M3FN, Int64
-from cutlass._mlir.dialects import math
-from cutlass.cute.nvgpu import cpasync, warpgroup
-from cutlass.cutlass_dsl import select_
+from cutlass import Float32, Float8E4M3FN, GridConstant, Int16, Int32, Int64
+from cutlass._mlir.dialects import llvm, math
+from cutlass.cute.nvgpu import warpgroup
+from cutlass.cutlass_dsl import T, dsl_user_op, select_
+from cutlass.experimental.cuda import TensorMap, TensorMapL2Promotion, TensorMapSwizzle, create_tensor_map_tiled
+from cutlass.experimental.primitives import nvvm_wrapper as nvvm
 
-from pithtrain.kernels.arch import SM_COUNT
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
+from pithtrain.kernels.cute_ptx_sm90 import asm, to_ir, unpack as unpack_registers
 from pithtrain.kernels.fp8_scale_layout import to_mn_major
 
 __all__ = ["fp8_wgrad_sm90"]
 
 BLOCK_K = 128
+SMEM_CAPACITY = 232448
 CACHE = {}
 
 
+def divide_up(size, divisor):
+    return (size + divisor - 1) // divisor
+
+
+def align_up(size, alignment):
+    return divide_up(size, alignment) * alignment
+
+
+def round_float32(value):
+    return unpack("f", pack("f", value))[0]
+
+
+def shared_footprint(block_m, block_n, num_k, rowwise):
+    scale_columns = 1 if BLOCK_K % block_n == 0 else 2
+    scale_bytes = 0 if rowwise else align_up(4 * num_k * scale_columns, 8)
+    reserved = align_up(4 * block_m * block_n, 1024) + 256 + scale_bytes
+    stage_bytes = BLOCK_K * (block_m + block_n) + align_up(4 * block_m, 128)
+    if rowwise:
+        stage_bytes += align_up(4 * block_n, 128)
+    return reserved, stage_bytes
+
+
+def select_layout(M, N, K, num_sms, rowwise=False, block_n_multiple=1):
+    block_m_choices = [64, 128]
+    if M <= 16:
+        block_m_choices.append(16)
+    if M <= 32:
+        block_m_choices.append(32)
+
+    best_cycles = float("inf")
+    best_layout = None
+    num_k = divide_up(K, BLOCK_K)
+    n_step = lcm(16, block_n_multiple)
+    for cluster_m, cluster_n in ((1, 1), (1, 2), (2, 1)):
+        if num_sms % (cluster_m * cluster_n):
+            continue
+        for block_m in block_m_choices:
+            for block_n in range(n_step, 193, n_step):
+                if block_n > BLOCK_K and BLOCK_K % (block_n - BLOCK_K):
+                    continue
+                if rowwise and block_n > 128:
+                    continue
+                out_bytes = 4 * block_m * block_n
+                reserved, stage_bytes = shared_footprint(block_m, block_n, num_k, rowwise)
+                stages = min(16, (SMEM_CAPACITY - reserved) // stage_bytes)
+                min_stages = 3 if block_m * block_n >= 128 * 192 else 4
+                if stages < min_stages:
+                    continue
+
+                tiles = divide_up(M, block_m) * divide_up(N, block_n)
+                waves = divide_up(tiles, num_sms)
+                if waves == 1 and cluster_m * cluster_n > 1:
+                    continue
+                l2_bytes = K * (block_m // cluster_n + block_n // cluster_m) + out_bytes
+                l1_bytes = K * (block_m + max(64, block_m) + 2 * block_n) + 2 * out_bytes
+                l2_cycles = l2_bytes * tiles // min(64 * num_sms, 6153)
+                l1_cycles = l1_bytes * tiles // (128 * num_sms)
+                wave_efficiency = round_float32(round_float32(tiles) / round_float32(waves * num_sms))
+                cycles = int(round_float32(round_float32(max(l1_cycles, l2_cycles)) / wave_efficiency))
+                if cycles < best_cycles:
+                    best_cycles = cycles
+                    best_layout = (block_m, block_n, stages, cluster_m, cluster_n)
+
+    if best_layout is None:
+        raise ValueError("no SM90 FP8 wgrad layout fits the requested dimensions")
+    return best_layout
+
+
+@dsl_user_op
+def wait_barrier(pointer, phase, *, loc=None, ip=None):
+    asm(
+        None,
+        [pointer.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+         to_ir(phase, Int32, loc, ip), to_ir(10_000_000, Int32, loc, ip)],
+        """{
+            .reg .pred complete;
+        wait:
+            mbarrier.try_wait.parity.shared::cta.b64 complete, [$0], $1, $2;
+            @complete bra done;
+            bra wait;
+        done:
+        }""",
+        "r,r,r",
+        side_effects=True,
+    )
+
+
+@dsl_user_op
+def wgmma_k_block(a_desc_lo, b_desc_lo, block_n, next_scale_ptrs=(), *, loc=None, ip=None):
+    # K-major SW128 descriptors have a 1024-byte stride and no leading offset.
+    count = block_n // 2
+    num_outputs = count + len(next_scale_ptrs)
+    outputs = ", ".join(f"${index}" for index in range(count))
+    shape = f"m64n{block_n}k32.f32.e4m3.e4m3"
+    instructions = [
+        "{",
+        ".reg .b32 aa, bb, desc_hi;",
+        ".reg .b64 a, b;",
+        ".reg .pred accumulate;",
+        "mov.b32 desc_hi, 0x40000040;",
+        "setp.ne.u32 accumulate, 0, 0;",
+        "wgmma.fence.sync.aligned;",
+        f"mov.b64 a, {{${num_outputs}, desc_hi}};",
+        f"mov.b64 b, {{${num_outputs + 1}, desc_hi}};",
+    ]
+    for k in range(0, BLOCK_K, 32):
+        if k:
+            instructions += [
+                f"add.u32 aa, ${num_outputs}, {k // 16};",
+                f"add.u32 bb, ${num_outputs + 1}, {k // 16};",
+                "mov.b64 a, {aa, desc_hi};",
+                "mov.b64 b, {bb, desc_hi};",
+            ]
+        instructions.append(f"wgmma.mma_async.sync.aligned.{shape} {{{outputs}}}, a, b, accumulate, 1, 1;")
+        if not k:
+            instructions.append("setp.ne.u32 accumulate, 1, 0;")
+    instructions.append("wgmma.commit_group.sync.aligned;")
+    for index in range(len(next_scale_ptrs)):
+        instructions.append(f"ld.shared.f32 ${count + index}, [${num_outputs + 2 + index}];")
+    instructions += ["wgmma.wait_group.sync.aligned 0;", "}"]
+    operands = [to_ir(a_desc_lo, Int32, loc, ip), to_ir(b_desc_lo, Int32, loc, ip)]
+    operands += [ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip) for ptr in next_scale_ptrs]
+    constraints = ",".join(["=f"] * num_outputs + ["r"] * len(operands))
+    result = asm(llvm.StructType.get_literal([T.f32()] * num_outputs), operands,
+                 "\n".join(instructions), constraints, side_effects=True)
+    return unpack_registers(result, num_outputs, Float32, loc, ip)
+
+
+@dsl_user_op
+def load_unicast_triplet(grad, scale, activation, a, a_scale, b, barrier, k, m, n, k_tile, *, loc=None, ip=None):
+    values = (
+        (a.toint(), Int32), (grad.get_ptr().toint(), Int64), (k, Int32), (m, Int32),
+        (barrier.toint(), Int32), (a_scale.toint(), Int32), (scale.get_ptr().toint(), Int64),
+        (k_tile, Int32), (b.toint(), Int32), (activation.get_ptr().toint(), Int64),
+        (n, Int32), (0x1000000000000000, Int64),
+    )
+    arguments = [to_ir(value, dtype, loc, ip) for value, dtype in values]
+    opcode = "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+    asm(
+        None, arguments,
+        f"{{ {opcode} [$0], [$1, {{$2, $3}}], [$4], $11; "
+        f"{opcode} [$5], [$6, {{$3, $7}}], [$4], $11; "
+        f"{opcode} [$8], [$9, {{$2, $10}}], [$4], $11; }}",
+        "r,l,r,r,r,r,l,r,r,l,r,l",
+        side_effects=True,
+    )
+
+
+
+@dsl_user_op
+def load_tma_with_hint(descriptor, dst, barrier, coord_lo, coord_hi, multicast, hint, *, loc=None, ip=None):
+    values = (
+        (dst.toint(), Int32), (descriptor.get_ptr().toint(), Int64), (coord_lo, Int32),
+        (coord_hi, Int32), (barrier.toint(), Int32), (hint, Int64),
+    )
+    args = [to_ir(value, dtype, loc, ip) for value, dtype in values]
+    opcode = "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
+    if multicast:
+        args.append(to_ir(3, Int16, loc, ip))
+        asm(None, args, f"{opcode}.multicast::cluster.L2::cache_hint [$0], [$1, {{$2, $3}}], [$4], $6, $5;",
+            "r,l,r,r,r,l,h", side_effects=True)
+    else:
+        asm(None, args, f"{opcode}.L2::cache_hint [$0], [$1, {{$2, $3}}], [$4], $5;",
+            "r,l,r,r,r,l", side_effects=True)
+
+
+@dsl_user_op
+def unused_scale(*, loc=None, ip=None):
+    return Float32(llvm.UndefOp(T.f32(), loc=loc, ip=ip).result)
+
+
 class WeightGradient:
-    def __init__(self, M, N, K, rowwise_activation):
-        self.block_m = 64 if M <= 64 else 128
-        self.block_n = 64 if N <= 64 else (128 if N <= 128 or rowwise_activation else 192)
-        self.num_m, self.num_n, self.num_k = cute.ceil_div(M, self.block_m), cute.ceil_div(N, self.block_n), cute.ceil_div(K, BLOCK_K)
-        self.rowwise_activation = rowwise_activation
-        self.num_activation_blocks = cute.ceil_div(N, BLOCK_K)
-        self.cluster_m = 2 if self.num_m % 2 == 0 and self.num_m * self.num_n >= SM_COUNT else 1
-        self.grid = min(SM_COUNT // self.cluster_m, self.num_m * self.num_n // self.cluster_m) * self.cluster_m
-        # The 128x128 FP32 epilogue leaves room for four input stages in shared memory.
-        max_stages = 3 if self.block_n == 192 else (4 if self.block_m == self.block_n == 128 else 5)
-        self.stages = min(self.num_k, max_stages)
-        self.threads_math = 2 * self.block_m
-        self.load_warp = self.threads_math // 32
-        self.load_regs, self.math_regs = 40, 232 if self.threads_math == 256 else 248
+    def __init__(self, M, N, K, num_sms, rowwise, block_n_multiple,
+                 compact_k_scale=False, aligned_fp8_rows=False, compact_rows=True):
+        self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n = select_layout(M, N, K, num_sms, rowwise, block_n_multiple)
+        self.num_m, self.num_n, self.num_k = divide_up(M, self.block_m), divide_up(N, self.block_n), divide_up(K, BLOCK_K)
+        self.N, self.num_sms, self.rowwise = N, num_sms, rowwise
+        # The output map still stores a 32-column tile. Only real columns need tensor-core work.
+        self.n32_single_tile = (not rowwise and self.num_m == self.num_n == 1 and N < self.block_n
+                               and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 32, 4, 1, 1))
+        # Amortize the partial ring and keep dynamic staging on misaligned multi-M grids.
+        self.n112_unicast_ring = (
+            not rowwise and self.num_k >= 3 * self.stages
+            and (aligned_fp8_rows or (self.num_m == 1 and self.num_k >= 256))
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 112, 5, 1, 1)
+        )
+        # Retain the inline WGMMA path on the previously qualified tile grids.
+        self.n112_short_k = (
+            not rowwise and self.num_k == 128 and aligned_fp8_rows
+            and self.num_m == 8
+            and ((self.num_n == 5 and (8 <= num_sms <= 12 or num_sms == 22))
+                 or (self.num_n == 10 and (40 <= num_sms <= 42 or 64 <= num_sms <= 78)))
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 112, 5, 1, 1)
+        )
+        self.skinny_short_n144 = (
+            not rowwise and N == 8 and self.num_k == 1
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 144, 7, 2, 1)
+        )
+        self.math_block_n = N if self.n32_single_tile or self.skinny_short_n144 else self.block_n
+        self.long_b_m16_n128 = (
+            not rowwise and self.num_m == 1 and self.num_k >= 512 and self.num_n == num_sms + 1 and N % 128 == 8
+            and (self.block_m, self.block_n, self.cluster_m, self.cluster_n) == (16, 128, 2, 1)
+            and 4 <= self.stages <= 10
+        )
+        self.long_tail_n = N % 128 if self.long_b_m16_n128 else 0
+        self.cluster_size = self.cluster_m * self.cluster_n
+        self.multicast_a = self.cluster_n > 1
+        self.n96_sustained = (
+            not rowwise and num_sms == 132 and self.num_m == 4 and self.num_n == 30
+            and self.num_k in (16, 64, 128) and K % BLOCK_K == 0
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 96, 6, 1, 1)
+        )
+        self.n160_sustained = (
+            not rowwise and num_sms == 132 and self.num_m == 8 and self.num_n == 32 and self.num_k == 64
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 160, 4, 2, 1)
+        )
+        # Qualify the six sustained N192 B-multicast call sites.
+        self.n192_b_sustained = (
+            not rowwise and num_sms == 132
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 192, 3, 2, 1)
+            and (M, N, K) in (
+                (2048, 4096, 2048),
+                (2048, 10944, 16384),
+                (2816, 2048, 16384),
+                (2880, 4096, 2048),
+                (2880, 4096, 8192),
+                (5120, 6144, 8192),
+            )
+        )
+        self.sustained_swizzled_output = self.n96_sustained or self.n160_sustained or self.n192_b_sustained
+        self.n80_sustained_mn = (
+            not rowwise and not compact_k_scale and num_sms == 132
+            and M == 576 and N == 2048 and K == 16384
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 80, 7, 1, 1)
+        )
+        self.n128_sustained = (
+            not rowwise and compact_k_scale and num_sms == 132
+            and M == 2048 and N == 512 and K == 8192
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 128, 8, 1, 1)
+        )
+        self.n48_one_wave = (
+            not rowwise and self.num_m * self.num_n <= num_sms
+            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (128, 48, 8, 1)
+        )
+        self.n48_mn_tail = (
+            self.n48_one_wave and not compact_k_scale and compact_rows
+            and num_sms == 122 and block_n_multiple == 48
+            and (M, N, K) == (961, 680, 16257)
+        )
+        use_long_n112_scales = (not rowwise and self.num_k >= 256
+                               and (self.block_m, self.block_n, self.cluster_size) == (128, 112, 1))
+        use_n80_scales = not rowwise and (self.block_m, self.block_n, self.cluster_size) == (128, 80, 1)
+        self.use_linear_k_major_scales = compact_k_scale and (use_n80_scales or use_long_n112_scales)
+        primary, secondary = (self.block_n, self.block_m) if self.multicast_a else (self.block_m, self.block_n)
+        self.group_tiles = min((8, 16), key=lambda width: width * primary + divide_up(num_sms, width) * secondary)
+        self.math_threads = 128 if self.block_m <= 64 else 256
+        self.first_producer_warp = self.math_threads // 32
+        self.producer_warp = self.first_producer_warp + 2
+        self.math_registers = 248 if self.math_threads == 128 else 232
+        if self.n48_one_wave or (self.n96_sustained and self.num_k == 64 and not compact_k_scale):
+            self.math_registers = 224
+        if self.n96_sustained and self.num_k == 128:
+            self.math_registers = 216
+        self.store_threads = min(self.math_threads, self.block_m * 2)
+        self.uniform_scale = BLOCK_K % self.block_n == 0
+        self.scale_columns = 1 if self.uniform_scale else 2
+        starts_at_zero = self.num_m * self.num_n <= self.num_sms or self.num_k % (2 * self.stages) == 0
+        self.single_n80_tile = (self.block_m, self.block_n, self.cluster_size) == (64, 80, 1) and self.num_m == self.num_n == 1 and not rowwise
+        long_n16_static_math = (
+            self.stages == 16 and aligned_fp8_rows and self.num_k >= 512
+            and (N > 2 * BLOCK_K or self.num_n == 1)
+        )
+        self.static_n16_stage8_math = (
+            self.block_m == 64 and self.block_n == 16
+            and (self.stages in (8, 13, 15) or long_n16_static_math)
+        )
+        self.long_n80_stage4 = not rowwise and self.num_k >= 4096 and (self.block_m, self.block_n, self.stages, self.cluster_size) == (128, 80, 4, 1)
+        self.canonical_n16_scale = (not rowwise and N <= BLOCK_K
+                                    and (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 16, 15, 1))
+        self.m16_n32_stage8_full = (
+            not rowwise and self.num_m == 1 and N == 32
+            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (16, 32, 8, 1)
+        )
+        self.narrow_n160_four_stages = not rowwise and (self.block_m, self.block_n, self.stages, self.cluster_size) == (16, 160, 4, 1)
+        self.wide_n192_four_math = (not rowwise
+                                   and self.block_m in (16, 32)
+                                   and (self.block_n, self.stages, self.cluster_size) == (192, 4, 1))
+        # Two CTAs cover three N tiles. Both tiles on CTA 0 share one block scale for B.
+        self.n32_reuse_grad = (not rowwise and self.num_m == 1 and self.num_n == 3 and num_sms == 2
+                               and (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 32, 4, 1)
+                               and self.num_k % self.stages == 0)
+        self.n96_stage9_wave = (
+            not rowwise and num_sms == 132 and (M, N, K) == (192, 4096, 16384)
+            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 96, 9, 1)
+        )
+        self.m64_n112_one_wave = (
+            not rowwise and (self.num_m, self.num_n, num_sms) == (2, 64, 132) and self.num_k in (16, 128)
+            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 112, 8, 1)
+        )
+        self.n16_u_short = (
+            not rowwise and num_sms == 132 and (M, N, K) == (621, 24, 283)
+            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 16, 16, 1)
+        )
+        self.n128_block_output_strips = (
+            not rowwise and compact_k_scale and compact_rows and (M, N, K, num_sms) == (512, 2048, 8192, 132)
+            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 128, 8, 1)
+        )
+        self.static_ring = self.cluster_size == 1 and not rowwise and starts_at_zero and (self.block_m < 64 and self.uniform_scale or self.block_n == 96 or self.single_n80_tile or self.static_n16_stage8_math or self.long_n80_stage4 or self.narrow_n160_four_stages or self.wide_n192_four_math or self.n32_reuse_grad or self.n32_single_tile or (self.block_m, self.block_n) == (128, 48) or self.m64_n112_one_wave)
+        self.dynamic_n96_stage7_producer = (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 96, 7, 1) and self.num_m == self.num_n == 1 and not rowwise
+        self.n80_three_tile_mn_scales = self.long_n80_stage4 and self.num_n <= 3 and not compact_k_scale
+        self.rolling_n128_producer = (not rowwise and self.num_m == self.num_n == 1
+                                      and (self.block_m, self.block_n, self.stages, self.cluster_size) == (32, 128, 8, 1))
+        self.inline_small_mma = self.static_ring and (
+            self.m16_n32_stage8_full or
+            self.block_m < 64 and (self.block_n == 16 or (self.block_n == 96 and self.stages == 8))
+        )
+        self.n192_one_wave = (
+            not rowwise and self.num_m == 1 and self.num_n <= num_sms
+            and self.num_k == 12 and N % 192 == 0
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 192, 3, 1, 1)
+        )
+        self.u128_stage4_one_wave = (
+            not rowwise and (self.block_m, self.block_n, self.stages, self.cluster_size) == (128, 128, 4, 1)
+            and self.num_k == 128
+            and (
+                (num_sms, self.num_m, self.num_n) == (132, 32, 4) and N % 128 == 0
+                or (num_sms, self.num_m, self.num_n) == (2, 2, 1) and N == 128 and K % BLOCK_K == 0
+            )
+        )
+        if self.u128_stage4_one_wave:
+            self.group_tiles = 4
+        # The persistent short-K N64 multicast waves fit in one pipeline phase.
+        self.short_a_n64 = (
+            not rowwise and self.num_k == 1 and self.multicast_a and self.block_n == 64
+            and (self.block_m, self.stages, self.num_m, self.num_n, num_sms)
+            in ((128, 7, 64, 3, 98), (64, 12, 3, 65, 98), (64, 12, 26, 55, 132))
+        )
+        self.swizzle_fp32_output = (
+            self.n192_one_wave or (self.u128_stage4_one_wave and N % 128 == 0) or self.short_a_n64 or self.n96_stage9_wave or self.n128_block_output_strips
+        )
+        self.full_a128_stage4 = (
+            not rowwise and self.num_n == 4 and self.num_k % 8 == 0
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 128, 4, 1, 2)
+        )
+        self.a128_stage4_full_groups = (
+            not rowwise and self.num_n > self.group_tiles and self.num_n % self.group_tiles == 0
+            and self.num_k % 8 == 0
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 128, 4, 1, 2)
+        )
+        self.short_n144_cluster = (not rowwise and self.num_k <= 8 and self.num_m * self.num_n <= 2 * self.num_sms
+                                   and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 144, 4, 2, 1))
+        self.reuse_short_a128 = (
+            not rowwise and self.num_m == 1 and self.num_k == 2
+            and self.num_n % 2 == 0 and self.num_n > 2 * num_sms
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 128, 5, 1, 2)
+        )
+        self.short_a_n32 = (not rowwise and self.num_k == 1
+                            and self.num_m * self.num_n <= (2 * self.stages - 1) * self.num_sms
+                            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 32, 10, 1, 2))
+        self.short_a_n16 = (not rowwise and self.num_m == self.num_k == 1
+                            and self.num_n <= 2 * self.num_sms
+                            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (16, 16, 16, 1, 2))
+        self.short_b_n128 = (
+            not rowwise and self.num_k == 1 and (self.num_m == 1 or self.num_n == 1)
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 128, 8, 2, 1)
+        )
+        self.short_a_n144 = (
+            not rowwise and self.num_m == self.num_k == 1
+            and self.num_n <= 2 * self.num_sms
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 144, 7, 1, 2)
+        )
+        self.short_a_n96 = (not rowwise and self.num_m == self.num_k == 1
+                            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (16, 96, 15, 1, 2))
+        self.short_a_n96_no_wrap = self.short_a_n96 and divide_up(self.num_n, self.num_sms) < self.stages
+        self.n112_a_full_ring = (
+            not rowwise and (self.num_m, self.num_n, self.num_k, num_sms) == (9, 26, 30, 132)
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 112, 5, 1, 2)
+        )
+        self.short_a_n112 = (
+            not rowwise and self.num_k == 1 and (self.num_m, self.num_n, num_sms) == (5, 37, 98)
+            and M % self.block_m > self.block_m // 2
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 112, 5, 1, 2)
+        )
+        self.short_a_n128 = (
+            not rowwise and self.num_m == self.num_k == 1 and self.num_n <= 2 * self.num_sms
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 128, 8, 1, 2)
+        )
+        self.short_b_n80 = (
+            not rowwise and self.num_k <= 2 and self.num_m * self.num_n <= 2 * self.num_sms
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 80, 11, 2, 1)
+        )
+        self.reuse_full_b_n144 = (
+            not rowwise and N == 144 and K <= BLOCK_K // 2 and self.num_m % 2 == 0
+            and self.num_m <= (self.stages - 1) * num_sms
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 144, 7, 2, 1)
+        )
+        self.use_linear_stage_index = (
+            self.reuse_full_b_n144 or self.short_a_n64 or self.short_n144_cluster or self.short_a_n16 or self.short_a_n144
+            or self.short_a_n96_no_wrap or self.short_a_n128 or self.short_a_n112 or self.short_b_n80
+            or (not rowwise and self.multicast_a and self.num_n == 1
+                and (self.block_m, self.block_n, self.stages) == (64, 16, 16))
+        )
+        self.n80_stage7_block = (
+            not rowwise and compact_k_scale and (M, N, K, num_sms) == (576, 2048, 16384, 132)
+            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (128, 80, 7, 1)
+        )
+        self.select_scale_before_product = (self.use_linear_k_major_scales or use_long_n112_scales
+                                            or self.static_ring and (self.block_m, self.block_n) == (128, 48))
+        self.scale_gap = gcd(BLOCK_K, self.block_n)
+        self.specialize_scale = not self.uniform_scale and BLOCK_K // self.scale_gap <= 4
+        reserved, per_stage = shared_footprint(self.block_m, self.block_n, self.num_k, rowwise)
+        self.shared_bytes = reserved + self.stages * per_stage
+        self.n80_full_sms_unicast = (
+            self.single_n80_tile and self.stages == 10 and num_sms == 132
+            and (M, N, K, block_n_multiple) == (64, 80, 98305, 80)
+        )
+        if self.n80_full_sms_unicast:
+            self.producer_warp = self.first_producer_warp + 3
+        self.prefetch_n80 = self.n80_full_sms_unicast or (self.single_n80_tile and self.stages == 10 and num_sms == 2)
+        self.n80_b_multicast = (
+            not rowwise and self.num_m * self.num_n <= 2 * num_sms
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 80, 10, 2, 1)
+        )
+        # The native cluster has one N tile and therefore no A multicast peer.
+        self.n16_a_single_n = (
+            not rowwise and num_sms == 132 and (M, N, K) == (20428, 16, 1720)
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 16, 16, 1, 2)
+        )
+        self.prefetch_n16 = (not rowwise and
+                             (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 16, 16, 1))
+        activation_block_n = self.math_block_n if self.skinny_short_n144 else self.block_n
+        self.transaction_bytes = (self.block_m + activation_block_n) * BLOCK_K + 4 * self.block_m + (4 * self.block_n if rowwise else 0)
 
     @cute.jit
     def __call__(self, mGrad: cute.Tensor, mGradScale: cute.Tensor, mActivation: cute.Tensor, mActivationScale: cute.Tensor, mOut: cute.Tensor, stream):
-        grad_shape, activation_shape = (self.block_m, BLOCK_K), (self.block_n, BLOCK_K)
-        grad_scale_shape, activation_scale_shape = (self.block_m, 1), (self.block_n, 1)
-        atom_k = warpgroup.make_smem_layout_atom(warpgroup.SmemLayoutAtomKind.K_SW128, Float8E4M3FN)
-        grad_layout, activation_layout = cute.tile_to_shape(atom_k, (*grad_shape, self.stages), (0, 1, 2)), cute.tile_to_shape(atom_k, (*activation_shape, self.stages), (0, 1, 2))
-        grad_scale_layout, activation_scale_layout = cute.make_layout((*grad_scale_shape, self.stages)), cute.make_layout((*activation_scale_shape, self.stages))
-        out_shape = (self.block_m, self.block_n)
-        out_layout = cute.make_layout(out_shape, stride=(self.block_n, 1))
+        grad_tile, activation_tile = (self.block_m, BLOCK_K), (self.block_n, BLOCK_K)
+        grad_scale_tile, activation_scale_tile = (self.block_m, 1), (self.block_n, 1)
+        out_tile = (self.block_m, self.block_n)
+        atom = warpgroup.make_smem_layout_atom(warpgroup.SmemLayoutAtomKind.K_SW128, Float8E4M3FN)
+        grad_layout = cute.tile_to_shape(atom, (*grad_tile, self.stages), (0, 1, 2))
+        activation_layout = cute.tile_to_shape(atom, (*activation_tile, self.stages), (0, 1, 2))
+        grad_scale_layout = cute.make_layout((*grad_scale_tile, self.stages), stride=(1, self.block_m, align_up(self.block_m, 32)))
+        activation_scale_layout = cute.make_layout((*activation_scale_tile, self.stages), stride=(1, self.block_n, align_up(self.block_n, 32)))
+        out_layout = cute.make_layout(out_tile, stride=(self.block_n, 1))
 
-        load, multicast = cpasync.CopyBulkTensorTileG2SOp(), cpasync.CopyBulkTensorTileG2SMulticastOp()
-        grad_copy = cpasync.make_tiled_tma_atom(load, mGrad, cute.slice_(grad_layout, (None, None, 0)), grad_shape)
-        grad_scale_copy = cpasync.make_tiled_tma_atom(load, mGradScale, cute.slice_(grad_scale_layout, (None, None, 0)), grad_scale_shape)
-        activation_copy = cpasync.make_tiled_tma_atom(multicast if self.cluster_m == 2 else load, mActivation, cute.slice_(activation_layout, (None, None, 0)), activation_shape, num_multicast=self.cluster_m)
-        activation_scale_copy = None
-        if cutlass.const_expr(self.rowwise_activation):
-            activation_scale_copy = cpasync.make_tiled_tma_atom(load, mActivationScale, cute.slice_(activation_scale_layout, (None, None, 0)), activation_scale_shape)
-        out_copy = cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileS2GOp(), mOut, out_layout, out_shape)
+        promote = TensorMapL2Promotion.l2_256b
+        swizzle = TensorMapSwizzle.s128b
+        grad = create_tensor_map_tiled(mGrad.iterator.toint(), Float8E4M3FN, [mGrad.shape[1], mGrad.shape[0]], [Int64(mGrad.stride[0]) // 16], [BLOCK_K, self.block_m], swizzle=swizzle, l2_promotion=promote)
+        activation_block_n = self.math_block_n if self.skinny_short_n144 else self.block_n
+        activation = create_tensor_map_tiled(mActivation.iterator.toint(), Float8E4M3FN, [mActivation.shape[1], mActivation.shape[0]], [Int64(mActivation.stride[0]) // 16], [BLOCK_K, activation_block_n], swizzle=swizzle, l2_promotion=promote)
+        grad_scale = create_tensor_map_tiled(mGradScale.iterator.toint(), Float32, [align_up(mGradScale.shape[0], 4), self.num_k], [Int64(mGradScale.stride[1]) // 4], [self.block_m, 1], l2_promotion=promote)
+        if cutlass.const_expr(self.swizzle_fp32_output or self.sustained_swizzled_output):
+            out = create_tensor_map_tiled(mOut.iterator.toint(), Float32, [mOut.shape[1], mOut.shape[0]],
+                                          [Int64(mOut.stride[0]) // 4], [32, self.block_m],
+                                          swizzle=swizzle, l2_promotion=promote)
+        else:
+            out = create_tensor_map_tiled(mOut.iterator.toint(), Float32, [mOut.shape[1], mOut.shape[0]], [Int64(mOut.stride[0]) // 4], [self.block_n, self.block_m], l2_promotion=promote)
+        activation_scale = grad_scale
+        if cutlass.const_expr(self.rowwise):
+            activation_scale = create_tensor_map_tiled(mActivationScale.iterator.toint(), Float32, [mActivationScale.shape[0], self.num_k], [Int64(mActivationScale.stride[1]) // 4], [self.block_n, 1], l2_promotion=promote)
 
-        mma = warpgroup.MmaF8Op(Float8E4M3FN, Float8E4M3FN, Float32, (64, self.block_n, 32), warpgroup.OperandSource.SMEM, warpgroup.OperandMajorMode.K, warpgroup.OperandMajorMode.K)
-        tiled_mma = cute.make_tiled_mma(cute.make_mma_atom(mma), (self.block_m // 64, 1, 1))
-        layouts = (grad_layout, grad_scale_layout, activation_layout, activation_scale_layout, out_layout)
-        copies = (grad_copy, grad_scale_copy, activation_copy, activation_scale_copy, out_copy)
-        self.kernel(tiled_mma, layouts, copies, mActivationScale).launch(grid=(self.grid, 1, 1), block=(self.threads_math + 128, 1, 1), cluster=(self.cluster_m, 1, 1), min_blocks_per_mp=1, stream=stream)
+        elif cutlass.const_expr(self.long_tail_n):
+            activation_scale = create_tensor_map_tiled(
+                mActivation.iterator.toint(), Float8E4M3FN,
+                [mActivation.shape[1], mActivation.shape[0]], [Int64(mActivation.stride[0]) // 16],
+                [BLOCK_K, self.long_tail_n], swizzle=swizzle, l2_promotion=promote)
+
+        operation = warpgroup.MmaF8Op(Float8E4M3FN, Float8E4M3FN, Float32, (64, self.math_block_n, 32), warpgroup.OperandSource.SMEM, warpgroup.OperandMajorMode.K, warpgroup.OperandMajorMode.K)
+        mma = cute.make_tiled_mma(cute.make_mma_atom(operation), (self.math_threads // 128, 1, 1))
+        layouts = (out_layout, grad_layout, activation_layout, grad_scale_layout, activation_scale_layout)
+        if cutlass.const_expr(self.canonical_n16_scale):
+            scale_layout = cute.make_layout((1, self.num_k), stride=(1, 1))
+            mActivationScale = cute.make_tensor(mActivationScale.iterator, scale_layout)
+        # Co-locate prefetch with the TMA issuer on the misaligned input path.
+        prefetch_warp = self.first_producer_warp
+        if cutlass.const_expr((self.prefetch_n16 or self.prefetch_n80)
+                              and mGrad.stride[0] % 32 == 16 and mActivation.stride[0] % 32 == 16):
+            prefetch_warp = self.producer_warp
+        if cutlass.const_expr(self.n16_u_short):
+            prefetch_warp = self.producer_warp
+        self.kernel(mma, layouts, grad, activation, grad_scale, out, activation_scale, mActivationScale, prefetch_warp).launch(grid=(self.num_sms, 1, 1), block=(self.math_threads + 128, 1, 1), cluster=(self.cluster_size, 1, 1) if self.cluster_size > 1 else None, smem=self.shared_bytes, min_blocks_per_mp=1, stream=stream)
 
     @cute.kernel
-    def kernel(self, tiled_mma: cute.TiledMma, layouts: tuple, copies: tuple, mActivationScale: cute.Tensor):
+    def kernel(self, mma: cute.TiledMma, layouts: tuple, grad: GridConstant[TensorMap], activation: GridConstant[TensorMap], grad_scale: GridConstant[TensorMap], out: GridConstant[TensorMap], activation_scale: GridConstant[TensorMap], mActivationScale: cute.Tensor, prefetch_warp: cutlass.Constexpr):
         tidx, _, _ = cute.arch.thread_idx()
         bx, _, _ = cute.arch.block_idx()
         warp = cute.arch.warp_idx()
-        grad_layout, grad_scale_layout, activation_layout, activation_scale_layout, out_layout = layouts
+        first_scale_loader = 32
+        # Use the first warpgroup for TMA on the full, misaligned 12-SM wave.
+        if cutlass.const_expr(
+            self.prefetch_n16 and self.num_sms == self.num_m * self.num_n == 12
+            and prefetch_warp == self.producer_warp
+        ):
+            tidx ^= self.math_threads
+            warp ^= self.first_producer_warp
+            if cutlass.const_expr((self.num_m, self.num_n) == (4, 3)):
+                if cutlass.const_expr(self.num_k == 33):
+                    first_scale_loader = 96
+                elif cutlass.const_expr(self.num_k == 131):
+                    first_scale_loader = 64
+            if cutlass.const_expr((self.num_m, self.num_n, self.num_k) == (3, 4, 256)):
+                first_scale_loader = 96
+            if cutlass.const_expr((self.num_m, self.num_n, self.num_k) == (4, 3, 256)):
+                prefetch_warp = self.first_producer_warp
+        out_layout, grad_layout, activation_layout, grad_scale_layout, activation_scale_layout = layouts
         smem = cutlass.utils.SmemAllocator()
+        s_out = smem.allocate_tensor(Float32, out_layout, byte_alignment=1024)
         s_grad = smem.allocate_tensor(Float8E4M3FN, grad_layout.outer, byte_alignment=1024, swizzle=grad_layout.inner)
         s_activation = smem.allocate_tensor(Float8E4M3FN, activation_layout.outer, byte_alignment=1024, swizzle=activation_layout.inner)
-        s_grad_scale, s_out = smem.allocate_tensor(Float32, grad_scale_layout, byte_alignment=16), smem.allocate_tensor(Float32, out_layout, byte_alignment=128)
-        s_activation_scale = smem.allocate_tensor(Float32, activation_scale_layout, byte_alignment=16) if cutlass.const_expr(self.rowwise_activation) else None
-        s_block_scales = smem.allocate_tensor(Float32, cute.make_layout((self.num_k, 2)), byte_alignment=16) if cutlass.const_expr(not self.rowwise_activation) else None
-
-        barrier_storage = smem.allocate_array(Int64, 2 * self.stages)
-        tx_count = (self.block_m + self.block_n) * BLOCK_K + 4 * self.block_m
-        if cutlass.const_expr(self.rowwise_activation):
-            tx_count += 4 * self.block_n
-        producer, consumer = pipeline.CooperativeGroup(pipeline.Agent.Thread), pipeline.CooperativeGroup(pipeline.Agent.Thread, self.cluster_m * self.threads_math // 32)
-        cluster_layout = cute.make_layout((1, self.cluster_m, 1, 1))
-        load_pipe = pipeline.PipelineTmaAsync.create(barrier_storage=barrier_storage, num_stages=self.stages, producer_group=producer, consumer_group=consumer, tx_count=tx_count, cta_layout_vmnk=cluster_layout)
-        inputs = (s_grad, s_grad_scale, s_activation, s_activation_scale)
-
-        if warp >= self.load_warp:
-            cute.arch.warpgroup_reg_dealloc(self.load_regs)
-            if warp == self.load_warp:
-                self.load_loop(bx, copies, inputs, load_pipe)
+        s_grad_scale = smem.allocate_tensor(Float32, grad_scale_layout, byte_alignment=16)
+        if cutlass.const_expr(self.rowwise):
+            s_activation_scale = smem.allocate_tensor(Float32, activation_scale_layout, byte_alignment=128)
         else:
-            cute.arch.warpgroup_reg_alloc(self.math_regs)
-            self.compute_loop(tidx, bx, tiled_mma, load_pipe, inputs, (s_out, s_block_scales), copies[4], mActivationScale)
+            s_activation_scale = smem.allocate_tensor(Float32, cute.make_layout((self.num_k, self.scale_columns)), byte_alignment=8)
+        full = smem.allocate_array(Int64, self.stages)
+        empty = smem.allocate_array(Int64, self.stages)
+
+        descriptors = (grad, activation, grad_scale, out, activation_scale)
+        self.initialize(warp, descriptors, full, empty, prefetch_warp)
+        inputs = (s_grad, s_activation, s_grad_scale, s_activation_scale)
+        barriers = (full, empty)
+        if warp >= self.first_producer_warp:
+            cute.arch.warpgroup_reg_dealloc(40)
+            if warp == self.producer_warp:
+                with cute.arch.elect_one():
+                    self.load_loop(bx, descriptors, inputs, barriers)
+        else:
+            cute.arch.warpgroup_reg_alloc(self.math_registers)
+            self.compute_loop(tidx, warp, bx, mma, inputs, barriers, s_out, descriptors[3], mActivationScale, first_scale_loader)
+
+    @cute.jit
+    def initialize(self, warp, descriptors, full, empty, prefetch_warp: cutlass.Constexpr):
+        if warp == prefetch_warp:
+            with cute.arch.elect_one():
+                for descriptor in cutlass.range_constexpr(4):
+                    nvvm.prefetch_tensormap(descriptors[descriptor].get_ptr())
+                if cutlass.const_expr(self.rowwise or self.long_tail_n):
+                    nvvm.prefetch_tensormap(descriptors[4].get_ptr())
+        cute.arch.sync_warp()
+        if warp == self.first_producer_warp + 1:
+            with cute.arch.elect_one():
+                for stage in cutlass.range_constexpr(self.stages):
+                    cute.arch.mbarrier_init(full + stage, 1)
+                    consumers = 1 if self.n16_a_single_n else self.cluster_size
+                    cute.arch.mbarrier_init(empty + stage, consumers * (self.math_threads // 32))
+                cute.arch.mbarrier_init_fence()
+        if cutlass.const_expr(self.cluster_size > 1):
+            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_wait()
+        else:
+            cute.arch.sync_threads()
+        cute.arch.griddepcontrol_wait()
 
     @cute.jit
     def tile_coords(self, tile_idx):
-        # Visit a band of M tiles before moving to the next N tile to reuse activations in L2.
-        tiles_per_band = 16 * self.num_n
-        first_m = tile_idx // tiles_per_band * 16
-        band_m = cutlass.min(self.num_m - first_m, 16)
-        within_band = tile_idx % tiles_per_band
-        return first_m + within_band % band_m, within_band // band_m
-
-    @cute.jit
-    def load_loop(self, bx, copies, inputs, load_pipe):
-        grad_copy, grad_scale_copy, activation_copy, activation_scale_copy, _ = copies
-        s_grad, s_grad_scale, s_activation, s_activation_scale = inputs
-        state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stages)
-        for tile_idx in cutlass.range(bx, self.num_m * self.num_n, self.grid):
-            tile_m, tile_n = self.tile_coords(tile_idx)
-            grad = self.partition_copy(grad_copy, s_grad, (self.block_m, BLOCK_K), (tile_m, None))
-            grad_scale = self.partition_copy(grad_scale_copy, s_grad_scale, (self.block_m, 1), (tile_m, None))
-            activation = self.partition_copy(activation_copy, s_activation, (self.block_n, BLOCK_K), (tile_n, None), self.cluster_m, bx % self.cluster_m)
-            activation_scale = None
-            if cutlass.const_expr(self.rowwise_activation):
-                activation_scale = self.partition_copy(activation_scale_copy, s_activation_scale, (self.block_n, 1), (tile_n, None))
-            for k_tile in cutlass.range(self.num_k, unroll=1):
-                load_pipe.producer_acquire(state)
-                barrier = load_pipe.producer_get_barrier(state)
-                self.load_tile(grad_copy[0], grad, barrier, state.index, k_tile)
-                self.load_tile(grad_scale_copy[0], grad_scale, barrier, state.index, k_tile)
-                if cutlass.const_expr(self.cluster_m == 2):
-                    self.load_tile(activation_copy[0], activation, barrier, state.index, k_tile, 3)
-                else:
-                    self.load_tile(activation_copy[0], activation, barrier, state.index, k_tile)
-                if cutlass.const_expr(self.rowwise_activation):
-                    self.load_tile(activation_scale_copy[0], activation_scale, barrier, state.index, k_tile)
-                state.advance()
-        if cutlass.const_expr(self.cluster_m == 2):
-            load_pipe.producer_tail(state)
-
-    @cute.jit
-    def partition_copy(self, descriptor, smem, tile: cutlass.Constexpr, coord, multicast: cutlass.Constexpr = 1, rank=0):
-        atom, gmem = descriptor
-        g_tile = cute.local_tile(gmem, tile, coord)
-        return cpasync.tma_partition(atom, rank, cute.make_layout(multicast), cute.group_modes(smem, 0, 2), cute.group_modes(g_tile, 0, 2))
-
-    @cute.jit
-    def load_tile(self, atom, buffers, barrier, stage, k_tile, mask: cutlass.Constexpr = 0):
-        shared, global_tile = buffers
-        if cutlass.const_expr(mask):
-            cute.copy(atom, global_tile[None, k_tile], shared[None, stage], tma_bar_ptr=barrier, mcast_mask=cutlass.Int16(mask))
-        else:
-            cute.copy(atom, global_tile[None, k_tile], shared[None, stage], tma_bar_ptr=barrier)
-
-    @cute.jit
-    def compute_loop(self, tidx, bx, tiled_mma, load_pipe, inputs, outputs, out_copy, mActivationScale):
-        s_grad, s_grad_scale, s_activation, s_activation_scale = inputs
-        s_out, s_block_scales = outputs
-        mma_slice = tiled_mma.get_slice(tidx)
-        grad_desc, activation_desc = tiled_mma.make_fragment_A(mma_slice.partition_A(s_grad)), tiled_mma.make_fragment_B(mma_slice.partition_B(s_activation))
-        thread_out = mma_slice.partition_C(s_out)
-        acc_tile, acc_wgrad = cute.make_rmem_tensor(thread_out.shape, Float32), cute.make_rmem_tensor(thread_out.shape, Float32)
-        state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.stages)
-        row_lo, col_pair = tidx // 32 * 16 + tidx % 32 // 4, tidx % 4 * 2
-        row_hi = row_lo + 8
-        for tile_idx in cutlass.range(bx, self.num_m * self.num_n, self.grid):
-            tile_m, tile_n = self.tile_coords(tile_idx)
-            scale_tile = (tile_n * self.block_n) // BLOCK_K
-            if cutlass.const_expr(not self.rowwise_activation):
-                self.load_block_scales(tidx, scale_tile, mActivationScale, s_block_scales)
-            acc_wgrad.fill(0.0)
-            for k_tile in cutlass.range(self.num_k, unroll=1):
-                load_pipe.consumer_wait(state)
-                stage = state.index
-                grad_lo, grad_hi = s_grad_scale[row_lo, 0, stage], s_grad_scale[row_hi, 0, stage]
-                if cutlass.const_expr(not self.rowwise_activation):
-                    act_lo, act_hi = s_block_scales[k_tile, 0], s_block_scales[k_tile, 1]
-                self.mma_tile(tiled_mma, acc_tile, grad_desc, activation_desc, stage)
-                if cutlass.const_expr(self.rowwise_activation):
-                    self.promote_rows(acc_wgrad, acc_tile, (grad_lo, grad_hi), s_activation_scale, col_pair, stage)
-                load_pipe.consumer_release(state)
-                if cutlass.const_expr(not self.rowwise_activation):
-                    self.promote_blocks(acc_wgrad, acc_tile, (grad_lo, grad_hi), (act_lo, act_hi), tile_n)
-                state.advance()
-            self.store_tile(tidx, acc_wgrad, thread_out, s_out, out_copy, (tile_m, tile_n))
-        if tidx == 0:
-            cute.arch.cp_async_bulk_wait_group(0)
-
-    @cute.jit
-    def load_block_scales(self, tidx, scale_tile, mActivationScale, s_block_scales):
-        for k_tile in cutlass.range(tidx, self.num_k, self.threads_math):
-            s_block_scales[k_tile, 0] = mActivationScale[scale_tile, k_tile]
-            if cutlass.const_expr(self.block_n > BLOCK_K):
-                next_scale = cutlass.min(scale_tile + 1, self.num_activation_blocks - 1)
-                s_block_scales[k_tile, 1] = mActivationScale[next_scale, k_tile]
+        if cutlass.const_expr(self.n16_u_short):
+            tile_m, tile_n, _ = self.short_cluster_coords(tile_idx, False)
+            return tile_m, tile_n, cutlass.Boolean(False)
+        if cutlass.const_expr(self.n16_a_single_n):
+            return tile_idx, Int32(0), cutlass.Boolean(False)
+        if cutlass.const_expr(self.n48_mn_tail):
+            # Keep neighboring N tiles together and fold the seven-tile tail at compile time.
+            group_n = 8
+            group_tiles = self.num_m * group_n
+            full_tiles = self.num_n // group_n * group_tiles
+            tail_n = self.num_n % group_n
+            within_group = tile_idx % group_tiles
+            tile_m = within_group // group_n
+            tile_n = tile_idx // group_tiles * group_n + within_group % group_n
+            if cutlass.const_expr(tail_n):
+                if tile_idx >= full_tiles:
+                    tail = tile_idx - full_tiles
+                    tile_m = tail // tail_n
+                    tile_n = self.num_n - tail_n + tail % tail_n
+            return tile_m, tile_n, cutlass.Boolean(False)
+        if cutlass.const_expr(self.reuse_full_b_n144):
+            return tile_idx, Int32(0), cutlass.Boolean(True)
+        if cutlass.const_expr(self.n192_one_wave):
+            return Int32(0), tile_idx, cutlass.Boolean(False)
+        if cutlass.const_expr(self.n48_one_wave or self.n128_sustained):
+            # Keep adjacent N tiles together to reuse A while retaining reuse of B.
+            n_tiles_per_group = 4 if self.n48_one_wave else 2
+            tiles_per_group = self.num_m * n_tiles_per_group
+            first_n = tile_idx // tiles_per_group * n_tiles_per_group
+            group_width = cutlass.min(n_tiles_per_group, self.num_n - first_n)
+            tile_in_group = tile_idx % tiles_per_group
+            return tile_in_group // group_width, first_n + tile_in_group % group_width, cutlass.Boolean(False)
+        if cutlass.const_expr(self.single_n80_tile):
+            return Int32(0), Int32(0), False
+        if cutlass.const_expr(self.short_n144_cluster or self.short_b_n80 or self.n80_b_multicast):
+            return self.short_cluster_coords(tile_idx, False)
+        if cutlass.const_expr(self.short_a_n112):
+            tile_n, tile_m, multicast = self.short_cluster_coords(tile_idx, True)
+            return tile_m, tile_n, multicast
+        if cutlass.const_expr(self.full_a128_stage4):
+            return tile_idx // self.num_n, tile_idx % self.num_n, cutlass.Boolean(True)
+        if cutlass.const_expr(self.reuse_short_a128):
+            return Int32(0), tile_idx, cutlass.Boolean(True)
+        if cutlass.const_expr(self.short_a_n32 or self.short_a_n64):
+            tile_n, tile_m, multicast = self.short_cluster_coords(tile_idx, True)
+            return tile_m, tile_n, multicast
+        if cutlass.const_expr(self.short_a_n16 or self.short_a_n144 or self.short_a_n96 or self.short_a_n128):
+            return Int32(0), tile_idx, (tile_idx ^ 1) < self.num_n
+        if cutlass.const_expr(self.short_b_n128):
+            if cutlass.const_expr(self.num_m == 1):
+                return Int32(0), tile_idx, cutlass.Boolean(False)
             else:
-                s_block_scales[k_tile, 1] = 0.0
-        cute.arch.barrier(barrier_id=1, number_of_threads=self.threads_math)
+                return tile_idx, Int32(0), (tile_idx ^ 1) < self.num_m
+        primary, secondary = self.num_m, self.num_n
+        if cutlass.const_expr(self.multicast_a):
+            primary, secondary = self.num_n, self.num_m
+        tiles_per_group = secondary * self.group_tiles
+        first_tile = tile_idx // tiles_per_group * self.group_tiles
+        group_width = cutlass.min(self.group_tiles, primary - first_tile)
+        in_group = tile_idx % tiles_per_group
+        if cutlass.const_expr(self.cluster_size > 1 and (self.num_n if self.multicast_a else self.num_m) % 2 != 0):
+            if group_width % 2:
+                paired_width = group_width - 1
+                paired_tiles = paired_width * secondary
+                if in_group < paired_tiles:
+                    group_width = paired_width
+                else:
+                    in_group = in_group - paired_tiles
+                    first_tile = first_tile + paired_width
+                    group_width = 1
+        primary_tile, secondary_tile = first_tile + in_group % group_width, in_group // group_width
+        if cutlass.const_expr(self.multicast_a):
+            return secondary_tile, primary_tile, group_width > 1
+        else:
+            return primary_tile, secondary_tile, group_width > 1
 
     @cute.jit
-    def mma_tile(self, tiled_mma, acc_tile, grad_desc, activation_desc, stage):
-        # Reset WGMMA once per scale block and promote only after all four K32 instructions.
-        warpgroup.fence()
-        for mma_k in cutlass.range_constexpr(BLOCK_K // 32):
-            tiled_mma.set(warpgroup.Field.ACCUMULATE, mma_k != 0)
-            cute.gemm(tiled_mma, acc_tile, grad_desc[None, None, mma_k, stage], activation_desc[None, None, mma_k, stage], acc_tile)
-        warpgroup.commit_group()
-        warpgroup.wait_group(0)
+    def short_cluster_coords(self, tile_idx, multicast_a: cutlass.Constexpr):
+        primary, secondary = self.num_m, self.num_n
+        if cutlass.const_expr(multicast_a):
+            primary, secondary = self.num_n, self.num_m
+        block_group = self.group_tiles * secondary
+        full_groups, tail_rows = primary // self.group_tiles, primary % self.group_tiles
+        full_blocks = full_groups * block_group
+        first_tail_row = full_groups * self.group_tiles
+        tile_m, tile_n = Int32(0), Int32(0)
+        multicast = cutlass.Boolean(False)
+        if tile_idx < full_blocks:
+            in_group = tile_idx % block_group
+            tile_m = tile_idx // block_group * self.group_tiles + in_group % self.group_tiles
+            tile_n = in_group // self.group_tiles
+            multicast = True
+        else:
+            paired_rows = tail_rows - tail_rows % 2
+            paired_tiles = paired_rows * secondary
+            in_tail = tile_idx - full_blocks
+            if cutlass.const_expr(paired_rows == 0):
+                tile_m, tile_n, multicast = Int32(first_tail_row), in_tail, False
+            elif in_tail < paired_tiles:
+                tile_m = first_tail_row + in_tail % paired_rows
+                tile_n = in_tail // paired_rows
+                multicast = True
+            else:
+                tile_m, tile_n, multicast = Int32(first_tail_row + paired_rows), in_tail - paired_tiles, False
+        return tile_m, tile_n, multicast
 
     @cute.jit
-    def promote_blocks(self, acc_wgrad, acc_tile, grad_scales, activation_scales, tile_n):
-        grad_lo, grad_hi = grad_scales
-        act_lo, act_hi = activation_scales
-        scale_lo, scale_hi = grad_lo * act_lo, grad_hi * act_lo
-        if cutlass.const_expr(self.block_n > BLOCK_K):
-            next_lo, next_hi = grad_lo * act_hi, grad_hi * act_hi
-            boundary = BLOCK_K - (tile_n * self.block_n) % BLOCK_K
-        for col_group in cutlass.range_constexpr(self.block_n // 8):
-            row_lo_scale, row_hi_scale = scale_lo, scale_hi
-            if cutlass.const_expr(self.block_n > BLOCK_K):
-                row_lo_scale, row_hi_scale = select_(col_group * 8 < boundary, scale_lo, next_lo), select_(col_group * 8 < boundary, scale_hi, next_hi)
-            self.promote_pair(acc_wgrad, acc_tile, col_group, (row_lo_scale, row_hi_scale), (row_lo_scale, row_hi_scale))
+    def load_input(self, descriptor, dst, barrier, coord_lo, coord_hi, multicast: cutlass.Constexpr = False):
+        if cutlass.const_expr(self.n80_b_multicast and self.num_sms == 132):
+            # Match the reference TMA cache policy for the full-SM B-multicast route.
+            load_tma_with_hint(descriptor, dst, barrier, coord_lo, coord_hi, multicast, 0x1000000000000000)
+        elif cutlass.const_expr(multicast):
+            nvvm.cp_async_bulk_tensor_shared_cluster_global(dst, descriptor.get_ptr(), [coord_lo, coord_hi], barrier, [], multicast_mask=Int16(3))
+        else:
+            nvvm.cp_async_bulk_tensor_shared_cta_global(dst, descriptor.get_ptr(), [coord_lo, coord_hi], barrier)
 
     @cute.jit
-    def promote_rows(self, acc_wgrad, acc_tile, grad_scales, s_activation_scale, col_pair, stage):
-        grad_lo, grad_hi = grad_scales
-        for col_group in cutlass.range_constexpr(self.block_n // 8):
-            col_lo = col_group * 8 + col_pair
-            act_lo, act_hi = s_activation_scale[col_lo, 0, stage], s_activation_scale[col_lo + 1, 0, stage]
-            self.promote_pair(acc_wgrad, acc_tile, col_group, (grad_lo * act_lo, grad_hi * act_lo), (grad_lo * act_hi, grad_hi * act_hi))
+    def load_loop(self, bx, descriptors, inputs, barriers):
+        grad, activation, grad_scale, _, activation_scale = descriptors
+        s_grad, s_activation, s_grad_scale, s_activation_scale = inputs
+        full, empty = barriers
+        stage, phase = Int32(0), Int32(0)
+        output_tiles = self.num_m * self.num_n
+        if cutlass.const_expr(self.n32_reuse_grad):
+            output_tiles = self.num_sms
+        for tile_idx in cutlass.range(bx, output_tiles, self.num_sms):
+            tile_m, tile_n, use_multicast = self.tile_coords(tile_idx)
+            m_offset, n_offset = tile_m * self.block_m, tile_n * self.block_n
+            if cutlass.const_expr(self.n32_reuse_grad):
+                if bx == 0:
+                    self.load_n32_reused(m_offset, n_offset, descriptors, inputs, barriers)
+                else:
+                    self.load_static_ring(m_offset, n_offset, descriptors, inputs, barriers)
+            elif cutlass.const_expr(self.n80_stage7_block):
+                self.load_static_ring(m_offset, n_offset, descriptors, inputs, barriers)
+            elif cutlass.const_expr(
+                self.u128_stage4_one_wave or self.n80_sustained_mn
+                or self.static_ring and not (
+                    self.n96_stage9_wave or self.dynamic_n96_stage7_producer or self.static_n16_stage8_math
+                    or self.rolling_n128_producer or self.narrow_n160_four_stages or self.wide_n192_four_math
+                )
+            ):
+                self.load_static_ring(m_offset, n_offset, descriptors, inputs, barriers)
+            else:
+                for k_tile in cutlass.range(self.num_k, unroll=self.num_k if self.short_n144_cluster else 1):
+                    if cutlass.const_expr(self.use_linear_stage_index):
+                        stage, phase = self.linear_ring_position(tile_idx, k_tile)
+                    self.wait_stage(empty + stage, phase ^ 1)
+                    barrier = full + stage
+                    k_offset = k_tile * BLOCK_K
+                    a = s_grad.iterator + stage * (self.block_m * BLOCK_K)
+                    b = s_activation.iterator + stage * (self.block_n * BLOCK_K)
+                    scale_a = s_grad_scale.iterator + stage * align_up(self.block_m, 32)
+                    if cutlass.const_expr(self.reuse_short_a128):
+                        if tile_idx < 2 * self.num_sms and bx % 2 == 0:
+                            self.load_input(grad, a, barrier, k_offset, m_offset, True)
+                            self.load_input(grad_scale, scale_a, barrier, m_offset, k_tile, True)
+                    elif cutlass.const_expr(self.multicast_a):
+                        if use_multicast:
+                            if bx % 2 == 0:
+                                self.load_input(grad, a, barrier, k_offset, m_offset, True)
+                                self.load_input(grad_scale, scale_a, barrier, m_offset, k_tile, True)
+                        else:
+                            self.load_input(grad, a, barrier, k_offset, m_offset)
+                            self.load_input(grad_scale, scale_a, barrier, m_offset, k_tile)
+                    else:
+                        self.load_input(grad, a, barrier, k_offset, m_offset)
+                        self.load_input(grad_scale, scale_a, barrier, m_offset, k_tile)
+                    if cutlass.const_expr(self.long_tail_n):
+                        # One M tile never uses B multicast, even with a two-CTA launch.
+                        if tile_n == self.num_n - 1:
+                            self.load_input(activation_scale, b, barrier, k_offset, n_offset)
+                        else:
+                            self.load_input(activation, b, barrier, k_offset, n_offset)
+                    elif cutlass.const_expr(self.n16_a_single_n):
+                        # Each K block keeps its B panel for the CTA's later M tiles.
+                        if tile_idx < self.num_sms:
+                            self.load_input(activation, b, barrier, k_offset, n_offset)
+                    elif cutlass.const_expr(self.reuse_full_b_n144):
+                        # Every wave consumes the B tile first loaded into stage zero.
+                        if tile_idx < self.num_sms and bx % 2 == 0:
+                            self.load_input(activation, b, barrier, k_offset, n_offset, True)
+                    elif cutlass.const_expr(self.cluster_m == 2):
+                        if use_multicast:
+                            if bx % 2 == 0:
+                                self.load_input(activation, b, barrier, k_offset, n_offset, True)
+                        else:
+                            self.load_input(activation, b, barrier, k_offset, n_offset)
+                    else:
+                        self.load_input(activation, b, barrier, k_offset, n_offset)
+                    if cutlass.const_expr(self.rowwise):
+                        scale_b = s_activation_scale.iterator + stage * align_up(self.block_n, 32)
+                        self.load_input(activation_scale, scale_b, barrier, n_offset, k_tile)
+                    transaction_bytes = Int32(self.transaction_bytes)
+                    if cutlass.const_expr(self.reuse_full_b_n144 or self.n16_a_single_n):
+                        transaction_bytes = select_(tile_idx < self.num_sms, transaction_bytes,
+                                                    transaction_bytes - self.block_n * BLOCK_K)
+                    if cutlass.const_expr(self.long_tail_n):
+                        transaction_bytes = select_(tile_n == self.num_n - 1,
+                                                    transaction_bytes - (self.block_n - self.long_tail_n) * BLOCK_K,
+                                                    transaction_bytes)
+                    if cutlass.const_expr(self.reuse_short_a128):
+                        transaction_bytes = select_(tile_idx < 2 * self.num_sms, transaction_bytes,
+                                                    Int32(self.block_n * BLOCK_K))
+                    cute.arch.mbarrier_arrive_and_expect_tx(barrier, transaction_bytes)
+                    if cutlass.const_expr(not self.use_linear_stage_index):
+                        stage, phase = self.advance_stage(stage, phase)
+                if cutlass.const_expr(self.use_linear_stage_index):
+                    stage, phase = self.linear_ring_position(tile_idx, self.num_k)
+        if cutlass.const_expr(self.cluster_size > 1 and not self.n16_a_single_n):
+            live_stages = 4 if self.reuse_short_a128 else self.stages
+            for _ in cutlass.range_constexpr(live_stages):
+                self.wait_stage(empty + stage, phase ^ 1)
+                stage, phase = self.advance_stage(stage, phase)
 
     @cute.jit
-    def promote_pair(self, acc_wgrad, acc_tile, col_group, scales_lo, scales_hi):
-        scale_lo_lo, scale_hi_lo = scales_lo
-        scale_lo_hi, scale_hi_hi = scales_hi
-        scales = (scale_lo_lo, scale_lo_hi, scale_hi_lo, scale_hi_hi)
+    def load_n32_reused(self, m_offset, n_offset, descriptors, inputs, barriers):
+        _, activation, _, _, _ = descriptors
+        _, s_activation, _, _ = inputs
+        full, empty = barriers
+        other_n_offset = n_offset + self.num_sms * self.block_n
+        for group in cutlass.range(self.num_k // self.stages, unroll=1):
+            for stage in cutlass.range_constexpr(self.stages):
+                k_tile = group * self.stages + stage
+                self.load_static_stage(m_offset, n_offset, descriptors, inputs, barriers, stage, Int32(0), k_tile)
+            for stage in cutlass.range_constexpr(self.stages):
+                k_tile = group * self.stages + stage
+                # Overwrite B after the first tile releases the stage. A and its scale stay live.
+                self.wait_stage(empty + stage, Int32(0))
+                barrier = full + stage
+                b = s_activation.iterator + stage * (self.block_n * BLOCK_K)
+                self.load_input(activation, b, barrier, k_tile * BLOCK_K, other_n_offset)
+                cute.arch.mbarrier_arrive_and_expect_tx(barrier, self.block_n * BLOCK_K)
+
+    @cute.jit
+    def load_static_ring(self, m_offset, n_offset, descriptors, inputs, barriers):
+        if cutlass.const_expr(self.long_n80_stage4 or self.wide_n192_four_math):
+            period = 2 * self.stages
+            for group in cutlass.range(self.num_k // period, unroll=1):
+                for index in cutlass.range_constexpr(period):
+                    slot, phase = index % self.stages, index // self.stages
+                    k_tile = group * period + index
+                    self.load_static_stage(m_offset, n_offset, descriptors, inputs, barriers, slot, phase, k_tile)
+            for index in cutlass.range_constexpr(self.num_k % period):
+                slot, phase = index % self.stages, index // self.stages
+                k_tile = self.num_k // period * period + index
+                self.load_static_stage(m_offset, n_offset, descriptors, inputs, barriers, slot, phase, k_tile)
+        else:
+            for group in cutlass.range(self.num_k // self.stages, unroll=1):
+                for slot in cutlass.range_constexpr(self.stages):
+                    self.load_static_stage(m_offset, n_offset, descriptors, inputs, barriers, slot, group & 1, group * self.stages + slot)
+            for slot in cutlass.range_constexpr(self.num_k % self.stages):
+                group = self.num_k // self.stages
+                self.load_static_stage(m_offset, n_offset, descriptors, inputs, barriers, slot, group & 1, group * self.stages + slot)
+
+    @cute.jit
+    def load_static_stage(self, m_offset, n_offset, descriptors, inputs, barriers, stage, phase, k_tile):
+        grad, activation, grad_scale, _, _ = descriptors
+        s_grad, s_activation, s_grad_scale, _ = inputs
+        full, empty = barriers
+        self.wait_stage(empty + stage, phase ^ 1)
+        barrier = full + stage
+        k_offset = k_tile * BLOCK_K
+        a = s_grad.iterator + stage * (self.block_m * BLOCK_K)
+        b = s_activation.iterator + stage * (self.block_n * BLOCK_K)
+        scale_a = s_grad_scale.iterator + stage * align_up(self.block_m, 32)
+        if cutlass.const_expr(self.u128_stage4_one_wave or (self.single_n80_tile and self.num_sms > 2)):
+            load_unicast_triplet(grad, grad_scale, activation, a, scale_a, b, barrier, k_offset, m_offset, n_offset, k_tile)
+        else:
+            self.load_input(grad, a, barrier, k_offset, m_offset)
+            self.load_input(grad_scale, scale_a, barrier, m_offset, k_tile)
+            self.load_input(activation, b, barrier, k_offset, n_offset)
+        cute.arch.mbarrier_arrive_and_expect_tx(barrier, self.transaction_bytes)
+
+    @cute.jit
+    def wait_stage(self, buffer, phase):
+        if cutlass.const_expr(self.n32_single_tile or self.n80_full_sms_unicast):
+            wait_barrier(buffer, phase)
+        elif cutlass.const_expr(self.cluster_size == 1 and not self.rowwise):
+            if not cute.arch.mbarrier_try_wait(buffer, phase):
+                wait_barrier(buffer, phase)
+        else:
+            cute.arch.mbarrier_wait(buffer, phase)
+
+    @cute.jit
+    def linear_ring_position(self, tile_idx, k_tile):
+        if cutlass.const_expr(self.n16_a_single_n):
+            return k_tile, (tile_idx // self.num_sms) & 1
+        if cutlass.const_expr(self.reuse_full_b_n144):
+            return tile_idx // self.num_sms + k_tile, Int32(0)
+        if cutlass.const_expr(self.short_a_n64):
+            if cutlass.const_expr(self.num_m * self.num_n <= 2 * self.num_sms):
+                return Int32(tile_idx >= self.num_sms) + k_tile, Int32(0)
+            return tile_idx // self.num_sms + k_tile, Int32(0)
+        if cutlass.const_expr(self.short_n144_cluster or self.short_a_n16 or self.short_a_n144
+                              or self.short_a_n128 or self.short_a_n112 or self.short_b_n80):
+            tile_iteration = Int32(tile_idx >= self.num_sms)
+        else:
+            tile_iteration = tile_idx // self.num_sms
+        ordinal = tile_iteration * self.num_k + k_tile
+        if cutlass.const_expr(self.short_a_n144 or self.short_a_n96_no_wrap or self.short_a_n112 or self.short_b_n80):
+            return ordinal, Int32(0)
+        return ordinal & (self.stages - 1), (ordinal // self.stages) & 1
+
+    @cute.jit
+    def advance_stage(self, stage, phase):
+        live_stages = 4 if self.reuse_short_a128 else self.stages
+        next_stage = select_(stage == live_stages - 1, Int32(0), stage + 1)
+        return next_stage, phase ^ Int32(next_stage == 0)
+
+    @cute.jit
+    def load_block_scales(self, tidx, tile_n, former_groups, output_groups, mActivationScale, s_activation_scale, first_scale_loader: cutlass.Constexpr):
+        if cutlass.const_expr(first_scale_loader != 32):
+            # Every tile in these waves uses B scale row zero.
+            if tidx >= first_scale_loader:
+                if cutlass.const_expr((self.num_m, self.num_n, self.num_k) == (3, 4, 256)):
+                    lane = tidx - first_scale_loader
+                    for stripe in cutlass.range_constexpr(8):
+                        k_tile = lane + stripe * 32
+                        s_activation_scale[k_tile, 0] = mActivationScale[0, k_tile]
+                else:
+                    for k_tile in cutlass.range(tidx - first_scale_loader, self.num_k, self.math_threads - first_scale_loader, unroll=1):
+                        s_activation_scale[k_tile, 0] = mActivationScale[0, k_tile]
+            cute.arch.barrier(barrier_id=1, number_of_threads=self.math_threads)
+            return
+        num_groups = select_(former_groups >= output_groups, Int32(1), Int32(2))
+        if cutlass.const_expr(self.uniform_scale):
+            num_groups = Int32(1)
+        if cutlass.const_expr(self.n80_stage7_block):
+            first_scale_loader = 0
+        if tidx >= first_scale_loader:
+            first_scale = tile_n * self.block_n // BLOCK_K
+            if cutlass.const_expr(self.use_linear_k_major_scales):
+                layout = cute.make_layout((self.num_k * self.scale_columns,))
+                source = cute.make_tensor(mActivationScale.iterator + first_scale * self.num_k, layout)
+                destination = cute.make_tensor(s_activation_scale.iterator, layout)
+                for idx in cutlass.range(tidx - first_scale_loader, self.num_k * num_groups, self.math_threads - first_scale_loader):
+                    destination[idx] = source[idx]
+            else:
+                for idx in cutlass.range(tidx - first_scale_loader, self.num_k * num_groups, self.math_threads - first_scale_loader):
+                    k_tile, scale_row = idx % self.num_k, idx // self.num_k
+                    s_activation_scale[k_tile, scale_row] = mActivationScale[first_scale + scale_row, k_tile]
+        cute.arch.barrier(barrier_id=1, number_of_threads=self.math_threads)
+
+    @cute.jit
+    def release_stage(self, empty, tile_idx, lane):
+        if cutlass.const_expr(self.cluster_size == 1 or self.n16_a_single_n):
+            if lane == 0:
+                cute.arch.mbarrier_arrive(empty)
+        else:
+            if lane < self.cluster_size:
+                target = lane
+                if cutlass.const_expr(self.num_m % 2 and self.num_n % 2):
+                    target = select_((tile_idx ^ 1) < self.num_m * self.num_n, lane, tile_idx % 2)
+                cute.arch.mbarrier_arrive(empty, target)
+
+    @cute.jit
+    def compute_loop(self, tidx, warp, bx, mma, inputs, barriers, s_out, out, mActivationScale, first_scale_loader: cutlass.Constexpr):
+        s_grad, s_activation, s_grad_scale, s_activation_scale = inputs
+        mma_slice = mma.get_slice(cute.arch.make_warp_uniform(warp // 4 * 128))
+        # Small M uses the first lanes of a 64-row WGMMA tile. The descriptor
+        # spans 64 rows, while the stage advance follows the actual A tile.
+        if cutlass.const_expr(self.block_m < 64):
+            grad_layout = cute.make_layout((64, BLOCK_K, self.stages), stride=(BLOCK_K, 1, self.block_m * BLOCK_K))
+            s_grad = cute.make_tensor(s_grad.iterator, grad_layout)
+        if cutlass.const_expr(self.n32_single_tile or self.skinny_short_n144):
+            activation_layout = cute.make_layout((self.math_block_n, BLOCK_K, self.stages),
+                                                  stride=(BLOCK_K, 1, self.block_n * BLOCK_K))
+            s_activation = cute.make_tensor(s_activation.iterator, activation_layout)
+        if cutlass.const_expr(self.n112_short_k):
+            a_warpgroup = s_grad.iterator + tidx // 128 * (64 * BLOCK_K)
+            grad_desc = cute.arch.make_warp_uniform((a_warpgroup.toint() >> 4) & 0x3FFF)
+            activation_desc = cute.arch.make_warp_uniform((s_activation.iterator.toint() >> 4) & 0x3FFF)
+        elif cutlass.const_expr(self.inline_small_mma or self.n80_b_multicast):
+            grad_desc = cute.arch.make_warp_uniform((s_grad.iterator.toint() >> 4) & 0x3FFF)
+            activation_desc = cute.arch.make_warp_uniform((s_activation.iterator.toint() >> 4) & 0x3FFF)
+        else:
+            grad_desc = mma_slice.make_fragment_A(mma_slice.partition_A(s_grad))
+            activation_desc = mma_slice.make_fragment_B(mma_slice.partition_B(s_activation))
+        fragment_shape = (self.math_block_n // 2,)
+        tile = cute.make_identity_tensor((self.math_threads // 2, self.math_block_n))
+        mma_acc = cute.make_rmem_tensor(cute.shape(mma_slice.partition_C(tile)), Float32)
+        partial = cute.make_tensor(mma_acc.iterator, cute.make_layout(fragment_shape))
+        accumulator = cute.make_rmem_tensor(fragment_shape, Float32)
+        do_store = True
+        if cutlass.const_expr(self.block_m < 64):
+            do_store = tidx < self.store_threads
+        stage, phase = Int32(0), Int32(0)
+        output_tiles = self.num_m * self.num_n
+        if cutlass.const_expr(self.n32_reuse_grad):
+            output_tiles = self.num_sms
+        if cutlass.const_expr(self.reuse_full_b_n144 or self.n16_a_single_n):
+            self.load_block_scales(tidx, Int32(0), Int32(BLOCK_K // 8), Int32(self.block_n // 8), mActivationScale,
+                                   s_activation_scale, first_scale_loader)
+        for tile_idx in cutlass.range(bx, output_tiles, self.num_sms):
+            tile_m, tile_n, _ = self.tile_coords(tile_idx)
+            former_groups = cutlass.min(self.block_n, BLOCK_K - tile_n * self.block_n % BLOCK_K) // 8
+            output_groups = cutlass.min(self.N - tile_n * self.block_n, self.block_n) // 8
+            if cutlass.const_expr(not (self.rowwise or self.reuse_full_b_n144 or self.n16_a_single_n)):
+                self.load_block_scales(tidx, tile_n, former_groups, output_groups, mActivationScale, s_activation_scale, first_scale_loader)
+            full_tile = True
+            if cutlass.const_expr(self.long_tail_n):
+                full_tile = tile_n != self.num_n - 1
+            if full_tile:
+                accumulator.fill(0.0)
+                compute_args = (mma, grad_desc, activation_desc, s_grad_scale, s_activation_scale, mma_acc, partial, accumulator)
+                if cutlass.const_expr(self.n32_reuse_grad):
+                    if bx == 0:
+                        # Each output tile accumulates K blocks in order in its own registers.
+                        other_accumulator = cute.make_rmem_tensor(fragment_shape, Float32)
+                        other_accumulator.fill(0.0)
+                        other_args = (mma, grad_desc, activation_desc, s_grad_scale, s_activation_scale, mma_acc,
+                                      partial, other_accumulator)
+                        self.compute_n32_reused(tidx, tile_idx, barriers, compute_args, other_args, former_groups)
+                        self.store_tile(tidx, other_accumulator, s_out, out, tile_m, tile_n + self.num_sms)
+                    else:
+                        stage, phase = self.compute_tile(tidx, tile_idx, barriers, compute_args, stage, phase, former_groups)
+                elif cutlass.const_expr(self.n80_three_tile_mn_scales):
+                    if former_groups == 6:
+                        stage, phase = self.compute_tile(tidx, tile_idx, barriers, compute_args, stage, phase, 6)
+                    else:
+                        stage, phase = self.compute_tile(tidx, tile_idx, barriers, compute_args, stage, phase, 10)
+                elif cutlass.const_expr(self.specialize_scale and not self.rowwise):
+                    stage, phase = self.dispatch_scale_split(tidx, tile_idx, barriers, compute_args, stage, phase, former_groups, 0)
+                else:
+                    stage, phase = self.compute_tile(tidx, tile_idx, barriers, compute_args, stage, phase, former_groups)
+                if do_store:
+                    self.store_tile(tidx, accumulator, s_out, out, tile_m, tile_n)
+            elif cutlass.const_expr(self.long_tail_n):
+                self.compute_long_tail(tidx, tile_idx, tile_m, tile_n, inputs, barriers, s_out, out)
+            if cutlass.const_expr(not self.n96_sustained):
+                cute.arch.sync_warp()
+
+    @cute.jit
+    def compute_long_tail(self, tidx, tile_idx, tile_m, tile_n, inputs, barriers, s_out, out):
+        s_grad, s_activation, s_grad_scale, s_activation_scale = inputs
+        full, empty = barriers
+        lane = tidx % 32
+        row_lo = tidx // 32 * 16 + lane // 4
+        row_hi = row_lo + 8
+        do_store = tidx < self.store_threads
+        grad_desc = cute.arch.make_warp_uniform((s_grad.iterator.toint() >> 4) & 0x3FFF)
+        activation_desc = cute.arch.make_warp_uniform((s_activation.iterator.toint() >> 4) & 0x3FFF)
+        accumulator = cute.make_rmem_tensor((self.long_tail_n // 2,), Float32)
+        partial = cute.make_rmem_tensor((self.long_tail_n // 2,), Float32)
+        accumulator.fill(0.0)
+        stage = Int32(self.num_k % self.stages)
+        phase = Int32((self.num_k // self.stages) & 1)
+        for k_tile in cutlass.range(self.num_k, unroll=8):
+            stage = cute.arch.make_warp_uniform(stage)
+            activation = s_activation_scale[k_tile, 0]
+            self.wait_stage(full + stage, phase)
+            grad_lo, grad_hi = unused_scale(), unused_scale()
+            if do_store:
+                grad_lo, grad_hi = s_grad_scale[row_lo, 0, stage], s_grad_scale[row_hi, 0, stage]
+            a_low = grad_desc + stage * (self.block_m * BLOCK_K // 16)
+            b_low = activation_desc + stage * (self.block_n * BLOCK_K // 16)
+            output = wgmma_k_block(a_low, b_low, self.long_tail_n)
+            for index in cutlass.range_constexpr(self.long_tail_n // 2):
+                partial[index] = output[index]
+            self.release_stage(empty + stage, tile_idx, lane)
+            if do_store:
+                lo, hi = grad_lo * activation, grad_hi * activation
+                for group in cutlass.range_constexpr(self.long_tail_n // 8):
+                    self.promote_pair(accumulator, partial, group, (lo, lo, hi, hi))
+            stage, phase = self.advance_stage(stage, phase)
+        if do_store:
+            self.store_tile(tidx, accumulator, s_out, out, tile_m, tile_n, self.long_tail_n)
+
+    @cute.jit
+    def dispatch_scale_split(self, tidx, tile_idx, barriers, compute_args, stage, phase, former_groups, split: cutlass.Constexpr):
+        if former_groups == split:
+            stage, phase = self.compute_tile(tidx, tile_idx, barriers, compute_args, stage, phase, split)
+        else:
+            if cutlass.const_expr(split + self.scale_gap // 8 <= BLOCK_K // 8):
+                stage, phase = self.dispatch_scale_split(tidx, tile_idx, barriers, compute_args, stage, phase, former_groups, split + self.scale_gap // 8)
+        return stage, phase
+
+    @cute.jit
+    def compute_tile(self, tidx, tile_idx, barriers, compute_args, stage, phase, former_groups):
+        if cutlass.const_expr(self.n16_a_single_n):
+            phase = (tile_idx // self.num_sms) & 1
+            for slot in cutlass.range_constexpr(self.num_k):
+                self.compute_stage(tidx, tile_idx, barriers, compute_args, slot, phase, former_groups, slot)
+            return Int32(0), phase
+        if cutlass.const_expr(
+            self.n112_unicast_ring or self.n112_a_full_ring or self.long_b_m16_n128
+        ):
+            return self.compute_n112_ring(tidx, tile_idx, barriers, compute_args, stage, phase, former_groups)
+        if cutlass.const_expr(self.u128_stage4_one_wave or self.static_ring or self.full_a128_stage4 or self.a128_stage4_full_groups):
+            self.compute_static_ring(tidx, tile_idx, barriers, compute_args, former_groups)
+            return stage, phase
+        mma, grad_desc, activation_desc, s_grad_scale, s_activation_scale, mma_acc, partial, accumulator = compute_args
+        full, empty = barriers
+        lane = tidx % 32
+        row_lo = tidx // 32 * 16 + lane // 4
+        row_hi = row_lo + 8
+        do_store = True
+        if cutlass.const_expr(self.block_m < 64):
+            do_store = tidx < self.store_threads
+        if cutlass.const_expr(self.n80_b_multicast):
+            b_scale_lo = s_activation_scale[0, 0]
+            b_scale_hi = s_activation_scale[0, 1]
+        else:
+            b_scale_lo, b_scale_hi = Float32(0), Float32(0)
+        for k_tile in cutlass.range(self.num_k, unroll=8):
+            if cutlass.const_expr(self.use_linear_stage_index):
+                stage, phase = self.linear_ring_position(tile_idx, k_tile)
+            stage = cute.arch.make_warp_uniform(stage)
+            if cutlass.const_expr(self.n80_b_multicast):
+                activation_lo, activation_hi = b_scale_lo, b_scale_hi
+            elif cutlass.const_expr(not self.rowwise):
+                activation_lo = s_activation_scale[k_tile, 0]
+                activation_hi = activation_lo
+                if cutlass.const_expr(not self.uniform_scale):
+                    activation_hi = s_activation_scale[k_tile, 1]
+            self.wait_stage(full + stage, phase)
+            grad_lo, grad_hi = Float32(0), Float32(0)
+            if do_store:
+                grad_lo, grad_hi = s_grad_scale[row_lo, 0, stage], s_grad_scale[row_hi, 0, stage]
+
+            if cutlass.const_expr(self.n80_b_multicast):
+                grad_low = grad_desc + stage * (self.block_m * BLOCK_K // 16)
+                activation_low = activation_desc + stage * (self.block_n * BLOCK_K // 16)
+                # The tile's B scales are ready in shared memory before the K loop.
+                next_k = cutlass.min(k_tile + 1, self.num_k - 1)
+                next_lo = s_activation_scale.iterator + next_k
+                next_hi = next_lo + self.num_k
+                values = wgmma_k_block(grad_low, activation_low, self.block_n, (next_lo, next_hi))
+                for index in cutlass.range_constexpr(self.block_n // 2):
+                    partial[index] = values[index]
+            else:
+                b_stage = Int32(0) if self.reuse_full_b_n144 else stage
+                warpgroup.fence()
+                for mma_k in cutlass.range_constexpr(BLOCK_K // 32):
+                    mma.set(warpgroup.Field.ACCUMULATE, mma_k != 0)
+                    cute.gemm(mma, mma_acc, grad_desc[None, None, mma_k, stage], activation_desc[None, None, mma_k, b_stage], mma_acc)
+                warpgroup.commit_group()
+                warpgroup.wait_group(0)
+            if cutlass.const_expr(self.rowwise):
+                if do_store:
+                    self.promote_rows(accumulator, partial, grad_lo, grad_hi, s_activation_scale, lane % 4 * 2, stage)
+            self.release_stage(empty + stage, tile_idx, lane)
+            if cutlass.const_expr(not self.rowwise):
+                if do_store:
+                    self.promote_blocks(accumulator, partial, grad_lo, grad_hi, activation_lo, activation_hi, former_groups)
+            if cutlass.const_expr(self.n80_b_multicast):
+                b_scale_lo = values[self.block_n // 2]
+                b_scale_hi = values[self.block_n // 2 + 1]
+            if cutlass.const_expr(not self.use_linear_stage_index):
+                stage, phase = self.advance_stage(stage, phase)
+        if cutlass.const_expr(self.use_linear_stage_index):
+            stage, phase = self.linear_ring_position(tile_idx, self.num_k)
+        return stage, phase
+
+    @cute.jit
+    def compute_n112_ring(self, tidx, tile_idx, barriers, compute_args, stage, phase, former_groups):
+        # Complete the partial ring before issuing the five literal stage offsets.
+        prefix = select_(stage == 0, Int32(0), self.stages - stage)
+        for k_tile in cutlass.range(prefix, unroll=1):
+            self.compute_stage(tidx, tile_idx, barriers, compute_args, stage, phase, former_groups, k_tile)
+            stage, phase = self.advance_stage(stage, phase)
+        groups = (self.num_k - prefix) // self.stages
+        for group in cutlass.range(groups, unroll=1):
+            for slot in cutlass.range_constexpr(self.stages):
+                k_tile = prefix + group * self.stages + slot
+                self.compute_stage(tidx, tile_idx, barriers, compute_args, slot, phase, former_groups, k_tile)
+            phase ^= 1
+        stage = Int32(0)
+        for k_tile in cutlass.range(prefix + groups * self.stages, self.num_k, unroll=1):
+            self.compute_stage(tidx, tile_idx, barriers, compute_args, stage, phase, former_groups, k_tile)
+            stage, phase = self.advance_stage(stage, phase)
+        return stage, phase
+
+    @cute.jit
+    def compute_static_ring(self, tidx, tile_idx, barriers, compute_args, former_groups):
+        if cutlass.const_expr(self.u128_stage4_one_wave or self.long_n80_stage4 or self.full_a128_stage4 or self.a128_stage4_full_groups):
+            period = 2 * self.stages
+            for group in cutlass.range(self.num_k // period, unroll=1):
+                for index in cutlass.range_constexpr(period):
+                    slot, phase = index % self.stages, index // self.stages
+                    k_tile = group * period + index
+                    self.compute_stage(tidx, tile_idx, barriers, compute_args, slot, phase, former_groups, k_tile)
+            for index in cutlass.range_constexpr(self.num_k % period):
+                slot, phase = index % self.stages, index // self.stages
+                k_tile = self.num_k // period * period + index
+                self.compute_stage(tidx, tile_idx, barriers, compute_args, slot, phase, former_groups, k_tile)
+        else:
+            for group in cutlass.range(self.num_k // self.stages, unroll=1):
+                for slot in cutlass.range_constexpr(self.stages):
+                    self.compute_stage(tidx, tile_idx, barriers, compute_args, slot, group & 1, former_groups, group * self.stages + slot)
+            for slot in cutlass.range_constexpr(self.num_k % self.stages):
+                group = self.num_k // self.stages
+                self.compute_stage(tidx, tile_idx, barriers, compute_args, slot, group & 1, former_groups, group * self.stages + slot)
+
+    @cute.jit
+    def compute_n32_reused(self, tidx, tile_idx, barriers, compute_args, other_args, former_groups):
+        for group in cutlass.range(self.num_k // self.stages, unroll=1):
+            for stage in cutlass.range_constexpr(self.stages):
+                k_tile = group * self.stages + stage
+                self.compute_stage(tidx, tile_idx, barriers, compute_args, stage, Int32(0), former_groups, k_tile)
+            for stage in cutlass.range_constexpr(self.stages):
+                k_tile = group * self.stages + stage
+                self.compute_stage(tidx, tile_idx, barriers, other_args, stage, Int32(1), former_groups, k_tile)
+
+    @cute.jit
+    def compute_stage(self, tidx, tile_idx, barriers, compute_args, stage, phase, former_groups, k_tile):
+        mma, grad_desc, activation_desc, s_grad_scale, s_activation_scale, mma_acc, partial, accumulator = compute_args
+        mma = mma.with_()
+        full, empty = barriers
+        lane = tidx % 32
+        row_lo = tidx // 32 * 16 + lane // 4
+        row_hi = row_lo + 8
+        do_store = True
+        if cutlass.const_expr(self.block_m < 64):
+            do_store = tidx < self.store_threads
+        if cutlass.const_expr(not self.rowwise):
+            activation_lo = s_activation_scale[k_tile, 0]
+            activation_hi = activation_lo
+            if cutlass.const_expr(not self.uniform_scale):
+                activation_hi = s_activation_scale[k_tile, 1]
+        self.wait_stage(full + stage, phase)
+        grad_lo, grad_hi = Float32(0), Float32(0)
+        if cutlass.const_expr((self.inline_small_mma and self.block_n == 96 and self.num_n == 1)
+                              or self.rolling_n128_producer or self.m16_n32_stage8_full):
+            grad_lo, grad_hi = unused_scale(), unused_scale()
+        if do_store:
+            grad_lo, grad_hi = s_grad_scale[row_lo, 0, stage], s_grad_scale[row_hi, 0, stage]
+
+        if cutlass.const_expr(self.inline_small_mma or self.n112_short_k):
+            grad_low = grad_desc + stage * (self.block_m * BLOCK_K // 16)
+            activation_low = activation_desc + stage * (self.block_n * BLOCK_K // 16)
+            values = wgmma_k_block(grad_low, activation_low, self.block_n)
+            for index in cutlass.range_constexpr(self.block_n // 2):
+                partial[index] = values[index]
+        else:
+            warpgroup.fence()
+            for mma_k in cutlass.range_constexpr(BLOCK_K // 32):
+                mma.set(warpgroup.Field.ACCUMULATE, mma_k != 0)
+                cute.gemm(mma, mma_acc, grad_desc[None, None, mma_k, stage], activation_desc[None, None, mma_k, stage], mma_acc)
+            warpgroup.commit_group()
+            warpgroup.wait_group(0)
+        if cutlass.const_expr(self.rowwise):
+            if do_store:
+                self.promote_rows(accumulator, partial, grad_lo, grad_hi, s_activation_scale, lane % 4 * 2, stage)
+        self.release_stage(empty + stage, tile_idx, lane)
+        if cutlass.const_expr(not self.rowwise):
+            if do_store:
+                self.promote_blocks(accumulator, partial, grad_lo, grad_hi, activation_lo, activation_hi, former_groups)
+
+    @cute.jit
+    def promote_blocks(self, accumulator, partial, grad_lo, grad_hi, activation_lo, activation_hi, former_groups):
+        if cutlass.const_expr(self.m64_n112_one_wave or self.n112_unicast_ring or self.n112_a_full_ring):
+            lo_a, hi_a = grad_lo * activation_lo, grad_hi * activation_lo
+            lo_b, hi_b = grad_lo * activation_hi, grad_hi * activation_hi
+            # A 112-column tile crosses scale boundaries in pairs of 8-column groups.
+            for group in cutlass.range_constexpr(0, self.math_block_n // 8, 2):
+                lo = select_(group < former_groups, lo_a, lo_b)
+                hi = select_(group < former_groups, hi_a, hi_b)
+                self.promote_pair(accumulator, partial, group, (lo, lo, hi, hi))
+                self.promote_pair(accumulator, partial, group + 1, (lo, lo, hi, hi))
+        elif cutlass.const_expr(self.select_scale_before_product):
+            for group in cutlass.range_constexpr(self.math_block_n // 8):
+                activation = select_(group < former_groups, activation_lo, activation_hi)
+                lo, hi = grad_lo * activation, grad_hi * activation
+                self.promote_pair(accumulator, partial, group, (lo, lo, hi, hi))
+        else:
+            scale_lo, scale_hi = grad_lo * activation_lo, grad_hi * activation_lo
+            scale_next_lo, scale_next_hi = grad_lo * activation_hi, grad_hi * activation_hi
+            for group in cutlass.range_constexpr(self.math_block_n // 8):
+                lo, hi = scale_lo, scale_hi
+                if cutlass.const_expr((self.specialize_scale or self.n80_three_tile_mn_scales) and not self.uniform_scale):
+                    if cutlass.const_expr(group >= former_groups):
+                        lo, hi = scale_next_lo, scale_next_hi
+                elif cutlass.const_expr(not self.uniform_scale):
+                    lo = select_(group < former_groups, scale_lo, scale_next_lo)
+                    hi = select_(group < former_groups, scale_hi, scale_next_hi)
+                self.promote_pair(accumulator, partial, group, (lo, lo, hi, hi))
+
+    @cute.jit
+    def promote_rows(self, accumulator, partial, grad_lo, grad_hi, s_activation_scale, col_pair, stage):
+        for group in cutlass.range_constexpr(self.block_n // 8):
+            col = group * 8 + col_pair
+            activation_lo, activation_hi = s_activation_scale[col, 0, stage], s_activation_scale[col + 1, 0, stage]
+            self.promote_pair(accumulator, partial, group, (grad_lo * activation_lo, grad_lo * activation_hi, grad_hi * activation_lo, grad_hi * activation_hi))
+
+    @cute.jit
+    def promote_pair(self, accumulator, partial, group, scales):
         for entry in cutlass.range_constexpr(4):
-            slot = col_group * 4 + entry
-            acc_wgrad[slot] = Float32(math.fma(acc_tile[slot].ir_value(), scales[entry].ir_value(), acc_wgrad[slot].ir_value()))
+            idx = group * 4 + entry
+            accumulator[idx] = Float32(math.fma(partial[idx].ir_value(), scales[entry].ir_value(), accumulator[idx].ir_value()))
 
     @cute.jit
-    def store_tile(self, tidx, acc_wgrad, thread_out, s_out, out_copy, coord):
-        if tidx == 0:
-            cute.arch.cp_async_bulk_wait_group(0, read=True)
-        cute.arch.barrier(barrier_id=1, number_of_threads=self.threads_math)
-        # Preserve the original reduce-add's positive zero without flushing subnormals.
-        acc_wgrad.store(acc_wgrad.load() + Float32(0.0))
-        cute.autovec_copy(acc_wgrad, thread_out)
+    def store_tile(self, tidx, accumulator, s_out, out, tile_m, tile_n, math_n: cutlass.Constexpr = 0):
+        if cutlass.const_expr(self.short_a_n64):
+            # The two issuing lanes must finish reading before the CTA reuses either strip.
+            if tidx < self.block_n // 32:
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+            cute.arch.barrier(barrier_id=2, number_of_threads=self.store_threads)
+        elif cutlass.const_expr(not (self.swizzle_fp32_output or self.n96_sustained or self.n16_u_short)):
+            if cutlass.const_expr(self.n160_sustained or self.n192_b_sustained):
+                # Each issuing lane waits before any warp reuses the shared tile.
+                if cute.arch.warp_idx() < self.block_n // 32 and tidx % 32 == 0:
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+            elif tidx == 0:
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+            cute.arch.barrier(barrier_id=2, number_of_threads=self.store_threads)
+        row_lo = tidx // 32 * 16 + tidx % 32 // 4
+        col_pair = tidx % 4 * 2
+        for group in cutlass.range_constexpr((math_n or self.math_block_n) // 8):
+            if cutlass.const_expr(self.swizzle_fp32_output or self.sustained_swizzled_output):
+                # The two rows share a swizzle phase because they are eight rows apart.
+                strip = group // 4 * (self.block_m * 32)
+                col = col_pair + group % 4 * 8
+                col = ((col // 4) ^ (row_lo % 8)) * 4 + col % 4
+                tile = cute.make_tensor(s_out.iterator + strip + row_lo * 32 + col,
+                                        cute.make_layout((2, 2), stride=(1, 8 * 32)))
+            else:
+                col = col_pair + group * 8
+                tile = cute.make_tensor(s_out.iterator + row_lo * self.block_n + col,
+                                        cute.make_layout((2, 2), stride=(1, 8 * self.block_n)))
+            values = cute.make_tensor(accumulator.iterator + group * 4, cute.make_layout((2, 2)))
+            values.store(values.load() + Float32(0))
+            cute.autovec_copy(values, tile)
+        if cutlass.const_expr(self.n32_single_tile):
+            for group in cutlass.range_constexpr(self.math_block_n // 8, self.block_n // 8):
+                col = col_pair + group * 8
+                tile = cute.make_tensor(s_out.iterator + row_lo * self.block_n + col,
+                                        cute.make_layout((2, 2), stride=(1, 8 * self.block_n)))
+                tile.fill(Float32(0))
         cute.arch.fence_view_async_shared()
-        cute.arch.barrier(barrier_id=1, number_of_threads=self.threads_math)
-        if tidx == 0:
-            shared, global_tile = self.partition_copy(out_copy, s_out, (self.block_m, self.block_n), coord)
-            cute.copy(out_copy[0], shared, global_tile)
+        cute.arch.barrier(barrier_id=2, number_of_threads=self.store_threads)
+        if cutlass.const_expr(self.swizzle_fp32_output):
+            if tidx < self.block_n // 32:
+                source = s_out.iterator + tidx * self.block_m * 32
+                col = tile_n * self.block_n + tidx * 32
+                nvvm.cp_async_bulk_tensor_global_shared_cta(out.get_ptr(), source, [col, tile_m * self.block_m])
+                cute.arch.cp_async_bulk_commit_group()
+        elif cutlass.const_expr(self.sustained_swizzled_output):
+            strip = cute.arch.warp_idx()
+            if strip < self.block_n // 32 and tidx % 32 == 0:
+                source = s_out.iterator + strip * self.block_m * 32
+                col = tile_n * self.block_n + strip * 32
+                nvvm.cp_async_bulk_tensor_global_shared_cta(out.get_ptr(), source, [col, tile_m * self.block_m])
+                cute.arch.cp_async_bulk_commit_group()
+        elif tidx == 0:
+            nvvm.cp_async_bulk_tensor_global_shared_cta(out.get_ptr(), s_out.iterator, [tile_n * self.block_n, tile_m * self.block_m])
             cute.arch.cp_async_bulk_commit_group()
 
 
-def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out):
+def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_sms=None, block_n_multiple=1):
     """
-    Use Hopper WGMMA with one FP32 promotion per 128 reduction elements.
+    Write the fresh FP32 Hopper weight gradient with one scale product per K block.
     """
     M, K = grad.shape
     N = activation.shape[0]
-    num_blocks = (K + BLOCK_K - 1) // BLOCK_K
-    rowwise_activation = activation_scale.shape == (N, num_blocks)
-    if activation.shape != (N, K) or out.shape != (M, N) or K % 16 or N % 8:
-        raise ValueError("fp8_wgrad requires matching (M, K), (N, K) and (M, N) shapes, K % 16 == 0 and N % 8 == 0")
-    if grad_scale.shape != (M, num_blocks) or not (rowwise_activation or activation_scale.shape == ((N + BLOCK_K - 1) // BLOCK_K, num_blocks)):
-        raise ValueError("fp8_wgrad scales must cover the corresponding row or tile for each 128 tokens")
-    if grad.dtype != torch.float8_e4m3fn or activation.dtype != grad.dtype or any(tensor.dtype != torch.float32 for tensor in (grad_scale, activation_scale, out)):
-        raise TypeError("fp8_wgrad requires FP8 E4M3 inputs and FP32 scales and output")
-    if not out.is_contiguous() or not out.is_cuda or any(tensor.device != out.device for tensor in (grad, grad_scale, activation, activation_scale)):
-        raise ValueError("fp8_wgrad requires a contiguous output and tensors on the same CUDA device")
+    if activation.shape != (N, K) or out.shape != (M, N):
+        raise ValueError("expected matching (M, K), (N, K) and (M, N) shapes")
+    if grad.dtype != torch.float8_e4m3fn or activation.dtype != grad.dtype or out.dtype != torch.float32:
+        raise TypeError("expected FP8 E4M3 operands and FP32 output")
+    if not out.is_cuda or any(tensor.device != out.device for tensor in (grad, activation)):
+        raise ValueError("expected operands and output on the same CUDA device")
+    if any(tensor.stride(1) != 1 for tensor in (grad, activation, out)):
+        raise ValueError("expected unit inner strides")
     if not M or not N:
         return
     if not K:
         out.zero_()
         return
 
-    grad, activation = grad.contiguous(), activation.contiguous()
-    grad_scale = to_mn_major(grad_scale)
-    activation_scale = to_mn_major(activation_scale) if rowwise_activation else activation_scale.contiguous()
+    if N % 8:
+        raise ValueError("positive work requires N aligned to 8")
+    if any((tensor.stride(0) * tensor.element_size()) % 16 or tensor.data_ptr() % 16 for tensor in (grad, activation, out)):
+        raise ValueError("expected 16-byte TMA alignment")
+    num_k = divide_up(K, BLOCK_K)
+    rowwise = activation_scale.shape == (N, num_k)
+    if grad_scale.shape != (M, num_k) or not (rowwise or activation_scale.shape == (divide_up(N, BLOCK_K), num_k)):
+        raise ValueError("expected one scale per input row or scale tile for every K block")
+    if any(scale.dtype != torch.float32 for scale in (grad_scale, activation_scale)):
+        raise TypeError("expected FP32 scales")
+    if any(scale.device != out.device for scale in (grad_scale, activation_scale)):
+        raise ValueError("expected scales on the operand CUDA device")
 
+    grad_scale = to_mn_major(grad_scale)
+    if rowwise:
+        activation_scale = to_mn_major(activation_scale)
+    elif not (activation_scale.is_contiguous() or activation_scale.T.is_contiguous()):
+        activation_scale = activation_scale.contiguous()
+    if not rowwise and M <= 64 and N <= 80 and block_n_multiple == 80 and activation_scale.shape[0] == 1:
+        activation_scale = activation_scale.as_strided(activation_scale.shape, (num_k, activation_scale.stride(1)))
+    device_sms = torch.cuda.get_device_properties(out.device).multi_processor_count
+    num_sms = device_sms if num_sms is None else num_sms
+    if not 2 <= num_sms <= device_sms or num_sms % 2:
+        raise ValueError("expected an even SM count from two through the device SM count")
+    if not 1 <= block_n_multiple <= 192:
+        raise ValueError("expected a positive block-N multiple at most 192")
     tensors = (grad, grad_scale, activation, activation_scale, out)
-    key = ("fp8_wgrad", M, N, K, rowwise_activation, tuple(tensor.stride() for tensor in tensors))
-    fn = CACHE.get(key)
-    if fn is None:
+    key = ("fp8_wgrad", M, N, K, num_sms, rowwise, block_n_multiple, tuple(tensor.stride() for tensor in tensors))
+    compiled = CACHE.get(key)
+    if compiled is None:
         dtypes = (Float8E4M3FN, Float32, Float8E4M3FN, Float32, Float32)
-        operands = tuple(fake(dtype, tuple(tensor.shape), tensor.stride(), 4 if index == 3 and not rowwise_activation else 16) for index, (dtype, tensor) in enumerate(zip(dtypes, tensors)))
-        fn = cute.compile(WeightGradient(M, N, K, rowwise_activation), *operands, fake_stream(), options="--enable-tvm-ffi")
-        CACHE[key] = fn
-    fn(*tensors)
+        operands = []
+        for idx, (dtype, tensor) in enumerate(zip(dtypes, tensors)):
+            if idx == 3 and not rowwise:
+                operands.append(fake(dtype, tuple(tensor.shape), tensor.stride(), 4))
+            else:
+                # Keep a two-dimensional TMA box when a global extent is one.
+                shape = tuple(cute.sym_int32() if extent == 1 else extent for extent in tensor.shape)
+                operands.append(fake(dtype, shape, tensor.stride()))
+        aligned_fp8_rows = grad.stride(0) % 32 == 0 and activation.stride(0) % 32 == 0
+        natural_k_stride = align_up(K, 16)
+        compact_rows = grad.stride(0) == activation.stride(0) == natural_k_stride and out.stride(0) == N
+        operation = WeightGradient(M, N, K, num_sms, rowwise, block_n_multiple,
+                                   activation_scale.stride() == (num_k, 1), aligned_fp8_rows, compact_rows)
+        compiled = cute.compile(operation, *operands, fake_stream(), options="--enable-tvm-ffi")
+        CACHE[key] = compiled
+    compiled(*tensors)
