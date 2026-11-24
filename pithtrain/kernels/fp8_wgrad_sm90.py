@@ -299,8 +299,9 @@ class WeightGradient:
                  aligned_n32_stage10_operands=False, aligned_m32_n64_stage4_operands=False,
                  n80_b_stage7_aligned_storage=False, aligned_m32_n96_stage4_operands=False,
                  aligned_m16_n64_stage4_prefetch_operands=False, n128_stage4_wide=False,
-                 n80_b_stage9_aligned_storage=False,
-                 aligned_stage11_spill_operands=False, n32_a_stage13_aligned_storage=False, aligned_n32_stage12_operands=False):
+                 n80_stage6_gate3_storage=False, n80_b_stage9_aligned_storage=False,
+                 aligned_stage11_spill_operands=False, n32_a_stage13_aligned_storage=False, n64_a_stage9_aligned_storage=False,
+                 aligned_n32_stage12_operands=False):
         self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n = select_layout(M, N, K, num_sms, rowwise, block_n_multiple)
         self.num_m, self.num_n, self.num_k = divide_up(M, self.block_m), divide_up(N, self.block_n), divide_up(K, BLOCK_K)
         if (not rowwise and compact_rows and block_n_multiple == 32
@@ -521,6 +522,14 @@ class WeightGradient:
             and ((4 <= self.stages <= 10 and self.num_k >= 512)
                  or (self.stages == 11 and (num_sms, self.num_k) == (120, 321)))
         )
+        self.n64_a_stage9_spill = (
+            compact_rows and n64_a_stage9_aligned_storage
+            and self.num_m <= self.num_n and self.num_n % 2 == 1
+            and 0 < N % self.block_n <= self.block_n // 2
+            and num_sms < self.num_m * (self.num_n - 1)
+            and self.num_m * self.num_n <= 2 * num_sms
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 64, 9, 1, 2)
+        )
         self.long_a_n64_stage11_spill = (
             aligned_stage11_spill_operands and self.num_m <= self.num_n and self.num_n % 2 == 1
             and num_sms < self.num_m * (self.num_n - 1)
@@ -587,6 +596,10 @@ class WeightGradient:
             )
         )
         self.sustained_swizzled_output = self.n96_sustained or self.n160_sustained or self.n192_b_sustained
+        self.m128_n80_stage6_gate3_mn = (
+            compact_rows and n80_stage6_gate3_storage
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 80, 6, 1, 1)
+        )
         self.n80_unicast_scale_pairs = (
             not rowwise and not compact_k_scale and compact_rows
             and (self.block_m, self.block_n, self.stages, self.cluster_size) == (128, 80, 7, 1)
@@ -1307,7 +1320,8 @@ class WeightGradient:
         )
         self.scale_promotion = select_route(
             ScalePromotion.GROUPS,
-            (ScalePromotion.PAIRS_SELECT_FIRST, self.m64_n48_a_stage9_wide),
+            (ScalePromotion.PAIRS_SELECT_FIRST,
+             self.m64_n48_a_stage9_wide or self.m128_n80_stage6_gate3_mn),
             (ScalePromotion.GROUP_PAIRS, self.b144_three_wave or self.m64_n80_grouped_wave
              or self.m64_n112_a_stage7_two_waves or self.m64_n48_a_stage10_multi_n
              or self.n112_stage4_two_waves
@@ -1322,7 +1336,7 @@ class WeightGradient:
                                   or self.u128_stage4_one_wave or self.long_n80_stage4
                                   or self.full_a128_stage4 or self.a128_stage4_full_groups)
         self.swizzle_tma_output = self.swizzle_fp32_output or self.sustained_swizzled_output
-        self.input_l2_128b = self.m64_n128_single_m_share_a or self.m64_n48_a_stage9_wide or self.b144_three_wave or self.m64_n80_input_128b or self.m64_n112_a_stage7_two_waves or self.m64_n48_a_stage10_multi_n
+        self.input_l2_128b = self.m64_n128_single_m_share_a or self.m64_n48_a_stage9_wide or self.b144_three_wave or self.m64_n80_input_128b or self.m64_n112_a_stage7_two_waves or self.m64_n48_a_stage10_multi_n or self.n64_a_stage9_spill
         self.fixed_scale_split = self.two_sm_single_tile or self.stream_n48_b_scales or self.n192_u_stage4_aligned
 
     @cute.jit
@@ -2819,6 +2833,23 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
+    n80_stage6_gate3_storage = (
+        not rowwise and K == 131072 and block_n_multiple == 1
+        and (M, N, num_sms) in (
+            (128, 4096, 52), (128, 4096, 56),
+            (256, 4096, 104), (256, 4096, 114), (256, 512, 14),
+        )
+        and activation_scale.stride() != (num_k, 1)
+        and all(tensor.data_ptr() % BLOCK_K == 0 and tensor.stride(0) * tensor.element_size() == K
+                for tensor in (grad, activation))
+    )
+    # The native 64x64 footprint fits nine stages for 12,353 to 16,512 K blocks.
+    n64_a_stage9_aligned_storage = (
+        not rowwise and block_n_multiple == 64 and 12352 < num_k <= 16512
+        and all(tensor.data_ptr() % 32 == 0
+                and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
+                for tensor in (grad, activation))
+    )
     key = ("fp8_wgrad", M, N, K, num_sms, rowwise, block_n_multiple,
            tuple(tensor.stride() for tensor in tensors), aligned_two_sm_operands, long_a_storage_ok,
            aligned_stage11_tail, aligned_n160_operands, n80_streamed_scale_storage, aligned_a128_tail,
@@ -2829,7 +2860,9 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
            aligned_n96_stage4_operands, n96_stage4_tail_storage, aligned_n32_stage10_operands,
            aligned_m32_n64_stage4_operands, n80_b_stage7_aligned_storage,
            aligned_m32_n96_stage4_operands, aligned_m16_n64_stage4_prefetch_operands,
-           n80_b_stage9_aligned_storage, aligned_stage11_spill_operands, n32_a_stage13_aligned_storage, aligned_n32_stage12_operands)
+           n80_stage6_gate3_storage, n80_b_stage9_aligned_storage,
+           aligned_stage11_spill_operands, n32_a_stage13_aligned_storage,
+           n64_a_stage9_aligned_storage, aligned_n32_stage12_operands)
     compiled = CACHE.get(key)
     if compiled is None:
         dtypes = (Float8E4M3FN, Float32, Float8E4M3FN, Float32, Float32)
@@ -2875,9 +2908,11 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                                    aligned_m32_n96_stage4_operands=aligned_m32_n96_stage4_operands,
                                    aligned_m16_n64_stage4_prefetch_operands=aligned_m16_n64_stage4_prefetch_operands,
                                    n128_stage4_wide=n128_stage4_wide,
+                                   n80_stage6_gate3_storage=n80_stage6_gate3_storage,
                                    n80_b_stage9_aligned_storage=n80_b_stage9_aligned_storage,
                                    aligned_stage11_spill_operands=aligned_stage11_spill_operands,
                                    n32_a_stage13_aligned_storage=n32_a_stage13_aligned_storage,
+                                   n64_a_stage9_aligned_storage=n64_a_stage9_aligned_storage,
                                    aligned_n32_stage12_operands=aligned_n32_stage12_operands)
         compiled = cute.compile(operation, *operands, fake_stream(), options="--enable-tvm-ffi")
         CACHE[key] = compiled
