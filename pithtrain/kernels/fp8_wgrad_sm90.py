@@ -760,6 +760,10 @@ class WeightGradient:
             and (self.stages, K) in ((14, 1146881), (15, 745473))
             and (self.block_m, self.block_n, self.cluster_m, self.cluster_n) == (64, 32, 1, 2)
         )
+        self.short_n96_b_stage10 = (
+            not rowwise and compact_rows and (M, N, K, num_sms) == (1596, 1928, 12, 132)
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 96, 10, 2, 1)
+        )
         self.paired_ring_slots = self.stages - self.stages % 2
         self.paired_ring_has_last_stage = self.paired_ring_slots != self.stages
         self.use_linear_stage_index = (
@@ -836,6 +840,10 @@ class WeightGradient:
             and (M, N, K, num_sms) == (897, 776, 950273, 132)
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 48, 10, 1, 2)
         )
+        self.n128_u_stage4_two_sm = (
+            not rowwise and compact_rows and (M, N, K, num_sms) == (64, 1152, 3203072, 2)
+            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 128, 4, 1)
+        )
         self.select_routes()
         for width in self.wgmma_widths():
             check_wgmma_width(width)
@@ -859,7 +867,7 @@ class WeightGradient:
             ProducerRoute.DYNAMIC_RING,
             (ProducerRoute.RESIDENT_GRADIENT, self.n32_reuse_grad or self.n64_reuse_grad),
             (ProducerRoute.STATIC_RING, self.n16_u_stage10_pair or self.n160_stage4_full_panel
-             or self.n160_stage4_grad_offset
+             or self.n160_stage4_grad_offset or self.n128_u_stage4_two_sm
              or self.n80_stage7_block or self.stream_b_scale_row
              or self.n16_u_stage7 or self.u128_stage4_one_wave or self.n80_sustained_mn
              or (self.static_ring and not dynamic_producer)),
@@ -889,7 +897,7 @@ class WeightGradient:
             (TileOrder.SINGLE_TILE, self.n16_u_stage10_pair or self.stream_b_scale_row or self.n16_u_stage7 or self.m64_n32_long_stage8),
             (TileOrder.M_LINEAR, self.m64_n48_narrow_a),
             (TileOrder.SINGLE_TILE, self.m16_n128_stage8_single),
-            (TileOrder.N_LINEAR, self.n112_stage4_two_waves or self.n64_reuse_grad),
+            (TileOrder.N_LINEAR, self.n112_stage4_two_waves or self.n64_reuse_grad or self.n128_u_stage4_two_sm),
             (TileOrder.SINGLE_TILE, self.n16_u_stage11 or self.two_sm_single_tile),
             (TileOrder.M_LINEAR, self.n32_two_sm_narrow),
             (TileOrder.N144_B_WIDE, self.wide_n144_schedule),
@@ -914,7 +922,7 @@ class WeightGradient:
             (TileOrder.N_LINEAR_MULTICAST, self.m32_n112_two_waves),
             (TileOrder.SHORT_N_LINEAR_A, self.short_a_n16 or self.short_a_n144 or self.short_a_n96
              or self.short_a_n128 or self.m32_n48_short_a),
-            (TileOrder.SHORT_B, self.m64_n128_b_short),
+            (TileOrder.SHORT_B, self.m64_n128_b_short or self.short_n96_b_stage10),
             (TileOrder.SHORT_B_N128, self.short_b_n128),
         )
         self.scale_promotion = select_route(
@@ -1383,7 +1391,7 @@ class WeightGradient:
         grad, activation, grad_scale, _, _ = descriptors
         s_grad, s_activation, s_grad_scale, _ = inputs
         full, empty = barriers
-        if cutlass.const_expr(self.n160_stage4_full_panel):
+        if cutlass.const_expr(self.n160_stage4_full_panel or self.n128_u_stage4_two_sm):
             next_lookahead = k_tile + 2 * self.stages
             if next_lookahead < self.num_k:
                 prefetch_activation_tile(activation, next_lookahead * BLOCK_K, n_offset)
@@ -1402,6 +1410,10 @@ class WeightGradient:
             load_tma_with_hint(activation, b, barrier, k_offset, n_offset, False, 0x12F0000000000000)
         elif cutlass.const_expr(self.u128_stage4_one_wave or (self.single_n80_tile and self.num_sms > 2)):
             load_unicast_triplet(grad, grad_scale, activation, a, scale_a, b, barrier, k_offset, m_offset, n_offset, k_tile)
+        elif cutlass.const_expr(self.n160_stage4_grad_offset):
+            self.load_input(activation, b, barrier, k_offset, n_offset)
+            self.load_input(grad, a, barrier, k_offset, m_offset)
+            self.load_input(grad_scale, scale_a, barrier, m_offset, k_tile)
         else:
             self.load_input(grad, a, barrier, k_offset, m_offset)
             self.load_input(grad_scale, scale_a, barrier, m_offset, k_tile)
@@ -1411,7 +1423,7 @@ class WeightGradient:
     @cute.jit
     def wait_stage(self, buffer, phase):
         if cutlass.const_expr(self.n16_single_n_local_barriers or self.n16_u_stage10_pair
-                              or self.n160_stage4_grad_offset):
+                              or self.n160_stage4_grad_offset or self.n128_u_stage4_two_sm):
             wait_n16_stage7(buffer, phase)
             return
         if cutlass.const_expr(self.n32_single_tile or self.n80_full_sms_unicast):
@@ -1696,7 +1708,7 @@ class WeightGradient:
             if cutlass.const_expr(self.n160_stage4_ordinal_math):
                 # A single output tile enters the ring at stage and phase zero.
                 stage, phase = k_tile % self.stages, (k_tile // self.stages) & 1
-            else:
+            elif cutlass.const_expr(not self.n128_u_stage4_two_sm):
                 stage = cute.arch.make_warp_uniform(stage)
             if cutlass.const_expr(self.n80_b_multicast):
                 activation_lo, activation_hi = b_scale_lo, b_scale_hi
