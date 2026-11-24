@@ -53,8 +53,13 @@ def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
     converter = next((c for c in CONVERTERS if c.detect_hf(hf_root)), None)
     stdout.info("Selected HF loader: %s" % (converter.name if converter else "generic"))
 
-    with open(Path(hf_root, "model.safetensors.index.json")) as f:
-        raw = json.load(f)["weight_map"]
+    index = hf_root / "model.safetensors.index.json"
+    if index.is_file():
+        raw = json.loads(index.read_text())["weight_map"]
+    else:
+        weights = hf_root / "model.safetensors"
+        with safe_open(str(weights), framework="pt", device="cpu") as handle:
+            raw = dict.fromkeys(handle.keys(), weights.name)
     # Planners look up keys without the "model." prefix; reads use the name stored in the file.
     file_key = {k.removeprefix("model."): k for k in raw}
     weight_map = {k: raw[v] for k, v in file_key.items()}

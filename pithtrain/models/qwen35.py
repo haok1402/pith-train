@@ -2,6 +2,7 @@
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 from pithtrain.contexts import distributed, training
@@ -141,17 +142,28 @@ class Qwen35TextModel(nn.Module):
 
     def __init__(self, config: Qwen3_5TextConfig):
         super().__init__()
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        if config.tie_word_embeddings:
+            # Keep the HF embedding key and use the same FP32 head wgrad as the untied model.
+            self.embed_tokens = BF16Linear(config.hidden_size, config.vocab_size, bias=False)
+            self.lm_head = None
+        else:
+            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.rotary_emb = Qwen35MoeRotaryEmbedding(config)
         self.layers = nn.ModuleList(
             Qwen35DecoderLayer(config, idx) for idx in range(config.num_hidden_layers)
         )
         self.norm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = BF16Linear(config.hidden_size, config.vocab_size, bias=False)
+        if not config.tie_word_embeddings:
+            self.lm_head = BF16Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.embed_tokens(tokens)
+        if self.lm_head is None:
+            hidden_states = F.embedding(tokens, self.embed_tokens.weight)
+        else:
+            hidden_states = self.embed_tokens(tokens)
         rotary_posemb = tuple(t.unsqueeze(0) for t in self.rotary_emb(tokens.size(1)))
         for layer in self.layers:
             hidden_states = layer(hidden_states, rotary_posemb)
-        return self.lm_head(self.norm(hidden_states))
+        hidden_states = self.norm(hidden_states)
+        head = self.embed_tokens if self.lm_head is None else self.lm_head
+        return head(hidden_states)
