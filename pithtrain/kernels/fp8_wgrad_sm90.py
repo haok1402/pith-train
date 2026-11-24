@@ -263,11 +263,19 @@ def select_route(default, *choices):
     return next((route for route, selected in choices if selected), default)
 
 
+@dsl_user_op
+def prefetch_activation_tile(descriptor, k, n, *, loc=None, ip=None):
+    operands = [to_ir(descriptor.get_ptr().toint(), Int64, loc, ip),
+                to_ir(k, Int32, loc, ip), to_ir(n, Int32, loc, ip)]
+    asm(None, operands, "cp.async.bulk.prefetch.tensor.2d.L2.global [$0, {$1, $2}];",
+        "l,r,r", side_effects=True)
+
+
 class WeightGradient:
     def __init__(self, M, N, K, num_sms, rowwise, block_n_multiple,
                  compact_k_scale=False, aligned_fp8_rows=False, compact_rows=True, compact_output=True,
                  misaligned_fp8_rows=False, aligned_two_sm_operands=False,
-                 long_a_storage_ok=False, aligned_stage11_tail=False, fp8_row_alignment=(0, 0)):
+                 long_a_storage_ok=False, aligned_stage11_tail=False, fp8_row_alignment=(0, 0), aligned_n160_operands=False):
         self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n = select_layout(M, N, K, num_sms, rowwise, block_n_multiple)
         self.num_m, self.num_n, self.num_k = divide_up(M, self.block_m), divide_up(N, self.block_n), divide_up(K, BLOCK_K)
         self.N, self.num_sms, self.rowwise = N, num_sms, rowwise
@@ -334,7 +342,12 @@ class WeightGradient:
             and (self.block_m, self.block_n, self.cluster_m, self.cluster_n) == (128, 16, 1, 1)
             and self.stages in (4, 5, 6, 7, 10)
         )
-        narrow_unicast = self.narrow_n16_unicast or self.n160_single_scale_panel
+        self.narrow_n16_default = (
+            not rowwise and N == 8 and block_n_multiple == 1
+            and self.num_m == self.num_n == 1 and self.num_k > self.stages
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 16, 16, 1, 1)
+        )
+        narrow_unicast = self.narrow_n16_unicast or self.n160_single_scale_panel or self.narrow_n16_default
         use_narrow_math = (self.n32_single_tile or self.n32_two_sm_narrow or self.skinny_short_n144
                            or self.m64_n48_narrow_a or narrow_unicast)
         self.math_block_n = N if use_narrow_math else self.block_n
@@ -434,6 +447,11 @@ class WeightGradient:
         self.scale_columns = 1 if self.uniform_scale else 2
         starts_at_zero = self.num_m * self.num_n <= self.num_sms or self.num_k % (2 * self.stages) == 0
         self.single_n80_tile = (self.block_m, self.block_n, self.cluster_size) == (64, 80, 1) and self.num_m == self.num_n == 1 and not rowwise
+        self.n16_default_full_width_static_math = (
+            not rowwise and N == 16 and block_n_multiple == 1
+            and self.num_m == self.num_n == 1 and self.num_k >= 512
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 16, 16, 1, 1)
+        )
         long_n16_static_math = (
             self.stages == 16 and aligned_fp8_rows and self.num_k >= 512
             and (N > 2 * BLOCK_K or self.num_n == 1)
@@ -494,6 +512,12 @@ class WeightGradient:
             self.stages = 8
             self.uniform_scale = True
             self.scale_columns = 1
+        # Restrict B lookahead to FP8 rows aligned to the K-block boundary.
+        self.n160_stage4_full_panel = (
+            not rowwise and aligned_n160_operands and block_n_multiple == 160 and N == self.block_n
+            and self.num_m == self.num_n == 1 and self.num_k > 2 * self.stages
+            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 160, 4, 1)
+        )
         self.m16_n160_stage8 = (
             not rowwise and (M, N, K, num_sms) == (16, 160, 651264, 2)
             and (self.block_m, self.block_n, self.stages, self.cluster_size) == (16, 160, 8, 1)
@@ -760,7 +784,7 @@ class WeightGradient:
         self.producer_route = select_route(
             ProducerRoute.DYNAMIC_RING,
             (ProducerRoute.RESIDENT_GRADIENT, self.n32_reuse_grad),
-            (ProducerRoute.STATIC_RING, self.n80_stage7_block or self.stream_b_scale_row
+            (ProducerRoute.STATIC_RING, self.n160_stage4_full_panel or self.n80_stage7_block or self.stream_b_scale_row
              or self.n16_u_stage7 or self.u128_stage4_one_wave or self.n80_sustained_mn
              or (self.static_ring and not dynamic_producer)),
         )
@@ -772,7 +796,8 @@ class WeightGradient:
             (MathRoute.RESIDENT_ACTIVATION, self.n64_a_single_n),
             (MathRoute.SINGLE_N_A, self.single_n_a_cluster),
             (MathRoute.PREFIX_RING, self.n112_unicast_ring or self.n112_a_full_ring or self.long_b_n128),
-            (MathRoute.STATIC_RING, self.u128_stage4_one_wave or self.static_ring
+            (MathRoute.STATIC_RING, self.n16_default_full_width_static_math
+             or self.u128_stage4_one_wave or self.static_ring
              or self.full_a128_stage4 or self.a128_stage4_full_groups),
         )
         self.a_tail_first_tiles = 0
@@ -1246,6 +1271,10 @@ class WeightGradient:
         grad, activation, grad_scale, _, _ = descriptors
         s_grad, s_activation, s_grad_scale, _ = inputs
         full, empty = barriers
+        if cutlass.const_expr(self.n160_stage4_full_panel):
+            next_lookahead = k_tile + 2 * self.stages
+            if next_lookahead < self.num_k:
+                prefetch_activation_tile(activation, next_lookahead * BLOCK_K, n_offset)
         if cutlass.const_expr(self.n16_u_stage7 or self.stream_b_scale_row):
             wait_n16_stage7(empty + stage, phase ^ 1)
         else:
@@ -1530,7 +1559,11 @@ class WeightGradient:
         for k_tile in cutlass.range(self.num_k, unroll=8):
             if cutlass.const_expr(self.use_linear_stage_index):
                 stage, phase = self.linear_ring_position(tile_idx, k_tile)
-            stage = cute.arch.make_warp_uniform(stage)
+            if cutlass.const_expr(self.n160_stage4_full_panel):
+                # A single output tile enters the ring at stage and phase zero.
+                stage, phase = k_tile % self.stages, (k_tile // self.stages) & 1
+            else:
+                stage = cute.arch.make_warp_uniform(stage)
             if cutlass.const_expr(self.n80_b_multicast):
                 activation_lo, activation_hi = b_scale_lo, b_scale_hi
             elif cutlass.const_expr(not self.rowwise):
@@ -1540,8 +1573,9 @@ class WeightGradient:
                     activation_hi = s_activation_scale[k_tile, 1]
             self.wait_stage(full + stage, phase)
             grad_lo, grad_hi = Float32(0), Float32(0)
-            if do_store:
-                grad_lo, grad_hi = s_grad_scale[row_lo, 0, stage], s_grad_scale[row_hi, 0, stage]
+            if cutlass.const_expr(not self.n160_stage4_full_panel):
+                if do_store:
+                    grad_lo, grad_hi = s_grad_scale[row_lo, 0, stage], s_grad_scale[row_hi, 0, stage]
 
             if cutlass.const_expr(self.n80_b_multicast):
                 grad_low = grad_desc + stage * (self.block_m * BLOCK_K // 16)
@@ -1562,6 +1596,9 @@ class WeightGradient:
                     mma.set(warpgroup.Field.ACCUMULATE, mma_k != 0)
                     cute.gemm(mma, mma_acc, grad_desc[None, None, mma_k, stage], activation_desc[None, None, mma_k, b_stage], mma_acc)
                 warpgroup.commit_group()
+                if cutlass.const_expr(self.n160_stage4_full_panel):
+                    # Read the current A scales while the WGMMA group is in flight.
+                    grad_lo, grad_hi = s_grad_scale[row_lo, 0, stage], s_grad_scale[row_hi, 0, stage]
                 warpgroup.wait_group(0)
             if cutlass.const_expr(self.rowwise):
                 if do_store:
@@ -1573,7 +1610,7 @@ class WeightGradient:
             if cutlass.const_expr(self.n80_b_multicast):
                 b_scale_lo = values[self.block_n // 2]
                 b_scale_hi = values[self.block_n // 2 + 1]
-            if cutlass.const_expr(not self.use_linear_stage_index):
+            if cutlass.const_expr(not (self.use_linear_stage_index or self.n160_stage4_full_panel)):
                 stage, phase = self.advance_stage(stage, phase)
         if cutlass.const_expr(self.use_linear_stage_index):
             stage, phase = self.linear_ring_position(tile_idx, self.num_k)
@@ -1934,8 +1971,16 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
         not rowwise and 4032 < num_k <= 8192 and 0 < N % 64 <= 16
         and all(tensor.data_ptr() % 32 == 0 for tensor in tensors)
     )
+    # Offset views can share the strides of an aligned launch and need a separate cached kernel.
+    aligned_n160_operands = (
+        not rowwise and M <= 64 and N == 160 and block_n_multiple == 160
+        and all(tensor.data_ptr() % BLOCK_K == 0
+                and tensor.stride(0) * tensor.element_size() % BLOCK_K == 0
+                for tensor in (grad, activation))
+    )
     key = ("fp8_wgrad", M, N, K, num_sms, rowwise, block_n_multiple,
-           tuple(tensor.stride() for tensor in tensors), aligned_two_sm_operands, long_a_storage_ok, aligned_stage11_tail)
+           tuple(tensor.stride() for tensor in tensors), aligned_two_sm_operands, long_a_storage_ok,
+           aligned_stage11_tail, aligned_n160_operands)
     compiled = CACHE.get(key)
     if compiled is None:
         dtypes = (Float8E4M3FN, Float32, Float8E4M3FN, Float32, Float32)
@@ -1956,7 +2001,7 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
         operation = WeightGradient(M, N, K, num_sms, rowwise, block_n_multiple,
                                    activation_scale.stride() == (num_k, 1), aligned_fp8_rows, compact_rows,
                                    compact_output, misaligned_fp8_rows, aligned_two_sm_operands,
-                                   long_a_storage_ok, aligned_stage11_tail, fp8_row_alignment)
+                                   long_a_storage_ok, aligned_stage11_tail, fp8_row_alignment, aligned_n160_operands)
         compiled = cute.compile(operation, *operands, fake_stream(), options="--enable-tvm-ffi")
         CACHE[key] = compiled
     compiled(*tensors)
