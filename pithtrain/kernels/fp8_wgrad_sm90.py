@@ -347,7 +347,7 @@ class WeightGradient:
             not rowwise and self.num_m == 1 and self.num_n == num_sms + 1 and N % 128 == 8
             and (self.block_m, self.block_n, self.cluster_m, self.cluster_n) == (32, 128, 2, 1)
             and num_sms in (118, 132) and (self.stages, self.num_k) in (
-                (4, 28193), (6, 17889), (7, 12737), (8, 7585), (9, 2433),
+                (4, 28193), (5, 23041), (6, 17889), (7, 12737), (8, 7585), (9, 2433),
             )
         )
         self.long_b_n128 = self.long_b_m16_n128 or self.long_b_m32_n128
@@ -599,6 +599,11 @@ class WeightGradient:
             and self.num_n <= 2 * self.num_sms
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 144, 7, 1, 2)
         )
+        self.m32_n48_short_a = (
+            not rowwise and compact_rows and self.num_m == self.num_k == 1
+            and self.num_sms % 2 == 0 and 4 * self.num_sms < self.num_n <= 5 * self.num_sms
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (32, 48, 16, 1, 2)
+        )
         self.short_a_n96 = (not rowwise and self.num_m == self.num_k == 1
                             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (16, 96, 15, 1, 2))
         self.short_a_n96_no_wrap = self.short_a_n96 and divide_up(self.num_n, self.num_sms) < self.stages
@@ -640,8 +645,8 @@ class WeightGradient:
             not rowwise and self.num_n == 1 and self.num_k > self.stages
             and (
                 self.stages in (13, 16)
-                or (self.stages == 14 and compact_rows and N == 8
-                    and (num_sms, self.num_m, self.num_k) == (98, 197, 8961))
+                or (compact_rows and N == 8 and (num_sms, self.num_m) == (98, 197)
+                    and (self.stages, self.num_k) in ((14, 8961), (15, 5825)))
             )
             and (self.block_m, self.block_n, self.cluster_m, self.cluster_n) == (64, 32, 1, 2)
         )
@@ -787,7 +792,8 @@ class WeightGradient:
             (TileOrder.SHORT_A, self.short_a_n32 or self.short_a_n64 or self.long_a_n64_tail
              or self.m64_n80_grouped_wave or self.m64_n112_a_stage7_two_waves),
             (TileOrder.N_LINEAR_MULTICAST, self.m32_n112_two_waves),
-            (TileOrder.SHORT_N_LINEAR_A, self.short_a_n16 or self.short_a_n144 or self.short_a_n96 or self.short_a_n128),
+            (TileOrder.SHORT_N_LINEAR_A, self.short_a_n16 or self.short_a_n144 or self.short_a_n96
+             or self.short_a_n128 or self.m32_n48_short_a),
             (TileOrder.SHORT_B, self.m64_n128_b_short),
             (TileOrder.SHORT_B_N128, self.short_b_n128),
         )
