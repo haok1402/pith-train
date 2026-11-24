@@ -210,9 +210,10 @@ if __name__ == "__main__":
         help="Replay the gate and up projections from saved FP8 input codes",
     )
     parser.add_argument(
-        "--fp8-replay-save",
+        "--unsafe-fp8-replay-save",
+        dest="fp8_replay_save",
         action="store_true",
-        help="Experimentally save FP8 projection outputs for up to 52 mixers and 24 MLPs",
+        help="Unsafe diagnostic recipe that saves up to 52 mixers and 24 MLPs",
     )
     parser.add_argument(
         "--checkpoint-replay-mixers",
@@ -228,7 +229,7 @@ if __name__ == "__main__":
         parser.error("--fp8-mlp-recompute requires --fp8")
     if args.fp8_replay_save and (not args.fp8 or args.fp8_mlp_recompute):
         parser.error(
-            "--fp8-replay-save requires --fp8 and is incompatible with --fp8-mlp-recompute"
+            "--unsafe-fp8-replay-save requires --fp8 and is incompatible with --fp8-mlp-recompute"
         )
     if args.fp8_shard_cache_mib is not None and args.fp8_shard_cache_mib < 0:
         parser.error("--fp8-shard-cache-mib must be nonnegative")

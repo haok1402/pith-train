@@ -1,6 +1,8 @@
 # Qwen3.5-27B FP8 replay saves
 
-At the BF16-matched settings, the original FP8 stack ran about **1.25×** the BF16 throughput. Saving the projection outputs of 52 mixers and 24 MLPs brought it to **1.35×** the 23,017 tok/s/node BF16 reference. The 24-MLP run used 132.25 GiB of reserved memory per H200. One timing run diverged in loss bits at step 5, so the guarded recipe is opt-in.
+**MLP projection saving is unsafe pending diagnosis.** Step-5 loss bits diverged on two nodes despite exact first-step gradients. The branch exposes this configuration under an explicitly unsafe flag for diagnosis.
+
+At the BF16-matched settings, the original FP8 stack ran about **1.25×** the BF16 throughput. Saving the projection outputs of 52 mixers and 24 MLPs brought it to **1.35×** the 23,017 tok/s/node BF16 reference. The 24-MLP run used 132.25 GiB of reserved memory per H200.
 
 ## Matched step profile
 
@@ -50,7 +52,7 @@ The 24 MLPs saved about 0.37 s/step, or 4.3% in node throughput, with another 14
 - In a five-layer, full-width fixture loaded from the 27B checkpoint, the guarded save matched the guarded no-recompute reference at all 70 parameters. Relative gradient L2 was zero and loss bits matched. The full 64-layer MB2 no-recompute reference ran out of memory, including with expandable segments.
 - The guard can change Inductor's fused RMSNorm reduction order. In a four-layer fixture it changed gradient relative L2 by 0.207% versus the unguarded build. Direct kernel replay localized the rounding difference to a changed FP32 reduction tile, with the same BF16 casts. The no-recompute comparison therefore uses the same guarded build.
 - The 16-, 32-, and 52-mixer ladder arms matched the opening control's 6,808 first-step FP32 gradient shards and 64 rank-step loss records. The closing control differed first on rank 3's first forward microbatch despite the same batch hash. Two UUID-tagged repeats on `pool1-00665` in ticket `7321` matched the opening control bit for bit. The original `pool1-00203` job did not record UUIDs, so the cause remains unattributed.
-- The two 24-MLP timing arms matched all 6,808 first-step gradient shards. The first arm's forward loss bits diverged at step 5 across all ranks, while the reverse order matched both controls through step 8. In a later run on `pool1-00298` (ticket `7351`), two 24-MLP repeats matched the control at every batch, loss, and pre-clip gradient fingerprint through step 5 and at all post-step-4 weight fingerprints. The first timing arm on `pool1-00828` did not log GPU UUIDs. A same-node repeat and the original rank-to-device mapping are pending.
+- The two 24-MLP timing arms matched all 6,808 first-step gradient shards. The first arm's forward loss bits diverged at step 5 across all ranks, while the reverse order matched both controls through step 8. In a later run on `pool1-00298` (ticket `7351`), two 24-MLP repeats matched the control at every batch, loss, and pre-clip gradient fingerprint through step 5 and at all post-step-4 weight fingerprints. The first timing arm on `pool1-00828` did not log GPU UUIDs. The repeat on that host was canceled in favor of a six-arm bisect. The control, mixer-only save, and mixer-plus-MLP save each run twice on one node with eight steps of gradient and weight fingerprints.
 - The opt-in branch at `3c9533c` with wgrad pin `bcab26e` completed five steps with zero retries on `pool1-00665` (Slurm `1329272`, ticket `7358`). It matched all 6,808 first-step gradient shards and all loss bits through step 4. At step 5 it diverged on all eight ranks, with loss 1.7488 versus 1.7485 and a fingerprint different from the divergence on `pool1-00828`. The drift has occurred on two nodes and remains unattributed.
 
 ## Run the experiment
@@ -62,5 +64,5 @@ torchrun --standalone --nnodes=1 --nproc-per-node=8 \
     benchmarks/end2end/qwen3.5-27b-seq4096-bf16/h200-1n8g/fsdp2/script.py \
     --model "$MODEL" --weights "$MODEL" --dataset "$DATA" \
     --seq 4096 --batch 64 --steps 8 --micro-batch 2 --checkpoint-mlp-tail 12 \
-    --fp8 --fp8-attention --fp8-shard-cache-mib 0 --fp8-replay-save
+    --fp8 --fp8-attention --fp8-shard-cache-mib 0 --unsafe-fp8-replay-save
 ```
