@@ -158,6 +158,7 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         torch.cuda.memory._record_memory_history(max_entries=65536, stacks="python")
 
     device = torch.cuda.current_device()
+    alloc_retries_before = torch.cuda.memory_stats()["num_alloc_retries"]
     step_start_time = time.time()
 
     torch.cuda.memory.reset_peak_memory_stats()
@@ -227,9 +228,16 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     torch.distributed.all_reduce(elapsed_tensor, op=torch.distributed.ReduceOp.MAX)
     elapsed = elapsed_tensor.item()
 
-    peak_gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
-    peak_gpu_mem = torch.tensor(peak_gpu_mem, device=device)
-    torch.distributed.all_reduce(peak_gpu_mem, op=torch.distributed.ReduceOp.MAX)
+    memory_stats = torch.cuda.memory_stats()
+    memory_metrics = torch.tensor(
+        [
+            memory_stats["allocated_bytes.all.peak"] / 1024**3,
+            memory_stats["reserved_bytes.all.peak"] / 1024**3,
+            memory_stats["num_alloc_retries"] - alloc_retries_before,
+        ],
+        device=device,
+    )
+    torch.distributed.all_reduce(memory_metrics, op=torch.distributed.ReduceOp.MAX)
 
     # The tracked values include the coefficient; dividing it out logs E * dot(f, p), where 1.0
     # is perfect balance (the Megatron-LM convention).
@@ -244,6 +252,7 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
 
     logger = logging.stdout
     if distributed.rank == 0:
+        peak_gpu_mem, peak_gpu_reserved, alloc_retries = memory_metrics.tolist()
         max_steps = cfg.training.max_steps
         loss, lr = loss.item(), schedulers[0].get_last_lr()[0]
         tokens_per_second = global_batch_size * cfg.training.sequence_length / elapsed
@@ -257,6 +266,8 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         statements.append("gradient-norm %.4f" % gradient_norm.item())
         statements.append("tokens-per-second %s" % format(tokens_per_second, ",.0f"))
         statements.append("peak-gpu-memory %.2f GB" % peak_gpu_mem)
+        statements.append("peak-gpu-reserved %.2f GB" % peak_gpu_reserved)
+        statements.append("cuda-alloc-retries %d" % alloc_retries)
         logger.info(" | ".join(statements))
         activate_wandb(cfg)
         if logging.wandb is not None:
