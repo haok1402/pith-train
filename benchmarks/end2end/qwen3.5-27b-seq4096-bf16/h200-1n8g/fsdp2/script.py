@@ -88,6 +88,7 @@ def shard_model(
     replay_mixers: str = "none",
     fp8: bool = False,
     fp8_attention: bool = False,
+    fsdp_group_size: int = 2,
 ) -> None:
     checkpoint_layers(
         model,
@@ -100,20 +101,21 @@ def shard_model(
     )
 
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
-    for blocks in batched(model.layers, 2):
+    for blocks in batched(model.layers, fsdp_group_size):
         fully_shard(list(blocks), mesh=mesh, mp_policy=mp, reshard_after_forward=True)
         blocks[0].set_gradient_divide_factor(1.0)
 
-    fully_shard(model.embed_tokens, mesh=mesh, mp_policy=mp, reshard_after_forward=True)
-    if fp8:
-        # Embedding backward uses only the saved token indices.
-        model.embed_tokens.set_unshard_in_backward(False)
-    model.embed_tokens.set_gradient_divide_factor(1.0)
+    if model.lm_head is not None:
+        fully_shard(model.embed_tokens, mesh=mesh, mp_policy=mp, reshard_after_forward=True)
+        if fp8:
+            # Embedding backward uses only the saved token indices.
+            model.embed_tokens.set_unshard_in_backward(False)
+        model.embed_tokens.set_gradient_divide_factor(1.0)
 
-    fully_shard(model.lm_head, mesh=mesh, mp_policy=mp, reshard_after_forward=not fp8)
-    model.lm_head.set_gradient_divide_factor(1.0)
+        fully_shard(model.lm_head, mesh=mesh, mp_policy=mp, reshard_after_forward=not fp8)
+        model.lm_head.set_gradient_divide_factor(1.0)
 
-    # The root owns the final norm and drives FSDP's implicit prefetch.
+    # The root owns the final norm and any tied embedding and drives implicit prefetch.
     fully_shard(model, mesh=mesh, mp_policy=mp, reshard_after_forward=False)
     model.set_gradient_divide_factor(1.0)
 
@@ -151,6 +153,7 @@ if __name__ == "__main__":
     parser.add_argument("--seq", type=int, default=4096)
     parser.add_argument("--batch", type=int, default=64)
     parser.add_argument("--micro-batch", type=int, default=2)
+    parser.add_argument("--fsdp-group-size", type=int, default=2)
     parser.add_argument(
         "--checkpoint-mlp-tail", type=int, help="Layers that checkpoint only their MLP"
     )
@@ -173,6 +176,8 @@ if __name__ == "__main__":
         "--fp8-attention", action="store_true", help="Use FP8 Delta-Matching attention"
     )
     args = parser.parse_args()
+    if args.fsdp_group_size < 1:
+        parser.error("--fsdp-group-size must be positive")
     if args.fp8_mlp_recompute and not args.fp8:
         parser.error("--fp8-mlp-recompute requires --fp8")
     if args.fp8_shard_cache_mib is not None and args.fp8_shard_cache_mib < 0:
@@ -214,6 +219,7 @@ if __name__ == "__main__":
         replay_mixers=args.checkpoint_replay_mixers,
         fp8=args.fp8,
         fp8_attention=args.fp8_attention,
+        fsdp_group_size=args.fsdp_group_size,
     )
     with bulk_reduce_scatter_packing(args.fp8):
         launch(cfg, shard_dense_model=shard)
