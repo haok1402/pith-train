@@ -712,6 +712,10 @@ class WeightGradient:
             not rowwise and compact_k_scale and compact_rows and (M, N, K, num_sms) == (512, 2048, 8192, 132)
             and (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 128, 8, 1)
         )
+        self.n16_u_stage9_one_tile = (
+            not rowwise and (M, N, K, num_sms, block_n_multiple) == (64, 16, 4276224, 132, 1)
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 16, 9, 1, 1)
+        )
         self.n16_u_stage11 = (
             not rowwise and compact_rows and (M, N, K, num_sms) == (64, 16, 3604480, 132)
             and (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 16, 11, 1)
@@ -1185,7 +1189,7 @@ class WeightGradient:
             ProducerRoute.DYNAMIC_RING,
             (ProducerRoute.RESIDENT_A_PANELS, self.resident_a_panels),
             (ProducerRoute.RESIDENT_GRADIENT, self.n32_reuse_grad or self.n64_reuse_grad),
-            (ProducerRoute.STATIC_RING, self.n32_u_stage5_one_tile
+            (ProducerRoute.STATIC_RING, self.n16_u_stage9_one_tile or self.n32_u_stage5_one_tile
              or self.n32_u_stage10_single_tile or self.n32_u_stage14_one_tile
              or self.n48_u_stage8_single_tile or self.n16_u_stage5_shifted or self.n16_u_stage5_aligned
              or self.n16_u_stage14_shifted or self.n16_u_stage14_aligned or self.n16_u_stage10_pair or self.n160_stage4_full_panel
@@ -1206,7 +1210,7 @@ class WeightGradient:
             (MathRoute.SINGLE_N_A, self.single_n_a_cluster),
             (MathRoute.PREFIX_RING, self.n112_unicast_ring or self.n112_a_full_ring or self.long_b_n128),
             (MathRoute.DYNAMIC_RING, self.n96_stage5_full_n_wave),
-            (MathRoute.STATIC_RING, self.n32_u_stage5_one_tile or self.n16_default_full_width_static_math
+            (MathRoute.STATIC_RING, self.n16_u_stage9_one_tile or self.n32_u_stage5_one_tile or self.n16_default_full_width_static_math
              or self.n16_default_grid_static_math
              or self.u128_stage4_one_wave or self.static_ring
              or self.full_a128_stage4 or self.a128_stage4_full_groups),
@@ -1219,7 +1223,7 @@ class WeightGradient:
                 self.a_tail_first_tiles = repeat_tiles
         self.tile_order = select_route(
             TileOrder.PERSISTENT,
-            (TileOrder.SINGLE_TILE, self.n32_u_stage5_one_tile
+            (TileOrder.SINGLE_TILE, self.n16_u_stage9_one_tile or self.n32_u_stage5_one_tile
              or self.n32_u_stage10_single_tile or self.n32_u_stage14_one_tile
              or self.n48_u_stage8_single_tile or self.n192_u_stage4_aligned or self.n16_u_stage5_aligned
              or self.n16_u_stage14_aligned or self.n16_u_stage10_pair or self.stream_b_scale_row or self.n16_u_stage7 or self.m64_n32_long_stage8),
@@ -1804,7 +1808,7 @@ class WeightGradient:
             next_lookahead = k_tile + 2 * self.stages
             if next_lookahead < self.num_k:
                 prefetch_activation_tile(activation, next_lookahead * BLOCK_K, n_offset)
-        if cutlass.const_expr(self.n16_u_stage7 or self.stream_b_scale_row):
+        if cutlass.const_expr(self.n16_u_stage9_one_tile or self.n16_u_stage7 or self.stream_b_scale_row):
             wait_n16_stage7(empty + stage, phase ^ 1)
         else:
             self.wait_stage(empty + stage, phase ^ 1)
@@ -2369,7 +2373,7 @@ class WeightGradient:
         activation_stage = k_tile if cutlass.const_expr(self.n64_a_single_n) else stage
         if cutlass.const_expr(self.m64_n32_long_stage8):
             cute.arch.mbarrier_wait(full + stage, phase)
-        elif cutlass.const_expr(self.n16_u_stage7 or self.stream_b_scale_row):
+        elif cutlass.const_expr(self.n16_u_stage9_one_tile or self.n16_u_stage7 or self.stream_b_scale_row):
             wait_n16_stage7(full + stage, phase)
         else:
             self.wait_stage(full + stage, phase)
