@@ -202,12 +202,13 @@ class WeightGradient:
         # The output map still stores a 32-column tile. Only real columns need tensor-core work.
         self.n32_single_tile = (not rowwise and self.num_m == self.num_n == 1 and N < self.block_n
                                and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 32, 4, 1, 1))
-        # Use literal offsets for the five-stage 128 by 112 tile grids.
-        self.n112_single_m_tile = (
-            not rowwise and self.num_k == 128 and aligned_fp8_rows
-            and (self.num_m, self.num_n, num_sms) == (1, 37, 20)
+        # Amortize the partial ring and keep dynamic staging on misaligned multi-M grids.
+        self.n112_unicast_ring = (
+            not rowwise and self.num_k >= 3 * self.stages
+            and (aligned_fp8_rows or (self.num_m == 1 and self.num_k >= 256))
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 112, 5, 1, 1)
         )
+        # Retain the inline WGMMA path on the previously qualified tile grids.
         self.n112_short_k = (
             not rowwise and self.num_k == 128 and aligned_fp8_rows
             and self.num_m == 8
@@ -1061,7 +1062,9 @@ class WeightGradient:
             for slot in cutlass.range_constexpr(self.num_k):
                 self.compute_stage(tidx, tile_idx, barriers, compute_args, slot, phase, former_groups, slot)
             return Int32(0), phase
-        if cutlass.const_expr(self.n112_short_k or self.n112_single_m_tile or self.n112_a_full_ring or self.long_b_m16_n128):
+        if cutlass.const_expr(
+            self.n112_unicast_ring or self.n112_a_full_ring or self.long_b_m16_n128
+        ):
             return self.compute_n112_ring(tidx, tile_idx, barriers, compute_args, stage, phase, former_groups)
         if cutlass.const_expr(self.u128_stage4_one_wave or self.static_ring or self.full_a128_stage4 or self.a128_stage4_full_groups):
             self.compute_static_ring(tidx, tile_idx, barriers, compute_args, former_groups)
@@ -1226,7 +1229,7 @@ class WeightGradient:
 
     @cute.jit
     def promote_blocks(self, accumulator, partial, grad_lo, grad_hi, activation_lo, activation_hi, former_groups):
-        if cutlass.const_expr(self.m64_n112_one_wave or self.n112_short_k or self.n112_single_m_tile or self.n112_a_full_ring):
+        if cutlass.const_expr(self.m64_n112_one_wave or self.n112_unicast_ring or self.n112_a_full_ring):
             lo_a, hi_a = grad_lo * activation_lo, grad_hi * activation_lo
             lo_b, hi_b = grad_lo * activation_hi, grad_hi * activation_hi
             # A 112-column tile crosses scale boundaries in pairs of 8-column groups.
