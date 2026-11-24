@@ -311,6 +311,11 @@ class WeightGradient:
             not rowwise and num_sms == 2 and self.num_m == 2 and N == 8 and self.num_k == 1473
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 32, 9, 1, 1)
         )
+        self.n16_a_stage15_one_n = (
+            not rowwise and compact_rows and misaligned_fp8_rows and N == 8
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 16, 15, 1, 2)
+            and self.num_m > num_sms and self.num_k > self.stages
+        )
         self.math_block_n = N if self.n32_single_tile or self.n32_two_sm_narrow or self.skinny_short_n144 or self.m64_n48_narrow_a else self.block_n
         self.long_a_n64 = (
             long_a_storage_ok and N % 8 == 0 and self.num_n % 2 == 1 and self.num_m <= num_sms
@@ -732,7 +737,7 @@ class WeightGradient:
             (TileOrder.SINGLE_TILE, self.m16_n160_stage8),
             (TileOrder.SHORT_A, self.m128_n16_a_stage11),
             (TileOrder.SHORT_UNICAST, self.n16_u_short),
-            (TileOrder.M_LINEAR, self.single_n_a_cluster),
+            (TileOrder.M_LINEAR, self.single_n_a_cluster or self.n16_a_stage15_one_n),
             (TileOrder.N48_MN_TAIL, self.n48_mn_tail),
             (TileOrder.M_LINEAR_MULTICAST, self.reuse_full_b_n144),
             (TileOrder.N_LINEAR, self.n192_one_wave),
@@ -888,7 +893,7 @@ class WeightGradient:
             with cute.arch.elect_one():
                 for stage in cutlass.range_constexpr(self.stages):
                     cute.arch.mbarrier_init(full + stage, 1)
-                    consumers = 1 if self.single_n_a_cluster else self.cluster_size
+                    consumers = 1 if self.single_n_a_cluster or self.n16_a_stage15_one_n else self.cluster_size
                     cute.arch.mbarrier_init(empty + stage, consumers * (self.math_threads // 32))
                 cute.arch.mbarrier_init_fence()
         if cutlass.const_expr(self.cluster_size > 1):
@@ -1128,7 +1133,7 @@ class WeightGradient:
                         stage, phase = self.advance_stage(stage, phase)
                 if cutlass.const_expr(self.use_linear_stage_index):
                     stage, phase = self.linear_ring_position(tile_idx, self.num_k)
-        if cutlass.const_expr(self.cluster_size > 1 and not self.single_n_a_cluster):
+        if cutlass.const_expr(self.cluster_size > 1 and not (self.single_n_a_cluster or self.n16_a_stage15_one_n)):
             live_stages = 4 if self.reuse_short_a128 else self.stages
             for _ in cutlass.range_constexpr(live_stages):
                 self.wait_stage(empty + stage, phase ^ 1)
@@ -1198,6 +1203,9 @@ class WeightGradient:
 
     @cute.jit
     def wait_stage(self, buffer, phase):
+        if cutlass.const_expr(self.n16_a_stage15_one_n):
+            wait_n16_stage7(buffer, phase)
+            return
         if cutlass.const_expr(self.n32_single_tile or self.n80_full_sms_unicast):
             wait_barrier(buffer, phase)
         elif cutlass.const_expr(self.cluster_size == 1 and not self.rowwise):
@@ -1276,7 +1284,7 @@ class WeightGradient:
     def release_stage(self, empty, tile_idx, lane):
         if cutlass.const_expr(self.n64_a_single_n):
             return
-        if cutlass.const_expr(self.cluster_size == 1 or self.single_n_a_cluster):
+        if cutlass.const_expr(self.cluster_size == 1 or self.single_n_a_cluster or self.n16_a_stage15_one_n):
             if lane == 0:
                 cute.arch.mbarrier_arrive(empty)
         else:
