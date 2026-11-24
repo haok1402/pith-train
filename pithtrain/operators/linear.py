@@ -7,7 +7,10 @@ from typing import Any, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch._inductor.custom_graph_pass import CustomSchedulerPass, get_hash_for_files
+from torch._inductor.ir import FallbackKernel, MultiOutput
 from torch._inductor.lowering import fallback_handler, register_lowering
+from torch._inductor.virtualized import V
 
 from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
 from pithtrain.kernels import (
@@ -25,7 +28,13 @@ from pithtrain.kernels import (
     silu_mul_bwd,
 )
 
-__all__ = ["BF16Linear", "BF16LinearFunc", "FP8Linear", "fp8_swiglu_main_grad"]
+__all__ = [
+    "BF16Linear",
+    "BF16LinearFunc",
+    "FP8Linear",
+    "PreserveFP8ProjectionOutputs",
+    "fp8_swiglu_main_grad",
+]
 
 
 @torch.library.custom_op("pithtrain::fp8_linear_fwd", mutates_args=())
@@ -201,6 +210,23 @@ def fp8_linear_prequantized_backward(ctx, grad_output):
 fp8_linear_fwd_prequantized.register_autograd(
     fp8_linear_prequantized_backward, setup_context=fp8_linear_prequantized_setup_context
 )
+
+
+class PreserveFP8ProjectionOutputs(CustomSchedulerPass):
+    """Keep projection outputs retained by an outer checkpoint alive through storage reuse."""
+
+    def __call__(self, nodes):
+        ops = torch.ops.pithtrain
+        projections = (ops.fp8_linear_fwd.default, ops.fp8_linear_fwd_prequantized.default)
+        for node in nodes:
+            output = node.node
+            producer = output.inputs[0] if isinstance(output, MultiOutput) else output
+            if isinstance(producer, FallbackKernel) and producer.op_overload in projections:
+                V.graph.never_reuse_but_free_buffers.add(output.get_name())
+        return nodes
+
+    def uuid(self):
+        return get_hash_for_files((__file__,))
 
 
 class FP8LinearMainGradFunc(torch.autograd.Function):
