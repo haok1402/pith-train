@@ -437,6 +437,11 @@ class WeightGradient:
             and N == self.num_n * self.block_n
             and (self.block_m, self.block_n, self.stages, self.cluster_size) == (128, 96, 5, 1)
         )
+        self.n96_stage5_block_wave = (
+            not rowwise and compact_k_scale and misaligned_fp8_rows and 1 < self.num_m and 1 < self.num_n
+            and self.num_m * self.num_n <= num_sms
+            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (128, 96, 5, 1)
+        )
         self.n48_one_wave = (
             not rowwise and self.num_m * self.num_n <= num_sms
             and (self.block_m, self.block_n, self.stages, self.cluster_size) == (128, 48, 8, 1)
@@ -928,7 +933,11 @@ class WeightGradient:
             grad_promotion = TensorMapL2Promotion.l2_128b
         grad = create_tensor_map_tiled(mGrad.iterator.toint(), Float8E4M3FN, [mGrad.shape[1], mGrad.shape[0]], [Int64(mGrad.stride[0]) // 16], [BLOCK_K, self.block_m], swizzle=swizzle, l2_promotion=grad_promotion)
         activation_promotion = input_promotion
-        if cutlass.const_expr(self.stage14_activation_l2_128):
+        stage5_b_promotion = (
+            self.n96_stage5_block_wave
+            and mGrad.stride[0] % 256 == mActivation.stride[0] % 256 == 16
+        )
+        if cutlass.const_expr(self.stage14_activation_l2_128 or stage5_b_promotion):
             activation_promotion = TensorMapL2Promotion.l2_128b
         activation = create_tensor_map_tiled(mActivation.iterator.toint(), Float8E4M3FN, [mActivation.shape[1], mActivation.shape[0]], [Int64(mActivation.stride[0]) // 16], [BLOCK_K, self.activation_block_n], swizzle=swizzle, l2_promotion=activation_promotion)
         grad_scale = create_tensor_map_tiled(mGradScale.iterator.toint(), Float32, [align_up(mGradScale.shape[0], 4), self.num_k], [Int64(mGradScale.stride[1]) // 4], [self.block_m, 1], l2_promotion=promote)
