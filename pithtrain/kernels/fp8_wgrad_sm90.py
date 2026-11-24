@@ -329,12 +329,17 @@ class WeightGradient:
             not rowwise and compact_k_scale and compact_rows and (M, N, K, num_sms) == (512, 2048, 8192, 132)
             and (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 128, 8, 1)
         )
-        self.static_ring = self.cluster_size == 1 and not rowwise and starts_at_zero and (self.block_m < 64 and self.uniform_scale or self.block_n == 96 or self.single_n80_tile or self.static_n16_stage8_math or self.long_n80_stage4 or self.narrow_n160_four_stages or self.wide_n192_four_math or self.n32_reuse_grad or self.n32_single_tile or (self.block_m, self.block_n) == (128, 48) or self.m64_n112_one_wave)
+        self.m16_n160_stage8 = (
+            not rowwise and (M, N, K, num_sms) == (16, 160, 651264, 2)
+            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (16, 160, 8, 1)
+        )
+        self.static_ring = self.m16_n160_stage8 or self.cluster_size == 1 and not rowwise and starts_at_zero and (self.block_m < 64 and self.uniform_scale or self.block_n == 96 or self.single_n80_tile or self.static_n16_stage8_math or self.long_n80_stage4 or self.narrow_n160_four_stages or self.wide_n192_four_math or self.n32_reuse_grad or self.n32_single_tile or (self.block_m, self.block_n) == (128, 48) or self.m64_n112_one_wave)
         self.dynamic_n96_stage7_producer = (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 96, 7, 1) and self.num_m == self.num_n == 1 and not rowwise
         self.n80_three_tile_mn_scales = self.long_n80_stage4 and self.num_n <= 3 and not compact_k_scale
         self.rolling_n128_producer = (not rowwise and self.num_m == self.num_n == 1
                                       and (self.block_m, self.block_n, self.stages, self.cluster_size) == (32, 128, 8, 1))
         self.inline_small_mma = self.static_ring and (
+            self.m16_n160_stage8 or
             self.m16_n32_stage8_full or
             self.block_m < 64 and (self.block_n == 16 or (self.block_n == 96 and self.stages == 8))
         )
@@ -586,6 +591,8 @@ class WeightGradient:
 
     @cute.jit
     def tile_coords(self, tile_idx):
+        if cutlass.const_expr(self.m16_n160_stage8):
+            return Int32(0), Int32(0), cutlass.Boolean(False)
         if cutlass.const_expr(self.m128_n16_a_stage11):
             tile_n, tile_m, multicast = self.short_cluster_coords(tile_idx, True)
             return tile_m, tile_n, multicast
@@ -732,7 +739,7 @@ class WeightGradient:
             elif cutlass.const_expr(
                 self.u128_stage4_one_wave or self.n80_sustained_mn
                 or self.static_ring and not (
-                    self.n96_stage9_wave or self.dynamic_n96_stage7_producer or self.static_n16_stage8_math
+                    self.m16_n160_stage8 or self.n96_stage9_wave or self.dynamic_n96_stage7_producer or self.static_n16_stage8_math
                     or self.rolling_n128_producer or self.narrow_n160_four_stages or self.wide_n192_four_math
                 )
             ):
