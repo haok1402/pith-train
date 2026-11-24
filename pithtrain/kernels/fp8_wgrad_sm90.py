@@ -291,7 +291,7 @@ class WeightGradient:
                  n80_streamed_scale_storage=False, aligned_a128_tail=False,
                  n16_stage10_bulk_storage=False, n16_stage10_pair_storage=False,
                  n160_grad_offset_only=False, aligned_grid_n16_operands=False, aligned_m128_n32_a=False,
-                 n48_a_stage9_storage=False, aligned_n192_stage4=False):
+                 n48_a_stage9_storage=False, aligned_n192_stage4=False, n16_stage8_local_storage=False):
         self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n = select_layout(M, N, K, num_sms, rowwise, block_n_multiple)
         self.num_m, self.num_n, self.num_k = divide_up(M, self.block_m), divide_up(N, self.block_n), divide_up(K, BLOCK_K)
         self.m64_n48_a_stage9_wide = False
@@ -372,7 +372,13 @@ class WeightGradient:
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 16, 16, 1, 2)
             and self.num_k == self.stages + 1
         )
-        self.n16_single_n_local_barriers = self.n16_a_one_panel_single_wrap or (
+        # There is no A multicast peer when the only N tile is eight columns.
+        self.n16_stage8_one_n_local = (
+            not rowwise and compact_rows and n16_stage8_local_storage and N == 8
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 16, 8, 1, 2)
+            and self.num_m == 2 * num_sms + 1 and self.num_k == 33409
+        )
+        self.n16_single_n_local_barriers = self.n16_stage8_one_n_local or self.n16_a_one_panel_single_wrap or (
             not rowwise and compact_rows and misaligned_fp8_rows and N == 8
             and (self.block_m, self.block_n, self.cluster_m, self.cluster_n) == (64, 16, 1, 2)
             and (self.stages == 15 or local_one_n_ring)
@@ -2342,11 +2348,16 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 0
                 for tensor in (grad, activation))
     )
+    n16_stage8_local_storage = (
+        not rowwise and N == 8 and block_n_multiple == 16
+        and all(tensor.data_ptr() % 32 == 0 and tensor.stride(0) * tensor.element_size() % 32 == 16
+                for tensor in (grad, activation))
+    )
     key = ("fp8_wgrad", M, N, K, num_sms, rowwise, block_n_multiple,
            tuple(tensor.stride() for tensor in tensors), aligned_two_sm_operands, long_a_storage_ok,
            aligned_stage11_tail, aligned_n160_operands, n80_streamed_scale_storage, aligned_a128_tail,
            n16_stage10_bulk_storage, n16_stage10_pair_storage, n160_grad_offset_only, aligned_grid_n16_operands,
-           aligned_m128_n32_a, n48_a_stage9_storage, aligned_n192_stage4)
+           aligned_m128_n32_a, n48_a_stage9_storage, aligned_n192_stage4, n16_stage8_local_storage)
     compiled = CACHE.get(key)
     if compiled is None:
         dtypes = (Float8E4M3FN, Float32, Float8E4M3FN, Float32, Float32)
@@ -2376,7 +2387,8 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                                    aligned_grid_n16_operands=aligned_grid_n16_operands,
                                    aligned_m128_n32_a=aligned_m128_n32_a,
                                    n48_a_stage9_storage=n48_a_stage9_storage,
-                                   aligned_n192_stage4=aligned_n192_stage4)
+                                   aligned_n192_stage4=aligned_n192_stage4,
+                                   n16_stage8_local_storage=n16_stage8_local_storage)
         compiled = cute.compile(operation, *operands, fake_stream(), options="--enable-tvm-ffi")
         CACHE[key] = compiled
     compiled(*tensors)
