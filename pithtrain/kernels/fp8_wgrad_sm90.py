@@ -908,9 +908,15 @@ class WeightGradient:
             and self.num_k in (16, 64, 128) and K % BLOCK_K == 0
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 96, 6, 1, 1)
         )
+        n160_short_full_tiles = (
+            compact_k_scale and compact_rows and block_n_multiple == 1
+            and M == self.num_m * self.block_m and N == self.num_n * self.block_n
+            and K == 32 * BLOCK_K
+        )
         self.n160_sustained = (
-            not rowwise and num_sms == 132 and self.num_m == 8 and self.num_n == 32 and self.num_k == 64
+            not rowwise and num_sms == 132 and self.num_m == 8 and self.num_n == 32
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 160, 4, 2, 1)
+            and (self.num_k == 64 or n160_short_full_tiles)
         )
         # Qualify the six sustained N192 B-multicast call sites.
         self.n192_b_sustained = (
@@ -1263,10 +1269,18 @@ class WeightGradient:
             not rowwise and self.num_n == 4 and self.num_k % 8 == 0
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 128, 4, 1, 2)
         )
+        # One even N group uses the same zero-phase reset as several complete groups.
+        a128_stage4_one_group = (
+            compact_k_scale and compact_rows and block_n_multiple == 1 and num_sms == 132
+            and self.num_n == self.group_tiles == 8 and N == self.num_n * self.block_n
+            and M == self.num_m * self.block_m and num_sms < self.num_m * self.num_n <= 3 * num_sms
+            and K == 256 * BLOCK_K
+        )
         self.a128_stage4_full_groups = (
-            not rowwise and self.num_n > self.group_tiles and self.num_n % self.group_tiles == 0
-            and self.num_k % 8 == 0
+            not rowwise and self.num_k % 8 == 0
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 128, 4, 1, 2)
+            and ((self.num_n > self.group_tiles and self.num_n % self.group_tiles == 0)
+                 or a128_stage4_one_group)
         )
         self.short_n144_cluster = (not rowwise and self.num_k <= 8 and self.num_m * self.num_n <= 2 * self.num_sms
                                    and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 144, 4, 2, 1))
@@ -1321,9 +1335,18 @@ class WeightGradient:
         self.short_a_n96 = (not rowwise and self.num_m == self.num_k == 1
                             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (16, 96, 15, 1, 2))
         self.short_a_n96_no_wrap = self.short_a_n96 and divide_up(self.num_n, self.num_sms) < self.stages
+        dense_n112_a_two_waves = (
+            compact_rows and full_device_sm_budget and block_n_multiple == 1
+            and M % self.block_m == N % self.block_n == K % BLOCK_K == 0
+            and self.num_n % self.group_tiles == 0
+            and num_sms < self.num_m * self.num_n <= 2 * num_sms
+            and 32 <= self.num_k <= 256
+        )
         self.n112_a_full_ring = (
-            not rowwise and (self.num_m, self.num_n, self.num_k, num_sms) == (9, 26, 30, 132)
+            not rowwise
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 112, 5, 1, 2)
+            and ((self.num_m, self.num_n, self.num_k, num_sms) == (9, 26, 30, 132)
+                 or dense_n112_a_two_waves)
         )
         self.m32_n112_two_waves = (
             not rowwise and self.num_m == self.num_k == 1 and self.num_n == num_sms + 2
