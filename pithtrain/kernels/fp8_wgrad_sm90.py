@@ -305,9 +305,15 @@ class WeightGradient:
                  n16_u_stage6_aligned_storage=False, n64_u_stage4_aligned_storage=False,
                  n64_u_stage7_aligned_storage=False,
                  n96_stage15_n88_storage=False, m16_n96_stage4_aligned_storage=False,
-                 n16_u_stage12_aligned_storage=False, n48_stage12_mn_storage=False, n96_b_stage7_aligned_storage=False, n80_b_stage8_aligned_storage=False):
+                 n16_u_stage12_aligned_storage=False, n48_stage12_mn_storage=False, m64_n32_stage13_two_sm_storage=False, n96_b_stage7_aligned_storage=False, n80_b_stage8_aligned_storage=False):
         self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n = select_layout(M, N, K, num_sms, rowwise, block_n_multiple)
         self.num_m, self.num_n, self.num_k = divide_up(M, self.block_m), divide_up(N, self.block_n), divide_up(K, BLOCK_K)
+        if (compact_rows and m64_n32_stage13_two_sm_storage
+                and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 32, 13, 1, 1)):
+            self.block_m, self.block_n = 64, 16
+            self.num_m, self.num_n = divide_up(M, self.block_m), divide_up(N, self.block_n)
+            reserved, per_stage = shared_footprint(self.block_m, self.block_n, self.num_k, rowwise)
+            self.stages = min(16, (SMEM_CAPACITY - reserved) // per_stage)
         self.n64_stage4_skinny = (
             compact_rows and n64_u_stage4_aligned_storage
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 64, 4, 1, 1)
@@ -3023,6 +3029,11 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
+    m64_n32_stage13_two_sm_storage = (
+        not rowwise and (M, N, K, num_sms, block_n_multiple) == (64, 32, 1949696, 2, 32)
+        and all(tensor.data_ptr() % BLOCK_K == 0 and tensor.stride(0) * tensor.element_size() == K
+                for tensor in (grad, activation))
+    )
     key = ("fp8_wgrad", M, N, K, num_sms, rowwise, block_n_multiple,
            tuple(tensor.stride() for tensor in tensors), aligned_two_sm_operands, long_a_storage_ok,
            aligned_stage11_tail, aligned_n160_operands, n80_streamed_scale_storage, aligned_a128_tail,
@@ -3039,7 +3050,7 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
            aligned_n32_stage12_operands, n16_u_stage6_aligned_storage, n64_u_stage4_aligned_storage,
            n64_u_stage7_aligned_storage,
            n96_stage15_n88_storage, m16_n96_stage4_aligned_storage, n16_u_stage12_aligned_storage,
-           n48_stage12_mn_storage, n80_b_stage8_aligned_storage, n96_b_stage7_aligned_storage)
+           n48_stage12_mn_storage, n80_b_stage8_aligned_storage, m64_n32_stage13_two_sm_storage, n96_b_stage7_aligned_storage)
     compiled = CACHE.get(key)
     if compiled is None:
         dtypes = (Float8E4M3FN, Float32, Float8E4M3FN, Float32, Float32)
@@ -3099,6 +3110,7 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                                    m16_n96_stage4_aligned_storage=m16_n96_stage4_aligned_storage,
                                    n16_u_stage12_aligned_storage=n16_u_stage12_aligned_storage,
                                    n48_stage12_mn_storage=n48_stage12_mn_storage,
+                                   m64_n32_stage13_two_sm_storage=m64_n32_stage13_two_sm_storage,
                                    n96_b_stage7_aligned_storage=n96_b_stage7_aligned_storage,
                                    n80_b_stage8_aligned_storage=n80_b_stage8_aligned_storage)
         compiled = cute.compile(operation, *operands, fake_stream(), options="--enable-tvm-ffi")
