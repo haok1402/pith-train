@@ -307,7 +307,8 @@ class WeightGradient:
                  n96_stage15_n88_storage=False, m16_n96_stage4_aligned_storage=False,
                  n16_u_stage12_aligned_storage=False, n48_stage12_mn_storage=False, m64_n32_stage13_two_sm_storage=False, n32_a_stage4_long_aligned_storage=False, n160_a_stage4_aligned_storage=False, n16_u_stage12_2sm_mn_storage=False, m64_n32_stage7_static_storage=False, m64_n32_stage7_one_wave_storage=False, m128_n32_a_stage9_storage=False, aligned_m64_n96_stage4_two_m_storage=False, m64_n32_stage15_two_sm_storage=False, n96_b_stage7_aligned_storage=False, n80_b_stage8_aligned_storage=False,
                  m128_n192_u_stage3_storage=False, n96_b_stage8_aligned_storage=False, m32_n80_stage4_aligned_storage=False,
-                 m64_n192_b_stage4_storage=False, n64_u_stage7_two_sm_storage=False, n160_a_stage5_aligned_storage=False, n48_u_stage4_aligned_storage=False, n192_a_stage4_aligned_storage=False):
+                 m64_n192_b_stage4_storage=False, n64_u_stage7_two_sm_storage=False, n160_a_stage5_aligned_storage=False, n48_u_stage4_aligned_storage=False, n192_a_stage4_aligned_storage=False,
+                 m64_n48_u_stage8_full_storage=False):
         self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n = select_layout(M, N, K, num_sms, rowwise, block_n_multiple)
         self.num_m, self.num_n, self.num_k = divide_up(M, self.block_m), divide_up(N, self.block_n), divide_up(K, BLOCK_K)
         if (compact_rows and (self.block_m, self.block_n, self.cluster_m, self.cluster_n) == (64, 32, 1, 1)
@@ -408,6 +409,15 @@ class WeightGradient:
         if self.m16_n96_stage4_two_panels:
             # Each SM gets one half of the only B-scale panel.
             self.block_n, self.num_n = 48, 2
+            reserved, per_stage = shared_footprint(self.block_m, self.block_n, self.num_k, rowwise)
+            self.stages = min(16, (SMEM_CAPACITY - reserved) // per_stage)
+        self.m64_n48_u_stage8_full = (
+            compact_rows and m64_n48_u_stage8_full_storage and self.num_m == 1 and self.num_n == 3
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 48, 8, 1, 1)
+        )
+        if self.m64_n48_u_stage8_full:
+            # A 32-column panel stays within a single B-scale group.
+            self.block_n, self.num_n = 32, divide_up(N, 32)
             reserved, per_stage = shared_footprint(self.block_m, self.block_n, self.num_k, rowwise)
             self.stages = min(16, (SMEM_CAPACITY - reserved) // per_stage)
         self.n48_stage12_unicast_mn = (
@@ -1029,7 +1039,7 @@ class WeightGradient:
         )
         self.static_ring = ((compact_rows and m64_n32_stage7_static_storage and self.num_k % 7 == 0
                             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 32, 7, 1, 1))
-                           or self.n48_stage4_split_m or self.n48_stage12_unicast_mn or self.n16_u_stage12 or self.n96_stage15_n88 or self.n16_u_stage6 or self.stream_b_scale_row or self.n16_u_stage7 or self.m64_n32_long_stage8 or self.m16_n128_stage8_single or self.n112_stage4_two_waves or self.n16_u_stage11 or self.n144_unicast_one_wave or self.m16_n160_stage8 or self.cluster_size == 1 and not rowwise and starts_at_zero and (self.block_m < 64 and self.uniform_scale or self.block_n == 96 or self.single_n80_tile or self.static_n16_stage8_math or self.long_n80_stage4 or self.narrow_n160_four_stages or self.wide_n192_four_math or self.n32_reuse_grad or self.n64_reuse_grad or self.n32_single_tile or (self.block_m, self.block_n) == (128, 48) or self.m64_n112_one_wave) )
+                           or self.m64_n48_u_stage8_full or self.n48_stage4_split_m or self.n48_stage12_unicast_mn or self.n16_u_stage12 or self.n96_stage15_n88 or self.n16_u_stage6 or self.stream_b_scale_row or self.n16_u_stage7 or self.m64_n32_long_stage8 or self.m16_n128_stage8_single or self.n112_stage4_two_waves or self.n16_u_stage11 or self.n144_unicast_one_wave or self.m16_n160_stage8 or self.cluster_size == 1 and not rowwise and starts_at_zero and (self.block_m < 64 and self.uniform_scale or self.block_n == 96 or self.single_n80_tile or self.static_n16_stage8_math or self.long_n80_stage4 or self.narrow_n160_four_stages or self.wide_n192_four_math or self.n32_reuse_grad or self.n64_reuse_grad or self.n32_single_tile or (self.block_m, self.block_n) == (128, 48) or self.m64_n112_one_wave) )
         self.dynamic_n96_stage7_producer = (self.block_m, self.block_n, self.stages, self.cluster_size) == (64, 96, 7, 1) and self.num_m == self.num_n == 1 and not rowwise
         self.n80_three_tile_mn_scales = self.long_n80_stage4 and self.num_n <= 3 and not compact_k_scale
         self.rolling_n128_producer = (not rowwise and self.num_m == self.num_n == 1
@@ -1511,7 +1521,7 @@ class WeightGradient:
              or self.n16_u_stage6 or self.n16_u_stage12 or self.m64_n32_long_stage8),
             (TileOrder.M_LINEAR, self.m64_n48_narrow_a or self.n48_a_stage8_one_n),
             (TileOrder.SINGLE_TILE, self.m16_n128_stage8_single),
-            (TileOrder.N_LINEAR, self.n32_u_stage12_one_wave or self.n112_stage4_two_waves
+            (TileOrder.N_LINEAR, self.m64_n48_u_stage8_full or self.n32_u_stage12_one_wave or self.n112_stage4_two_waves
              or self.n64_reuse_grad or self.n128_u_stage4_two_sm),
             (TileOrder.SINGLE_TILE, self.n16_u_stage11 or self.two_sm_single_tile),
             (TileOrder.M_LINEAR, self.n32_two_sm_narrow or self.m128_n32_a_stage9_one_n),
@@ -3342,6 +3352,13 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
+    m64_n48_u_stage8_full_storage = (
+        not rowwise and num_sms == 132 and block_n_multiple == 48 and N in (136, 144)
+        and 11073 <= num_k <= 11200 and 0 < K % BLOCK_K <= 16
+        and all(tensor.data_ptr() % 32 == 0
+                and tensor.stride(0) * tensor.element_size() == align_up(K, 16)
+                for tensor in (grad, activation))
+    )
     key = ("fp8_wgrad", M, N, K, num_sms, rowwise, block_n_multiple,
            tuple(tensor.stride() for tensor in tensors), aligned_two_sm_operands, long_a_storage_ok,
            aligned_stage11_tail, aligned_n160_operands, n80_streamed_scale_storage, aligned_a128_tail,
@@ -3358,7 +3375,8 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
            aligned_n32_stage12_operands, n16_u_stage6_aligned_storage, n64_u_stage4_aligned_storage,
            n64_u_stage7_aligned_storage, n64_u_stage5_aligned_storage, n48_u_stage4_aligned_storage,
            n96_stage15_n88_storage, m16_n96_stage4_aligned_storage, n16_u_stage12_aligned_storage,
-           n48_stage12_mn_storage, n80_b_stage8_aligned_storage, m64_n32_stage13_two_sm_storage, n32_a_stage4_long_aligned_storage, n160_a_stage4_aligned_storage, n16_u_stage12_2sm_mn_storage, m64_n32_stage7_static_storage, m64_n32_stage7_one_wave_storage, m128_n32_a_stage9_storage, aligned_m64_n96_stage4_two_m_storage, m128_n192_u_stage3_storage, m64_n32_stage15_two_sm_storage, n96_b_stage8_aligned_storage, m32_n80_stage4_aligned_storage, m64_n192_b_stage4_storage, n64_u_stage7_two_sm_storage, n160_a_stage5_aligned_storage, n192_a_stage4_aligned_storage, n96_b_stage7_aligned_storage)
+           n48_stage12_mn_storage, n80_b_stage8_aligned_storage, m64_n32_stage13_two_sm_storage, n32_a_stage4_long_aligned_storage, n160_a_stage4_aligned_storage, n16_u_stage12_2sm_mn_storage, m64_n32_stage7_static_storage, m64_n32_stage7_one_wave_storage, m128_n32_a_stage9_storage, aligned_m64_n96_stage4_two_m_storage, m128_n192_u_stage3_storage, m64_n32_stage15_two_sm_storage, n96_b_stage8_aligned_storage, m32_n80_stage4_aligned_storage, m64_n192_b_stage4_storage, n64_u_stage7_two_sm_storage, n160_a_stage5_aligned_storage, n192_a_stage4_aligned_storage,
+           m64_n48_u_stage8_full_storage, n96_b_stage7_aligned_storage)
     compiled = CACHE.get(key)
     if compiled is None:
         dtypes = (Float8E4M3FN, Float32, Float8E4M3FN, Float32, Float32)
@@ -3437,7 +3455,8 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                                    m64_n192_b_stage4_storage=m64_n192_b_stage4_storage,
                                    n64_u_stage7_two_sm_storage=n64_u_stage7_two_sm_storage,
                                    n160_a_stage5_aligned_storage=n160_a_stage5_aligned_storage,
-                                   n192_a_stage4_aligned_storage=n192_a_stage4_aligned_storage)
+                                   n192_a_stage4_aligned_storage=n192_a_stage4_aligned_storage,
+                                   m64_n48_u_stage8_full_storage=m64_n48_u_stage8_full_storage)
         compiled = cute.compile(operation, *operands, fake_stream(), options="--enable-tvm-ffi")
         CACHE[key] = compiled
     compiled(*tensors)
