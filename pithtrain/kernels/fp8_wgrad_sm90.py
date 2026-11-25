@@ -375,21 +375,25 @@ class WeightGradient:
         n48_stage7_wide = (
             self.stages == 7 and (M, N, K, num_sms) == (769, 680, 1650689, 98)
         )
+        n48_stage11_wide = (
+            self.stages == 11 and num_sms == 132
+        )
         n48_stage12_wide = (
             self.stages == 12 and (M, N, K, num_sms) == (897, 776, 483329, 132)
         )
         self.m64_n48_a_stage9_wide = False
         if (not rowwise and compact_rows and n48_a_stage9_storage and N % 8 == 0
                 and (self.block_m, self.block_n, self.cluster_m, self.cluster_n) == (64, 48, 1, 2)
-                and (self.stages in (8, 9) or n48_stage7_wide or n48_stage12_wide)):
+                and (self.stages in (8, 9) or n48_stage7_wide or n48_stage11_wide or n48_stage12_wide)):
             # One wider wave replaces two native waves while keeping the A multicast pairs.
             wide_n = 3 * self.block_n
             wide_tiles_n = divide_up(N, wide_n)
             wide_tiles = self.num_m * wide_tiles_n
             reserved, stage_bytes = shared_footprint(self.block_m, wide_n, self.num_k, rowwise)
             wide_stages = (SMEM_CAPACITY - reserved) // stage_bytes
+            supported_wide_stages = (5,) if n48_stage11_wide else (6,) if n48_stage12_wide else (3, 4)
             self.m64_n48_a_stage9_wide = (
-                (wide_stages == 6 if n48_stage12_wide else wide_stages in (3, 4))
+                wide_stages in supported_wide_stages
                 and wide_tiles_n > 1 and 2 * wide_tiles >= num_sms >= wide_tiles
                 and num_sms < self.num_m * self.num_n <= 2 * num_sms
                 and self.num_n > 8 and self.num_n % 2 == 1
