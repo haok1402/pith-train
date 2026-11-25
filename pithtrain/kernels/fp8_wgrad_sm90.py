@@ -317,7 +317,8 @@ class WeightGradient:
                  m64_n32_stage8_one_wave_storage=False, m64_n32_stage11_scale_storage=False,
                  m32_n64_stage12_split_storage=False,
                  m64_n32_stage12_full_storage=False, m64_n32_stage11_two_sm_storage=False,
-                 m128_n32_stage5_n8_storage=False, m64_n48_stage6_two_sm_storage=False):
+                 m128_n32_stage5_n8_storage=False, m64_n48_stage6_two_sm_storage=False,
+                 m16_n48_stage4_crossed_storage=False):
         self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n = select_layout(M, N, K, num_sms, rowwise, block_n_multiple)
         self.num_m, self.num_n, self.num_k = divide_up(M, self.block_m), divide_up(N, self.block_n), divide_up(K, BLOCK_K)
         stage12_n32_full_device = (
@@ -1119,8 +1120,11 @@ class WeightGradient:
         stream_n16 = self.n48_stage4_skinny or self.n64_stage4_skinny or (self.block_m, self.block_n) == (64, 16) or (
             compact_rows and (self.block_m, self.block_n, M, N, K, num_sms) == (32, 16, 32, 16, 6561792, 132)
         )
-        stream_n48 = self.block_n == N == 48 and num_sms == 2 and (self.block_m, K) in (
-            (16, 3133440), (32, 2953216),
+        stream_n48 = (
+            (self.block_n == N == 48 and num_sms == 2 and (self.block_m, K) in (
+                (16, 3133440), (32, 2953216),
+            ))
+            or (compact_rows and m16_n48_stage4_crossed_storage and (self.block_m, self.block_n) == (16, 48))
         )
         stream_n80 = (
             self.single_n80_tile and self.stages == 9 and compact_rows and n80_streamed_scale_storage
@@ -3659,6 +3663,14 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
+    # The native 16x48 ring fits four stages from 23,441 to 24,480 K blocks.
+    m16_n48_stage4_crossed_storage = (
+        not rowwise and num_sms in (98, 108, 110, 124, 132) and block_n_multiple == 48
+        and M == 16 and N == 48 and 23440 < num_k <= 24480 and K % BLOCK_K == 0
+        and all(tensor.data_ptr() % BLOCK_K == 0
+                and tensor.stride(0) * tensor.element_size() == K
+                for tensor in (grad, activation))
+    )
     key = ("fp8_wgrad", M, N, K, num_sms, rowwise, block_n_multiple,
            tuple(tensor.stride() for tensor in tensors), aligned_two_sm_operands, long_a_storage_ok,
            aligned_stage11_tail, aligned_n160_operands, n80_streamed_scale_storage, aligned_a128_tail,
@@ -3679,7 +3691,7 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
            m64_n48_u_stage8_full_storage, m64_n32_stage14_high_storage,
            m64_n80_u_split_storage, n96_b_stage7_aligned_storage, m128_stage4_n8_storage, m64_n16_two_sm_split_storage,
            m64_n32_stage6_high_storage, m64_n32_stage8_one_wave_storage, m32_n64_stage12_split_storage, m64_n32_stage12_full_storage, m64_n128_stage6_split_storage,
-           m64_n32_stage11_two_sm_storage, m64_n32_stage11_scale_storage, m128_n32_stage5_n8_storage, m64_n48_stage6_two_sm_storage)
+           m64_n32_stage11_two_sm_storage, m64_n32_stage11_scale_storage, m128_n32_stage5_n8_storage, m64_n48_stage6_two_sm_storage, m16_n48_stage4_crossed_storage)
     compiled = CACHE.get(key)
     if compiled is None:
         dtypes = (Float8E4M3FN, Float32, Float8E4M3FN, Float32, Float32)
@@ -3779,7 +3791,8 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                                    m64_n32_stage11_two_sm_storage=m64_n32_stage11_two_sm_storage,
                                    m64_n32_stage11_scale_storage=m64_n32_stage11_scale_storage,
                                    m128_n32_stage5_n8_storage=m128_n32_stage5_n8_storage,
-                                   m64_n48_stage6_two_sm_storage=m64_n48_stage6_two_sm_storage)
+                                   m64_n48_stage6_two_sm_storage=m64_n48_stage6_two_sm_storage,
+                                   m16_n48_stage4_crossed_storage=m16_n48_stage4_crossed_storage)
         compiled = cute.compile(operation, *operands, fake_stream(), options="--enable-tvm-ffi")
         CACHE[key] = compiled
     compiled(*tensors)
