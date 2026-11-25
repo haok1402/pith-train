@@ -310,7 +310,7 @@ class WeightGradient:
                  m64_n192_b_stage4_storage=False, n64_u_stage7_two_sm_storage=False, n160_a_stage5_aligned_storage=False, n48_u_stage4_aligned_storage=False, n192_a_stage4_aligned_storage=False,
                  m64_n48_u_stage8_full_storage=False,
                  n48_u_stage7_aligned_storage=False, m64_n32_stage14_high_storage=False,
-                 m64_n80_u_split_storage=False, n32_a_stage6_aligned_storage=False, m128_n32_stage4_n8_storage=False,
+                 m64_n80_u_split_storage=False, n32_a_stage6_aligned_storage=False, m128_stage4_n8_storage=False,
                  m128_n48_two_sm_narrow_storage=False, n32_a_stage9_aligned_storage=False, n32_a_stage8_aligned_storage=False,
                  m64_n16_two_sm_split_storage=False, m64_n128_stage6_split_storage=False,
                  m64_n16_stage15_aligned_storage=False, m64_n32_stage6_high_storage=False, n32_a_stage7_aligned_storage=False,
@@ -352,11 +352,12 @@ class WeightGradient:
             self.block_m, self.num_m = 32, 2
             reserved, stage_bytes = shared_footprint(self.block_m, self.block_n, self.num_k, rowwise)
             self.stages = min(16, (SMEM_CAPACITY - reserved) // stage_bytes)
-        self.m128_n32_stage4_n8 = (
-            compact_rows and m128_n32_stage4_n8_storage and self.num_m == 2 and self.num_n == 1
-            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 32, 4, 1, 1)
+        self.m128_stage4_n8 = (
+            compact_rows and m128_stage4_n8_storage and self.num_m == 2 and self.num_n == 1
+            and (self.block_m, self.stages, self.cluster_m, self.cluster_n) == (128, 4, 1, 1)
+            and self.block_n == block_n_multiple and self.block_n in (32, 64)
         )
-        if self.m128_n32_stage4_n8:
+        if self.m128_stage4_n8:
             self.block_n = 8
             reserved, per_stage = shared_footprint(self.block_m, self.block_n, self.num_k, rowwise)
             self.stages = min(16, (SMEM_CAPACITY - reserved) // per_stage)
@@ -3566,10 +3567,11 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # The native 128x32 footprint fits four stages for 27,713 to 32,960 K blocks.
-    m128_n32_stage4_n8_storage = (
-        not rowwise and num_sms == 2 and block_n_multiple == 32
-        and 128 < M <= 256 and N == 8 and 27712 < num_k <= 32960
+    # Four native stages have separate K-block ranges for N32 and N64.
+    m128_stage4_n8_storage = (
+        not rowwise and num_sms == 2 and 128 < M <= 256 and N == 8
+        and ((block_n_multiple == 32 and 27712 < num_k <= 32960)
+             or (block_n_multiple == 64 and 18496 < num_k <= 24768))
         and all(tensor.data_ptr() % 32 == 0
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
@@ -3646,7 +3648,7 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
            n96_stage15_n88_storage, m16_n96_stage4_aligned_storage, n16_u_stage12_aligned_storage,
            n48_stage12_mn_storage, n80_b_stage8_aligned_storage, m64_n32_stage13_two_sm_storage, n32_a_stage4_long_aligned_storage, n160_a_stage4_aligned_storage, n16_u_stage12_2sm_mn_storage, m64_n32_stage7_static_storage, m64_n32_stage7_one_wave_storage, m128_n32_a_stage9_storage, aligned_m64_n96_stage4_two_m_storage, m128_n192_u_stage3_storage, m64_n32_stage15_two_sm_storage, n96_b_stage8_aligned_storage, m32_n80_stage4_aligned_storage, m64_n192_b_stage4_storage, n64_u_stage7_two_sm_storage, n160_a_stage5_aligned_storage, n192_a_stage4_aligned_storage,
            m64_n48_u_stage8_full_storage, m64_n32_stage14_high_storage,
-           m64_n80_u_split_storage, n96_b_stage7_aligned_storage, m128_n32_stage4_n8_storage, m64_n16_two_sm_split_storage,
+           m64_n80_u_split_storage, n96_b_stage7_aligned_storage, m128_stage4_n8_storage, m64_n16_two_sm_split_storage,
            m64_n32_stage6_high_storage, m64_n32_stage8_one_wave_storage, m32_n64_stage12_split_storage, m64_n32_stage12_full_storage, m64_n128_stage6_split_storage,
            m64_n32_stage11_two_sm_storage, m64_n32_stage11_scale_storage)
     compiled = CACHE.get(key)
@@ -3738,7 +3740,7 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                                    m64_n48_u_stage8_full_storage=m64_n48_u_stage8_full_storage,
                                    m64_n32_stage14_high_storage=m64_n32_stage14_high_storage,
                                    m64_n80_u_split_storage=m64_n80_u_split_storage,
-                                   m128_n32_stage4_n8_storage=m128_n32_stage4_n8_storage,
+                                   m128_stage4_n8_storage=m128_stage4_n8_storage,
                                    m64_n16_two_sm_split_storage=m64_n16_two_sm_split_storage,
                                    m64_n32_stage6_high_storage=m64_n32_stage6_high_storage,
                                    m64_n32_stage8_one_wave_storage=m64_n32_stage8_one_wave_storage,
