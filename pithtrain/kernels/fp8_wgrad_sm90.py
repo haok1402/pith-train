@@ -311,7 +311,7 @@ class WeightGradient:
                  m64_n48_u_stage8_full_storage=False,
                  n48_u_stage7_aligned_storage=False, m64_n32_stage14_high_storage=False,
                  m64_n80_u_split_storage=False, n32_a_stage6_aligned_storage=False, m128_n32_stage4_n8_storage=False,
-                 m128_n48_stage7_narrow_storage=False, n32_a_stage9_aligned_storage=False, n32_a_stage8_aligned_storage=False,
+                 m128_n48_two_sm_narrow_storage=False, n32_a_stage9_aligned_storage=False, n32_a_stage8_aligned_storage=False,
                  m64_n16_two_sm_split_storage=False,
                  m64_n16_stage15_aligned_storage=False, m64_n32_stage6_high_storage=False, n32_a_stage7_aligned_storage=False,
                  m64_n32_stage8_one_wave_storage=False,
@@ -389,13 +389,17 @@ class WeightGradient:
             self.block_m, self.num_m = 32, 2
             reserved, stage_bytes = shared_footprint(self.block_m, self.block_n, self.num_k, rowwise)
             self.stages = min(16, (SMEM_CAPACITY - reserved) // stage_bytes)
-        self.m128_n48_stage7_narrow = (
-            compact_rows and m128_n48_stage7_narrow_storage
+        self.m128_n48_two_sm_narrow = (
+            compact_rows and m128_n48_two_sm_narrow_storage
             and self.num_m == num_sms == 2 and self.num_n == 1
-            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 48, 7, 1, 1)
+            and (self.block_m, self.block_n, self.cluster_m, self.cluster_n) == (128, 48, 1, 1)
+            and self.stages in (6, 7)
         )
-        if self.m128_n48_stage7_narrow:
+        if self.m128_n48_two_sm_narrow:
             self.block_n = N
+            if self.stages == 6:
+                reserved, per_stage = shared_footprint(self.block_m, self.block_n, self.num_k, rowwise)
+                self.stages = min(16, (SMEM_CAPACITY - reserved) // per_stage)
         self.n64_stage4_skinny = (
             compact_rows and n64_u_stage4_aligned_storage
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 64, 4, 1, 1)
@@ -3520,10 +3524,11 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # Seven native stages fit with 2,913 through 5,792 K blocks.
-    m128_n48_stage7_narrow_storage = (
+    # Native Stage 7 spans 2,913–5,792 K blocks, and Stage 6 spans 5,793–8,672.
+    m128_n48_two_sm_narrow_storage = (
         not rowwise and num_sms == 2 and block_n_multiple == 48
-        and 128 < M <= 256 and 0 < N <= 16 and N % 8 == 0 and 2912 < num_k <= 5792
+        and 128 < M <= 256 and N in (8, 16)
+        and (2912 < num_k <= 5792 or (N == 8 and 5792 < num_k <= 8672))
         and all(tensor.data_ptr() % 32 == 0
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
@@ -3563,7 +3568,7 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
            n16_stage10_bulk_storage, n16_stage10_pair_storage, n160_grad_offset_only, aligned_grid_n16_operands,
            aligned_m128_n32_a, n48_a_stage9_storage, aligned_n192_stage4, n16_stage8_local_storage,
            aligned_n16_stage14_operands, full_device_sm_budget, n112_stage5_l2_storage, aligned_n32_stage14_operands,
-           aligned_n48_stage8_operands, aligned_n96_narrow_operands, m64_n16_stage15_aligned_storage, m128_n48_stage7_narrow_storage, n32_a_stage6_aligned_storage, n32_a_stage7_aligned_storage, n32_a_stage8_aligned_storage, n32_a_stage9_aligned_storage,
+           aligned_n48_stage8_operands, aligned_n96_narrow_operands, m64_n16_stage15_aligned_storage, m128_n48_two_sm_narrow_storage, n32_a_stage6_aligned_storage, n32_a_stage7_aligned_storage, n32_a_stage8_aligned_storage, n32_a_stage9_aligned_storage,
            aligned_n96_stage4_operands, n96_stage4_tail_storage, aligned_n32_stage10_operands,
            aligned_m32_n64_stage4_operands, n80_b_stage7_aligned_storage,
            aligned_m32_n96_stage4_operands, aligned_m16_n64_stage4_prefetch_operands,
@@ -3615,7 +3620,7 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                                    aligned_n32_stage14_operands=aligned_n32_stage14_operands,
                                    aligned_n48_stage8_operands=aligned_n48_stage8_operands,
                                    m64_n16_stage15_aligned_storage=m64_n16_stage15_aligned_storage,
-                                   m128_n48_stage7_narrow_storage=m128_n48_stage7_narrow_storage,
+                                   m128_n48_two_sm_narrow_storage=m128_n48_two_sm_narrow_storage,
                                    n32_a_stage6_aligned_storage=n32_a_stage6_aligned_storage,
                                    n32_a_stage7_aligned_storage=n32_a_stage7_aligned_storage,
                                    n32_a_stage8_aligned_storage=n32_a_stage8_aligned_storage,
