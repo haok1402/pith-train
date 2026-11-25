@@ -361,6 +361,13 @@ class WeightGradient:
         if self.m64_n128_single_m_share_a:
             # Pair adjacent N tiles so they share the single A tile.
             self.cluster_m, self.cluster_n = 1, 2
+        self.m16_n128_single_m_share_a = (
+            not rowwise and M <= 8 and self.num_m == 1 and self.num_n > 2 * num_sms
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (16, 128, 11, 2, 1)
+        )
+        if self.m16_n128_single_m_share_a:
+            # Pair adjacent N tiles so the cluster actually shares the single A tile.
+            self.cluster_m, self.cluster_n = 1, 2
         n128_panels = divide_up(N, BLOCK_K)
         self.m128_n80_stage6_balance = (
             not rowwise
@@ -1358,7 +1365,7 @@ class WeightGradient:
              or self.m64_n80_grouped_wave or self.m64_n112_a_stage7_two_waves
              or self.m64_n48_a_stage9_wide or self.long_a_n128_tail),
             (TileOrder.N_LINEAR_MULTICAST, self.m32_n112_two_waves or self.m32_n128_two_waves),
-            (TileOrder.SHORT_N_LINEAR_A, self.short_a_n16 or self.short_a_n144 or self.short_a_n96
+            (TileOrder.SHORT_N_LINEAR_A, self.m16_n128_single_m_share_a or self.short_a_n16 or self.short_a_n144 or self.short_a_n96
              or self.short_a_n128 or self.m32_n48_short_a),
             (TileOrder.SHORT_B, self.m64_n128_b_short or self.short_n96_b_stage10),
             (TileOrder.SHORT_B_N128, self.short_b_n128),
@@ -1422,7 +1429,7 @@ class WeightGradient:
                               or self.m64_n112_a_stage5_l2 or self.n48_a_stage8_activation_l2_128
                               or self.n32_a_stage13_multi_n):
             activation_promotion = TensorMapL2Promotion.l2_128b
-        if cutlass.const_expr(self.n96_short_n_tail):
+        if cutlass.const_expr(self.n96_short_n_tail or self.m16_n128_single_m_share_a):
             activation_promotion = TensorMapL2Promotion.l2_128b
         activation = create_tensor_map_tiled(mActivation.iterator.toint(), Float8E4M3FN, [mActivation.shape[1], mActivation.shape[0]], [Int64(mActivation.stride[0]) // 16], [BLOCK_K, self.activation_block_n], swizzle=swizzle, l2_promotion=activation_promotion)
         grad_scale = create_tensor_map_tiled(mGradScale.iterator.toint(), Float32, [align_up(mGradScale.shape[0], 4), self.num_k], [Int64(mGradScale.stride[1]) // 4], [self.block_m, 1], l2_promotion=promote)
@@ -2493,7 +2500,9 @@ class WeightGradient:
                               or self.small_stage8_full_tile):
             grad_lo, grad_hi = unused_scale(), unused_scale()
         if do_store:
-            grad_lo, grad_hi = s_grad_scale[row_lo, 0, stage], s_grad_scale[row_hi, 0, stage]
+            grad_lo = s_grad_scale[row_lo, 0, stage]
+            if cutlass.const_expr(not self.m16_n128_single_m_share_a):
+                grad_hi = s_grad_scale[row_hi, 0, stage]
 
         if cutlass.const_expr(self.inline_small_mma or self.n112_short_k):
             grad_low = grad_desc + stage * (self.block_m * BLOCK_K // 16)
@@ -2560,7 +2569,8 @@ class WeightGradient:
 
     @cute.jit
     def promote_pair(self, accumulator, partial, group, scales):
-        for entry in cutlass.range_constexpr(4):
+        entries = 2 if self.m16_n128_single_m_share_a else 4
+        for entry in cutlass.range_constexpr(entries):
             idx = group * 4 + entry
             accumulator[idx] = Float32(math.fma(partial[idx].ir_value(), scales[entry].ir_value(), accumulator[idx].ir_value()))
 
