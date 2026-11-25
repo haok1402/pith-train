@@ -791,7 +791,7 @@ class WeightGradient:
         )
         self.n16_u_stage6 = (
             not rowwise and compact_rows and n16_u_stage6_aligned_storage
-            and num_sms == 2 and self.num_m == self.num_n == 1 and N == self.block_n
+            and self.num_m == self.num_n == 1 and N == self.block_n
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 16, 6, 1, 1)
         )
         self.n16_u_stage7 = (
@@ -2895,11 +2895,17 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
     )
     # The native 64x16 footprint fits six stages for 38,657 to 41,280 K blocks.
     n16_u_stage6_aligned_storage = (
-        not rowwise and num_sms == 2 and block_n_multiple == 16
-        and 32 < M <= 64 and N == 16 and 38656 < num_k <= 41280
-        and all(tensor.data_ptr() % 32 == 0
-                and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
-                for tensor in (grad, activation))
+        not rowwise and 32 < M <= 64 and N == 16 and 38656 < num_k <= 41280
+        and (
+            (num_sms, block_n_multiple) == (2, 16)
+            and all(tensor.data_ptr() % 32 == 0
+                    and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
+                    for tensor in (grad, activation))
+            or (num_sms, block_n_multiple) == (132, 1)
+            and all(tensor.data_ptr() % BLOCK_K == 0
+                    and tensor.stride(0) * tensor.element_size() % BLOCK_K == 0
+                    for tensor in (grad, activation))
+        )
     )
     # The native 128x48 footprint fits seven stages for 2,913 to 5,792 K blocks.
     n48_a_stage7_aligned_storage = (
