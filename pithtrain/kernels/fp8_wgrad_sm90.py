@@ -302,7 +302,7 @@ class WeightGradient:
                  n80_stage6_gate3_storage=False, n80_b_stage9_aligned_storage=False,
                  aligned_stage11_spill_operands=False, n32_a_stage13_aligned_storage=False, n64_a_stage9_aligned_storage=False,
                  n48_a_stage7_aligned_storage=False, aligned_n32_stage12_operands=False,
-                 n16_u_stage6_aligned_storage=False):
+                 n16_u_stage6_aligned_storage=False, n96_b_stage7_aligned_storage=False):
         self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n = select_layout(M, N, K, num_sms, rowwise, block_n_multiple)
         self.num_m, self.num_n, self.num_k = divide_up(M, self.block_m), divide_up(N, self.block_n), divide_up(K, BLOCK_K)
         if (not rowwise and compact_rows and block_n_multiple == 32
@@ -1102,6 +1102,13 @@ class WeightGradient:
             not rowwise and self.num_m * self.num_n <= 2 * num_sms
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 80, 10, 2, 1)
         )
+        self.n96_b_stage7 = (
+            compact_rows and n96_b_stage7_aligned_storage
+            and self.num_m % 2 == 1 and 0 < N % self.block_n <= 32
+            and num_sms < (self.num_m - 1) * self.num_n
+            and self.num_m * self.num_n <= 2 * num_sms
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 96, 7, 2, 1)
+        )
         self.n80_b_stage7_aligned = (
             compact_rows and n80_b_stage7_aligned_storage
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 80, 7, 2, 1)
@@ -1373,7 +1380,7 @@ class WeightGradient:
         input_promotion = TensorMapL2Promotion.l2_128b if self.n112_misaligned_unicast else promote
         if cutlass.const_expr(self.m128_n80_short_a and mGrad.stride[0] == 16 and mActivation.stride[0] == 16):
             input_promotion = TensorMapL2Promotion.l2_128b
-        if cutlass.const_expr(self.input_l2_128b or self.n80_b_stage7_aligned):
+        if cutlass.const_expr(self.input_l2_128b or self.n80_b_stage7_aligned or self.n96_b_stage7):
             input_promotion = TensorMapL2Promotion.l2_128b
         swizzle = TensorMapSwizzle.s128b
         grad_promotion = input_promotion
@@ -2885,6 +2892,13 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
+    # The native 64x96 footprint fits seven stages for 5,217 to 7,808 K blocks.
+    n96_b_stage7_aligned_storage = (
+        not rowwise and block_n_multiple == 96 and 5216 < num_k <= 7808
+        and all(tensor.data_ptr() % 32 == 0
+                and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
+                for tensor in (grad, activation))
+    )
     key = ("fp8_wgrad", M, N, K, num_sms, rowwise, block_n_multiple,
            tuple(tensor.stride() for tensor in tensors), aligned_two_sm_operands, long_a_storage_ok,
            aligned_stage11_tail, aligned_n160_operands, n80_streamed_scale_storage, aligned_a128_tail,
@@ -2898,7 +2912,7 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
            n80_stage6_gate3_storage, n80_b_stage9_aligned_storage,
            aligned_stage11_spill_operands, n32_a_stage13_aligned_storage,
            n64_a_stage9_aligned_storage, n48_a_stage7_aligned_storage,
-           aligned_n32_stage12_operands, n16_u_stage6_aligned_storage)
+           aligned_n32_stage12_operands, n16_u_stage6_aligned_storage, n96_b_stage7_aligned_storage)
     compiled = CACHE.get(key)
     if compiled is None:
         dtypes = (Float8E4M3FN, Float32, Float8E4M3FN, Float32, Float32)
@@ -2951,7 +2965,8 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                                    n64_a_stage9_aligned_storage=n64_a_stage9_aligned_storage,
                                    n48_a_stage7_aligned_storage=n48_a_stage7_aligned_storage,
                                    aligned_n32_stage12_operands=aligned_n32_stage12_operands,
-                                   n16_u_stage6_aligned_storage=n16_u_stage6_aligned_storage)
+                                   n16_u_stage6_aligned_storage=n16_u_stage6_aligned_storage,
+                                   n96_b_stage7_aligned_storage=n96_b_stage7_aligned_storage)
         compiled = cute.compile(operation, *operands, fake_stream(), options="--enable-tvm-ffi")
         CACHE[key] = compiled
     compiled(*tensors)
