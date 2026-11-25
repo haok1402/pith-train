@@ -305,12 +305,13 @@ class WeightGradient:
                  n16_u_stage6_aligned_storage=False, n64_u_stage4_aligned_storage=False,
                  n64_u_stage7_aligned_storage=False, n64_u_stage5_aligned_storage=False,
                  n96_stage15_n88_storage=False, m16_n96_stage4_aligned_storage=False,
-                 n16_u_stage12_aligned_storage=False, n48_stage12_mn_storage=False, m64_n32_stage13_two_sm_storage=False, n32_a_stage4_long_aligned_storage=False, n160_a_stage4_aligned_storage=False, n16_u_stage12_2sm_mn_storage=False, m64_n32_stage7_static_storage=False, m128_n32_a_stage9_storage=False, aligned_m64_n96_stage4_two_m_storage=False, n96_b_stage7_aligned_storage=False, n80_b_stage8_aligned_storage=False,
+                 n16_u_stage12_aligned_storage=False, n48_stage12_mn_storage=False, m64_n32_stage13_two_sm_storage=False, n32_a_stage4_long_aligned_storage=False, n160_a_stage4_aligned_storage=False, n16_u_stage12_2sm_mn_storage=False, m64_n32_stage7_static_storage=False, m128_n32_a_stage9_storage=False, aligned_m64_n96_stage4_two_m_storage=False, m64_n32_stage15_two_sm_storage=False, n96_b_stage7_aligned_storage=False, n80_b_stage8_aligned_storage=False,
                  m128_n192_u_stage3_storage=False):
         self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n = select_layout(M, N, K, num_sms, rowwise, block_n_multiple)
         self.num_m, self.num_n, self.num_k = divide_up(M, self.block_m), divide_up(N, self.block_n), divide_up(K, BLOCK_K)
-        if (compact_rows and m64_n32_stage13_two_sm_storage
-                and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 32, 13, 1, 1)):
+        if (compact_rows and (self.block_m, self.block_n, self.cluster_m, self.cluster_n) == (64, 32, 1, 1)
+                and (self.stages == 13 and m64_n32_stage13_two_sm_storage
+                     or self.stages == 15 and m64_n32_stage15_two_sm_storage)):
             self.block_m, self.block_n = 64, 16
             self.num_m, self.num_n = divide_up(M, self.block_m), divide_up(N, self.block_n)
             reserved, per_stage = shared_footprint(self.block_m, self.block_n, self.num_k, rowwise)
@@ -3199,6 +3200,11 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 0
                 for tensor in (grad, activation))
     )
+    m64_n32_stage15_two_sm_storage = (
+        not rowwise and (M, N, K, num_sms, block_n_multiple) == (64, 32, 1146880, 2, 32)
+        and all(tensor.data_ptr() % BLOCK_K == 0 and tensor.stride(0) * tensor.element_size() == K
+                for tensor in (grad, activation))
+    )
     key = ("fp8_wgrad", M, N, K, num_sms, rowwise, block_n_multiple,
            tuple(tensor.stride() for tensor in tensors), aligned_two_sm_operands, long_a_storage_ok,
            aligned_stage11_tail, aligned_n160_operands, n80_streamed_scale_storage, aligned_a128_tail,
@@ -3215,7 +3221,7 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
            aligned_n32_stage12_operands, n16_u_stage6_aligned_storage, n64_u_stage4_aligned_storage,
            n64_u_stage7_aligned_storage, n64_u_stage5_aligned_storage,
            n96_stage15_n88_storage, m16_n96_stage4_aligned_storage, n16_u_stage12_aligned_storage,
-           n48_stage12_mn_storage, n80_b_stage8_aligned_storage, m64_n32_stage13_two_sm_storage, n32_a_stage4_long_aligned_storage, n160_a_stage4_aligned_storage, n16_u_stage12_2sm_mn_storage, m64_n32_stage7_static_storage, m128_n32_a_stage9_storage, aligned_m64_n96_stage4_two_m_storage, m128_n192_u_stage3_storage, n96_b_stage7_aligned_storage)
+           n48_stage12_mn_storage, n80_b_stage8_aligned_storage, m64_n32_stage13_two_sm_storage, n32_a_stage4_long_aligned_storage, n160_a_stage4_aligned_storage, n16_u_stage12_2sm_mn_storage, m64_n32_stage7_static_storage, m128_n32_a_stage9_storage, aligned_m64_n96_stage4_two_m_storage, m128_n192_u_stage3_storage, m64_n32_stage15_two_sm_storage, n96_b_stage7_aligned_storage)
     compiled = CACHE.get(key)
     if compiled is None:
         dtypes = (Float8E4M3FN, Float32, Float8E4M3FN, Float32, Float32)
@@ -3282,6 +3288,7 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                                    n16_u_stage12_2sm_mn_storage=n16_u_stage12_2sm_mn_storage,
                                    m64_n32_stage7_static_storage=m64_n32_stage7_static_storage,
                                    m128_n32_a_stage9_storage=m128_n32_a_stage9_storage,
+                                   m64_n32_stage15_two_sm_storage=m64_n32_stage15_two_sm_storage,
                                    n96_b_stage7_aligned_storage=n96_b_stage7_aligned_storage,
                                    n80_b_stage8_aligned_storage=n80_b_stage8_aligned_storage,
                                    aligned_m64_n96_stage4_two_m_storage=aligned_m64_n96_stage4_two_m_storage,
