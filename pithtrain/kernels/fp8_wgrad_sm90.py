@@ -301,7 +301,8 @@ class WeightGradient:
                  aligned_m16_n64_stage4_prefetch_operands=False, n128_stage4_wide=False,
                  n80_stage6_gate3_storage=False, n80_b_stage9_aligned_storage=False,
                  aligned_stage11_spill_operands=False, n32_a_stage13_aligned_storage=False, n64_a_stage9_aligned_storage=False,
-                 aligned_n32_stage12_operands=False, n16_u_stage6_aligned_storage=False):
+                 n48_a_stage7_aligned_storage=False, aligned_n32_stage12_operands=False,
+                 n16_u_stage6_aligned_storage=False):
         self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n = select_layout(M, N, K, num_sms, rowwise, block_n_multiple)
         self.num_m, self.num_n, self.num_k = divide_up(M, self.block_m), divide_up(N, self.block_n), divide_up(K, BLOCK_K)
         if (not rowwise and compact_rows and block_n_multiple == 32
@@ -532,6 +533,13 @@ class WeightGradient:
             and num_sms < self.num_m * (self.num_n - 1)
             and self.num_m * self.num_n <= 2 * num_sms
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 64, 9, 1, 2)
+        )
+        self.n48_a_stage7_grad_l2 = (
+            compact_rows and n48_a_stage7_aligned_storage
+            and self.num_m <= self.num_n and self.num_n % 2 == 1
+            and 0 < N % self.block_n <= 16
+            and self.num_m * self.num_n == 2 * num_sms
+            and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 48, 7, 1, 2)
         )
         self.long_a_n64_stage11_spill = (
             aligned_stage11_spill_operands and self.num_m <= self.num_n and self.num_n % 2 == 1
@@ -1374,6 +1382,8 @@ class WeightGradient:
             grad_promotion = TensorMapL2Promotion.l2_128b
         if cutlass.const_expr(self.n160_stage4_grad_offset or self.m64_n112_a_stage5_l2 or self.n48_a_stage8_grad_l2_128
                               or self.n80_b_stage9_l2_128):
+            grad_promotion = TensorMapL2Promotion.l2_128b
+        if cutlass.const_expr(self.n48_a_stage7_grad_l2):
             grad_promotion = TensorMapL2Promotion.l2_128b
         grad = create_tensor_map_tiled(mGrad.iterator.toint(), Float8E4M3FN, [mGrad.shape[1], mGrad.shape[0]], [Int64(mGrad.stride[0]) // 16], [BLOCK_K, self.block_m], swizzle=swizzle, l2_promotion=grad_promotion)
         activation_promotion = input_promotion
@@ -2868,6 +2878,13 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
+    # The native 128x48 footprint fits seven stages for 2,913 to 5,792 K blocks.
+    n48_a_stage7_aligned_storage = (
+        full_device_sm_budget and not rowwise and block_n_multiple == 48 and 2912 < num_k <= 5792
+        and all(tensor.data_ptr() % 32 == 0
+                and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
+                for tensor in (grad, activation))
+    )
     key = ("fp8_wgrad", M, N, K, num_sms, rowwise, block_n_multiple,
            tuple(tensor.stride() for tensor in tensors), aligned_two_sm_operands, long_a_storage_ok,
            aligned_stage11_tail, aligned_n160_operands, n80_streamed_scale_storage, aligned_a128_tail,
@@ -2880,7 +2897,8 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
            aligned_m32_n96_stage4_operands, aligned_m16_n64_stage4_prefetch_operands,
            n80_stage6_gate3_storage, n80_b_stage9_aligned_storage,
            aligned_stage11_spill_operands, n32_a_stage13_aligned_storage,
-           n64_a_stage9_aligned_storage, aligned_n32_stage12_operands, n16_u_stage6_aligned_storage)
+           n64_a_stage9_aligned_storage, n48_a_stage7_aligned_storage,
+           aligned_n32_stage12_operands, n16_u_stage6_aligned_storage)
     compiled = CACHE.get(key)
     if compiled is None:
         dtypes = (Float8E4M3FN, Float32, Float8E4M3FN, Float32, Float32)
@@ -2931,6 +2949,7 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                                    aligned_stage11_spill_operands=aligned_stage11_spill_operands,
                                    n32_a_stage13_aligned_storage=n32_a_stage13_aligned_storage,
                                    n64_a_stage9_aligned_storage=n64_a_stage9_aligned_storage,
+                                   n48_a_stage7_aligned_storage=n48_a_stage7_aligned_storage,
                                    aligned_n32_stage12_operands=aligned_n32_stage12_operands,
                                    n16_u_stage6_aligned_storage=n16_u_stage6_aligned_storage)
         compiled = cute.compile(operation, *operands, fake_stream(), options="--enable-tvm-ffi")
