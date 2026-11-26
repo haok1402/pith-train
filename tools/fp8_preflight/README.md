@@ -33,7 +33,9 @@ checks the hashes of selected seed artifacts. `PITHTRAIN_PREFLIGHT_ONLY=1` stops
 verification. Set `PITHTRAIN_GPU_TIME` for runs longer than the smoke.
 
 The bundle records the source and compiler identity, CuTe launch ABI, DeepGEMM
-cache entries, and rank-local weight digests. The training worker resolves CuTe
+cache entries, rank-local weight digests, and the resolved HF text configuration.
+The dense worker uses that configuration directly and imports only its model family.
+The training worker resolves CuTe
 and DeepGEMM specializations from the sealed bundle. A missing artifact ends the
 job with the launch signature or cache compiler invocation in the log. Torch
 Inductor's runtime compile and first use of cross-entropy have separate timings.

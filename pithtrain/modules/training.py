@@ -5,7 +5,8 @@ import random
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Literal, Optional
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Callable, Literal, Optional
 
 import numpy as np
 import torch
@@ -16,15 +17,9 @@ from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor
 from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import LambdaLR, LRScheduler
-from transformers import AutoConfig
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, training
-from pithtrain.models.deepseek_v2 import DeepSeekV2Model
-from pithtrain.models.gpt_oss import GptOssModel
-from pithtrain.models.qwen3_moe import Qwen3MoeModel
-from pithtrain.models.qwen35 import Qwen35Model, Qwen35TextModel
-from pithtrain.models.qwen35_moe import Qwen35MoeModel, Qwen35MoeRotaryEmbedding
 from pithtrain.modules import imbalance
 from pithtrain.modules.fp8_param_gather import (
     install_fp8_param_gather,
@@ -44,6 +39,11 @@ from pithtrain.pipeline import DualPipeV
 
 from .distributed import DistributedCfg
 
+if TYPE_CHECKING:
+    from transformers import PreTrainedConfig
+
+    from pithtrain.models.qwen35 import Qwen35TextModel
+
 __all__ = [
     "TrainingCfg",
     "is_muon_param",
@@ -58,9 +58,6 @@ __all__ = [
     "reload_training_state",
     "setup_training",
 ]
-
-PIPELINE_STAGE_MODELS = (DeepSeekV2Model, GptOssModel, Qwen3MoeModel, Qwen35MoeModel, Qwen35Model)
-
 
 def is_muon_param(name: str, param: torch.Tensor) -> bool:
     if param.ndim < 2:
@@ -327,6 +324,13 @@ def apply_fsdp(model, hsdp_replica: int = 1):
     weights shard over the dp axis of the expert mesh, everything else over the dp x cp stage, and
     gradients reduce as a plain sum. Under FP8 the FP8 weights are all-gathered in FP8.
     """
+    from pithtrain.models.deepseek_v2 import DeepSeekV2Model
+    from pithtrain.models.gpt_oss import GptOssModel
+    from pithtrain.models.qwen3_moe import Qwen3MoeModel
+    from pithtrain.models.qwen35 import Qwen35Model
+    from pithtrain.models.qwen35_moe import Qwen35MoeModel
+
+    stage_models = (DeepSeekV2Model, GptOssModel, Qwen3MoeModel, Qwen35MoeModel, Qwen35Model)
     expt_fsdp_mesh = distributed.expt_mesh["dp"]
     if hsdp_replica > 1:
         # A separate name: _unflatten takes the flattened dim away from its mesh, and setup_model
@@ -346,7 +350,7 @@ def apply_fsdp(model, hsdp_replica: int = 1):
     # FSDP2 shards submodules before their parents; the walk stops at a sharded submodule, so
     # the expert parameters stay out of the layer's group.
     for i in range(2):
-        assert isinstance(model[i], PIPELINE_STAGE_MODELS)
+        assert isinstance(model[i], stage_models)
         # Embeddings, final norm and LM head run once per step, so they reshard after forward.
         for name, child in model[i].named_children():
             if name != "layers" and next(child.parameters(), None) is not None:
@@ -386,6 +390,7 @@ def setup_model(
     distributed_cfg: DistributedCfg,
     *,
     shard_dense_model: Callable[[Qwen35TextModel, DeviceMesh], None] | None = None,
+    model_config: PreTrainedConfig | SimpleNamespace | None = None,
 ) -> None:
     training.fp8 = cfg.fp8
     training.fp8_attention = cfg.fp8_attention
@@ -396,7 +401,11 @@ def setup_model(
     cp_group = distributed.cp_group
 
     modules = []
-    module_config = AutoConfig.from_pretrained(cfg.model)
+    if model_config is None:
+        from transformers import AutoConfig
+
+        model_config = AutoConfig.from_pretrained(cfg.model)
+    module_config = model_config
     if module_config.model_type in ("qwen3_5", "qwen3_5_moe"):
         module_config = module_config.text_config
     module_config.max_position_embeddings = cfg.sequence_length
@@ -417,6 +426,9 @@ def setup_model(
         )
 
     if shard_dense_model is not None:
+        from pithtrain.models.qwen35 import Qwen35TextModel
+        from pithtrain.models.qwen35_moe import Qwen35MoeRotaryEmbedding
+
         if module_config.model_type != "qwen3_5_text" or cfg.moe_load_balance_coef:
             raise ValueError("Direct FSDP2 training requires dense Qwen3.5")
         if (distributed.pp_size, distributed.cp_size, distributed.ep_size) != (1, 1, 1):
@@ -454,14 +466,24 @@ def setup_model(
         return
 
     if module_config.model_type == "deepseek_v2":
+        from pithtrain.models.deepseek_v2 import DeepSeekV2Model
+
         ModelClass = DeepSeekV2Model
     elif module_config.model_type == "qwen3_moe":
+        from pithtrain.models.qwen3_moe import Qwen3MoeModel
+
         ModelClass = Qwen3MoeModel
     elif module_config.model_type == "gpt_oss":
+        from pithtrain.models.gpt_oss import GptOssModel
+
         ModelClass = GptOssModel
     elif module_config.model_type == "qwen3_5_moe_text":
+        from pithtrain.models.qwen35_moe import Qwen35MoeModel
+
         ModelClass = Qwen35MoeModel
     elif module_config.model_type == "qwen3_5_text":
+        from pithtrain.models.qwen35 import Qwen35Model
+
         ModelClass = Qwen35Model
     else:
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")

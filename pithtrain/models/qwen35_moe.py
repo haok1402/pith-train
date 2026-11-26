@@ -2,6 +2,10 @@
 Qwen/Qwen3.5-35B-A3B, Qwen/Qwen3.5-122B-A10B, and Qwen/Qwen3.5-397B-A17B (text tower).
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -10,7 +14,6 @@ from torch.utils.checkpoint import (
     checkpoint,
     create_selective_checkpoint_contexts,
 )
-from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
 
 from pithtrain.contexts import distributed, training
 from pithtrain.kernels import (
@@ -47,6 +50,9 @@ from pithtrain.operators.token_scatter import (
 )
 from pithtrain.pipeline.dualpipev import layer_partition, layer_sizes
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
+
+if TYPE_CHECKING:
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
 
 __all__ = ["Qwen35MoeGatedDeltaNet", "Qwen35MoeModel", "Qwen35MoeTopKRouter"]
 

@@ -1,8 +1,11 @@
 """Dense Qwen3.5 text tower, including checkpoints published as Qwen3.8-27B."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import torch
 from torch import nn
-from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 from pithtrain.contexts import distributed, training
 from pithtrain.kernels import stage_compile_options
@@ -16,6 +19,9 @@ from pithtrain.models.qwen35_moe import (
 from pithtrain.operators.cp_sequence import contiguous_to_zigzag, zigzag_to_contiguous
 from pithtrain.operators.linear import BF16Linear, FP8Linear, fp8_swiglu_main_grad
 from pithtrain.operators.silu_mul import silu_mul
+
+if TYPE_CHECKING:
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 __all__ = ["Qwen35Model", "Qwen35TextModel"]
 

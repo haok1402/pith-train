@@ -329,7 +329,7 @@ def prepare_weights_and_seal(args):
     target = kernel_seal["identity"]
     if target["model_config"] != recipe["model_config"] or target["source"] != source_fingerprint():
         raise ValueError("The model or source changed after the kernel seal")
-    _, model = model_geometry(args.model)
+    config, model = model_geometry(args.model)
     weights = publish_stage(
         args.cache / "weights",
         recipe,
@@ -341,6 +341,8 @@ def prepare_weights_and_seal(args):
     prepare_dataset(args)
     bundle = args.ready.parent / "bundle"
     bundle.mkdir()
+    config_path = bundle / "model-config.json"
+    write_json(config_path, config.to_dict())
     for name in ("cute", "imports.zip"):
         (bundle / name).symlink_to(kernel / name)
     shutil.copytree(kernel / "deepgemm", bundle / "deepgemm")
@@ -353,6 +355,7 @@ def prepare_weights_and_seal(args):
         {
             **kernel_seal,
             "identity": {**kernel_seal["identity"], **recipe},
+            "prepared_model_config": digest(config_path),
             "weights": read_json(weights / "seal.json")["weights"],
         },
     )

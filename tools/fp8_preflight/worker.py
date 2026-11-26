@@ -20,7 +20,7 @@ from tools.fp8_preflight.recipe import (
     WORLD_SIZE,
     shared_memory_attribute,
 )
-from tools.fp8_preflight.weights import load_rank
+from tools.fp8_preflight.weights import load_rank, sealed_model_config
 
 BENCHMARK = (
     Path(__file__).resolve().parents[2]
@@ -64,6 +64,7 @@ def timed(name, function, *, first_only=False):
 def run(args):
     bundle = args.bundle
     seal = read_json(bundle / "seal.json")
+    model_config = sealed_model_config(bundle, seal)
     target = seal["identity"]
     if (target["arch"], target["sm_count"], target["world_size"]) != (ARCH, SMS, WORLD_SIZE):
         raise ValueError("Sealed bundle targets another cluster configuration")
@@ -147,7 +148,9 @@ def run(args):
     def timed_setup_model(cfg, distributed_cfg, *, shard_dense_model=None):
         if shard_dense_model is not None:
             shard_dense_model = timed("fsdp_shard", shard_dense_model)
-        return setup_model(cfg, distributed_cfg, shard_dense_model=shard_dense_model)
+        return setup_model(
+            cfg, distributed_cfg, shard_dense_model=shard_dense_model, model_config=model_config
+        )
 
     training.setup_model = timed("model_and_fsdp", timed_setup_model)
 

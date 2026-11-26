@@ -8,15 +8,19 @@ from tools.fp8_preflight.artifacts import digest, read_json, write_json
 from tools.fp8_preflight.recipe import SEQUENCE, WORLD_SIZE
 
 
-def model_geometry(model_path):
+def model_geometry(model_path, *, prepared_config=None):
     import torch
-    from transformers import AutoConfig
 
     from pithtrain.contexts import distributed, training
     from pithtrain.models.qwen35 import Qwen35TextModel
     from pithtrain.operators.linear import FP8Linear
 
-    config = AutoConfig.from_pretrained(model_path, local_files_only=True).text_config
+    if prepared_config is None:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(model_path, local_files_only=True).text_config
+    else:
+        config = prepared_config
     config.max_position_embeddings = SEQUENCE
     distributed.cp_size = distributed.ep_size = 1
     training.fp8 = training.fp8_attention = True
@@ -29,6 +33,13 @@ def model_geometry(model_path):
     if shapes != set(PROJECTIONS):
         raise ValueError(f"Unsupported dense FP8 projection geometry: {sorted(shapes)}")
     return config, model
+
+
+def sealed_model_config(bundle, seal):
+    path = bundle / "model-config.json"
+    if digest(path) != seal["prepared_model_config"]:
+        raise ValueError("Resolved model config does not match the CPU seal")
+    return SimpleNamespace(**read_json(path))
 
 
 def source_index(source):
