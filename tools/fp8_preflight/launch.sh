@@ -52,7 +52,7 @@ python=${PITHTRAIN_PYTHON:-python}
 # Kernel workers cold-import the stack, export CuTe libraries, then run the offline DeepGEMM build.
 srun -A nvr_elm_llm -p cpu -q cpu-short -J deltamatch-fp8-kernels \
     -N1 -n1 -c4 --mem=24G --time=00:10:00 \
-    env CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=2 DG_JIT_NVCC_COMPILER="$CUDA_HOME/bin/nvcc" \
+    env CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=2 CUTE_DSL_SHOW_STACKTRACE=1 DG_JIT_NVCC_COMPILER="$CUDA_HOME/bin/nvcc" \
         "$python" -B -m tools.fp8_preflight.prepare kernels "${model_args[@]}" \
         --ready "$output/kernels-ready" "${gemm_seed[@]}" > "$output/preflight.log" 2>&1
 # Four rank pack workers read the 50 GiB checkpoint and verify the resulting shards before sealing.

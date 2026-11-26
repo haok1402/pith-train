@@ -7,6 +7,8 @@ from enum import Enum
 from pathlib import Path
 from types import FunctionType, MethodType
 
+from tools.fp8_preflight.recipe import offline_cute_hardware
+
 
 def digest(path):
     with path.open("rb") as file:
@@ -118,8 +120,9 @@ class CuteArtifacts:
         binary = self.root / "cute" / f"{key}.so"
         binary.parent.mkdir(exist_ok=True)
         obj = binary.with_suffix(".o")
-        entry = self.compiler(operation, *args, **kwargs)
-        entry.export_to_c(str(obj), "preflight_entry", export_only_tvm_ffi_symbols=True)
+        with offline_cute_hardware():
+            entry = self.compiler(operation, *args, **kwargs)
+            entry.export_to_c(str(obj), "preflight_entry", export_only_tvm_ffi_symbols=True)
         rpath = ":".join(dict.fromkeys(str(Path(lib).parent) for lib in self.libraries))
         subprocess.run(
             [

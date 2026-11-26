@@ -12,7 +12,14 @@ from pathlib import Path
 
 from tools.fp8_preflight.artifacts import CuteArtifacts, read_json
 from tools.fp8_preflight.imports import ImportArchive
-from tools.fp8_preflight.recipe import ARCH, MICROBATCH, SEQUENCE, SMS, WORLD_SIZE
+from tools.fp8_preflight.recipe import (
+    ARCH,
+    MICROBATCH,
+    SEQUENCE,
+    SMS,
+    WORLD_SIZE,
+    shared_memory_attribute,
+)
 from tools.fp8_preflight.weights import load_rank
 
 BENCHMARK = (
@@ -80,7 +87,15 @@ def run(args):
 
     with measure("pithtrain_import"):
         from cutlass import cute
+        from cutlass.base_dsl.runtime import cuda as cuda_helpers
 
+        shared_memory = cuda_helpers.get_device_attribute(
+            shared_memory_attribute(cuda_helpers), local_rank
+        )
+        if shared_memory != target["shared_memory_per_sm"]:
+            raise RuntimeError(
+                f"Sealed CuTe shared-memory target differs from the device: {shared_memory}"
+            )
         cute.compile = CuteArtifacts(bundle, seal["cute"], build=False)
         from torch._inductor import compile_fx
 

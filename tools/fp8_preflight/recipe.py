@@ -7,6 +7,8 @@ from unittest.mock import patch
 
 ARCH = "sm_90a"
 SMS = 132
+# NVIDIA Hopper Tuning Guide, shared memory capacity per multiprocessor.
+SMEM_PER_SM = 228 * 1024
 WORLD_SIZE = 8
 SEQUENCE = 4096
 MICROBATCH = 8
@@ -47,6 +49,25 @@ def offline_target():
             sys.modules.pop(arch.__name__)
         else:
             sys.modules[arch.__name__] = previous
+
+
+def shared_memory_attribute(cuda_helpers):
+    return cuda_helpers.cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR
+
+
+@contextmanager
+def offline_cute_hardware():
+    from cutlass.base_dsl.runtime import cuda as cuda_helpers
+
+    shared_memory = shared_memory_attribute(cuda_helpers)
+
+    def device_attribute(attribute, device_id=0):
+        if attribute != shared_memory or device_id != 0:
+            raise RuntimeError(f"No CPU preflight hardware value for CUDA attribute {attribute}")
+        return SMEM_PER_SM
+
+    with patch.object(cuda_helpers, "get_device_attribute", device_attribute):
+        yield
 
 
 def compile_cute(compiler, config, model):
