@@ -1,3 +1,6 @@
+import logging
+from functools import cache
+
 import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR
@@ -37,6 +40,14 @@ def fp8_wgrad_fallback(grad: torch.Tensor, grad_scale: torch.Tensor, activation:
             out.addcmul_(product, scale)
     # Match the kernel's canonical positive zero.
     out.add_(0.0)
+
+
+@cache
+def warn_fp8_wgrad_fallback() -> None:
+    """
+    Log once per process when a dense wgrad uses the slower FP32 fallback.
+    """
+    logging.getLogger(__name__).warning("SM90 FP8 wgrad cannot use CuTe for this layout or visible SM count and is using the slower blockwise FP32 fallback.")
 
 
 def fp8_wgrad(grad: torch.Tensor, grad_scale: torch.Tensor, activation: torch.Tensor, activation_scale: torch.Tensor, out: torch.Tensor) -> None:
@@ -84,4 +95,5 @@ def fp8_wgrad(grad: torch.Tensor, grad_scale: torch.Tensor, activation: torch.Te
             from pithtrain.kernels.fp8_wgrad_sm90 import fp8_wgrad_sm90, fp8_wgrad_sm90_can_tile
             if fp8_wgrad_sm90_can_tile(M, blocks, rowwise):
                 return fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, num_sms=num_sms)
+    warn_fp8_wgrad_fallback()
     fp8_wgrad_fallback(grad, grad_scale, activation, activation_scale, out, rowwise)
