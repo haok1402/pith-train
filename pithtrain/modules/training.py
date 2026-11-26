@@ -20,6 +20,7 @@ from transformers import AutoConfig
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, training
+from pithtrain.kernels import fp8_wgrad_supported
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
@@ -387,14 +388,29 @@ def setup_model(
     *,
     shard_dense_model: Callable[[Qwen35TextModel, DeviceMesh], None] | None = None,
 ) -> None:
+    cp_size = distributed.cp_size
+
+    if cfg.sequence_length % (2 * cp_size) != 0:
+        raise ValueError(
+            f"sequence_length ({cfg.sequence_length}) must be divisible by "
+            f"2 * context_parallel_size ({2 * cp_size}); zigzag ring attention "
+            f"splits the sequence into 2*cp_size equal chunks"
+        )
+    if shard_dense_model is not None and cfg.fp8 and fp8_wgrad_supported():
+        local_tokens = cfg.micro_batch_size * (cfg.sequence_length // cp_size)
+        if local_tokens <= 0 or local_tokens % 16 != 0:
+            raise ValueError(
+                "Dense SM90 FP8 training requires micro_batch_size * "
+                f"(sequence_length / context_parallel_size) to be a positive multiple of 16 "
+                f"for compact wgrad operands, got {local_tokens}"
+            )
+
     training.fp8 = cfg.fp8
     training.fp8_attention = cfg.fp8_attention
     training.Linear = FP8Linear if cfg.fp8 else BF16Linear
     training.GroupedLinear = FP8GroupedLinear if cfg.fp8 else GroupedLinear
 
-    cp_size = distributed.cp_size
     cp_group = distributed.cp_group
-
     modules = []
     module_config = AutoConfig.from_pretrained(cfg.model)
     if module_config.model_type in ("qwen3_5", "qwen3_5_moe"):
@@ -409,13 +425,6 @@ def setup_model(
 
     assert hasattr(module_config, "hidden_size")
     assert isinstance(module_config.hidden_size, int)
-    if cfg.sequence_length % (2 * cp_size) != 0:
-        raise ValueError(
-            f"sequence_length ({cfg.sequence_length}) must be divisible by "
-            f"2 * context_parallel_size ({2 * cp_size}); zigzag ring attention "
-            f"splits the sequence into 2*cp_size equal chunks"
-        )
-
     if shard_dense_model is not None:
         if module_config.model_type != "qwen3_5_text" or cfg.moe_load_balance_coef:
             raise ValueError("Direct FSDP2 training requires dense Qwen3.5")
