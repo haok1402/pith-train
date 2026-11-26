@@ -13,10 +13,15 @@ bash examples/pretrain_lm/launch.sh --fp8-preflight \
 The supported recipe is eight H200s with FSDP2, FP8 linear layers and Delta-Matching
 attention, sequence length 4096, and eight examples per rank. It loads the dense
 Qwen3.5-27B HF checkpoint. The launcher seals kernels and weights in separate CPU
-jobs, then requests the training GPUs on short QoS. The kernel job has 10 minutes
+jobs, then requests the training GPUs. The kernel job has 10 minutes
 for cold imports, CuTe export and native DeepGEMM compilation. The weight job
 has 8 minutes for cold imports and four concurrent workers reading and verifying
 the 50 GiB rank packs. A successful stage can be reused if the next stage fails.
+
+Set `PITHTRAIN_SLURM_ACCOUNT`, `PITHTRAIN_CPU_PARTITION`, and
+`PITHTRAIN_GPU_PARTITION` for your site. The launcher also accepts
+`PITHTRAIN_CPU_QOS`, `PITHTRAIN_GPU_QOS`, `PITHTRAIN_GPU_CONSTRAINT`, and
+`PITHTRAIN_SLURM_JOB_PREFIX`. Unset scheduler options use Slurm defaults.
 
 `PITHTRAIN_PYTHON` selects the interpreter. `ELFUTILS_INCLUDE` adds an elfutils
 header directory to the DeepGEMM build. `PITHTRAIN_PREFLIGHT_CACHE` lets

@@ -25,6 +25,29 @@ fi
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 : "${CUDA_HOME:?Set CUDA_HOME to CUDA 13.2}"
 : "${DEEP_JIT_INCLUDE:?Set DEEP_JIT_INCLUDE to the installed DeepGEMM deep_jit include path}"
+# Scheduler options can also be supplied through Slurm's SRUN_* environment.
+slurm=()
+cpu_slurm=()
+gpu_slurm=()
+if [[ -n ${PITHTRAIN_SLURM_ACCOUNT:-} ]]; then
+    slurm+=(--account "$PITHTRAIN_SLURM_ACCOUNT")
+fi
+if [[ -n ${PITHTRAIN_CPU_PARTITION:-} ]]; then
+    cpu_slurm+=(--partition "$PITHTRAIN_CPU_PARTITION")
+fi
+if [[ -n ${PITHTRAIN_CPU_QOS:-} ]]; then
+    cpu_slurm+=(--qos "$PITHTRAIN_CPU_QOS")
+fi
+if [[ -n ${PITHTRAIN_GPU_PARTITION:-} ]]; then
+    gpu_slurm+=(--partition "$PITHTRAIN_GPU_PARTITION")
+fi
+if [[ -n ${PITHTRAIN_GPU_QOS:-} ]]; then
+    gpu_slurm+=(--qos "$PITHTRAIN_GPU_QOS")
+fi
+if [[ -n ${PITHTRAIN_GPU_CONSTRAINT:-} ]]; then
+    gpu_slurm+=(--constraint "$PITHTRAIN_GPU_CONSTRAINT")
+fi
+job_prefix=${PITHTRAIN_SLURM_JOB_PREFIX:-pithtrain-fp8}
 export CUDA_HOME DEEP_JIT_INCLUDE
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/compat:$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -50,13 +73,13 @@ if [[ -n ${PITHTRAIN_DEEPGEMM_SEED:-} ]]; then
 fi
 python=${PITHTRAIN_PYTHON:-python}
 # Kernel workers cold-import the stack, export CuTe libraries, then run the offline DeepGEMM build.
-srun -A nvr_elm_llm -p cpu -q cpu-short -J deltamatch-fp8-kernels \
+srun "${slurm[@]}" "${cpu_slurm[@]}" --job-name "$job_prefix-kernels" \
     -N1 -n1 -c4 --mem=24G --time=00:10:00 \
     env CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=2 CUTE_DSL_SHOW_STACKTRACE=1 DG_JIT_NVCC_COMPILER="$CUDA_HOME/bin/nvcc" \
         "$python" -B -m tools.fp8_preflight.prepare kernels "${model_args[@]}" \
         --ready "$output/kernels-ready" "${gemm_seed[@]}" > "$output/preflight.log" 2>&1
 # Four rank pack workers read the 50 GiB checkpoint and verify the resulting shards before sealing.
-srun -A nvr_elm_llm -p cpu -q cpu-short -J deltamatch-fp8-weights \
+srun "${slurm[@]}" "${cpu_slurm[@]}" --job-name "$job_prefix-weights" \
     -N1 -n1 -c8 --mem=48G --time=00:08:00 \
     env CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=1 \
         "$python" -B -m tools.fp8_preflight.prepare weights "${model_args[@]}" \
@@ -69,8 +92,8 @@ if [[ ${PITHTRAIN_PREFLIGHT_ONLY:-0} == 1 ]]; then
     exit 0
 fi
 recipe=(--model "$model" --weights "$weights" --dataset "$output/dataset")
-srun -A nvr_elm_llm -p batch -q short -J deltamatch-fp8-preflight-train \
-    --constraint=nvidia_h200 -N1 -n8 --gpus=8 --gpu-bind=none -c4 --mem=128G \
+srun "${slurm[@]}" "${gpu_slurm[@]}" --job-name "$job_prefix-train" \
+    -N1 -n8 --gpus=8 --gpu-bind=none -c4 --mem=128G \
     --time="${PITHTRAIN_GPU_TIME:-00:08:00}" --kill-on-bad-exit=1 -W0 \
     bash tools/fp8_preflight/slurm-worker.sh "$bundle" "$output" "${recipe[@]}" \
         --steps "$steps" "${audit[@]}" > "$output/run.log" 2>&1
