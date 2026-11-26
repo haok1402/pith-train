@@ -172,10 +172,14 @@ def verify_kernels(root, seal, recipe, wanted):
     if seal["identity"] != recipe or digest(root / "imports.zip") != seal["imports"]:
         raise ValueError("Preflight identity or import archive mismatch")
     verify_cute(root, seal["cute"], wanted)
+    verify_deepgemm(root, seal["deepgemm"])
+
+
+def verify_deepgemm(root, entries):
     shapes = set(PROJECTIONS) | {(k, n) for n, k in PROJECTIONS}
-    if set(seal["deepgemm"]) != {f"{n},{k}" for n, k in shapes}:
+    if set(entries) != {f"{n},{k}" for n, k in shapes}:
         raise ValueError("Incomplete DeepGEMM coverage")
-    for entry in seal["deepgemm"].values():
+    for entry in entries.values():
         folder = root / "deepgemm/cache" / entry["key"]
         if not (folder / ".committed").is_file():
             raise ValueError(f"Uncommitted DeepGEMM artifact at {folder}")
@@ -189,18 +193,57 @@ def build_kernels(root, args, recipe, wanted, package):
 
     from pithtrain.tasks import pretrain_lm  # noqa: F401
 
+    cute = publish_stage(
+        args.cache / "cute",
+        recipe,
+        lambda stage: build_cute(stage, wanted),
+        lambda stage, entries, fresh: verify_cute(stage, entries, wanted),
+    )
+    deepgemm = prepare_deepgemm(args, recipe, package)
+    shutil.copytree(cute / "cute", root / "cute", copy_function=os.link)
+    shutil.copytree(deepgemm / "deepgemm", root / "deepgemm")
+    build_import_archive(root / "imports.zip")
+    return {
+        "identity": recipe,
+        "cute": read_json(cute / "seal.json"),
+        "deepgemm": read_json(deepgemm / "seal.json"),
+        "imports": digest(root / "imports.zip"),
+    }
+
+
+def build_cute(root, wanted):
     entries = {}
     artifacts = CuteArtifacts(root, entries, build=True)
     for key, (description, operation, operands, options) in wanted.items():
         artifacts.export(key, description, operation, operands, options)
-    deepgemm = compile_deepgemm(root, package, args.deepgemm_seed)
-    build_import_archive(root / "imports.zip")
-    return {
-        "identity": recipe,
-        "cute": entries,
-        "deepgemm": deepgemm,
-        "imports": digest(root / "imports.zip"),
-    }
+    return entries
+
+
+def prepare_deepgemm(args, recipe, package):
+    key_fields = (
+        "arch",
+        "sm_count",
+        "rows",
+        "cuda",
+        "nvcc",
+        "cxx",
+        "python",
+        "deepgemm_extension",
+        "deepgemm_headers",
+        "deep_jit_headers",
+    )
+    identity = {field: recipe[field] for field in key_fields}
+    identity["projections"] = PROJECTIONS
+    identity["builder"] = fingerprint(
+        [Path(__file__).with_name(name) for name in ("deepgemm.cpp", "deepgemm.py")],
+        REPO,
+    )
+    return publish_stage(
+        args.cache / "deepgemm",
+        identity,
+        lambda root: compile_deepgemm(root, package, args.deepgemm_seed),
+        lambda root, entries, fresh: verify_deepgemm(root, entries),
+    )
 
 
 def build_weights(root, args, recipe, model):

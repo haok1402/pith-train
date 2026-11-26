@@ -19,7 +19,13 @@ def compile_deepgemm(root, package, seed=None):
     include = Path(os.environ["DEEP_JIT_INCLUDE"])
     elf = os.environ.get("ELFUTILS_INCLUDE")
     torchlib = package.parent / "torch/lib"
-    python = Path(sysconfig.get_config_var("LIBDIR")) / sysconfig.get_config_var("LDLIBRARY")
+    python = (
+        Path(sysconfig.get_config_var("LIBDIR")) / f"libpython{sysconfig.get_python_version()}.so"
+    )
+    if not python.is_file():
+        raise FileNotFoundError(
+            f"DeepGEMM preflight requires the shared Python library at {python}"
+        )
     compiler = root / "compile-deepgemm"
     includes = [
         package,
