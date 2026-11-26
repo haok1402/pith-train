@@ -12,6 +12,7 @@ from pathlib import Path
 
 from tools.fp8_preflight.artifacts import CuteArtifacts, read_json
 from tools.fp8_preflight.imports import ImportArchive
+from tools.fp8_preflight.inductor import require_cache
 from tools.fp8_preflight.recipe import (
     ARCH,
     MICROBATCH,
@@ -73,7 +74,8 @@ def run(args):
         or int(os.environ["WORLD_SIZE"]) != WORLD_SIZE
     ):
         raise ValueError("Sealed weights or world size do not match the training launch")
-    sys.meta_path.insert(0, ImportArchive(bundle / "imports.zip"))
+    if not os.environ.get("PITHTRAIN_STAGED_RUNTIME"):
+        sys.meta_path.insert(0, ImportArchive(bundle / "imports.zip"))
     with measure("torch_import"):
         import torch
 
@@ -102,6 +104,9 @@ def run(args):
 
         from pithtrain.modules import training
         from pithtrain.tasks import pretrain_lm
+
+    with measure("inductor_cache"):
+        require_cache(bundle)
 
     pretrain_lm.setup_distributed = timed("process_group", pretrain_lm.setup_distributed)
     pretrain_lm.setup_dataset = timed("dataset", pretrain_lm.setup_dataset)

@@ -71,6 +71,21 @@ gemm_seed=()
 if [[ -n ${PITHTRAIN_DEEPGEMM_SEED:-} ]]; then
     gemm_seed=(--deepgemm-seed "$PITHTRAIN_DEEPGEMM_SEED")
 fi
+inductor_seed=()
+if [[ -n ${PITHTRAIN_INDUCTOR_SEED:-} || -n ${PITHTRAIN_INDUCTOR_MANIFEST:-} ]]; then
+    inductor_seed=(
+        --inductor-seed "${PITHTRAIN_INDUCTOR_SEED:?Set PITHTRAIN_INDUCTOR_SEED}"
+        --inductor-manifest "${PITHTRAIN_INDUCTOR_MANIFEST:?Set PITHTRAIN_INDUCTOR_MANIFEST}"
+    )
+fi
+if [[ ${PITHTRAIN_PREFLIGHT_ONLY:-0} != 1 && ${#inductor_seed[@]} == 0 ]]; then
+    echo 'Training requires a verified Inductor seed and manifest.' >&2
+    exit 2
+fi
+runtime_seed=()
+if [[ -n ${PITHTRAIN_RUNTIME_SEED:-} ]]; then
+    runtime_seed=(--runtime-seed "$PITHTRAIN_RUNTIME_SEED")
+fi
 python=${PITHTRAIN_PYTHON:-python}
 # Kernel workers cold-import the stack, export CuTe libraries, then run the offline DeepGEMM build.
 srun "${slurm[@]}" "${cpu_slurm[@]}" --job-name "$job_prefix-kernels" \
@@ -85,12 +100,16 @@ srun "${slurm[@]}" "${cpu_slurm[@]}" --job-name "$job_prefix-weights" \
         "$python" -B -m tools.fp8_preflight.prepare weights "${model_args[@]}" \
         --kernels-ready "$output/kernels-ready" --dataset "$dataset" --steps "$steps" \
         --staged-dataset "$output/dataset" --ready "$output/ready" "${seed[@]}" \
+        "${inductor_seed[@]}" "${runtime_seed[@]}" \
         > "$output/weights.log" 2>&1
 read -r bundle < "$output/ready"
 test -s "$bundle/seal.json"
 if [[ ${PITHTRAIN_PREFLIGHT_ONLY:-0} == 1 ]]; then
     exit 0
 fi
+test -s "$bundle/inductor/seal.json"
+mkdir -p "$TORCHINDUCTOR_CACHE_DIR"
+ln -s "$bundle/inductor/fxgraph" "$TORCHINDUCTOR_CACHE_DIR/fxgraph"
 recipe=(--model "$model" --weights "$weights" --dataset "$output/dataset")
 srun "${slurm[@]}" "${gpu_slurm[@]}" --job-name "$job_prefix-train" \
     -N1 -n8 --gpus=8 --gpu-bind=none -c4 --mem=128G \

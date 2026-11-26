@@ -24,6 +24,7 @@ from tools.fp8_preflight.artifacts import (
 )
 from tools.fp8_preflight.deepgemm import compile_deepgemm
 from tools.fp8_preflight.imports import build_import_archive
+from tools.fp8_preflight.inductor import seal_cache
 from tools.fp8_preflight.recipe import (
     ARCH,
     PROJECTIONS,
@@ -34,6 +35,7 @@ from tools.fp8_preflight.recipe import (
     compile_cute,
     offline_target,
 )
+from tools.fp8_preflight.runtime import seal_runtime
 from tools.fp8_preflight.weights import (
     model_geometry,
     plans,
@@ -343,6 +345,13 @@ def prepare_weights_and_seal(args):
     bundle.mkdir()
     config_path = bundle / "model-config.json"
     write_json(config_path, config.to_dict())
+    if args.inductor_seed is not None:
+        seal_cache(
+            bundle, args.inductor_seed, args.inductor_manifest,
+            recipe["model_config"], config.hidden_size,
+        )
+    if args.runtime_seed is not None:
+        seal_runtime(bundle, args.runtime_seed)
     for name in ("cute", "imports.zip"):
         (bundle / name).symlink_to(kernel / name)
     shutil.copytree(kernel / "deepgemm", bundle / "deepgemm")
@@ -390,6 +399,9 @@ def main():
     parser.add_argument("--deepgemm-seed", type=Path)
     parser.add_argument("--cache", required=True, type=Path)
     parser.add_argument("--weight-seed", type=Path)
+    parser.add_argument("--inductor-seed", type=Path)
+    parser.add_argument("--inductor-manifest", type=Path)
+    parser.add_argument("--runtime-seed", type=Path)
     parser.add_argument("--ready", required=True, type=Path)
     args = parser.parse_args()
     args.model, args.weights, args.cache = (
@@ -401,6 +413,8 @@ def main():
         (args.kernels_ready, args.dataset, args.staged_dataset, args.steps)
     ):
         parser.error("weights requires --kernels-ready, --dataset, --staged-dataset and --steps")
+    if (args.inductor_seed is None) != (args.inductor_manifest is None):
+        parser.error("--inductor-seed and --inductor-manifest must be used together")
     with offline_target():
         bundle = (
             prepare_kernels(args) if args.phase == "kernels" else prepare_weights_and_seal(args)

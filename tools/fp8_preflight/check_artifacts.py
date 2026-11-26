@@ -29,7 +29,7 @@ from tools.fp8_preflight.recipe import (
     offline_target,
     shared_memory_attribute,
 )
-from tools.fp8_preflight.weights import model_geometry
+from tools.fp8_preflight.weights import model_geometry, sealed_model_config
 
 
 @contextmanager
@@ -155,21 +155,32 @@ def main():
     parser.add_argument("bundle", type=Path)
     parser.add_argument("model", type=Path)
     parser.add_argument("--preload-imports", action="store_true")
-    parser.add_argument("--gpu-utilization", type=Path)
+    parser.add_argument("--staged-runtime", action="store_true")
+    utilization = parser.add_mutually_exclusive_group()
+    utilization.add_argument("--gpu-utilization", type=Path)
+    utilization.add_argument("--recorded-gpu-utilization", type=Path)
     args = parser.parse_args()
-    if args.mode == "cuda" and args.gpu_utilization is None:
-        parser.error("cuda mode requires --gpu-utilization")
-    sampler = sample_gpu(args.gpu_utilization) if args.mode == "cuda" else nullcontext()
+    if args.mode == "cuda" and not (args.gpu_utilization or args.recorded_gpu_utilization):
+        parser.error("cuda mode requires a GPU utilization log")
+    if args.recorded_gpu_utilization is not None:
+        with args.recorded_gpu_utilization.open() as output:
+            if not output.readline() or not output.readline():
+                parser.error("the GPU utilization log has no samples")
+    sampler = sample_gpu(args.gpu_utilization) if args.gpu_utilization else nullcontext()
     with sampler:
         run(args)
 
 
 def run(args):
     seal = read_json(args.bundle / "seal.json")
-    with measure("import_archive"):
-        sys.meta_path.insert(
-            0, ImportArchive(args.bundle / "imports.zip", preload=args.preload_imports)
-        )
+    config = (
+        sealed_model_config(args.bundle, seal) if "prepared_model_config" in seal else None
+    )
+    if not args.staged_runtime:
+        with measure("import_archive"):
+            sys.meta_path.insert(
+                0, ImportArchive(args.bundle / "imports.zip", preload=args.preload_imports)
+            )
     load_library = ctypes.CDLL.__init__
 
     def timed_library(library, name, *args, **kwargs):
@@ -184,7 +195,7 @@ def run(args):
 
     if args.mode == "abi":
         with offline_target(), measure("abi"):
-            config, model = model_geometry(args.model)
+            config, model = model_geometry(args.model, prepared_config=config)
             check_abi(args.bundle, seal, config, model)
     else:
         with measure("cuda_device"):
@@ -197,7 +208,13 @@ def run(args):
             from pithtrain.tasks import pretrain_lm  # noqa: F401
 
         with measure("model_geometry"):
-            config, model = model_geometry(args.model)
+            config, model = model_geometry(args.model, prepared_config=config)
+        if args.staged_runtime:
+            print(f"ARTIFACT_CHECK local_torch={torch.__file__}", flush=True)
+            with measure("inductor_source_key"):
+                from torch._inductor.codecache import torch_key
+
+                print(f"ARTIFACT_CHECK torch_key={torch_key().hex()}", flush=True)
         check_cuda(args.bundle, seal, config, model)
 
 
