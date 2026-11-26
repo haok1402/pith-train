@@ -1224,15 +1224,24 @@ class WeightGradient:
             and self.num_k == 12 and N % 192 == 0
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 192, 3, 1, 1)
         )
+        # The dense K=32768 recipe has 128 full tiles in one 132-SM wave.
+        self.u128_dense_wave = (
+            not rowwise and compact_rows and compact_k_scale and num_sms == 132 and block_n_multiple == 1
+            and K == 256 * BLOCK_K and M % BLOCK_K == N % BLOCK_K == 0
+            and (self.block_m, self.block_n, self.stages, self.cluster_size) == (128, 128, 4, 1)
+            and (self.num_m, self.num_n) in ((8, 16), (16, 8))
+        )
         self.u128_stage4_one_wave = (
             not rowwise and (self.block_m, self.block_n, self.stages, self.cluster_size) == (128, 128, 4, 1)
-            and self.num_k == 128
             and (
-                (num_sms, self.num_m, self.num_n) == (132, 32, 4) and N % 128 == 0
-                or (num_sms, self.num_m, self.num_n) == (2, 2, 1) and N == 128 and K % BLOCK_K == 0
+                self.u128_dense_wave
+                or self.num_k == 128 and (
+                    (num_sms, self.num_m, self.num_n) == (132, 32, 4) and N % 128 == 0
+                    or (num_sms, self.num_m, self.num_n) == (2, 2, 1) and N == 128 and K % BLOCK_K == 0
+                )
             )
         )
-        if self.u128_stage4_one_wave:
+        if self.u128_stage4_one_wave and not self.u128_dense_wave:
             self.group_tiles = 4
         # The persistent short-K N64 multicast waves fit in one pipeline phase.
         self.short_a_n64 = (
@@ -1609,6 +1618,7 @@ class WeightGradient:
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (64, 32, 12, 1, 1)
         )
         self.use_cta_local_stage_wait = (
+            self.u128_dense_wave or
             self.m64_n96_stage4_two_m_waves or
             self.n16_u_stage12 or self.n16_u_stage6 or
             self.n32_u_stage12_one_wave or self.m32_n96_stage4_one_tile
@@ -1743,7 +1753,7 @@ class WeightGradient:
              or self.n112_misaligned_unicast or self.n112_a_full_ring),
             (ScalePromotion.SELECT_FIRST, self.select_scale_before_product),
         )
-        self.double_producer_phase = (self.n16_stage4_two_phase or self.n96_short_n_tail or self.n160_stage4_grad_offset or self.n112_stage4_two_waves or self.n144_unicast_one_wave
+        self.double_producer_phase = (self.u128_dense_wave or self.n16_stage4_two_phase or self.n96_short_n_tail or self.n160_stage4_grad_offset or self.n112_stage4_two_waves or self.n144_unicast_one_wave
                                       or self.long_n80_stage4 or self.wide_n192_four_math)
         self.double_math_phase = (self.n112_stage4_two_waves or self.n144_unicast_one_wave
                                   or self.u128_stage4_one_wave or self.long_n80_stage4
