@@ -3,6 +3,7 @@
 import importlib.abc
 import importlib.machinery
 import importlib.util
+import io
 import json
 import marshal
 import sys
@@ -43,8 +44,9 @@ class ArchiveLoader(importlib.machinery.SourceFileLoader):
 
 
 class ImportArchive(importlib.abc.MetaPathFinder):
-    def __init__(self, path):
-        self.archive = zipfile.ZipFile(path)
+    def __init__(self, path, *, preload=False):
+        source = io.BytesIO(path.read_bytes()) if preload else path
+        self.archive = zipfile.ZipFile(source)
         self.entries = json.loads(self.archive.read("manifest.json"))
 
     def find_spec(self, fullname, path=None, target=None):

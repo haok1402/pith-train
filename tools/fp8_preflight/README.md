@@ -41,3 +41,8 @@ for each GPU. Generate a summary after a completed training job:
 python -m tools.fp8_preflight.receipt /path/to/output \
   --baseline /path/to/prior-run.log
 ```
+
+The wrapper check uses the same launch fixtures as preflight. The CPU mode checks
+the exported signatures and loads each shared object. The CUDA mode requires one
+H200 and `--gpu-utilization` to capture the timeline from its first import onward.
+Use the sealed DeepGEMM cache and the version-only NVCC shim for that check.

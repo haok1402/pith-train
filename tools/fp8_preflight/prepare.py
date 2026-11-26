@@ -14,7 +14,14 @@ from concurrent.futures import ThreadPoolExecutor
 from importlib import metadata
 from pathlib import Path
 
-from tools.fp8_preflight.artifacts import CuteArtifacts, digest, read_json, signature, write_json
+from tools.fp8_preflight.artifacts import (
+    CuteArtifacts,
+    digest,
+    read_json,
+    signature,
+    verify_wrapper,
+    write_json,
+)
 from tools.fp8_preflight.deepgemm import compile_deepgemm
 from tools.fp8_preflight.imports import build_import_archive
 from tools.fp8_preflight.recipe import (
@@ -125,13 +132,16 @@ def weight_identity(args):
 
 def plan_cute(config, model):
     wanted = {}
+    entered = set()
 
     def record(operation, *args, **kwargs):
         key, description = signature(operation, args, kwargs)
         wanted[key] = (description, operation, args, kwargs)
-        return CuteArtifacts.skip_launch
+        return verify_wrapper(operation, args, kwargs, lambda: entered.add(key))
 
     compile_cute(record, config, model)
+    if set(wanted) != entered:
+        raise ValueError(f"CuTe wrappers did not call all planned artifacts: {sorted(set(wanted) - entered)}")
     names = Counter(plan[0][0][1].rsplit(".", 1)[-1] for plan in wanted.values())
     required = {
         "WeightGradient": len(PROJECTIONS),

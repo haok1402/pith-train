@@ -1,6 +1,7 @@
 """Content-addressed CuTe artifacts and preflight receipts."""
 
 import hashlib
+import inspect
 import json
 import subprocess
 from enum import Enum
@@ -85,6 +86,53 @@ def signature(operation, args, kwargs):
     return key, description
 
 
+def ffi_parameters(operation, args, kwargs):
+    from cutlass.cute._tvm_ffi_args_spec_converter import _tvm_ffi_args_spec_converter
+
+    signature = inspect.signature(operation)
+    operands = {name: value for name, value in kwargs.items() if name != "options"}
+    _, spec, dataclasses = _tvm_ffi_args_spec_converter(
+        qualified(operation if isinstance(operation, FunctionType) else type(operation)),
+        signature,
+        args,
+        operands,
+    )
+    return spec, dataclasses
+
+
+def ffi_call(entry, operation, args, kwargs):
+    """Apply the same runtime signature adapter as the CuTe JIT function."""
+    from tvm_ffi.utils.kwargs_wrapper import make_kwargs_wrapper
+
+    spec, dataclasses = ffi_parameters(operation, args, kwargs)
+    if spec.arg_defaults or spec.kwonly_names or dataclasses:
+        return make_kwargs_wrapper(
+            entry,
+            arg_names=spec.arg_names,
+            arg_defaults=spec.arg_defaults,
+            kwonly_names=spec.kwonly_names,
+            kwonly_defaults=spec.kwonly_defaults,
+            map_dataclass_to_tuple=dataclasses,
+        )
+    return entry
+
+
+def verify_wrapper(operation, args, kwargs, launched):
+    """Check that the real Python wrapper provides every exported argument."""
+    spec, _ = ffi_parameters(operation, args, kwargs)
+    expected = len(spec.arg_names) + len(spec.kwonly_names)
+
+    def accept(*runtime_args):
+        if len(runtime_args) != expected:
+            raise RuntimeError(
+                f"CuTe exported arity mismatch for {operation}: expected {expected}, "
+                f"got {len(runtime_args)}"
+            )
+        launched()
+
+    return ffi_call(accept, operation, args, kwargs)
+
+
 class CuteArtifacts:
     """Export the normal compiler's executables, or load them with compilation disabled."""
 
@@ -112,9 +160,10 @@ class CuteArtifacts:
             return self.skip_launch
         path = self.root / self.entries[key]["path"]
         entry = self.load_module(str(path), enable_tvm_ffi=True).preflight_entry
-        self.loaded[key] = entry
+        adapted = ffi_call(entry, operation, args, kwargs)
+        self.loaded[key] = adapted
         print(f"PREFLIGHT cute_load key={key} executable={description[0][:2]}", flush=True)
-        return entry
+        return adapted
 
     def export(self, key, description, operation, args, kwargs):
         binary = self.root / "cute" / f"{key}.so"
