@@ -9,7 +9,6 @@ import torch.cuda
 import wandb
 from torch.distributed import DeviceMesh
 from torch.distributed.elastic.multiprocessing.errors import record
-from transformers import AutoConfig
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, logging, training
@@ -58,6 +57,8 @@ class PretrainLMCfg(SlottedDefault):
 
 def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset:
     if cfg.training.benchmark:
+        from transformers import AutoConfig
+
         vocab_size = AutoConfig.from_pretrained(cfg.training.model).get_text_config().vocab_size
         return SyntheticDataset(vocab_size, cfg.training.sequence_length, cfg.training.seed)
     files = sorted(cfg.dataset.rglob("*.bin"))

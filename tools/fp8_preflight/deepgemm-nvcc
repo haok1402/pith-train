@@ -1,0 +1,16 @@
+#!/bin/bash
+set -euo pipefail
+if [[ $# == 1 && $1 == --version ]]; then
+    exec "$CUDA_HOME/bin/nvcc" --version
+fi
+python3 -B -c '
+import hashlib
+import sys
+from pathlib import Path
+from tools.fp8_preflight.misses import record_miss
+
+source = next((Path(arg) for arg in sys.argv[1:] if arg.endswith(".cu") and Path(arg).is_file()), None)
+key = hashlib.sha256(source.read_bytes() if source else "\0".join(sys.argv[1:]).encode()).hexdigest()
+record_miss("deepgemm", key, "invoking nvcc", source=str(source), key_type="source_sha256")
+' "$@" || printf 'WARNING: DeepGEMM cache miss, invoking nvcc\n' >&2
+exec "$CUDA_HOME/bin/nvcc" "$@"

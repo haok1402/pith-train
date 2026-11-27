@@ -1,4 +1,5 @@
 import pytest
+from transformers import AutoConfig
 
 from pithtrain.modules import training
 from pithtrain.modules.distributed import DistributedCfg
@@ -20,7 +21,7 @@ def test_dense_sm90_fp8_recipe_rejects_compact_k_tail_before_loading_model(
     monkeypatch.setattr(training, "fp8_wgrad_supported", lambda: True)
     monkeypatch.setattr(training.distributed, "cp_size", cp, raising=False)
     monkeypatch.setattr(
-        training.AutoConfig,
+        AutoConfig,
         "from_pretrained",
         lambda *a, **kw: pytest.fail("recipe validation must precede loading the model"),
     )
@@ -53,7 +54,7 @@ def test_recipe_check_leaves_other_paths_available(
         monkeypatch.setattr(training.training, name, None, raising=False)
     monkeypatch.setattr(training.distributed, "cp_size", cp, raising=False)
     monkeypatch.setattr(training.distributed, "cp_group", None, raising=False)
-    monkeypatch.setattr(training.AutoConfig, "from_pretrained", load)
+    monkeypatch.setattr(AutoConfig, "from_pretrained", load)
     cfg = recipe(fp8, micro_batch, sequence)
     cfg.model = "test"
     with pytest.raises(LoadReached):

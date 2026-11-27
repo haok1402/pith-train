@@ -9,6 +9,11 @@
 #   srun -W 0 examples/pretrain_lm/launch.sh qwen3-30b-a3b
 
 set -euo pipefail
+
+if [[ ${1:-} == --fp8-preflight ]]; then
+    shift
+    exec bash "$(dirname -- "${BASH_SOURCE[0]}")/../../tools/fp8_preflight/launch.sh" "$@"
+fi
 export OMP_NUM_THREADS=8
 export PYTHONUNBUFFERED=1
 
