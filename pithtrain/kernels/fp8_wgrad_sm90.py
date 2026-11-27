@@ -735,7 +735,6 @@ class WeightGradient:
             and self.num_k >= 3 * self.stages
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 112, 5, 1, 1)
         )
-        # Retain the inline WGMMA path on the previously qualified tile grids.
         self.n112_short_k = (
             not rowwise and self.num_k == 128 and aligned_fp8_rows
             and self.num_m == 8
@@ -927,7 +926,6 @@ class WeightGradient:
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 160, 4, 2, 1)
             and (self.num_k == 64 or n160_short_full_tiles)
         )
-        # Qualify the six sustained N192 B-multicast call sites.
         self.n192_b_sustained = (
             not rowwise and num_sms == 132
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 192, 3, 2, 1)
@@ -1233,7 +1231,7 @@ class WeightGradient:
             and self.num_k == 12 and N % 192 == 0
             and (self.block_m, self.block_n, self.stages, self.cluster_m, self.cluster_n) == (128, 192, 3, 1, 1)
         )
-        # The dense K=32768 recipe has 128 full tiles in one 132-SM wave.
+        # This layout fills one SM wave with 128 complete tiles.
         self.u128_dense_wave = (
             not rowwise and compact_rows and compact_k_scale and num_sms == 132 and block_n_multiple == 1
             and K == 256 * BLOCK_K and M % BLOCK_K == N % BLOCK_K == 0
@@ -1317,7 +1315,7 @@ class WeightGradient:
                     and self.num_k % (2 * self.stages) == 0)
             )
         )
-        # Widen short N groups when FP32 stores stream past the 60 MiB H200 L2.
+        # Widen short N groups when FP32 output exceeds L2 capacity.
         self.wide_n48_a_one_k = (
             full_device_sm_budget and not rowwise and compact_rows and self.num_k == 1
             and self.num_m > 1
@@ -2080,7 +2078,7 @@ class WeightGradient:
     @cute.jit
     def load_input(self, descriptor, dst, barrier, coord_lo, coord_hi, multicast: cutlass.Constexpr = False):
         if cutlass.const_expr(self.n80_b_multicast and self.num_sms == 132):
-            # Match the reference TMA cache policy for the full-SM B-multicast route.
+            # Apply the TMA cache hints for full-device B multicast.
             load_tma_with_hint(descriptor, dst, barrier, coord_lo, coord_hi, multicast, 0x1000000000000000)
         elif cutlass.const_expr(multicast):
             nvvm.cp_async_bulk_tensor_shared_cluster_global(dst, descriptor.get_ptr(), [coord_lo, coord_hi], barrier, [], multicast_mask=Int16(3))
@@ -3097,7 +3095,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
         and all(tensor.data_ptr() % 32 == 0 for tensor in tensors)
         and all(tensor.stride(0) * tensor.element_size() % 32 == 0 for tensor in (grad, activation))
     )
-    # The 64x64 block-scaled tile fits eleven stages with 4,033 to 8,192 K blocks.
     aligned_stage11_tail = (
         not rowwise and 4032 < num_k <= 8192 and 0 < N % 64 <= 16
         and all(tensor.data_ptr() % 32 == 0 for tensor in tensors)
@@ -3183,7 +3180,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
         and all(tensor.data_ptr() % 32 == 0 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # The native 64x32 tile fits fourteen stages for 8,961 to 12,096 K blocks.
     # Gate async pairs on the actual 128-byte TMA tile bases and row pitches.
     aligned_n32_stage14_operands = (
         not rowwise and num_sms == 2 and M <= 64 and N == 32 and 8960 < num_k <= 12096
@@ -3216,7 +3212,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
             fp8_pitches in ((0, 0), (16, 16))
             and all(tensor.data_ptr() % BLOCK_K == 0 for tensor in (grad, activation))
         )
-    # The native 128x96 tile fits four stages for 4,641 to 8,288 K blocks.
     n96_stage4 = not rowwise and 4640 < num_k <= 8288
     aligned_n96_stage4_operands = (
         n96_stage4 and num_sms == 2 and M > 256 and N == 96
@@ -3231,7 +3226,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % 256 == 16
                 for tensor in (grad, activation))
     )
-    # The native 32x64 tile fits four stages for 40,481 to 43,584 K blocks.
     aligned_m32_n64_stage4_operands = (
         not rowwise and num_sms == 2 and M <= 32 and N == 192 and 40480 < num_k <= 43584
         and all(tensor.data_ptr() % BLOCK_K == 0
@@ -3246,13 +3240,11 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
         and all(tensor.data_ptr() % 32 == 0 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # The native 64x80 footprint fits nine stages for 3,105 to 5,440 K blocks.
     n80_b_stage9_aligned_storage = (
         not rowwise and 3104 < num_k <= 5440 and lcm(16, block_n_multiple) == 80
         and all(tensor.data_ptr() % 32 == 0 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # The native 32x96 tile fits four stages for 17,169 to 19,232 K blocks.
     aligned_m32_n96_stage4_operands = (
         not rowwise and num_sms == 2 and M <= 32 and N == 96 and 17168 < num_k <= 19232
         and all(tensor.data_ptr() % BLOCK_K == 0
@@ -3269,7 +3261,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
         aligned_stage11_tail and block_n_multiple == 64 and num_k * 4 <= 16 * 1024
         and all(tensor.stride(0) * tensor.element_size() % BLOCK_K == 16 for tensor in (grad, activation))
     )
-    # The native 64x32 footprint fits thirteen stages for 12,097 to 15,232 K blocks.
     n32_a_stage13_aligned_storage = (
         full_device_sm_budget and not rowwise and 12096 < num_k <= 15232
         and lcm(16, block_n_multiple) == 32
@@ -3287,14 +3278,12 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
         and all(tensor.data_ptr() % BLOCK_K == 0 and tensor.stride(0) * tensor.element_size() == K
                 for tensor in (grad, activation))
     )
-    # The native 64x64 footprint fits nine stages for 12,353 to 16,512 K blocks.
     n64_a_stage9_aligned_storage = (
         not rowwise and block_n_multiple == 64 and 12352 < num_k <= 16512
         and all(tensor.data_ptr() % 32 == 0
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # The native 64x16 footprint fits six stages for 38,657 to 41,280 K blocks.
     n16_u_stage6_aligned_storage = (
         not rowwise and 32 < M <= 64 and N == 16 and 38656 < num_k <= 41280
         and (
@@ -3308,15 +3297,12 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                     for tensor in (grad, activation))
         )
     )
-    # The native 128x48 footprint fits seven stages for 2,913 to 5,792 K blocks.
     n48_a_stage7_aligned_storage = (
         full_device_sm_budget and not rowwise and block_n_multiple == 48 and 2912 < num_k <= 5792
         and all(tensor.data_ptr() % 32 == 0
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # The native 64x64 footprint fits seven stages for 20,673 to 24,832 K blocks
-    # and four stages for 33,153 to 37,312 K blocks.
     n64_u_n8_aligned_storage = (
         full_device_sm_budget and not rowwise and block_n_multiple == 64
         and 32 < M <= 64 and N == 8
@@ -3333,21 +3319,18 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() == align_up(K, 16)
                 for tensor in (grad, activation))
     )
-    # The native 64x96 footprint fits seven stages for 5,217 to 7,808 K blocks.
     n96_b_stage7_aligned_storage = (
         not rowwise and block_n_multiple == 96 and 5216 < num_k <= 7808
         and all(tensor.data_ptr() % 32 == 0
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # The native 16x96 footprint fits four stages for 19,217 to 21,024 K blocks.
     m16_n96_stage4_aligned_storage = (
         not rowwise and num_sms == 2 and 0 < M <= 16 and N == block_n_multiple == 96
         and 19216 < num_k <= 21024 and K % BLOCK_K == 0
         and all(tensor.data_ptr() % BLOCK_K == 0 and tensor.stride(0) * tensor.element_size() == K
                 for tensor in (grad, activation))
     )
-    # The native 64x16 footprint fits twelve stages for 22,913 to 25,536 K blocks.
     # Literal rings keep the full-cycle path when K has no trailing stage.
     n16_u_stage12_aligned_storage = (
         not rowwise and (num_sms, block_n_multiple) == (132, 1)
@@ -3364,7 +3347,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() == align_up(K, 16)
                 for tensor in (grad, activation))
     )
-    # The native 64x80 footprint fits eight stages for 5,441 to 7,776 K blocks.
     n80_b_stage8_aligned_storage = (
         not rowwise and num_sms == 132 and lcm(16, block_n_multiple) == 80
         and 5440 < num_k <= 7776
@@ -3377,7 +3359,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
         and all(tensor.data_ptr() % BLOCK_K == 0 and tensor.stride(0) * tensor.element_size() == K
                 for tensor in (grad, activation))
     )
-    # The native 64x32 footprint fits four stages for 40,321 to 43,456 K blocks.
     n32_a_stage4_long_aligned_storage = (
         not rowwise and block_n_multiple == 1 and M % 128 == 0 and N % 48 == 0
         and 40320 < num_k <= 43456
@@ -3385,8 +3366,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 0
                 for tensor in (grad, activation))
     )
-    # The native 64x64 footprint fits seven stages for 20,673 to 24,832 K blocks
-    # five stages for 28,993 to 33,152, and four stages for 33,153 to 37,312.
     n64_u_n8_aligned_storage = (
         full_device_sm_budget and not rowwise and block_n_multiple == 64
         and 32 < M <= 64 and N == 8
@@ -3404,21 +3383,18 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() == align_up(K, 16)
                 for tensor in (grad, activation))
     )
-    # The native 64x96 footprint fits seven stages for 5,217 to 7,808 K blocks.
     n96_b_stage7_aligned_storage = (
         not rowwise and block_n_multiple == 96 and 5216 < num_k <= 7808
         and all(tensor.data_ptr() % 32 == 0
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # The native 16x96 footprint fits four stages for 19,217 to 21,024 K blocks.
     m16_n96_stage4_aligned_storage = (
         not rowwise and num_sms == 2 and 0 < M <= 16 and N == block_n_multiple == 96
         and 19216 < num_k <= 21024 and K % BLOCK_K == 0
         and all(tensor.data_ptr() % BLOCK_K == 0 and tensor.stride(0) * tensor.element_size() == K
                 for tensor in (grad, activation))
     )
-    # The native 64x16 footprint fits twelve stages for 22,913 to 25,536 K blocks.
     # Literal rings keep the full-cycle path when K has no trailing stage.
     n16_u_stage12_aligned_storage = (
         not rowwise and (num_sms, block_n_multiple) == (132, 1)
@@ -3435,7 +3411,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() == align_up(K, 16)
                 for tensor in (grad, activation))
     )
-    # Native Stage 4 starts at 5,825 K blocks. A 192-wide four-stage tile fits through 6,368.
     n160_a_stage4_aligned_storage = (
         not rowwise and num_sms == 112 and block_n_multiple == 160
         and 5824 < num_k <= 6368 and 0 < K % BLOCK_K <= 16
@@ -3456,7 +3431,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
         and all(tensor.data_ptr() % BLOCK_K == 0 and tensor.stride(0) * tensor.element_size() == K
                 for tensor in (grad, activation))
     )
-    # Stage 8 of native 64x32 unicast spans 27,777 to 30,912 K blocks.
     m64_n32_stage8_one_wave_storage = (
         not rowwise and full_device_sm_budget and block_n_multiple == 32
         and M == 64 and 32 < N and 27776 < num_k <= 30912
@@ -3464,7 +3438,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # Stage 11 of native 64x32 unicast spans 18,369 to 21,504 K blocks.
     m64_n32_stage11_scale_storage = (
         not rowwise and full_device_sm_budget and block_n_multiple == 32
         and M == 64 and BLOCK_K < N <= BLOCK_K + 32 and N % 8 == 0
@@ -3473,7 +3446,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # Stage 7 of the native 64x32 pipeline spans 30,913 to 34,048 K blocks.
     m64_n32_stage7_one_wave_storage = (
         not rowwise and full_device_sm_budget and block_n_multiple == 32
         and 32 < M <= 64 and 32 < N and 30912 < num_k <= 34048
@@ -3516,7 +3488,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 for tensor in (grad, activation))
     )
     m128_n32_a_stage9_storage |= full_budget_n32_stage9_storage
-    # The native 64x96 footprint fits eight stages for 2,625 to 5,216 K blocks.
     n96_b_stage8_aligned_storage = (
         not rowwise and num_sms == 122 and block_n_multiple == 96
         and 2624 < num_k <= 5216
@@ -3524,7 +3495,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # Four native stages fit with 18,369 through 20,192 K blocks for this tile.
     n48_u_stage4_aligned_storage = (
         not rowwise and block_n_multiple == 48 and 32 < M <= 64 and N % 8 == 0
         and (full_device_sm_budget and N == 8 or num_sms == 2 and 24 < N <= 48)
@@ -3546,7 +3516,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() == align_up(K, 16)
                 for tensor in (grad, activation))
     )
-    # Native Stage 7 for 64x64 spans 20,673 to 24,832 K blocks.
     n64_u_stage7_two_sm_storage = (
         not rowwise and num_sms == 2 and block_n_multiple == 1
         and 0 < N <= 64 and N % 8 == 0 and 20672 < num_k <= 24832
@@ -3560,7 +3529,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() == align_up(K, 16)
                 for tensor in (grad, activation))
     )
-    # The native 64x192 footprint fits four stages for 2,241 to 6,368 K blocks.
     n192_a_stage4_aligned_storage = (
         not rowwise and num_sms == 108 and block_n_multiple == 192
         and 2240 < num_k <= 6368
@@ -3575,7 +3543,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() == align_up(K, 16)
                 for tensor in (grad, activation))
     )
-    # Seven native 64x48 stages fit with 12,897 through 14,720 K blocks.
     n48_u_stage7_aligned_storage = (
         full_device_sm_budget and not rowwise and block_n_multiple == 48
         and 32 < M <= 64 and N == 8 and 12896 < num_k <= 14720
@@ -3583,7 +3550,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # Native 64x32 fits six stages for 34,049 to 37,184 K blocks.
     m64_n32_stage6_high_storage = (
         not rowwise and full_device_sm_budget and block_n_multiple == 32
         and M == 64 and BLOCK_K < N <= BLOCK_K + 32 and N % 8 == 0
@@ -3592,7 +3558,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # Native 64x32 fits fourteen stages for 8,961 to 12,096 K blocks.
     m64_n32_stage14_high_storage = (
         not rowwise and full_device_sm_budget and block_n_multiple == 32
         and 32 < M <= 64 and BLOCK_K < N <= BLOCK_K + 32 and N % 8 == 0
@@ -3614,7 +3579,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() == align_up(K, 16)
                 for tensor in (grad, activation))
     )
-    # K-block ranges that fit the native A32 rings.
     n32_a_stage6_range = 34048 < num_k <= 37184
     n32_a_stage7_range = 30912 < num_k <= 34048
     n32_a_stage8_range = 27776 < num_k <= 30912
@@ -3626,7 +3590,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # The native 128x32 footprint fits five stages for 22,465 to 27,712 K blocks.
     m128_n32_stage5_n8_storage = (
         not rowwise and num_sms == 2 and block_n_multiple == 32
         and 128 < M <= 256 and N == 8 and 22464 < num_k <= 27712
@@ -3634,7 +3597,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # Four native stages have separate K-block ranges for N32 and N64.
     m128_stage4_n8_storage = (
         not rowwise and num_sms == 2 and 128 < M <= 256 and N == 8
         and ((block_n_multiple == 32 and 27712 < num_k <= 32960)
@@ -3643,7 +3605,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # Native Stage 7 spans 2,913–5,792 K blocks, and Stage 6 spans 5,793–8,672.
     m128_n48_two_sm_narrow_storage = (
         not rowwise and num_sms == 2 and block_n_multiple == 48
         and 128 < M <= 256 and N in (8, 16)
@@ -3656,7 +3617,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
     n32_a_stage7_aligned_storage = n32_a_stage7_range and n32_a_wide_aligned_storage
     n32_a_stage8_aligned_storage = n32_a_stage8_range and n32_a_wide_aligned_storage
     n32_a_stage9_aligned_storage = n32_a_stage9_range and n32_a_wide_aligned_storage
-    # K-block ranges that fit the native 64x16 stage-11 and stage-13 rings.
     m64_n16_two_sm_split_storage = (
         not rowwise and (num_sms, block_n_multiple) == (2, 16)
         and 32 < M <= 64 and N == 16
@@ -3665,7 +3625,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # Fifteen native 64x16 stages fit with 15,041 through 17,664 K blocks.
     m64_n16_stage15_aligned_storage = (
         not rowwise and num_sms == 2 and block_n_multiple == 16
         and M == 64 and N == 16 and 15040 < num_k <= 17664
@@ -3673,7 +3632,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # Native M32 N64 has twelve stages for 15,649 to 18,752 K blocks.
     m32_n64_stage12_split_storage = (
         not rowwise and (M, N, num_sms, block_n_multiple) == (32, 64, 2, 64)
         and 15648 < num_k <= 18752
@@ -3681,7 +3639,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # Native 64x32 Stage 12 spans 15,233 to 18,368 K blocks.
     m64_n32_stage12_full_storage = (
         not rowwise and full_device_sm_budget and block_n_multiple == 32
         and 32 < M <= 64 and BLOCK_K < N <= 2 * BLOCK_K and 15232 < num_k <= 18368
@@ -3689,7 +3646,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # Eleven native 64x32 stages fit with 18,369 through 21,504 K blocks.
     m64_n32_stage11_two_sm_storage = (
         not rowwise and (M, N, num_sms, block_n_multiple) == (64, 32, 2, 32)
         and 18368 < num_k <= 21504
@@ -3697,7 +3653,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # The native 64x48 footprint fits six stages for 14,721 through 16,544 K blocks.
     m64_n48_stage6_two_sm_storage = (
         not rowwise and (M, N, num_sms, block_n_multiple) == (64, 48, 2, 48)
         and 14720 < num_k <= 16544
@@ -3705,7 +3660,6 @@ def fp8_wgrad_sm90(grad, grad_scale, activation, activation_scale, out, *, num_s
                 and tensor.stride(0) * tensor.element_size() % BLOCK_K == 16
                 for tensor in (grad, activation))
     )
-    # The native 16x48 ring fits four stages from 23,441 to 24,480 K blocks.
     m16_n48_stage4_crossed_storage = (
         not rowwise and num_sms in (98, 108, 110, 124, 132) and block_n_multiple == 48
         and M == 16 and N == 48 and 23440 < num_k <= 24480 and K % BLOCK_K == 0

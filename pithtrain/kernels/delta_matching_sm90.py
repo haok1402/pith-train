@@ -17,14 +17,13 @@ from pithtrain.kernels.cute_compile_sm90 import TORCH2CUTE, fake, fake_stream
 from pithtrain.kernels.cute_ptx_sm90 import asm, to_ir
 
 __all__ = [
-    "BACKWARD_THREADS", "BLOCK_QUERY", "LOG2_E", "allocate_operand", "allocate_staged_operand", "copy_tma_operand",
+    "BLOCK_QUERY", "LOG2_E", "allocate_operand", "allocate_quantized_twins", "allocate_staged_operand", "copy_tma_operand",
     "initialize_attention_barriers", "issue_multiply_tile", "launch_delta_matching_kernel", "make_mma",
-    "load_quant_block", "make_operand_layout", "make_operand_tma", "multiply_tile", "quantize_centered_kv", "quantize_delta_matching", "quantizer_input", "reduce_mma_row", "reduce_quant_block",
+    "make_operand_layout", "make_operand_tma", "multiply_tile", "quantize_centered_kv", "quantize_delta_matching", "quantizer_input", "reduce_mma_row",
 ]
 
 BLOCK_QUERY = 64
 FORWARD_THREADS = 256
-BACKWARD_THREADS = 128
 LOG2_E = 1.4426950408889634
 COMPILE_CACHE = {}
 
@@ -173,32 +172,6 @@ def launch_key_sum(mKey, mPartial, stream):
 
 
 @cute.jit
-def load_quant_block(mInput, mCenter, bx, by, tidx, BLOCK: cutlass.Constexpr, THREADS: cutlass.Constexpr, center_key: cutlass.Constexpr, input_scale: cutlass.Constexpr):
-    _, _, H, D = mInput.shape
-    batch_idx, head_idx = by // H, by % H
-    VEC = 8
-    REPEATS = BLOCK * D // (THREADS * VEC)
-    values = cute.make_rmem_tensor((VEC, REPEATS), Float32)
-    col_idx, local_row = tidx % (D // VEC) * VEC, tidx // (D // VEC)
-    center = cute.make_rmem_tensor(VEC, Float32)
-    if const_expr(center_key):
-        center.fill(0.0)
-        for partial_idx in range(cute.size(mCenter, mode=[1])):
-            for elem_idx in cutlass.range_constexpr(VEC):
-                center[elem_idx] += mCenter[by, partial_idx, col_idx + elem_idx]
-    for repeat_idx in cutlass.range_constexpr(REPEATS):
-        row_idx = bx * BLOCK + local_row + repeat_idx * (THREADS * VEC // D)
-        source = cute.local_tile(mInput[batch_idx, row_idx, head_idx, None], (VEC,), (col_idx // VEC,))  # (input vector)
-        raw = source.load().to(Float32)
-        if const_expr(center_key):
-            raw = raw - center.load()
-        if const_expr(input_scale != 1.0):
-            raw = raw * input_scale
-        values[None, repeat_idx].store(raw)
-    return values
-
-
-@cute.jit
 def reduce_quant_block(values, s_amax, tidx, THREADS: cutlass.Constexpr, is_gradient: cutlass.Constexpr):
     amax = Float32(0.0)
     for elem_idx in cutlass.range_constexpr(cute.size(values)):
@@ -214,32 +187,6 @@ def reduce_quant_block(values, s_amax, tidx, THREADS: cutlass.Constexpr, is_grad
     if const_expr(is_gradient):
         return amax * (1.0 / 448.0)
     return amax / Float32(448.0)
-
-
-@cute.jit
-def store_quant_block(mCodes, mTwin, values, s_codes, bx, by, tidx, scale, BLOCK: cutlass.Constexpr, THREADS: cutlass.Constexpr):
-    D = cute.size(mCodes, mode=[2])
-    VEC = 8
-    col_idx, local_row = tidx % (D // VEC) * VEC, tidx // (D // VEC)
-    for repeat_idx in cutlass.range_constexpr(cute.size(values, mode=[1])):
-        row_idx = local_row + repeat_idx * (THREADS * VEC // D)
-        codes = cute.make_rmem_tensor(VEC, Float32)
-        for elem_idx in cutlass.range_constexpr(VEC):
-            codes[elem_idx] = values[elem_idx, repeat_idx] / scale
-        quantized = codes.load().to(Float8E4M3FN)
-        destination = cute.local_tile(mCodes[by, bx * BLOCK + row_idx, None], (VEC,), (col_idx // VEC,))  # (code vector)
-        destination.store(quantized)
-        for elem_idx in cutlass.range_constexpr(VEC):
-            s_codes[row_idx, col_idx + elem_idx] = quantized[elem_idx]
-    cute.arch.barrier()
-    for repeat_idx in cutlass.range_constexpr(BLOCK * D // (THREADS * VEC)):
-        tile_idx = tidx + repeat_idx * THREADS
-        col_idx, row_idx = tile_idx // (BLOCK // VEC), tile_idx % (BLOCK // VEC) * VEC
-        transposed = cute.make_rmem_tensor(VEC, Float8E4M3FN)
-        for elem_idx in cutlass.range_constexpr(VEC):
-            transposed[elem_idx] = s_codes[row_idx + elem_idx, col_idx]
-        destination = cute.local_tile(mTwin[by, col_idx, None], (VEC,), (bx * (BLOCK // VEC) + row_idx // VEC,))  # (transposed vector)
-        destination.store(transposed.load())
 
 
 @dsl_user_op
@@ -430,50 +377,19 @@ def launch_value_and_fold_key(mValue, mValueScale, mValueCodes, mValueTwin, mPar
     )
 
 
-@cute.kernel
-def quantize_block(mInput, mCenter, mCodes, mScale, mTwin, BLOCK: cutlass.Constexpr, THREADS: cutlass.Constexpr, center_key: cutlass.Constexpr, input_scale: cutlass.Constexpr, is_gradient: cutlass.Constexpr):
-    tidx, _, _ = cute.arch.thread_idx()
-    bx, by, _ = cute.arch.block_idx()
-    D = cute.size(mCodes, mode=[2])
-    allocator = SmemAllocator()
-    s_amax = allocator.allocate_tensor(Float32, cute.make_layout(THREADS // 32), 16)
-    s_codes = allocate_operand(allocator, BLOCK, D)
-
-    values = load_quant_block(mInput, mCenter, bx, by, tidx, BLOCK, THREADS, center_key, input_scale)
-    scale = reduce_quant_block(values, s_amax, tidx, THREADS, is_gradient)
-    if tidx == 0:
-        mScale[by, bx] = scale
-    store_quant_block(mCodes, mTwin, values, s_codes, bx, by, tidx, scale, BLOCK, THREADS)
-
-
 @cute.jit
-def launch_quant_block(mInput, mCenter, mCodes, mScale, mTwin, BLOCK: cutlass.Constexpr, center_key: cutlass.Constexpr, input_scale: cutlass.Constexpr, is_gradient: cutlass.Constexpr, is_forward: cutlass.Constexpr, stream):
-    B, N, H, _ = mInput.shape
-    register_gradient = const_expr(is_gradient and not center_key and BLOCK * cute.size(mInput, mode=[3]) == 16384)
-    THREADS = FORWARD_THREADS if const_expr(is_forward or register_gradient) else BACKWARD_THREADS
-    use_tma = const_expr(
-        cute.size(mInput, mode=[3]) == 256
-        and ((is_forward and BLOCK in (32, 64)) or (register_gradient and BLOCK == 64)),
-    )
-    if const_expr(use_tma):
-        D = cute.size(mInput, mode=[3])
+def launch_quant_block(mInput, mCenter, mCodes, mScale, mTwin, BLOCK: cutlass.Constexpr, center_key: cutlass.Constexpr, input_scale: cutlass.Constexpr, is_gradient: cutlass.Constexpr, stream):
+    B, N, H, D = mInput.shape
+    if const_expr(D == 256):
         code_store = make_quant_store(mCodes, BLOCK, D)
         twin_store = make_quant_store(mTwin, D, BLOCK)
-        quantize_tma_twins(mInput, mCenter, mScale, code_store, twin_store, BLOCK, center_key, input_scale, is_gradient).launch(
-            grid=(N // BLOCK, B * H, 1), block=(FORWARD_THREADS, 1, 1), stream=stream,
-        )
-    elif const_expr(is_forward or register_gradient):
-        quantize_register_twins(mInput, mCenter, mCodes, mScale, mTwin, BLOCK, center_key, input_scale, is_gradient).launch(
-            grid=(N // BLOCK, B * H, 1), block=(THREADS, 1, 1), stream=stream,
-        )
+        quantize_tma_twins(mInput, mCenter, mScale, code_store, twin_store, BLOCK, center_key, input_scale, is_gradient).launch(grid=(N // BLOCK, B * H, 1), block=(FORWARD_THREADS, 1, 1), stream=stream)
     else:
-        quantize_block(mInput, mCenter, mCodes, mScale, mTwin, BLOCK, THREADS, center_key, input_scale, is_gradient).launch(
-            grid=(N // BLOCK, B * H, 1), block=(THREADS, 1, 1), stream=stream,
-        )
+        quantize_register_twins(mInput, mCenter, mCodes, mScale, mTwin, BLOCK, center_key, input_scale, is_gradient).launch(grid=(N // BLOCK, B * H, 1), block=(FORWARD_THREADS, 1, 1), stream=stream)
 
 
 @cute.kernel
-def fold_key_partials(mPartial, mCenter, mTicket, RESET_TICKET: cutlass.Constexpr):
+def fold_key_partials(mPartial, mCenter, mTicket):
     tidx, _, _ = cute.arch.thread_idx()
     channel_block, head_idx, _ = cute.arch.block_idx()
     channel = channel_block * 128 + tidx
@@ -481,17 +397,14 @@ def fold_key_partials(mPartial, mCenter, mTicket, RESET_TICKET: cutlass.Constexp
     for partial_idx in range(cute.size(mPartial, mode=[1])):
         center += mPartial[head_idx, partial_idx, channel]
     mCenter[head_idx, 0, channel] = center
-    if const_expr(RESET_TICKET):
-        if channel == 0 and head_idx == 0:
-            mTicket[0] = 0
+    if channel == 0 and head_idx == 0:
+        mTicket[0] = 0
 
 
 @cute.jit
-def launch_key_fold(mPartial, mCenter, mTicket, RESET_TICKET: cutlass.Constexpr, stream):
+def launch_key_fold(mPartial, mCenter, mTicket, stream):
     heads, _, channels = mPartial.shape
-    fold_key_partials(mPartial, mCenter, mTicket, RESET_TICKET).launch(
-        grid=(channels // 128, heads, 1), block=(128, 1, 1), stream=stream,
-    )
+    fold_key_partials(mPartial, mCenter, mTicket).launch(grid=(channels // 128, heads, 1), block=(128, 1, 1), stream=stream)
 
 
 def allocate_quantized_twins(x, block_rows):
@@ -525,31 +438,24 @@ def quantize_centered_kv(key, value, ticket):
     )
     launch_delta_matching_kernel(
         "delta_matching_quantize", launch_quant_block, (key, center, key_codes, key_scales, key_twin),
-        (32, True, 1.0, False, True),
+        (32, True, 1.0, False),
     )
     return (key_codes, key_scales, key_twin), (value_codes, value_scales, value_twin)
 
 
-def quantize_delta_matching(x, block_rows, *, center_key=False, input_scale=1.0, is_gradient=False, is_forward=False, scheduler_ticket=None):
+def quantize_delta_matching(x, block_rows, *, input_scale=1.0, is_gradient=False, key_mean_ticket=None):
     """
     Quantize dense BSHD BF16 to E4M3 head-major and channel-major codes and per-head FP32 scales.
     """
     B, N, H, D = x.shape
     x = quantizer_input(x)
     codes, scales, twin = allocate_quantized_twins(x, block_rows)
-    center = torch.empty((B * H, N // 128, D) if center_key else (1, 1, 1), dtype=torch.float32, device=x.device)
-
+    center_key = key_mean_ticket is not None
+    center = torch.empty((B * H, 1, D) if center_key else (1, 1, 1), dtype=torch.float32, device=x.device)
     # Centering leaves the exact softmax unchanged and reduces the key quantization range.
     if center_key:
-        launch_delta_matching_kernel("delta_matching_key_sum", launch_key_sum, (x, center))
-        if is_forward:
-            mean = torch.empty((B * H, 1, D), dtype=torch.float32, device=x.device)
-            ticket = scheduler_ticket if scheduler_ticket is not None else mean
-            launch_delta_matching_kernel("delta_matching_key_mean", launch_key_fold,
-                                         (center, mean, ticket), (scheduler_ticket is not None,))
-            center = mean
-    launch_delta_matching_kernel(
-        "delta_matching_quantize", launch_quant_block, (x, center, codes, scales, twin),
-        (block_rows, center_key, input_scale, is_gradient, is_forward),
-    )
+        partial = torch.empty((B * H, N // 128, D), dtype=torch.float32, device=x.device)
+        launch_delta_matching_kernel("delta_matching_key_sum", launch_key_sum, (x, partial))
+        launch_delta_matching_kernel("delta_matching_key_mean", launch_key_fold, (partial, center, key_mean_ticket))
+    launch_delta_matching_kernel("delta_matching_quantize", launch_quant_block, (x, center, codes, scales, twin), (block_rows, center_key, input_scale, is_gradient))
     return codes, scales, twin
