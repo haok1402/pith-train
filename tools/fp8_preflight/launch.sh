@@ -1,6 +1,21 @@
 #!/bin/bash
 set -euo pipefail
 
+if [[ ${1:-} == --verified-smoke ]]; then
+    seal=${2:?Expected a CPU preflight seal}
+    shift 2
+    test -s "$seal"
+    launcher=()
+    while (( $# )) && [[ $1 != -- ]]; do
+        launcher+=("$1")
+        shift
+    done
+    (( ${#launcher[@]} && $# > 1 ))
+    shift
+    export PITHTRAIN_PREFLIGHT_SEAL="$seal"
+    exec "${launcher[@]}" "$@"
+fi
+
 if (( $# < 4 || $# > 6 )); then
     echo 'Usage: examples/pretrain_lm/launch.sh --fp8-preflight MODEL WEIGHTS DATASET OUTPUT [STEPS] [--audit-losses]' >&2
     exit 2

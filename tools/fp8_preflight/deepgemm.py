@@ -11,14 +11,14 @@ from tools.fp8_preflight.artifacts import digest, read_json
 from tools.fp8_preflight.recipe import PROJECTIONS
 
 
-def compile_deepgemm(root, package, seed=None):
+def build_host_compiler(root, package, source):
+    import torch
     from torch.utils.cpp_extension import include_paths
 
     cuda = Path(os.environ["CUDA_HOME"])
-    source = Path(__file__).with_suffix(".cpp")
     include = Path(os.environ["DEEP_JIT_INCLUDE"])
     elf = os.environ.get("ELFUTILS_INCLUDE")
-    torchlib = package.parent / "torch/lib"
+    torchlib = Path(torch.__file__).resolve().parent / "lib"
     python = (
         Path(sysconfig.get_config_var("LIBDIR")) / f"libpython{sysconfig.get_python_version()}.so"
     )
@@ -65,6 +65,11 @@ def compile_deepgemm(root, package, seed=None):
         ],
         check=True,
     )
+    return compiler
+
+
+def compile_deepgemm(root, package, seed=None):
+    compiler = build_host_compiler(root, package, Path(__file__).with_suffix(".cpp"))
     header = package / "csrc/jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp"
     template = re.search(
         r'jit->compile\(tag, std::format\(R"\((.*?)\n\)",', header.read_text(), re.S

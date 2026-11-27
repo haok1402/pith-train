@@ -170,6 +170,8 @@ class CuteArtifacts:
             if item is None or item.get("signature") != description:
                 raise ValueError(f"Missing sealed CuTe artifact {key} for {description}")
             path = self.root / item["path"]
+            if not self.fallback and digest(path) != item["sha256"]:
+                raise ValueError(f"Corrupt sealed CuTe artifact {path}")
             entry = self.load_module(str(path), enable_tvm_ffi=True).preflight_entry
             compiled = ffi_call(entry, operation, args, kwargs)
         except (OSError, RuntimeError, ValueError, AttributeError, KeyError) as error:
