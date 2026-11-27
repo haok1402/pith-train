@@ -287,18 +287,20 @@ def assert_scale_either(got: torch.Tensor, ref: torch.Tensor, alt: torch.Tensor,
     assert bool(ok.all()), f"{name}: {(~ok).sum().item()} scales differ"
 
 
-def check_grouped_input(x: torch.Tensor, ks: list[int], offs: torch.Tensor | None = None, nan_wins: bool = False) -> None:  # fmt: skip
+def check_grouped_input(x: torch.Tensor, ks: list[int], offs: torch.Tensor | None = None) -> None:
     """
     fp8_quant_grouped against the reference in the output's per-channel layout, the SM100-native
-    E8M0 accepted element by element (it differs only in blocks whose amax is infinite).
+    E8M0 accepted element by element (it differs only in blocks whose amax is infinite). NaNs win
+    the amax on SM90, which returns flat K-major per-channel data.
     """
     M, K = x.shape
     x_fp8, x_scale, ch_fp8, ch_scale = fp8_quant_grouped(x, offsets(ks) if offs is None else offs)
+    nan_wins = ch_fp8.ndim == 1
     (row_q, row_scale), (row_q_alt, row_scale_alt) = ref_rowwise(x, nan_wins=nan_wins), ref_rowwise(x, native=True, nan_wins=nan_wins)  # fmt: skip
     assert_fp8_either(x_fp8, row_q, row_q_alt, "x_fp8")
     assert_scale_either(x_scale, row_scale, row_scale_alt, "x_scale")
     (ch_q, ch_s), (ch_q_alt, ch_s_alt) = ref_channelwise(x, nan_wins=nan_wins), ref_channelwise(x, native=True, nan_wins=nan_wins)  # fmt: skip
-    if ch_fp8.ndim == 1:  # K-major per group
+    if nan_wins:  # K-major per group
         assert ch_fp8.shape == (M * K,)
         ch_q, ch_q_alt = to_kmajor(ch_q, ks), to_kmajor(ch_q_alt, ks)
     else:
@@ -366,7 +368,7 @@ def test_fp8_quant_grouped_empty() -> None:
 @pytest.mark.parametrize("ks,K", [([256, 0, 384], 768), ([128, 128], 200)])
 def test_fp8_quant_grouped_inf_nan(ks: list[int], K: int) -> None:
     """
-    NaN is ignored by the amax; a block whose amax is infinite takes either E8M0 result.
+    NaN wins the amax on SM90 and is ignored on SM100. Infinite amax takes either E8M0 result.
     """
     x = make_input(sum(ks), K, seed=8)
     inf, nan = float("inf"), float("nan")
@@ -508,7 +510,7 @@ def test_fp8_quant_grouped_nan_blocks(view: str, dtype: str) -> None:
     xv = make_view(sum(ks), N, view, DTYPES[dtype]).copy_(x) if view != "contiguous" else x
     if view == "transposed":
         xv = x.T.contiguous().T
-    check_grouped_input(xv, ks, nan_wins=True)
+    check_grouped_input(xv, ks)
     if dtype == "bf16":
         got, want = fp8_quant_grouped(xv, offsets(ks)), fp8_quant_grouped(x, offsets(ks))
         for g, w in zip(got, want):

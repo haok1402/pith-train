@@ -10,7 +10,8 @@ silu_mul_fwd and silu_mul_bwd, and that this output is within one bf16 rounding 
 a float64 PyTorch evaluation of the same formula.
 
 Recipe: per 128-element block, amax = max |x| ignoring NaN, scale = 2^ceil(log2(max(amax, 1e-4) /
-448)) and fp8 = e4m3_satfinite(x * (1 / scale)), rounded to nearest even.
+448)) and fp8 = e4m3_satfinite(x * (1 / scale)), rounded to nearest even. On the SM90 fallback,
+fp8_quant_grouped includes NaN in the amax, giving scale -0.0 and reciprocal bits 0xFF000000.
 
 Known SM100 difference: in a block whose amax is infinite the SM90 E8M0 arithmetic gives scale inf
 (reciprocal -inf, bytes -/+448), SM100's native cvt.rp.satfinite.ue8m0x2 saturates the scale to
@@ -38,7 +39,7 @@ def e8m0_scale_rcp(amax: torch.Tensor, native: bool = False) -> tuple[torch.Tens
     """
     Return the recipe's power-of-two scale of an fp32 amax, and its exact reciprocal. native
     saturates the scale of an infinite amax to 2^127 as SM100's cvt does (the SM90 arithmetic gives
-    inf); the two agree on every finite amax.
+    inf); the two agree on every finite amax. A NaN amax from the SM90 fallback gives scale -0.0.
     """
     clamped = torch.maximum(amax, torch.full_like(amax, 1e-4))
     ratio = clamped * torch.full_like(clamped, 1.0 / 448.0)
@@ -47,20 +48,23 @@ def e8m0_scale_rcp(amax: torch.Tensor, native: bool = False) -> tuple[torch.Tens
     scale = torch.maximum(bits.view(torch.float32), torch.full_like(clamped, 2.0**-126))
     if native:
         scale = torch.minimum(scale, torch.full_like(scale, 2.0**127))
+    scale = torch.where(torch.isnan(amax), -0.0, scale)
     rcp = ((254 << 23) - scale.view(torch.int32)).view(torch.float32)
     return scale, rcp
 
 
-def absmax_input(x: torch.Tensor) -> torch.Tensor:
+def block_amax(x: torch.Tensor, dim: int, nan_wins: bool) -> torch.Tensor:
     magnitude = x.abs()
-    return torch.where(torch.isnan(magnitude), torch.zeros_like(magnitude), magnitude)
+    if not nan_wins:
+        magnitude = torch.where(torch.isnan(magnitude), 0.0, magnitude)
+    return magnitude.amax(dim)
 
 
 def quantize_bytes(x: torch.Tensor, rcp: torch.Tensor) -> torch.Tensor:
     return (x * rcp).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
 
 
-def quantize_grouped_ref(x: torch.Tensor, offs: torch.Tensor, kmajor: bool = True, native: bool = False) -> tuple[torch.Tensor, ...]:  # fmt: skip
+def quantize_grouped_ref(x: torch.Tensor, offs: torch.Tensor, kmajor: bool = True, native: bool = False, *, nan_wins: bool = False) -> tuple[torch.Tensor, ...]:  # fmt: skip
     """
     Return fp8_quant_grouped in PyTorch: x_fp8 (M, K) as uint8, x_scale (M, ceil(K/128)), and the
     per-channel pair, K-major (x_ch flat (M*K,) uint8 K-major per group, x_ch_scale (K, M/128)) or
@@ -70,12 +74,11 @@ def quantize_grouped_ref(x: torch.Tensor, offs: torch.Tensor, kmajor: bool = Tru
     num_blocks = -(-K // BLOCK)
     x_pad = torch.zeros(M, num_blocks * BLOCK, dtype=torch.float32, device=x.device)
     x_pad[:, :K] = x.float()
-    scale_row, rcp_row = e8m0_scale_rcp(
-        absmax_input(x_pad).view(M, num_blocks, BLOCK).amax(-1), native
-    )
-    fp8_row = quantize_bytes(x_pad.view(M, num_blocks, BLOCK), rcp_row[..., None]).view(M, num_blocks * BLOCK)[:, :K]  # fmt: skip
+    x_row = x_pad.view(M, num_blocks, BLOCK)
+    scale_row, rcp_row = e8m0_scale_rcp(block_amax(x_row, -1, nan_wins), native)
+    fp8_row = quantize_bytes(x_row, rcp_row[..., None]).view(M, num_blocks * BLOCK)[:, :K]
     x_col = x_pad[:, :K].reshape(M // BLOCK, BLOCK, K)
-    scale_ch, rcp_ch = e8m0_scale_rcp(absmax_input(x_col).amax(1), native)
+    scale_ch, rcp_ch = e8m0_scale_rcp(block_amax(x_col, 1, nan_wins), native)
     fp8_ch = quantize_bytes(x_col, rcp_ch[:, None, :]).view(M, K)
     if not kmajor:
         return fp8_row.contiguous(), scale_row, fp8_ch.contiguous(), scale_ch
@@ -96,7 +99,9 @@ def bytes_match(got: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return (got == ref) | (nan & ((got & 0x7F) == 0x7F))
 
 
-def assert_quant_equal(got: tuple, x: torch.Tensor, offs: torch.Tensor) -> None:
+def assert_quant_equal(
+    got: tuple, x: torch.Tensor, offs: torch.Tensor, *, unfused: bool = False
+) -> None:
     """
     Check got, the 4-tuple of a fused op, against quantize_grouped_ref(x) in got's per-channel
     layout, accepting the SM100-native E8M0 variant element by element (it differs only in blocks
@@ -105,7 +110,10 @@ def assert_quant_equal(got: tuple, x: torch.Tensor, offs: torch.Tensor) -> None:
     names = ("x_fp8", "x_scale", "x_ch_fp8", "x_ch_scale")
     assert len(got) == 4
     kmajor = got[2].ndim == 1
-    ref, alt = (quantize_grouped_ref(x, offs, kmajor, native) for native in (False, True))
+    ref, alt = (
+        quantize_grouped_ref(x, offs, kmajor, native, nan_wins=kmajor and unfused)
+        for native in (False, True)
+    )
     for name, got_part, ref_part, alt_part in zip(names, got, ref, alt):
         assert got_part.shape == ref_part.shape, (name, got_part.shape, ref_part.shape)
         if name.endswith("fp8"):
@@ -113,7 +121,8 @@ def assert_quant_equal(got: tuple, x: torch.Tensor, offs: torch.Tensor) -> None:
             ok = bytes_match(got_part, ref_part) | bytes_match(got_part, alt_part)
         else:
             assert got_part.dtype == torch.float32, name
-            ok = (got_part == ref_part) | (got_part == alt_part)
+            bits = got_part.view(torch.int32)
+            ok = (bits == ref_part.view(torch.int32)) | (bits == alt_part.view(torch.int32))
         if not bool(ok.all()):
             bad = (~ok).nonzero()
             raise AssertionError(f"{name}: {bad.shape[0]} mismatches, first at {bad[:4].tolist()}")
@@ -367,8 +376,7 @@ def test_gu_qwen35_cases(counts: list[int], N: int) -> None:
 @pytest.mark.parametrize("N", [768, 200])
 def test_inf_nan_blocks(N: int) -> None:
     """
-    Blocks holding inf or NaN on every entry point: NaN is ignored by the amax, an infinite amax
-    takes either E8M0 result (see the module docstring), every other block is exact.
+    Blocks holding inf or NaN on every entry point, including the SM90 gate/up fallback at N=200.
     """
     offs = make_offs([256, 0, 384])
     M = 640
@@ -384,12 +392,15 @@ def test_inf_nan_blocks(N: int) -> None:
     h = silu_mul_fwd(g, u)
     assert not bool(torch.isfinite(h).all())
     assert_quant_equal(fp8_silu_mul_fwd(g, u, offs), h, offs)
-    assert_quant_equal(fp8_silu_mul_gu_fwd(gu, offs), h, offs)
+    gu_unfused = N % BLOCK != 0
+    assert_quant_equal(fp8_silu_mul_gu_fwd(gu, offs), h, offs, unfused=gu_unfused)
     dg, du = silu_mul_bwd(dh, g, u)
     got_g, got_u = fp8_silu_mul_bwd(dh, g, u, offs)
     assert_quant_equal(got_g, dg, offs)
     assert_quant_equal(got_u, du, offs)
-    assert_quant_equal(fp8_silu_mul_gu_bwd(dh, gu, offs), torch.cat([dg, du], 1), offs)
+    assert_quant_equal(
+        fp8_silu_mul_gu_bwd(dh, gu, offs), torch.cat([dg, du], 1), offs, unfused=gu_unfused
+    )
 
 
 @pytest.mark.parametrize("groups,N", [("imbalanced", 100), ("over_cap", 768), ("imbalanced", 1003), ("imbalanced", 768)])  # fmt: skip
