@@ -1,11 +1,13 @@
 """Verify and stage persistent Inductor graphs for the dense FP8 recipe."""
 
 import hashlib
+import pickle
 import pickletools
 import re
 from pathlib import Path
 
 from tools.fp8_preflight.artifacts import read_json, write_json
+from tools.fp8_preflight.misses import record_miss
 from tools.fp8_preflight.recipe import MICROBATCH, SEQUENCE, WORLD_SIZE
 
 ROUTES = {
@@ -80,27 +82,50 @@ def seal_cache(bundle, seed, manifest, model_config_hash, hidden_size):
 
 
 def require_cache(bundle):
-    """Allow graph loads from the sealed cache and reject any backend compilation."""
+    """Record sealed hits and let Inductor compile graphs that miss."""
     from torch._inductor import compile_fx
     from torch._inductor.codecache import FxGraphCache, torch_key, triton_key
 
-    seal = read_json(bundle / "inductor" / "seal.json")
-    if seal["torch_key"] != torch_key().hex() or seal["triton_key"] != triton_key():
-        raise RuntimeError("Live PyTorch and Triton differ from the Inductor seal")
-    allowed = set(seal["keys"])
+    try:
+        seal = read_json(bundle / "inductor" / "seal.json")
+        if seal["torch_key"] != torch_key().hex() or seal["triton_key"] != triton_key():
+            raise ValueError("Live PyTorch and Triton differ from the Inductor seal")
+        allowed = set(seal["keys"])
+    except (OSError, ValueError, KeyError) as error:
+        record_miss("inductor", "seal", str(error))
+        allowed = set()
     lookup = FxGraphCache.load_with_key
+    codegen = compile_fx.fx_codegen_and_compile
+    pending = set()
 
     def load_with_key(cls, key, *args, **kwargs):
-        if key not in allowed:
-            raise RuntimeError(f"Missing sealed Inductor graph {key}")
-        graph, info = lookup(key, *args, **kwargs)
-        if graph is None or info["cache_state"] != "hit":
-            raise RuntimeError(f"Sealed Inductor graph {key} did not satisfy its guards")
-        print(f"PREFLIGHT inductor_cache_hit={key} backward={kwargs.get('is_backward')}", flush=True)
+        try:
+            graph, info = lookup(key, *args, **kwargs)
+        except (OSError, RuntimeError, pickle.UnpicklingError) as error:
+            graph, info = None, {
+                "cache_state": "miss",
+                "key": key,
+                "components": kwargs.get("debug_lines", args[0] if args else []),
+            }
+            record_miss("inductor", key, str(error).splitlines()[0])
+            pending.add(key)
+            return graph, info
+        if graph is None:
+            record_miss("inductor", key, "no usable compiled graph", backward=kwargs.get("is_backward"))
+            pending.add(key)
+        elif key in allowed:
+            print(f"PREFLIGHT inductor_cache_hit={key} backward={kwargs.get('is_backward')}", flush=True)
         return graph, info
 
-    def no_codegen(*args, **kwargs):
-        raise RuntimeError("Inductor attempted code generation without a sealed graph")
+    def recorded_codegen(gm, *args, **kwargs):
+        if pending:
+            pending.clear()
+        else:
+            # Inductor can bypass FX caching before assigning a key.
+            source = str(gm.graph)
+            key = hashlib.sha256(source.encode()).hexdigest()
+            record_miss("inductor", key, "FX cache bypass", graph=source)
+        return codegen(gm, *args, **kwargs)
 
     FxGraphCache.load_with_key = classmethod(load_with_key)
-    compile_fx.fx_codegen_and_compile = no_codegen
+    compile_fx.fx_codegen_and_compile = recorded_codegen

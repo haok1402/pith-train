@@ -36,6 +36,7 @@ from tools.fp8_preflight.recipe import (
     offline_target,
 )
 from tools.fp8_preflight.runtime import seal_runtime
+from tools.fp8_preflight.scales import prepare_initial_scales
 from tools.fp8_preflight.weights import (
     model_geometry,
     plans,
@@ -340,16 +341,41 @@ def prepare_weights_and_seal(args):
             root, seal, recipe, args.weights, model, payload=not fresh or args.weight_seed is None
         ),
     )
+    scale_identity = {
+        "weight_stage": weights.name,
+        "scale_source": digest(Path(__file__).with_name("scales.py")),
+        "kernel_source": target["source"],
+    }
+
+    def verify_scales(root, seal, fresh):
+        if seal["identity"] != scale_identity or digest(root / "initial-scales.safetensors") != seal["sha256"]:
+            raise ValueError("Invalid initial FP8 scale stage")
+
+    def build_scales(root):
+        return {"identity": scale_identity, "sha256": prepare_initial_scales(root, weights, model)}
+
+    try:
+        scales = publish_stage(args.cache / "scales", scale_identity, build_scales, verify_scales)
+    except ValueError as error:
+        print(f"WARNING: Initial FP8 scales will be computed at runtime: {error}", flush=True)
+        scales = None
     prepare_dataset(args)
     bundle = args.ready.parent / "bundle"
     bundle.mkdir()
     config_path = bundle / "model-config.json"
     write_json(config_path, config.to_dict())
+    scale_seal = {}
+    if scales is not None:
+        (bundle / "initial-scales.safetensors").symlink_to(scales / "initial-scales.safetensors")
+        scale_seal["initial_scales"] = read_json(scales / "seal.json")["sha256"]
     if args.inductor_seed is not None:
-        seal_cache(
-            bundle, args.inductor_seed, args.inductor_manifest,
-            recipe["model_config"], config.hidden_size,
-        )
+        try:
+            seal_cache(
+                bundle, args.inductor_seed, args.inductor_manifest,
+                recipe["model_config"], config.hidden_size,
+            )
+        except (OSError, ValueError, KeyError) as error:
+            print(f"WARNING: Inductor seed unavailable, runtime compilation enabled: {error}", flush=True)
     if args.runtime_seed is not None:
         seal_runtime(bundle, args.runtime_seed)
     for name in ("cute", "imports.zip"):
@@ -365,6 +391,7 @@ def prepare_weights_and_seal(args):
             **kernel_seal,
             "identity": {**kernel_seal["identity"], **recipe},
             "prepared_model_config": digest(config_path),
+            **scale_seal,
             "weights": read_json(weights / "seal.json")["weights"],
         },
     )

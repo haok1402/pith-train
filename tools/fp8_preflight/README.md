@@ -17,8 +17,9 @@ attention, sequence length 4096, and eight examples per rank. It loads the dense
 Qwen3.5-27B HF checkpoint. The launcher seals kernels and weights in separate CPU
 jobs, then requests the training GPUs. The kernel job has 10 minutes
 for cold imports, CuTe export and native DeepGEMM compilation. The weight job
-has 8 minutes for cold imports and four concurrent workers reading and verifying
-the 50 GiB rank packs. A successful stage can be reused if the next stage fails.
+has 12 minutes for cold imports and four concurrent workers verifying the
+50 GiB rank packs and preparing the initial FP8 maxima and scales. A successful
+stage can be reused if the next stage fails.
 
 Set `PITHTRAIN_SLURM_ACCOUNT`, `PITHTRAIN_CPU_PARTITION`, and
 `PITHTRAIN_GPU_PARTITION` for your site. The launcher also accepts
@@ -39,23 +40,28 @@ The Inductor manifest records the SHA-256 of the original `config.json` in
 and a `files` mapping from relative `fxgraph` paths to SHA-256 digests. Preflight
 checks the target and covers both attention mixers in forward and backward and
 the residual stage in forward, on every CUDA device index. The worker logs the
-actual FX cache hits and fails on an uncovered graph or a guard mismatch.
+actual FX cache hits. Inductor compiles uncovered graphs and guard misses into
+the job's writable cache.
 
 `PITHTRAIN_RUNTIME_SEED` can supply the runtime's `venv-N.tar.zst` archives and
 their `sha256` manifest. The seed also records the base interpreter path in
 `python` and the venv-relative site-packages directory in `site`. CPU preflight
 verifies the archives. The worker starts utilization capture and extracts them
-once per node, then uses the staged interpreter on all ranks. The default
+once per node, stages the CuTe and DeepGEMM binaries, and uses the staged
+interpreter on all ranks. The default
 staging directory is `/dev/shm`. Set `PITHTRAIN_NODE_STORAGE` to use another
 node-local filesystem.
 
 The bundle records the source and compiler identity, CuTe launch ABI, DeepGEMM
 cache entries, rank-local weight digests, and the resolved HF text configuration.
 The dense worker uses that configuration directly and imports only its model family.
-The training worker resolves CuTe
-and DeepGEMM specializations from the sealed bundle. A missing artifact ends the
-job with the launch signature or cache compiler invocation in the log. Torch
-Inductor's runtime compile and first use of cross-entropy have separate timings.
+Initial weight maxima and scale bits come from CPU preflight. The first shard
+cast runs on the GPU and later optimizer steps recompute scales from live weights.
+CuTe and DeepGEMM look for sealed artifacts first, then invoke their regular
+compilers on a miss. The job records miss keys and launch metadata in
+`misses/rank-*.jsonl` and successful runtime DeepGEMM keys in
+`misses/deepgemm-keys.json`. Inductor and DeepGEMM retain their runtime artifacts
+under the job's `cache` directory. Compiler failures propagate normally.
 
 `preflight.log` and `weights.log` contain the CPU jobs and seal results. `run.log` records
 per-rank timings and loss, and `gpu.csv` contains a 200 ms utilization timeline
@@ -71,4 +77,4 @@ the exported signatures and loads each shared object. The CUDA mode requires one
 H200 and `--gpu-utilization` to capture the timeline from its first import onward.
 If a job-local sampler already started before staging, pass its CSV with
 `--recorded-gpu-utilization` and use `--staged-runtime` with the staged interpreter.
-Use the sealed DeepGEMM cache and the version-only NVCC shim for that check.
+Use the sealed DeepGEMM cache and inspect the miss receipts when checking coverage.

@@ -8,6 +8,7 @@ from enum import Enum
 from pathlib import Path
 from types import FunctionType, MethodType
 
+from tools.fp8_preflight.misses import record_miss
 from tools.fp8_preflight.recipe import offline_cute_hardware
 
 
@@ -134,36 +135,52 @@ def verify_wrapper(operation, args, kwargs, launched):
 
 
 class CuteArtifacts:
-    """Export the normal compiler's executables, or load them with compilation disabled."""
+    """Export or load CuTe executables, with an optional runtime JIT fallback."""
 
-    def __init__(self, root: Path, entries: dict, *, build: bool):
+    def __init__(self, root: Path, entries: dict, *, build: bool, fallback: bool = False):
         from cutlass import cute
         from cutlass.runtime import find_runtime_libraries, load_module
 
         self.root = root
         self.entries = entries
         self.build = build
+        self.fallback = fallback
         self.compiler = cute.compile
         self.load_module = load_module
         self.libraries = find_runtime_libraries(enable_tvm_ffi=True) if build else ()
         self.loaded = {}
 
     def __call__(self, operation, *args, **kwargs):
-        key, description = signature(operation, args, kwargs)
+        try:
+            key, description = signature(operation, args, kwargs)
+        except TypeError as error:
+            if not self.fallback:
+                raise
+            name = qualified(operation if isinstance(operation, (FunctionType, MethodType)) else type(operation))
+            record_miss("cute", name, f"unsealable signature: {error}")
+            return self.compiler(operation, *args, **kwargs)
         if key in self.loaded:
             return self.loaded[key]
-        if key not in self.entries:
-            if not self.build:
-                raise RuntimeError(f"Missing sealed CuTe artifact {key} for {description}")
-            self.export(key, description, operation, args, kwargs)
         if self.build:
+            if key not in self.entries:
+                self.export(key, description, operation, args, kwargs)
             return self.skip_launch
-        path = self.root / self.entries[key]["path"]
-        entry = self.load_module(str(path), enable_tvm_ffi=True).preflight_entry
-        adapted = ffi_call(entry, operation, args, kwargs)
-        self.loaded[key] = adapted
-        print(f"PREFLIGHT cute_load key={key} executable={description[0][:2]}", flush=True)
-        return adapted
+        try:
+            item = self.entries.get(key)
+            if item is None or item.get("signature") != description:
+                raise ValueError(f"Missing sealed CuTe artifact {key} for {description}")
+            path = self.root / item["path"]
+            entry = self.load_module(str(path), enable_tvm_ffi=True).preflight_entry
+            compiled = ffi_call(entry, operation, args, kwargs)
+        except (OSError, RuntimeError, ValueError, AttributeError, KeyError) as error:
+            if not self.fallback:
+                raise
+            record_miss("cute", key, str(error).splitlines()[0][:250], signature=description)
+            compiled = self.compiler(operation, *args, **kwargs)
+        else:
+            print(f"PREFLIGHT cute_load key={key} executable={description[0][:2]}", flush=True)
+        self.loaded[key] = compiled
+        return compiled
 
     def export(self, key, description, operation, args, kwargs):
         binary = self.root / "cute" / f"{key}.so"

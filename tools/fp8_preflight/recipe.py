@@ -250,12 +250,26 @@ def reduce_scatter(model):
     )
 
     from pithtrain.kernels import pack_reduce_scatter
+    from pithtrain.operators.linear import BF16Linear, FP8Linear
 
-    # MixedPrecisionPolicy gives every unsharded gradient the FP32 reduction dtype.
+    # FSDP packs the source gradients before casting into its FP32 reduction buffer.
+    # Only parameters with PithTrain's main_grad hooks already have FP32 gradients.
+    fp32_grads = {
+        id(module.weight)
+        for module in model.modules()
+        if isinstance(module, (BF16Linear, FP8Linear))
+    }
     groups = list(batched(model.layers, 2))
     groups.extend([(model.embed_tokens,), (model.lm_head,), (model.norm,)])
     for group in groups:
         params, _ = _get_managed_states(_get_managed_modules(group))
-        grads = [torch.zeros(param.shape, dtype=torch.float32) for param in params]
-        output = torch.empty(sum(grad.numel() for grad in grads), dtype=torch.float32)
-        pack_reduce_scatter(grads, output, WORLD_SIZE)
+        for all_fp32 in (False, True):
+            grads = [
+                torch.zeros(
+                    param.shape,
+                    dtype=torch.float32 if all_fp32 or id(param) in fp32_grads else torch.bfloat16,
+                )
+                for param in params
+            ]
+            output = torch.empty(sum(grad.numel() for grad in grads), dtype=torch.float32)
+            pack_reduce_scatter(grads, output, WORLD_SIZE)

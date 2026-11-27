@@ -8,7 +8,10 @@ export RANK="$SLURM_PROCID" LOCAL_RANK="$SLURM_LOCALID" WORLD_SIZE="$SLURM_NTASK
 export LOCAL_WORLD_SIZE="$SLURM_NTASKS" MASTER_ADDR=127.0.0.1
 export MASTER_PORT=$((10000 + SLURM_JOB_ID % 50000))
 export OMP_NUM_THREADS=4 TORCHINDUCTOR_COMPILE_THREADS=2
-export DG_JIT_CACHE_DIR="$bundle/deepgemm" DJ_JIT_CACHE_DIR="$bundle/deepgemm"
+export PITHTRAIN_MISS_DIR="$output/misses"
+mkdir -p "$PITHTRAIN_MISS_DIR" "$output/cache/deepgemm"
+export DG_JIT_CACHE_DIR="$output/cache/deepgemm:$bundle/deepgemm"
+export DJ_JIT_CACHE_DIR="$DG_JIT_CACHE_DIR"
 export DG_JIT_NVCC_COMPILER="$PWD/tools/fp8_preflight/deepgemm-nvcc"
 export DG_JIT_PRINT_LOAD_TIME=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -43,6 +46,10 @@ if [[ -s $bundle/runtime/sha256 ]]; then
         started=$SECONDS
         stage=$(mktemp -d "${PITHTRAIN_NODE_STORAGE:-/dev/shm}/pithtrain-runtime.${SLURM_JOB_ID}.XXXXXXXX")
         stage_runtime "$bundle/runtime" "$stage"
+        # Stage each sealed binary once to avoid eight ranks faulting it in from shared storage.
+        for name in cute deepgemm; do
+            if [[ -d $bundle/$name ]]; then cp -aL "$bundle/$name" "$stage/$name"; fi
+        done
         printf '%s\n' "$stage" > "$output/runtime-pending"
         mv "$output/runtime-pending" "$output/runtime-ready"
         printf 'STARTUP rank=0 time=%s phase=node_runtime state=end seconds=%s\n' \
@@ -60,6 +67,9 @@ if [[ -s $bundle/runtime/sha256 ]]; then
     flock -s "$runtime_lock"
     python="$stage/bin/python"
     export PITHTRAIN_STAGED_RUNTIME=1
+    export PITHTRAIN_KERNEL_ROOT="$stage"
+    export DG_JIT_CACHE_DIR="$output/cache/deepgemm:$stage/deepgemm"
+    export DJ_JIT_CACHE_DIR="$DG_JIT_CACHE_DIR"
     unset PYTHONPYCACHEPREFIX
 fi
 

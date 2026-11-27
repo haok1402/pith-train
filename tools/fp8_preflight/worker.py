@@ -13,6 +13,7 @@ from pathlib import Path
 from tools.fp8_preflight.artifacts import CuteArtifacts, read_json
 from tools.fp8_preflight.imports import ImportArchive
 from tools.fp8_preflight.inductor import require_cache
+from tools.fp8_preflight.misses import record_miss
 from tools.fp8_preflight.recipe import (
     ARCH,
     MICROBATCH,
@@ -22,6 +23,7 @@ from tools.fp8_preflight.recipe import (
     shared_memory_attribute,
 )
 from tools.fp8_preflight.weights import load_rank, sealed_model_config
+from tools.fp8_preflight.scales import load_initial_scales
 
 BENCHMARK = (
     Path(__file__).resolve().parents[2]
@@ -99,9 +101,11 @@ def run(args):
             raise RuntimeError(
                 f"Sealed CuTe shared-memory target differs from the device: {shared_memory}"
             )
-        cute.compile = CuteArtifacts(bundle, seal["cute"], build=False)
+        kernel_root = Path(os.environ.get("PITHTRAIN_KERNEL_ROOT", bundle))
+        cute.compile = CuteArtifacts(kernel_root, seal.get("cute", {}), build=False, fallback=True)
         from torch._inductor import compile_fx
 
+        from pithtrain.contexts import training as training_context
         from pithtrain.modules import training
         from pithtrain.tasks import pretrain_lm
 
@@ -111,9 +115,26 @@ def run(args):
     pretrain_lm.setup_distributed = timed("process_group", pretrain_lm.setup_distributed)
     pretrain_lm.setup_dataset = timed("dataset", pretrain_lm.setup_dataset)
     pretrain_lm.setup_training = timed("training_setup", pretrain_lm.setup_training)
-    pretrain_lm.precompute_fp8_param_scales = timed(
-        "fp8_scale_setup", pretrain_lm.precompute_fp8_param_scales, first_only=True
-    )
+    recompute_scales = pretrain_lm.precompute_fp8_param_scales
+    initial_scale_call = True
+
+    def prepare_scales():
+        nonlocal initial_scale_call
+        if not initial_scale_call:
+            return recompute_scales()
+        initial_scale_call = False
+        with measure("fp8_scale_setup"):
+            try:
+                if "initial_scales" not in seal:
+                    raise ValueError("No sealed initial scale artifact")
+                with torch.no_grad():
+                    load_initial_scales(bundle / "initial-scales.safetensors", training_context.model)
+            except (OSError, RuntimeError, ValueError, KeyError) as error:
+                record_miss("fp8_scales", "initial-scales", str(error).splitlines()[0])
+                return recompute_scales()
+            mark("initial_fp8_scales", "loaded")
+
+    pretrain_lm.precompute_fp8_param_scales = prepare_scales
     prepare_loss = timed("first_loss", pretrain_lm.prepare_cross_entropy_sum, first_only=True)
     first_loss_events = None
 

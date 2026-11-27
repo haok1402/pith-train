@@ -78,10 +78,6 @@ if [[ -n ${PITHTRAIN_INDUCTOR_SEED:-} || -n ${PITHTRAIN_INDUCTOR_MANIFEST:-} ]];
         --inductor-manifest "${PITHTRAIN_INDUCTOR_MANIFEST:?Set PITHTRAIN_INDUCTOR_MANIFEST}"
     )
 fi
-if [[ ${PITHTRAIN_PREFLIGHT_ONLY:-0} != 1 && ${#inductor_seed[@]} == 0 ]]; then
-    echo 'Training requires a verified Inductor seed and manifest.' >&2
-    exit 2
-fi
 runtime_seed=()
 if [[ -n ${PITHTRAIN_RUNTIME_SEED:-} ]]; then
     runtime_seed=(--runtime-seed "$PITHTRAIN_RUNTIME_SEED")
@@ -93,9 +89,9 @@ srun "${slurm[@]}" "${cpu_slurm[@]}" --job-name "$job_prefix-kernels" \
     env CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=2 CUTE_DSL_SHOW_STACKTRACE=1 DG_JIT_NVCC_COMPILER="$CUDA_HOME/bin/nvcc" \
         "$python" -B -m tools.fp8_preflight.prepare kernels "${model_args[@]}" \
         --ready "$output/kernels-ready" "${gemm_seed[@]}" > "$output/preflight.log" 2>&1
-# Four rank pack workers read the 50 GiB checkpoint and verify the resulting shards before sealing.
+# Four workers verify the 50 GiB rank packs and prepare initial FP8 scales.
 srun "${slurm[@]}" "${cpu_slurm[@]}" --job-name "$job_prefix-weights" \
-    -N1 -n1 -c8 --mem=48G --time=00:08:00 \
+    -N1 -n1 -c8 --mem=48G --time=00:12:00 \
     env CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=1 \
         "$python" -B -m tools.fp8_preflight.prepare weights "${model_args[@]}" \
         --kernels-ready "$output/kernels-ready" --dataset "$dataset" --steps "$steps" \
@@ -107,12 +103,16 @@ test -s "$bundle/seal.json"
 if [[ ${PITHTRAIN_PREFLIGHT_ONLY:-0} == 1 ]]; then
     exit 0
 fi
-test -s "$bundle/inductor/seal.json"
 mkdir -p "$TORCHINDUCTOR_CACHE_DIR"
-ln -s "$bundle/inductor/fxgraph" "$TORCHINDUCTOR_CACHE_DIR/fxgraph"
+if [[ -s $bundle/inductor/seal.json && -d $bundle/inductor/fxgraph ]]; then
+    cp -al "$bundle/inductor/fxgraph" "$TORCHINDUCTOR_CACHE_DIR/fxgraph"
+fi
 recipe=(--model "$model" --weights "$weights" --dataset "$output/dataset")
+status=0
 srun "${slurm[@]}" "${gpu_slurm[@]}" --job-name "$job_prefix-train" \
     -N1 -n8 --gpus=8 --gpu-bind=none -c4 --mem=128G \
     --time="${PITHTRAIN_GPU_TIME:-00:08:00}" --kill-on-bad-exit=1 -W0 \
     bash tools/fp8_preflight/slurm-worker.sh "$bundle" "$output" "${recipe[@]}" \
-        --steps "$steps" "${audit[@]}" > "$output/run.log" 2>&1
+        --steps "$steps" "${audit[@]}" > "$output/run.log" 2>&1 || status=$?
+"$python" -B -m tools.fp8_preflight.misses "$output" || echo 'WARNING: missed DeepGEMM key receipt'
+exit "$status"
