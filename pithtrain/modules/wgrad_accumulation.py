@@ -137,7 +137,7 @@ def _attach_main_grads(
                 elif grad is not None:
                     main_grad.add_(grad)
                 # A transposed main_grad is made contiguous once per step for the reduce-scatter.
-                # A precision ablation may round at reduce-scatter copy-in, after the FP32 GEMM.
+                # Keep the GEMM result in FP32 until reduce-scatter copy-in.
                 if fsdp_param.unsharded_grad_dtype != torch.float32:
                     param.grad_dtype = None
                 param.grad = main_grad.contiguous()

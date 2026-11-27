@@ -1,9 +1,10 @@
-"""Benchmark dense Qwen3.5 with FSDP2 on eight H200 GPUs."""
+"""Benchmark dense Qwen3.5 pretraining with FSDP2."""
 
 from __future__ import annotations
 
 import argparse
 import os
+from collections.abc import Callable
 from contextlib import contextmanager
 from functools import partial
 from itertools import batched
@@ -17,6 +18,7 @@ from torch.utils.checkpoint import checkpoint, create_selective_checkpoint_conte
 
 if TYPE_CHECKING:
     from pithtrain.models.qwen35 import Qwen35TextModel
+    from pithtrain.tasks.pretrain_lm import PretrainLMCfg
 
 
 def checkpoint_layers(
@@ -29,12 +31,11 @@ def checkpoint_layers(
     fp8: bool = False,
     fp8_attention: bool = False,
 ) -> None:
-    """Keep the final blocks intact, with MLP-only checkpointing immediately before them."""
+    """Checkpoint whole blocks, then only MLPs, then retain the final blocks."""
     retain_attention = fp8 and mlp_tail is None
     if mlp_tail is None:
         mlp_tail = 30 if fp8 else 12
-    # Inductor reuses FP8 projection output storage inside compiled stages.
-    # Recompute those projections so this eager checkpoint never retains their aliases.
+    # Recompute FP8 projections because compiled stages can reuse their output storage.
     saved_ops = [
         torch.ops.aten.mm.default,
         torch.ops.aten.addmm.default,
@@ -64,7 +65,7 @@ def checkpoint_layers(
         layer.forward = layer.forward_stock_stages
         if i >= keep_start:
             mixer = layer.linear_attn if layer.is_linear else layer.self_attn
-            # The mixer normally has an inner selective checkpoint inside the compiled stage.
+            # Bypass the mixer's inner checkpoint for retained blocks.
             mixer.forward = mixer.block
             continue
         checkpoint_mixer = i < tail_start and i != extra_attention
@@ -82,12 +83,12 @@ def shard_model(
     model: Qwen35TextModel,
     mesh: DeviceMesh,
     *,
-    mlp_tail: int | None = 12,
-    keep_tail: int = 0,
-    fp8_mlp_recompute: bool = False,
-    replay_mixers: str = "none",
-    fp8: bool = False,
-    fp8_attention: bool = False,
+    mlp_tail: int | None,
+    keep_tail: int,
+    fp8_mlp_recompute: bool,
+    replay_mixers: str,
+    fp8: bool,
+    fp8_attention: bool,
 ) -> None:
     checkpoint_layers(
         model,
@@ -142,7 +143,7 @@ def bulk_reduce_scatter_packing(enabled: bool):
         _fsdp_collectives.foreach_reduce_scatter_copy_in = original
 
 
-if __name__ == "__main__":
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=Path("examples/pretrain_lm/qwen3.5-27b"))
     parser.add_argument("--weights", type=Path)
@@ -177,13 +178,14 @@ if __name__ == "__main__":
         parser.error("--fp8-mlp-recompute requires --fp8")
     if args.fp8_shard_cache_mib is not None and args.fp8_shard_cache_mib < 0:
         parser.error("--fp8-shard-cache-mib must be nonnegative")
+    return args
 
-    # PithTrain's kernel imports query the current GPU.
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
+def customize(
+    cfg: PretrainLMCfg, args: argparse.Namespace
+) -> Callable[[Qwen35TextModel, DeviceMesh], None]:
     from pithtrain.modules.training import make_adamw_optimizer, make_constant_scheduler
-    from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
-    cfg = PretrainLMCfg()
     cfg.dataset = args.dataset if args.dataset is not None else Path(".")
     train = cfg.training
     train.model = args.model
@@ -200,13 +202,13 @@ if __name__ == "__main__":
     if args.fp8 and mlp_tail is None:
         train.fp8_shard_cache_bytes = 1 << 30
         if args.fp8_attention:
-            # Free space for Delta-Matching's backward workspace at microbatch four.
+            # Reserve space for the Delta-Matching backward workspace.
             mlp_tail = 16 if args.fp8_mlp_recompute else 29
     if args.fp8_shard_cache_mib is not None:
         train.fp8_shard_cache_bytes = args.fp8_shard_cache_mib << 20
-    train.optimizer = partial(make_adamw_optimizer, fused=True)
+    train.optimizer = make_adamw_optimizer
     train.scheduler = make_constant_scheduler
-    shard = partial(
+    return partial(
         shard_model,
         mlp_tail=mlp_tail,
         keep_tail=args.checkpoint_keep_tail,
@@ -215,5 +217,19 @@ if __name__ == "__main__":
         fp8=args.fp8,
         fp8_attention=args.fp8_attention,
     )
-    with bulk_reduce_scatter_packing(args.fp8):
+
+
+def main() -> None:
+    args = parse_args()
+    # PithTrain's kernel imports query the current GPU.
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
+
+    cfg = PretrainLMCfg()
+    shard = customize(cfg, args)
+    with bulk_reduce_scatter_packing(cfg.training.fp8):
         launch(cfg, shard_dense_model=shard)
+
+
+if __name__ == "__main__":
+    main()
