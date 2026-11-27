@@ -82,12 +82,15 @@ def fp8_gemm_bwd(grad_2d: torch.Tensor, weight_t_fp8: torch.Tensor, scale_weight
     - quantized_grad: optional prequantized fp8_quant_grad operands with identical scales.
     """
     M, N = grad_2d.shape
+    hopper_main_grad = main_grad is not None and ARCH_MAJOR == 9
+    if hopper_main_grad:
+        assert scale_input_t.ndim == 2 and scale_input_t.stride() == (max(1, scale_input_t.shape[1]), 1), "Dense SM90 FP8 wgrad requires row-major transposed activation scales"
     if quantized_grad is None:
         quantized_grad = fp8_quant_grad(grad_2d)
     grad_fp8, scale_grad, grad_t_fp8, scale_grad_t = quantized_grad
     grad_input = fp8_gemm_nt(grad_fp8, scale_grad, weight_t_fp8, scale_weight_t, M, k, grad_2d.device, grad_2d.dtype)
     if main_grad is not None:
-        if ARCH_MAJOR == 9:
+        if hopper_main_grad:
             fp8_wgrad(grad_t_fp8, scale_grad_t, input_t_fp8, scale_input_t, main_grad)
         else:
             main_grad.zero_()

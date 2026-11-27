@@ -16,7 +16,7 @@ from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
 from pithtrain.kernels.cute_ptx_sm90 import asm, to_ir, unpack as unpack_registers
 from pithtrain.kernels.fp8_scale_layout import to_mn_major
 
-__all__ = ["fp8_wgrad_sm90"]
+__all__ = ["fp8_wgrad_sm90", "fp8_wgrad_sm90_can_tile"]
 
 BLOCK_K = 128
 SMEM_CAPACITY = 232448
@@ -43,6 +43,15 @@ def shared_footprint(block_m, block_n, num_k, rowwise):
     if rowwise:
         stage_bytes += align_up(4 * block_n, 128)
     return reserved, stage_bytes
+
+
+def fp8_wgrad_sm90_can_tile(M, num_k, rowwise):
+    """
+    Whether the smallest unclustered tile for block_n_multiple=1 can fit four stages.
+    """
+    block_m = 16 if M <= 16 else 32 if M <= 32 else 64
+    reserved, stage_bytes = shared_footprint(block_m, 16, num_k, rowwise)
+    return reserved + 4 * stage_bytes <= SMEM_CAPACITY
 
 
 def select_layout(M, N, K, num_sms, rowwise=False, block_n_multiple=1):

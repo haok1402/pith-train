@@ -34,11 +34,14 @@ def is_mn_major(sf: torch.Tensor) -> bool:
 
 def to_mn_major(sf: torch.Tensor) -> torch.Tensor:
     """
-    The scale sf in the MN-major layout: sf itself when it already is, else an MN-major copy.
+    The scale sf in the MN-major layout for TMA, with an aligned base and full padded columns.
     """
-    if is_mn_major(sf):
+    mn, sf_k = sf.shape
+    padded = mn_pad(mn)
+    end = sf.storage_offset() + padded * sf_k
+    if is_mn_major(sf) and sf.data_ptr() % 16 == 0 and end * sf.element_size() <= sf.untyped_storage().nbytes():
         return sf
-    out = mn_major_scale(sf.shape[0], sf.shape[1], sf.device)
+    out = torch.empty((sf_k, padded), dtype=torch.float32, device=sf.device).T[:mn]
     out.copy_(sf)
     return out
 
