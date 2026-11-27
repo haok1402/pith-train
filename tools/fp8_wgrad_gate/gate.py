@@ -265,6 +265,14 @@ def compile_cute(root, rows):
     return entries
 
 
+def reference_shape(dims, rowwise):
+    m, n, k = dims
+    if rowwise:
+        # The 1D×1D reference must select full 64-row WGMMA tiles.
+        return ceildiv(m, 64) * 64, ceildiv(n, 64) * 64, ceildiv(k, 128) * 128
+    return m, ceildiv(n, 8) * 8, k
+
+
 def native_requests(rows, kind, stock):
     if kind == "stock":
         return [(stock, shape(row)) for row in rows] + [
@@ -276,14 +284,14 @@ def native_requests(rows, kind, stock):
         ]
     requests = [("block", shape(row)) for row in rows]
     for edge in edge_cases():
-        m, n, k = edge["shape"]
-        if m and n and k:
-            requests.append(("row" if edge.get("rowwise") else "block", (m, ceildiv(n, 8) * 8, k)))
+        if all(edge["shape"]):
+            rowwise = edge.get("rowwise", False)
+            requests.append(("row" if rowwise else "block", reference_shape(edge["shape"], rowwise)))
     return requests + [("block", SMOKE), ("bf16", SMOKE)]
 
 
 def build_native(root, package, requests):
-    root.mkdir()
+    root.mkdir(exist_ok=True)
     cpu_source = root / "host.cpp"
     template = (REPO / "tools/fp8_preflight/deepgemm.cpp").read_text().split("int main(")[0]
     cpu_source.write_text(template + HOST_MAIN)
@@ -550,30 +558,26 @@ def dense_exact(args, plan, torch, dg):
     return {"dense": results, "edges": edges}
 
 
-def legal_reference(torch, dg, data, rowwise, shape):
-    m, n, k = shape
+def legal_reference(torch, dg, data, rowwise, dims):
+    m, n, k = dims
     if not m or not n or not k:
         return torch.zeros((m, n), device="cuda", dtype=torch.float32)
     grad, gs, act, acs = data
-    padded_n = ceildiv(n, 8) * 8
-    # DeepGEMM requires aligned physical rows and an N divisible by eight.
-    # Extend only physical pitch and unused output columns.
-    pitch = ceildiv(k, 16) * 16
-    aligned_grad = scratch_tensor((m, k), pitch, 0, "cuda", grad.dtype)
-    aligned_grad.copy_(grad)
-    aligned_act = scratch_tensor((padded_n, k), pitch, 0, "cuda", act.dtype)
-    aligned_act.zero_()
-    aligned_act[:n].copy_(act)
-    if rowwise and padded_n != n:
-        aligned_scale = acs.new_zeros((padded_n, acs.shape[1]))
-        aligned_scale[:n].copy_(acs)
-    else:
-        aligned_scale = acs.contiguous()
-    output = torch.empty((m, padded_n), device="cuda", dtype=torch.float32)
-    reference_launch(
-        dg, (aligned_grad, gs.contiguous(), aligned_act, aligned_scale), output, rowwise
-    )
-    return output[:, :n]
+    ref_m, ref_n, ref_k = reference_shape(dims, rowwise)
+    pitch = ceildiv(ref_k, 16) * 16
+    aligned = []
+    for codes, rows in ((grad, ref_m), (act, ref_n)):
+        view = scratch_tensor((rows, ref_k), pitch, 0, "cuda", codes.dtype)
+        view.view(torch.uint8).zero_()
+        view[: codes.shape[0], :k].copy_(codes)
+        aligned.append(view)
+    grad_scale = gs.new_zeros((ref_m, gs.shape[1]))
+    grad_scale[:m].copy_(gs)
+    act_scale = acs.new_zeros((ref_n if rowwise else ceildiv(ref_n, 128), acs.shape[1]))
+    act_scale[: acs.shape[0]].copy_(acs)
+    output = torch.empty((ref_m, ref_n), device="cuda", dtype=torch.float32)
+    reference_launch(dg, (aligned[0], grad_scale, aligned[1], act_scale), output, rowwise)
+    return output[:m, :n]
 
 
 def check_edges(torch, dg, cases, *, caller_stream=False):

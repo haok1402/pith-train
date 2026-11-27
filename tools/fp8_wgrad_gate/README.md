@@ -27,7 +27,7 @@ prefix in the external launch commands.
 - **Exactness.** All 55 block-scale geometries must match the pinned patched DeepGEMM FP32 bits
   on recipe and signed-zero/subnormal inputs. The guard suite also covers odd M, K and N tails,
   offsets, zero work and all 132 visible SM counts. For an illegal reference layout the oracle
-  makes aligned copies and trims unused output columns.
+  makes aligned, zero-padded copies and trims unused output rows and columns.
 - **Timing.** Supply a comma-separated matrix ID for every touched production route and every
   distinct affected geometry. The script adds the nearest production geometry to each ID by
   summed log2 distance in M, N and K. Use `dispatch` for a change to the shared entry guard.
