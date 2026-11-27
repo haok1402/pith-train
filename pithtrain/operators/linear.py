@@ -75,7 +75,38 @@ def _(grad_output_2d, weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t, 
     return grad_input, weight_grad
 
 
-@torch.library.custom_op("pithtrain::fp8_linear_bwd_into", mutates_args=("main_grad",))
+def _fp8_backward_into_main_grad(
+    grad_output,
+    weight_t_fp8,
+    scale_weight_t,
+    input_t_fp8,
+    scale_input_t,
+    K,
+    main_grad,
+    written,
+    quantized_grad=None,
+):
+    # The FP8 GEMM overwrites its destination.
+    accumulate = written is not None and written.item()
+    dest = torch.empty_like(main_grad) if accumulate else main_grad
+    grad_input, _ = fp8_gemm_bwd(
+        grad_output,
+        weight_t_fp8,
+        scale_weight_t,
+        input_t_fp8,
+        scale_input_t,
+        K,
+        dest,
+        quantized_grad,
+    )
+    if accumulate:
+        main_grad.add_(dest)
+    elif written is not None:
+        written.fill_(True)
+    return grad_input
+
+
+@torch.library.custom_op("pithtrain::fp8_linear_bwd_into", mutates_args=("main_grad", "written"))
 def fp8_linear_bwd_into(
     grad_output: torch.Tensor,
     weight_t_fp8: torch.Tensor,
@@ -84,21 +115,24 @@ def fp8_linear_bwd_into(
     scale_input_t: torch.Tensor,
     K: int,
     main_grad: torch.Tensor,
+    written: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    grad_input, _ = fp8_gemm_bwd(
-        grad_output,
-        weight_t_fp8,
-        scale_weight_t,
-        input_t_fp8,
-        scale_input_t,
-        K,
-        main_grad,
+    return _fp8_backward_into_main_grad(
+        grad_output, weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t, K, main_grad, written
     )
-    return grad_input
 
 
 @fp8_linear_bwd_into.register_fake
-def _(grad_output, weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t, K, main_grad):
+def _(
+    grad_output,
+    weight_t_fp8,
+    scale_weight_t,
+    input_t_fp8,
+    scale_input_t,
+    K,
+    main_grad,
+    written=None,
+):
     return grad_output.new_empty((grad_output.shape[0], K))
 
 
@@ -217,6 +251,7 @@ class FP8LinearMainGradFunc(torch.autograd.Function):
         scale_weight_t: torch.Tensor,
         main_grad: torch.Tensor,
         quantized_input: Optional[Tuple[torch.Tensor, ...]],
+        written: torch.Tensor | None,
     ) -> torch.Tensor:
         if quantized_input is None:
             output, input_t_fp8, scale_input_t = fp8_linear_fwd(
@@ -235,18 +270,21 @@ class FP8LinearMainGradFunc(torch.autograd.Function):
             _, _, input_t_fp8, scale_input_t = quantized_input
         ctx.save_for_backward(weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t)
         ctx.main_grad = main_grad
+        ctx.written = written
         ctx.K = input_2d.shape[1]
         return output
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        grad_input = fp8_linear_bwd_into(grad_output, *ctx.saved_tensors, ctx.K, ctx.main_grad)
-        return grad_input, None, None, None, None, None, None, None
+        grad_input = fp8_linear_bwd_into(
+            grad_output, *ctx.saved_tensors, ctx.K, ctx.main_grad, ctx.written
+        )
+        return grad_input, None, None, None, None, None, None, None, None
 
 
 class FP8SwiGLUDownProjection(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, gate, up, weight, quantized_weight, main_grad):
+    def forward(ctx, gate, up, weight, quantized_weight, main_grad, written):
         weight_fp8, scale_weight, weight_t_fp8, scale_weight_t = quantized_weight
         activation_fp8, scale, activation_t_fp8, scale_t = fp8_quant_swiglu(gate, up)
         output = fp8_linear_fwd_prequantized(
@@ -263,6 +301,7 @@ class FP8SwiGLUDownProjection(torch.autograd.Function):
         )
         ctx.save_for_backward(gate, up, weight_t_fp8, scale_weight_t, activation_t_fp8, scale_t)
         ctx.main_grad = main_grad
+        ctx.written = written
         return output
 
     @staticmethod
@@ -272,14 +311,16 @@ class FP8SwiGLUDownProjection(torch.autograd.Function):
             grad_activation, grad_weight = fp8_linear_bwd(grad_output, *operands, gate.shape[1])
         else:
             grad_activation = fp8_linear_bwd_into(
-                grad_output, *operands, gate.shape[1], ctx.main_grad
+                grad_output, *operands, gate.shape[1], ctx.main_grad, ctx.written
             )
             grad_weight = None
         grad_gate, grad_up = silu_mul_bwd(grad_activation, gate, up)
-        return grad_gate, grad_up, grad_weight, None, None
+        return grad_gate, grad_up, grad_weight, None, None, None
 
 
-@torch.library.custom_op("pithtrain::fp8_delta_gate_bwd_into", mutates_args=("main_grad",))
+@torch.library.custom_op(
+    "pithtrain::fp8_delta_gate_bwd_into", mutates_args=("main_grad", "written")
+)
 def fp8_delta_gate_bwd_into(
     grad: torch.Tensor,
     value: torch.Tensor,
@@ -292,12 +333,20 @@ def fp8_delta_gate_bwd_into(
     scale_input_t: torch.Tensor,
     K: int,
     main_grad: torch.Tensor,
+    written: torch.Tensor | None = None,
 ) -> torch.Tensor:
     quantized_grad = fp8_quant_delta_grad(grad, value, gate, weight, inv_rms)
-    grad_input, _ = fp8_gemm_bwd(
-        grad, weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t, K, main_grad, quantized_grad
+    return _fp8_backward_into_main_grad(
+        grad,
+        weight_t_fp8,
+        scale_weight_t,
+        input_t_fp8,
+        scale_input_t,
+        K,
+        main_grad,
+        written,
+        quantized_grad,
     )
-    return grad_input
 
 
 @fp8_delta_gate_bwd_into.register_fake
@@ -313,6 +362,7 @@ def _(
     scale_input_t,
     K,
     main_grad,
+    written=None,
 ):
     return grad.new_empty((grad.shape[0], K))
 
@@ -329,9 +379,11 @@ class FP8DeltaGateProjection(torch.autograd.Function):
         weight,
         quantized_weight,
         main_grad,
+        written,
         z_weight,
         z_quantized_weight,
         z_main_grad,
+        z_written,
     ):
         gate = fp8_linear_fwd_prequantized(hidden, z_weight, *z_quantized_weight, *input_operands)
         width = norm_weight.numel()
@@ -356,7 +408,9 @@ class FP8DeltaGateProjection(torch.autograd.Function):
             *input_operands[2:],
         )
         ctx.main_grad = main_grad
+        ctx.written = written
         ctx.z_main_grad = z_main_grad
+        ctx.z_written = z_written
         ctx.hidden_width = hidden.shape[1]
         return output
 
@@ -365,7 +419,7 @@ class FP8DeltaGateProjection(torch.autograd.Function):
         value, gate, norm_weight, inv_rms, *operands = ctx.saved_tensors
         out_operands, z_operands = operands[:4], operands[4:]
         grad_activation = fp8_linear_bwd_into(
-            grad_output, *out_operands, value.shape[1], ctx.main_grad
+            grad_output, *out_operands, value.shape[1], ctx.main_grad, ctx.written
         )
         width = norm_weight.numel()
         x, z, grad = (tensor.view(-1, width).float() for tensor in (value, gate, grad_activation))
@@ -385,12 +439,15 @@ class FP8DeltaGateProjection(torch.autograd.Function):
             *z_operands,
             ctx.hidden_width,
             ctx.z_main_grad,
+            ctx.z_written,
         )
         return (
             grad_value.to(value.dtype).view_as(value),
             grad_hidden,
             None,
             grad_norm_weight.to(norm_weight.dtype),
+            None,
+            None,
             None,
             None,
             None,
@@ -410,6 +467,7 @@ class FP8Linear(nn.Linear):
 
     fp8_param_gather: bool = False
     main_grad: Optional[torch.Tensor] = None
+    main_grad_written: Optional[torch.Tensor] = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -420,7 +478,12 @@ class FP8Linear(nn.Linear):
         """Project silu(gate) * up with fused activation quantization in eager execution."""
         gate_2d, up_2d = gate.flatten(0, -2), up.flatten(0, -2)
         output = FP8SwiGLUDownProjection.apply(
-            gate_2d, up_2d, self.weight, self.get_quantized_weight(), self.main_grad
+            gate_2d,
+            up_2d,
+            self.weight,
+            self.get_quantized_weight(),
+            self.main_grad,
+            self.main_grad_written,
         ).view(*gate.shape[:-1], self.out_features)
         if self.bias is not None:
             output = output + self.bias
@@ -444,9 +507,11 @@ class FP8Linear(nn.Linear):
             self.weight,
             self.get_quantized_weight(),
             self.main_grad,
+            self.main_grad_written,
             z_proj.weight,
             z_proj.get_quantized_weight(),
             z_proj.main_grad,
+            z_proj.main_grad_written,
         ).view(*value.shape[:-1], self.out_features)
         return output if self.bias is None else output + self.bias
 
@@ -486,7 +551,12 @@ class FP8Linear(nn.Linear):
         input_2d = input.flatten(0, -2)
         if self.main_grad is not None and torch.is_grad_enabled():
             output_2d = FP8LinearMainGradFunc.apply(
-                input_2d, self.weight, *quantized_weight, self.main_grad, quantized_input
+                input_2d,
+                self.weight,
+                *quantized_weight,
+                self.main_grad,
+                quantized_input,
+                self.main_grad_written,
             )
         elif quantized_input is not None:
             output_2d = fp8_linear_fwd_prequantized(
@@ -512,7 +582,7 @@ class FP8SwiGLUMainGrad(torch.autograd.Function):
     """Quantize both rounded SwiGLU adjoints before the gate and up projection backpropagation."""
 
     @staticmethod
-    def forward(ctx, x, gate_weight, up_weight, down_weight, qweights, main_grads, replay):
+    def forward(ctx, x, gate_weight, up_weight, down_weight, qweights, main_grads, written, replay):
         gate_quantized, up_quantized, down_quantized = qweights
         quantized_x = fp8_quantize_activation(x)
         gate = fp8_linear_fwd_prequantized(x, gate_weight, *gate_quantized, *quantized_x)
@@ -533,6 +603,7 @@ class FP8SwiGLUMainGrad(torch.autograd.Function):
                 *quantized_hidden[2:],
             )
         ctx.main_grads = main_grads
+        ctx.written = written
         ctx.input_features = x.shape[1]
         return output
 
@@ -594,17 +665,25 @@ class FP8SwiGLUMainGrad(torch.autograd.Function):
                 hidden_scale_t,
             ) = ctx.saved_tensors
         gate_main_grad, up_main_grad, down_main_grad = ctx.main_grads
+        gate_written, up_written, down_written = ctx.written
         M, N = gate.shape
         grad_hidden = fp8_linear_bwd_into(
-            grad_output, weight_down_t, scale_down_t, hidden_t, hidden_scale_t, N, down_main_grad
+            grad_output,
+            weight_down_t,
+            scale_down_t,
+            hidden_t,
+            hidden_scale_t,
+            N,
+            down_main_grad,
+            down_written,
         )
         offsets = torch.full((1,), M, dtype=torch.int32, device=gate.device)
         grad_gate, grad_up = fp8_silu_mul_bwd(grad_hidden, gate, up, offsets)
 
-        def project(grad, activation, weight_t, scale_t, main_grad):
+        def project(grad, activation, weight_t, scale_t, main_grad, written):
             grad_fp8, grad_scale, grad_ch_fp8, grad_ch_scale = grad
             grad_t = fp8_channels_as_rows(grad_ch_fp8, grad_ch_scale, M, N)
-            grad_input, _ = fp8_gemm_bwd(
+            return _fp8_backward_into_main_grad(
                 activation,
                 weight_t,
                 scale_t,
@@ -612,13 +691,15 @@ class FP8SwiGLUMainGrad(torch.autograd.Function):
                 input_scale_t,
                 ctx.input_features,
                 main_grad,
+                written,
                 (grad_fp8, grad_scale, *grad_t),
             )
-            return grad_input
 
-        grad_x_up = project(grad_up, up, weight_up_t, scale_up_t, up_main_grad)
-        grad_x_gate = project(grad_gate, gate, weight_gate_t, scale_gate_t, gate_main_grad)
-        return grad_x_up + grad_x_gate, None, None, None, None, None, None
+        grad_x_up = project(grad_up, up, weight_up_t, scale_up_t, up_main_grad, up_written)
+        grad_x_gate = project(
+            grad_gate, gate, weight_gate_t, scale_gate_t, gate_main_grad, gate_written
+        )
+        return grad_x_up + grad_x_gate, None, None, None, None, None, None, None
 
 
 def fp8_swiglu_main_grad(x, gate_proj, up_proj, down_proj, *, replay=False):
@@ -626,6 +707,7 @@ def fp8_swiglu_main_grad(x, gate_proj, up_proj, down_proj, *, replay=False):
     projections = gate_proj, up_proj, down_proj
     quantized_weights = tuple(layer.get_quantized_weight() for layer in projections)
     main_grads = tuple(layer.main_grad for layer in projections)
+    written = tuple(layer.main_grad_written for layer in projections)
     output = FP8SwiGLUMainGrad.apply(
         x.flatten(0, -2),
         gate_proj.weight,
@@ -633,6 +715,7 @@ def fp8_swiglu_main_grad(x, gate_proj, up_proj, down_proj, *, replay=False):
         down_proj.weight,
         quantized_weights,
         main_grads,
+        written,
         replay,
     )
     return output.view(*x.shape[:-1], down_proj.out_features)
@@ -669,6 +752,21 @@ def lower_wgrad_accumulate(main_grad: Any, a: Any, b: Any, overwrite: bool = Fal
     )
 
 
+@torch.library.custom_op("pithtrain::bf16_wgrad_into", mutates_args=("main_grad", "written"))
+def bf16_wgrad_into(
+    main_grad: torch.Tensor, a: torch.Tensor, b: torch.Tensor, written: torch.Tensor
+) -> None:
+    accumulate = written.item()
+    wgrad_accumulate_cuda(main_grad, a, b, overwrite=not accumulate)
+    if not accumulate:
+        written.fill_(True)
+
+
+@bf16_wgrad_into.register_fake
+def _(main_grad, a, b, written):
+    return None
+
+
 class BF16LinearFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -676,7 +774,7 @@ class BF16LinearFunc(torch.autograd.Function):
         input: torch.Tensor,
         weight: torch.Tensor,
         main_grad: torch.Tensor,
-        overwrite: bool,
+        overwrite: bool | torch.Tensor,
     ) -> torch.Tensor:
         ctx.save_for_backward(input, weight)
         # Kept off the saved tensors: other micro-batches update main_grad in place meanwhile.
@@ -693,9 +791,12 @@ class BF16LinearFunc(torch.autograd.Function):
         grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
         input_2d = input.reshape(-1, input.shape[-1])
         grad_input = (grad_output_2d @ weight).view(*input.shape)
-        torch.ops.pithtrain.wgrad_accumulate_(
-            main_grad, grad_output_2d.t(), input_2d, ctx.overwrite
-        )
+        if isinstance(ctx.overwrite, torch.Tensor):
+            bf16_wgrad_into(main_grad, grad_output_2d.t(), input_2d, ctx.overwrite)
+        else:
+            torch.ops.pithtrain.wgrad_accumulate_(
+                main_grad, grad_output_2d.t(), input_2d, ctx.overwrite
+            )
         return grad_input, None, None, None
 
 
@@ -705,6 +806,7 @@ class BF16Linear(nn.Linear):
     """
 
     main_grad: Optional[torch.Tensor] = None
+    main_grad_written: Optional[torch.Tensor] = None
     overwrite_main_grad: bool = False
 
     @staticmethod
@@ -714,5 +816,8 @@ class BF16Linear(nn.Linear):
     def forward(self, input: torch.Tensor, quantized_input: None = None) -> torch.Tensor:
         if self.main_grad is None or not torch.is_grad_enabled():
             return F.linear(input, self.weight, self.bias)
-        output = BF16LinearFunc.apply(input, self.weight, self.main_grad, self.overwrite_main_grad)
+        overwrite = (
+            self.overwrite_main_grad if self.main_grad_written is None else self.main_grad_written
+        )
+        output = BF16LinearFunc.apply(input, self.weight, self.main_grad, overwrite)
         return output if self.bias is None else output + self.bias

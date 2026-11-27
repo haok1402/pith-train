@@ -8,7 +8,8 @@ bf16 and no bf16 temporary is allocated. setup_model enables it for every run, B
 
 install_wgrad_accumulation connects these layers to FSDP2 after fully_shard by extending two methods
 of each parameter group:
-- pre_backward allocates and zeroes main_grad at the first backward of the step.
+- pre_backward allocates main_grad. In dense overwrite mode the first wgrad writes it directly,
+  and later wgrads accumulate in fp32 until reduction. A weight skipped in backward contributes zero.
 - post_backward, when the group reduces, hands main_grad to FSDP2 as the gradient of the parameter
   and releases its memory once FSDP2 has copied it into the reduce-scatter input.
 
@@ -52,6 +53,9 @@ def install_wgrad_accumulation(model: nn.Module, *, overwrite: bool = False) -> 
     Give every BF16Linear, GroupedLinear and FP8GroupedLinear weight in the model a main_grad,
     after fully_shard. The dense overwrite path also installs FP8Linear buffers.
     """
+    linear_types = (BF16Linear, GroupedLinear, FP8GroupedLinear)
+    if overwrite:
+        linear_types += (FP8Linear,)
     seen_groups = set()
     for module in model.modules():
         if not isinstance(module, FSDPModule):
@@ -64,32 +68,44 @@ def install_wgrad_accumulation(model: nn.Module, *, overwrite: bool = False) -> 
             pairs = []
             for fsdp_param in group.fsdp_params:
                 assert isinstance(fsdp_param, FSDPParam)
-                owner = fsdp_param._module_info.module
-                if fsdp_param._module_info.param_name != "weight":
+                info = fsdp_param._module_info
+                module_params = [(info.module, info.param_name)]
+                if overwrite:
+                    module_params.extend(zip(info.shared_modules, info.shared_param_names))
+                owners = [
+                    owner
+                    for owner, name in module_params
+                    if name == "weight" and isinstance(owner, linear_types)
+                ]
+                if not owners:
                     continue
-                if not isinstance(owner, (BF16Linear, GroupedLinear, FP8GroupedLinear)) and not (
-                    overwrite and isinstance(owner, FP8Linear)
+                if overwrite and any(
+                    not isinstance(owner, (BF16Linear, FP8Linear)) for owner in owners
                 ):
-                    continue
-                if overwrite and not isinstance(owner, FP8Linear):
-                    if not isinstance(owner, BF16Linear):
-                        raise ValueError("Overwriting wgrad requires single-use BF16 linears")
-                    owner.overwrite_main_grad = True
+                    raise ValueError("Overwriting wgrad requires dense linears")
                 size, device = fsdp_param._orig_size, fsdp_param.device
-                if isinstance(owner, FP8GroupedLinear):
+                if isinstance(owners[0], FP8GroupedLinear):
                     # Laid out as the k-grouped FP8 wgrad accumulates in place (transposed where
                     # it computes the product transposed), not transposed twice per micro-batch.
-                    owner.main_grad = fp8_grouped_wgrad_empty(size, device)
+                    main_grad = fp8_grouped_wgrad_empty(size, device)
                 else:
-                    owner.main_grad = torch.empty(size, dtype=torch.float32, device=device)
-                owner.main_grad.untyped_storage().resize_(0)
-                pairs.append((fsdp_param, owner.main_grad))
+                    main_grad = torch.empty(size, dtype=torch.float32, device=device)
+                main_grad.untyped_storage().resize_(0)
+                written = None
+                if overwrite:
+                    # A CPU scalar tracks writes in eager and compiled backward without a sync.
+                    written = torch.zeros((), dtype=torch.bool, device="cpu")
+                for owner in owners:
+                    owner.main_grad = main_grad
+                    if written is not None:
+                        owner.main_grad_written = written
+                pairs.append((fsdp_param, main_grad, written))
             if pairs:
-                _attach_main_grads(group, pairs, overwrite=overwrite)
+                _attach_main_grads(group, pairs)
 
 
 def _attach_main_grads(
-    group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch.Tensor]], *, overwrite: bool = False
+    group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch.Tensor, torch.Tensor | None]]
 ) -> None:
     """
     Make the group allocate main_grad at the start of backward and reduce it in place of a .grad.
@@ -97,10 +113,10 @@ def _attach_main_grads(
     orig_pre_backward, orig_post_backward = group.pre_backward, group.post_backward
 
     def pre_backward(*args: Any) -> None:
-        for _, main_grad in pairs:
+        for _, main_grad, written in pairs:
             if main_grad.untyped_storage().size() == 0:
                 main_grad.untyped_storage().resize_(main_grad.numel() * main_grad.element_size())
-                if not overwrite:
+                if written is None:
                     main_grad.zero_()
         orig_pre_backward(*args)
 
@@ -109,11 +125,17 @@ def _attach_main_grads(
             orig_post_backward(*args)
             return
         # Keep any gradient the weight got outside its layer, e.g. kv_b_proj in MLA ring attention.
-        for fsdp_param, main_grad in pairs:
+        for fsdp_param, main_grad, written in pairs:
             if main_grad.untyped_storage().size() > 0:
                 param = fsdp_param.unsharded_param
-                if param.grad is not None:
-                    main_grad.add_(param.grad)
+                grad = param.grad
+                if written is not None and not written.item():
+                    if grad is None:
+                        main_grad.zero_()
+                    else:
+                        main_grad.copy_(grad)
+                elif grad is not None:
+                    main_grad.add_(grad)
                 # A transposed main_grad is made contiguous once per step for the reduce-scatter.
                 # A precision ablation may round at reduce-scatter copy-in, after the FP32 GEMM.
                 if fsdp_param.unsharded_grad_dtype != torch.float32:
@@ -121,8 +143,10 @@ def _attach_main_grads(
                 param.grad = main_grad.contiguous()
         orig_post_backward(*args)
         # FSDP2 has copied main_grad into the reduce-scatter input on this stream.
-        for _, main_grad in pairs:
+        for _, main_grad, written in pairs:
             main_grad.untyped_storage().resize_(0)
+            if written is not None:
+                written.fill_(False)
 
     group.pre_backward = pre_backward
     group.post_backward = post_backward
@@ -148,7 +172,7 @@ def install_raw_main_grad(model: nn.Module) -> None:
                 mg = torch.empty(fsdp_param._orig_size, dtype=torch.float32, device=fsdp_param.device)  # fmt: skip
                 mg.untyped_storage().resize_(0)
                 owner.__dict__.setdefault(MAIN_GRADS, {})[name] = mg
-                pairs.append((fsdp_param, mg))
+                pairs.append((fsdp_param, mg, None))
             if pairs:
                 _attach_main_grads(group, pairs)
 
