@@ -22,6 +22,7 @@ from pithtrain.kernels import (
     fp8_quant_swiglu,
     fp8_quant_weight,
     fp8_silu_mul_bwd,
+    fp8_wgrad_supported,
     silu_mul_bwd,
 )
 
@@ -85,6 +86,7 @@ def fp8_linear_bwd_into(
     K: int,
     main_grad: torch.Tensor,
 ) -> torch.Tensor:
+    _assert_wgrad_activation_scale_layout(scale_input_t)
     grad_input, _ = fp8_gemm_bwd(
         grad_output,
         weight_t_fp8,
@@ -100,6 +102,14 @@ def fp8_linear_bwd_into(
 @fp8_linear_bwd_into.register_fake
 def _(grad_output, weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t, K, main_grad):
     return grad_output.new_empty((grad_output.shape[0], K))
+
+
+def _assert_wgrad_activation_scale_layout(scale_input_t: torch.Tensor) -> None:
+    if fp8_wgrad_supported():
+        assert scale_input_t.ndim == 2 and scale_input_t.stride() == (
+            max(1, scale_input_t.shape[1]),
+            1,
+        ), "Dense SM90 FP8 wgrad requires row-major transposed activation scales"
 
 
 def fp8_linear_setup_context(ctx, inputs, output):
@@ -293,6 +303,7 @@ def fp8_delta_gate_bwd_into(
     K: int,
     main_grad: torch.Tensor,
 ) -> torch.Tensor:
+    _assert_wgrad_activation_scale_layout(scale_input_t)
     quantized_grad = fp8_quant_delta_grad(grad, value, gate, weight, inv_rms)
     grad_input, _ = fp8_gemm_bwd(
         grad, weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t, K, main_grad, quantized_grad
@@ -595,6 +606,7 @@ class FP8SwiGLUMainGrad(torch.autograd.Function):
             ) = ctx.saved_tensors
         gate_main_grad, up_main_grad, down_main_grad = ctx.main_grads
         M, N = gate.shape
+        _assert_wgrad_activation_scale_layout(input_scale_t)
         grad_hidden = fp8_linear_bwd_into(
             grad_output, weight_down_t, scale_down_t, hidden_t, hidden_scale_t, N, down_main_grad
         )
