@@ -34,7 +34,7 @@ prefix in the external launch commands.
   Both orders use the same operands and output address, a 700 W H200, 32-launch CUDA graphs,
   at least 2 s of reference preconditioning, 250 ms of warmup per arm and at least 750 ms per
   timed arm. Each order keeps two A/B and two A/A pairs. A case fails if both order medians
-  exceed +0.70%. The receipt retains one-order excursions and telemetry.
+  exceed +0.70%. The receipt retains one-order excursions and samples GPU telemetry from job startup.
 - **Memcheck.** Compute Sanitizer must exit successfully and report zero errors. The caller-stream
   dependency and offset cases must still match, including output guard regions.
 - **Integration.** The preflight launcher must load the sealed CPU artifacts for the eager,

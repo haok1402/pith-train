@@ -57,6 +57,16 @@ int main(int argc, char** argv) {
     std::string tag, template_path, mode;
     int m, n, k;
     while (requests >> tag >> template_path >> mode >> m >> n >> k) {
+        if (mode == "transpose") {
+            std::ifstream input(template_path);
+            if (!input) return 2;
+            const std::string format{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+            int threads = 512, block_mn = 64, block_sf_k = 128;
+            const auto code = std::vformat(format, std::make_format_args(threads, block_mn, k, block_sf_k));
+            auto path = jit->compile_without_load(tag, code);
+            std::cout << "GATE 0 0 0 0 0 0 0 0 0 132 " << path.string() << std::endl;
+            continue;
+        }
         const bool accumulate = mode == "stock";
         const bool one_d = accumulate || mode == "row";
         const bool bf16 = mode == "bf16" || mode == "bf16-mnk";
@@ -273,21 +283,37 @@ def reference_shape(dims, rowwise):
     return m, ceildiv(n, 8) * 8, k
 
 
+def scale_transposes(widths):
+    return [("transpose", (0, 0, width)) for width in sorted(set(widths))]
+
+
 def native_requests(rows, kind, stock):
     if kind == "stock":
-        return [(stock, shape(row)) for row in rows] + [
-            (
-                "bf16-mnk" if k == 16384 and (n, m) in ((17408, 5120), (5120, 17408)) else "bf16",
-                (k, n, m),
-            )
-            for m, n, k in map(shape, rows)
-        ]
+        return (
+            scale_transposes(ceildiv(row["K"], 128) for row in rows)
+            + [(stock, shape(row)) for row in rows]
+            + [
+                (
+                    "bf16-mnk"
+                    if k == 16384 and (n, m) in ((17408, 5120), (5120, 17408))
+                    else "bf16",
+                    (k, n, m),
+                )
+                for m, n, k in map(shape, rows)
+            ]
+        )
     requests = [("block", shape(row)) for row in rows]
     for edge in edge_cases():
         if all(edge["shape"]):
             rowwise = edge.get("rowwise", False)
-            requests.append(("row" if rowwise else "block", reference_shape(edge["shape"], rowwise)))
-    return requests + [("block", SMOKE), ("bf16", SMOKE)]
+            requests.append(
+                ("row" if rowwise else "block", reference_shape(edge["shape"], rowwise))
+            )
+    scale_widths = {ceildiv(SMOKE[2], 128)}
+    scale_widths.update(
+        ceildiv(edge["shape"][2], 128) for edge in edge_cases() if all(edge["shape"])
+    )
+    return requests + [("block", SMOKE), ("bf16", SMOKE)] + scale_transposes(scale_widths)
 
 
 def build_native(root, package, requests):
@@ -302,12 +328,17 @@ def build_native(root, package, requests):
     lines = []
     unique = list(dict.fromkeys(requests))
     for mode, (m, n, k) in unique:
-        flavor = "1d1d" if mode in ("row", "stock") else "1d2d"
-        tag = f"sm90_fp8_gemm_{flavor}"
+        if mode == "transpose":
+            flavor, tag, header_name = "transpose", "transpose_fp32", "smxx_layout"
+            call = r'jit->compile\("transpose_fp32", std::format'
+        else:
+            flavor = "1d1d" if mode in ("row", "stock") else "1d2d"
+            tag = header_name = f"sm90_fp8_gemm_{flavor}"
+            call = r"jit->compile\(tag, std::format"
         if flavor not in templates:
-            header = package / f"csrc/jit_kernels/impls/{tag}.hpp"
+            header = package / f"csrc/jit_kernels/impls/{header_name}.hpp"
             match = re.search(
-                r'jit->compile\(tag, std::format\(R"\((.*?)\n\)",(.*?)\)\);',
+                call + r'\(R"\((.*?)\n\)",(.*?)\)\);',
                 header.read_text(),
                 re.S,
             )
@@ -627,65 +658,65 @@ def timing(args, plan, torch, dg, order):
     require(float(limits.strip()) == 700, f"Expected enforced 700 W cap for {uuid}: {limits}")
     results = []
     telemetry = args.output / f"{order}.csv"
-    with protocol.sample_gpu(telemetry):
-        for row in plan["rows"]:
-            if row["id"] not in plan["scope"]["cases"]:
-                continue
-            _, dest, ref, pin = dense_launches(torch, dg, fixture, row)
-            check_pair(torch, dest, ref, pin, row["id"])
-            _, dest_edge, ref_edge, pin_edge = dense_launches(torch, dg, fixture, row, edge=True)
-            check_pair(torch, dest_edge, ref_edge, pin_edge, f"{row['id']} subnormals")
-            graph_ref, graph_pin = [fixture.make_graph(call, 32) for call in (ref, pin)]
-            graphs = {"ref": graph_ref, "pin": graph_pin, "repeat": graph_ref}
-            start, end = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
+    for row in plan["rows"]:
+        if row["id"] not in plan["scope"]["cases"]:
+            continue
+        _, dest, ref, pin = dense_launches(torch, dg, fixture, row)
+        check_pair(torch, dest, ref, pin, row["id"])
+        _, dest_edge, ref_edge, pin_edge = dense_launches(torch, dg, fixture, row, edge=True)
+        check_pair(torch, dest_edge, ref_edge, pin_edge, f"{row['id']} subnormals")
+        graph_ref, graph_pin = [fixture.make_graph(call, 32) for call in (ref, pin)]
+        graphs = {"ref": graph_ref, "pin": graph_pin, "repeat": graph_ref}
+        start, end = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
 
-            def epoch(arm, batch, seconds):
-                ms, count = protocol.run_epoch(graphs[arm], batch, seconds, torch, start, end)
-                return ms, count
+        def epoch(arm, batch, seconds):
+            ms, count = protocol.run_epoch(graphs[arm], batch, seconds, torch, start, end)
+            return ms, count
 
-            graph_ms = max(epoch(arm, 1, 0)[0] for arm in ("ref", "pin"))
-            batch = max(1, min(32, int(30 / max(graph_ms, 0.001))))
-            begin = protocol.utc()
-            pre_ms, pre_count = epoch("ref", batch, 2.0)
-            pre = {"begin": begin, "end": protocol.utc(), "ms": pre_ms, "graphs": pre_count}
-            require(pre_ms >= 2000, f"Short preconditioning for case {row['id']}")
-            ab, aa, epochs = [], [], []
-            for pair in PAIRS:
-                times = {}
-                for arm in reversed(pair) if order == "reverse" else pair:
-                    epoch(arm, batch, 0.25)
-                    begin = protocol.utc()
-                    elapsed, count = epoch(arm, batch, 0.760)
-                    require(elapsed >= 750, f"Short epoch for case {row['id']}")
-                    times[arm] = elapsed * 1e3 / (count * 32)
-                    epochs.append(
-                        {
-                            "arm": arm,
-                            "begin": begin,
-                            "end": protocol.utc(),
-                            "ms": elapsed,
-                            "graphs": count,
-                            "us": times[arm],
-                        }
-                    )
-                (ab if "pin" in times else aa).append(
-                    times.get("pin", times.get("repeat")) / times["ref"]
+        graph_ms = max(epoch(arm, 1, 0)[0] for arm in ("ref", "pin"))
+        batch = max(1, min(32, int(30 / max(graph_ms, 0.001))))
+        begin = protocol.utc()
+        # The target is measured on the device. Leave a small margin for event startup.
+        pre_ms, pre_count = epoch("ref", batch, 2.05)
+        pre = {"begin": begin, "end": protocol.utc(), "ms": pre_ms, "graphs": pre_count}
+        require(pre_ms >= 2000, f"Short preconditioning for case {row['id']}: {pre_ms:.3f} ms")
+        ab, aa, epochs = [], [], []
+        for pair in PAIRS:
+            times = {}
+            for arm in reversed(pair) if order == "reverse" else pair:
+                epoch(arm, batch, 0.25)
+                begin = protocol.utc()
+                elapsed, count = epoch(arm, batch, 0.760)
+                require(elapsed >= 750, f"Short epoch for case {row['id']}")
+                times[arm] = elapsed * 1e3 / (count * 32)
+                epochs.append(
+                    {
+                        "arm": arm,
+                        "begin": begin,
+                        "end": protocol.utc(),
+                        "ms": elapsed,
+                        "graphs": count,
+                        "us": times[arm],
+                    }
                 )
-            result = {
-                "case": row["id"],
-                "selector": row["expected_signature"],
-                "precondition": pre,
-                "epochs": epochs,
-                "ab": ab,
-                "aa": aa,
-            }
-            results.append(result)
-            print(json.dumps(result), flush=True)
+            (ab if "pin" in times else aa).append(
+                times.get("pin", times.get("repeat")) / times["ref"]
+            )
+        result = {
+            "case": row["id"],
+            "selector": row["expected_signature"],
+            "precondition": pre,
+            "epochs": epochs,
+            "ab": ab,
+            "aa": aa,
+        }
+        results.append(result)
+        print(json.dumps(result), flush=True)
     with telemetry.open() as stream:
         samples = [
             sample
             for sample in csv.DictReader(stream, skipinitialspace=True)
-            if uuid in sample.values()
+            if sample.get("uuid") == uuid and all(sample.values())
         ]
     require(
         samples and all(float(sample["enforced.power.limit [W]"]) == 700 for sample in samples),
@@ -967,6 +998,18 @@ def launch(args, step, command, *, exclude=None):
             str(root / "memcheck.log"),
             *cli,
         ]
+    if step != "prepare":
+        cli = [
+            sys.executable,
+            "-B",
+            str(ENTRY),
+            "_sample",
+            str(root),
+            step,
+            str(args.protocol),
+            "--",
+            *cli,
+        ]
     if step == "smoke":
         cli = [
             "bash",
@@ -1075,7 +1118,17 @@ def run(args):
     return 0 if result["pass"] and steps.get("stock", 0) == 0 else 1
 
 
+def sample_gpu_job(output, step, protocol, separator, *command):
+    require(separator == "--" and command, "Missing GPU worker command")
+    telemetry = Path(output) / f"{step}.csv"
+    replay = runpy.run_path(protocol, run_name="fp8_gate_startup_telemetry")
+    with replay["sample_gpu"](telemetry):
+        return subprocess.run(command).returncode
+
+
 def main():
+    if sys.argv[1:2] == ["_sample"]:
+        return sample_gpu_job(*sys.argv[2:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["run", "_worker"])
     parser.add_argument(
