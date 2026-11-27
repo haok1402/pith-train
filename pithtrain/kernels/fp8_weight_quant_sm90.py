@@ -660,6 +660,8 @@ def build_ops() -> str:
     with open(os.path.join(root, "lock"), "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if not os.path.exists(library):
+            if os.environ.get("PITHTRAIN_FP8_PREFLIGHT_STRICT") == "1":
+                raise RuntimeError(f"Missing CPU-prepared FP8 weight quantization library: {library}")
             # Publish atomically because the file lock may fail to exclude builders on other nodes.
             unique = f"{socket.gethostname()}.{os.getpid()}"
             source, partial = os.path.join(root, f"ops.{unique}.cpp"), f"{library}.{unique}.tmp"

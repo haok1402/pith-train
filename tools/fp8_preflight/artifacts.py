@@ -173,7 +173,13 @@ class CuteArtifacts:
             if not self.fallback and digest(path) != item["sha256"]:
                 raise ValueError(f"Corrupt sealed CuTe artifact {path}")
             entry = self.load_module(str(path), enable_tvm_ffi=True).preflight_entry
-            compiled = ffi_call(entry, operation, args, kwargs)
+            wrapped = ffi_call(entry, operation, args, kwargs)
+
+            def compiled(*runtime_args, **runtime_kwargs):
+                return wrapped(*runtime_args, **runtime_kwargs)
+
+            # The native weight-quantization bridge takes the TVM function handle.
+            compiled._tvm_ffi_function = entry
         except (OSError, RuntimeError, ValueError, AttributeError, KeyError) as error:
             if not self.fallback:
                 raise

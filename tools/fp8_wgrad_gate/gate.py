@@ -15,7 +15,7 @@ import subprocess
 import sys
 from contextlib import contextmanager, nullcontext
 from functools import partial
-from importlib import metadata
+from importlib import import_module, metadata
 from pathlib import Path
 from statistics import median
 from types import SimpleNamespace
@@ -85,7 +85,7 @@ int main(int argc, char** argv) {
         const char* dtype = bf16 ? "cutlass::bfloat16_t" : "float";
         const auto code = one_d
             ? render(cm,n,k,1,l.block_m,l.block_n,l.block_k,s.swizzle_a_mode,s.swizzle_b_mode,
-                     s.swizzle_cd_mode,p.num_stages,t.num_tma_threads,t.num_math_threads,
+                     p.num_stages,t.num_tma_threads,t.num_math_threads,
                      l.get_cluster_size(),l.cluster_n > 1,t.num_sms,"GemmType::Normal",dtype,accumulate)
             : render("cute::UMMA::Major::K",cm,n,k,1,l.block_m,l.block_n,l.block_k,
                      s.swizzle_a_mode,s.swizzle_b_mode,s.swizzle_cd_mode,p.num_stages,
@@ -228,9 +228,9 @@ def compile_cute(root, rows):
 
     from pithtrain.kernels import (
         fp8_quant_act,
+        fp8_quant_delta_gate,
         fp8_quant_grad,
         fp8_quant_swiglu,
-        fp8_quant_weight,
         fp8_wgrad,
     )
 
@@ -251,7 +251,9 @@ def compile_cute(root, rows):
             ):
                 fp8_wgrad(*data, dest)
         x = torch.empty((128, 128), dtype=torch.bfloat16)
-        fp8_quant_weight(x)
+        quant = import_module("pithtrain.kernels.fp8_weight_quant_sm90")
+        for dtype in (torch.bfloat16, torch.float32):
+            quant.resolve_blockwise_kernel(dtype, x.shape, x.stride(), 0)
         fp8_quant_act(x)
         fp8_quant_grad(x)
         data, dest = geometry({"shape": SMOKE}, "meta", populate=False)
@@ -259,6 +261,7 @@ def compile_cute(root, rows):
         wide = torch.empty((256, 256), dtype=torch.bfloat16)
         fp8_quant_act(wide)
         fp8_quant_swiglu(wide, wide)
+        fp8_quant_delta_gate(wide, wide.new_empty(128), wide.new_empty((256, 2)), wide)
     return entries
 
 
@@ -441,6 +444,7 @@ def setup_gpu(args, kind):
         DG_JIT_NVCC_COMPILER=str(root / "version-only-nvcc"),
         DG_JIT_USE_NVRTC="0",
         DG_JIT_PRINT_LOAD_TIME="1",
+        PITHTRAIN_FP8_PREFLIGHT_STRICT="1",
     )
     import deep_gemm
     import torch
